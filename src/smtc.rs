@@ -58,6 +58,11 @@ struct ListenerState {
     /// When the last TrackChanged was emitted, to suppress the transition state
     /// blip that follows a song change.
     last_track_emitted: Option<(usize, Instant)>,
+    /// When the tracked session last reported Stopped. A handoff to a new
+    /// session with identical content shortly after is the same song under a
+    /// new session object (browsers re-create their session per track/tab),
+    /// not a change.
+    last_stop_at: Option<Instant>,
     last_session_check: Instant,
     /// Whether the tracked session is currently Playing. Used to decide when a
     /// new source may take over the pill (only when nothing we track is active).
@@ -78,6 +83,12 @@ const STATE_HOLD_MS: u64 = 500;
 /// Window after a TrackChanged in which same-session playback state changes are
 /// suppressed (they are the transition blips of the song change itself).
 const TRACK_TRANSITION_MS: u64 = 400;
+/// Window after the tracked session stops in which a handoff to a new session
+/// with identical title/artist is treated as the same content continuing under
+/// a new session object instead of a change. Browsers re-create their session
+/// within this window in practice; a real replay of the same song later is not
+/// suppressed.
+const HANDOFF_SUPPRESS_MS: u64 = 2000;
 /// Upper bound for the album/artwork caches; beyond it they are cleared (the
 /// caches are a convenience, not critical state).
 const CACHE_CAP: usize = 32;
@@ -154,6 +165,7 @@ impl ListenerState {
             last_content_fingerprint: None,
             last_state_by_source: HashMap::new(),
             last_track_emitted: None,
+            last_stop_at: None,
             last_session_check: Instant::now(),
             current_playing: false,
             album_cache: HashMap::new(),
@@ -244,13 +256,17 @@ impl ListenerState {
                         if state == PlaybackState::Stopped {
                             // The tracked session stopped: hand off to whatever else
                             // is playing right now instead of waiting for the poll.
+                            // Record the stop first so a same-content handoff to a
+                            // re-created session is recognized as no change.
+                            self.last_stop_at = Some(Instant::now());
                             let before = self.current_key;
                             self.refresh_current_session(None, true, false)?;
                             if self.current_key == before {
-                                // Nothing else took over — report the stop.
+                                // Nothing else took over — report the stop. The
+                                // held deadline drops it if a new track takes over
+                                // within the hold window (song-change handoff).
                                 self.current_playing = false;
-                                self.pending_playback = Some((key, state, Instant::now(), source));
-                                self.schedule_flush();
+                                self.queue_playback_state(key, state, source);
                             }
                             return Ok(());
                         }
@@ -258,25 +274,7 @@ impl ListenerState {
                             self.recent_playing = Some(session.clone());
                         }
                         self.current_playing = state == PlaybackState::Playing;
-                        // Coalescing: skip state changes that are part of a song
-                        // change — a track is pending, or one was just emitted for
-                        // this session. Genuine pauses (no track activity) pass
-                        // through the hold window.
-                        let track_pending = self.pending_track.as_ref().is_some_and(|(k, _)| *k == key);
-                        let just_emitted = self.last_track_emitted.is_some_and(|(k, at)| {
-                            k == key && at.elapsed() < Duration::from_millis(TRACK_TRANSITION_MS)
-                        });
-                        if track_pending || just_emitted {
-                            self.last_state_by_source.insert(source, state);
-                            return Ok(());
-                        }
-                        self.pending_playback = Some((
-                            key,
-                            state,
-                            Instant::now() + Duration::from_millis(STATE_HOLD_MS),
-                            source,
-                        ));
-                        self.schedule_flush();
+                        self.queue_playback_state(key, state, source);
                     }
                 } else if !self.current_playing
                     && matches!(read_playback_state(&session)?, Some(PlaybackState::Playing))
@@ -317,6 +315,46 @@ impl ListenerState {
         }
     }
 
+    /// Queues a playback state for held emission, or drops it when a track for
+    /// the same session is pending or was just emitted — the state is then the
+    /// song-change blip, not a real change. The held deadline lets a handoff's
+    /// Stopped/Playing pair collapse into the track notification.
+    fn queue_playback_state(&mut self, key: usize, state: PlaybackState, source: String) {
+        let track_pending = self.pending_track.as_ref().is_some_and(|(k, _)| *k == key);
+        let just_emitted = self
+            .last_track_emitted
+            .is_some_and(|(k, at)| k == key && at.elapsed() < Duration::from_millis(TRACK_TRANSITION_MS));
+        if track_pending || just_emitted {
+            self.last_state_by_source.insert(source.clone(), state);
+            debug!("playback state suppressed | state={state:?} | source={source}");
+            return;
+        }
+        self.pending_playback = Some((
+            key,
+            state,
+            Instant::now() + Duration::from_millis(STATE_HOLD_MS),
+            source,
+        ));
+        self.schedule_flush();
+    }
+
+    /// True when a session that was just resolved carries the content we are
+    /// already showing, right after the previous session stopped. Browsers
+    /// re-create their SMTC session per track/tab, so this is the same song
+    /// continuing under a new session object — not a change to report.
+    fn handoff_is_same_content(&self, track: &TrackInfo) -> bool {
+        let Some(last) = &self.last_content_fingerprint else {
+            return false;
+        };
+        let Some(stopped_at) = self.last_stop_at else {
+            return false;
+        };
+        if stopped_at.elapsed() > Duration::from_millis(HANDOFF_SUPPRESS_MS) {
+            return false;
+        }
+        is_same_content(track, last)
+    }
+
     fn refresh_current_session(
         &mut self,
         hint: Option<&GlobalSystemMediaTransportControlsSession>,
@@ -340,6 +378,19 @@ impl ListenerState {
                     && let Ok(mut track) = read_track_info(&session)
                 {
                     self.apply_cache(&mut track);
+                    // Same-content handoff: adopt the re-created session silently
+                    // (the pill keeps tracking it) and let its property events
+                    // emit only when the content actually differs.
+                    if self.handoff_is_same_content(&track) {
+                        if playback == Some(PlaybackState::Playing) {
+                            self.recent_playing = Some(session.clone());
+                        }
+                        debug!(
+                            "session handoff, content unchanged | source={}",
+                            read_source_app(&session)
+                        );
+                        return Ok(());
+                    }
                     self.pending_track = Some((session_key(&session), track));
                 }
                 if let Some(state) = playback {
@@ -351,11 +402,13 @@ impl ListenerState {
                         // notification when the app starts with no active media.
                         self.last_state_by_source.insert(read_source_app(&session), state);
                     } else {
-                        self.pending_playback =
-                            Some((session_key(&session), state, Instant::now(), read_source_app(&session)));
+                        self.queue_playback_state(session_key(&session), state, read_source_app(&session));
                     }
                 }
-                self.flush_pending();
+                // Schedule instead of flushing now: the held playback state needs
+                // its full hold window before it may be emitted, and the track
+                // pending loop is driven by the scheduled deadline.
+                self.schedule_flush();
             }
         }
         Ok(())
@@ -515,13 +568,22 @@ impl ListenerState {
         // while artwork/album of a slow track is pending. Duplicate states for
         // the same source are deduplicated (sessions of an app are re-created
         // constantly, so the same state re-fires over and over).
-        if let Some((_key, state, deadline, source)) = self.pending_playback.take() {
-            if Instant::now() >= deadline && self.last_state_by_source.get(&source) != Some(&state) {
-                self.last_state_by_source.insert(source.clone(), state);
-                info!("playback state changed | state={state:?} | source={source}");
-                let _ = self.output.send(MediaEvent::PlaybackStateChanged(state));
+        if let Some((_key, state, deadline, source)) = self.pending_playback.as_ref().cloned() {
+            if Instant::now() < deadline {
+                // Still inside the hold window: keep the state and retry at the
+                // deadline. An early flush (the track loop fires every 100ms
+                // while artwork is pending) must not drop a state that is merely
+                // waiting — the hold is a delay, not a drop.
+                self.pending_deadline = Some(deadline);
             } else {
-                debug!("playback state suppressed | state={state:?} | source={source}");
+                self.pending_playback = None;
+                if self.last_state_by_source.get(&source) != Some(&state) {
+                    self.last_state_by_source.insert(source.clone(), state);
+                    info!("playback state changed | state={state:?} | source={source}");
+                    let _ = self.output.send(MediaEvent::PlaybackStateChanged(state));
+                } else {
+                    debug!("playback state suppressed | state={state:?} | source={source}");
+                }
             }
         }
 
@@ -742,6 +804,12 @@ fn track_fingerprint(track: &TrackInfo) -> TrackFingerprint {
     }
 }
 
+/// Whether a freshly-read track is the content we are already showing. Used to
+/// recognize a session handoff as no change. Title+artist equality, exact.
+fn is_same_content(track: &TrackInfo, last: &TrackFingerprint) -> bool {
+    track.title == last.title && track.artist == last.artist
+}
+
 fn debounce_duration(config: &Config) -> Duration {
     Duration::from_millis(config.behavior.debounce_ms.clamp(150, 250))
 }
@@ -779,5 +847,37 @@ mod tests {
         // Short enough to bound browser latency, long enough to catch the
         // album event that typically follows artwork.
         assert_eq!(album_grace(), Duration::from_millis(400));
+    }
+
+    #[test]
+    fn same_content_matches_title_and_artist_only() {
+        let track = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            ..TrackInfo::default()
+        };
+        let last = TrackFingerprint {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            has_artwork: true,
+        };
+        assert!(is_same_content(&track, &last));
+        // A different artist is a real change.
+        let other = TrackInfo {
+            title: "Song".into(),
+            artist: "Other".into(),
+            ..TrackInfo::default()
+        };
+        assert!(!is_same_content(&other, &last));
+        // A momentarily blank artist must not match (fall back to the normal
+        // path; the fingerprint dedup is the backstop).
+        let blank = TrackInfo {
+            title: "Song".into(),
+            artist: String::new(),
+            ..TrackInfo::default()
+        };
+        assert!(!is_same_content(&blank, &last));
     }
 }
