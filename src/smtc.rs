@@ -48,6 +48,11 @@ struct ListenerState {
     /// Whether the tracked session is currently Playing. Used to decide when a
     /// new source may take over the pill (only when nothing we track is active).
     current_playing: bool,
+    /// Whether the most recently flushed track had an album title. When the
+    /// previous track of this session carried album info, the next track is also
+    /// held until its album arrives — without adding latency for sources that
+    /// never provide album (browsers).
+    last_track_had_album: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +123,7 @@ impl ListenerState {
             last_session_check: Instant::now(),
             session_has_album: false,
             current_playing: false,
+            last_track_had_album: false,
         }
     }
 
@@ -360,10 +366,12 @@ impl ListenerState {
     fn flush_pending(&mut self) {
         self.pending_deadline = None;
         // Wait until the track is complete before sending: artwork must be ready,
-        // and the album too when this session is known to provide one. Re-schedule
-        // every 100ms up to 3s from the first read of this track.
+        // and the album too when this session is known to provide one (or the
+        // previous flushed track had one). Re-schedule every 100ms up to 3s from
+        // the first read of this track.
         let incomplete = self.pending_track.as_ref().is_some_and(|(_, track)| {
-            track.artwork.is_none() || (self.session_has_album && track.album.trim().is_empty())
+            track.artwork.is_none()
+                || (track.album.trim().is_empty() && (self.session_has_album || self.last_track_had_album))
         });
         if incomplete {
             if self.track_pending_since.is_none() {
@@ -380,6 +388,7 @@ impl ListenerState {
             let fingerprint = track_fingerprint(&track);
             if self.last_content_fingerprint.as_ref() != Some(&fingerprint) {
                 self.last_content_fingerprint = Some(fingerprint);
+                self.last_track_had_album = !track.album.trim().is_empty();
                 info!(
                     "track changed | title={:?} | artist={:?} | album={:?} | source={:?}",
                     track.title, track.artist, track.album, track.source_app
