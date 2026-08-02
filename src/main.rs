@@ -13,9 +13,15 @@ use anyhow::Result;
 use log::{error, info, warn};
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex, mpsc};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::System::Diagnostics::Debug::{
+    AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW, TranslateMessage,
@@ -24,9 +30,65 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent};
 use crate::overlay::EventQueue;
 
+static CRASH_LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Diagnostic vectored exception handler: on an access violation it appends the
+/// faulting instruction address and a raw backtrace to crash.log (no locks, no
+/// allocations that can deadlock), then lets Windows continue with default crash
+/// handling.
+unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    if info.is_null() {
+        return 0;
+    }
+    let record = unsafe { &*((*info).ExceptionRecord) };
+    if record.ExceptionCode.0 != 0xC000_0005u32 as i32 {
+        return 0;
+    }
+    let addr = if record.NumberParameters >= 2 {
+        record.ExceptionInformation[1]
+    } else {
+        0
+    };
+    let ip = record.ExceptionAddress as usize;
+    let base = unsafe { GetModuleHandleW(None) }.map(|h| h.0 as usize).unwrap_or(0);
+    let mut frames = [0usize; 24];
+    let mut raw: [*mut c_void; 24] = [std::ptr::null_mut(); 24];
+    let count = unsafe { RtlCaptureStackBackTrace(0, &mut raw, None) } as usize;
+    for (i, r) in raw.iter().take(count).enumerate() {
+        frames[i] = *r as usize;
+    }
+    let mut out = String::from("CRASH access violation\n");
+    out += &format!("  ip    = 0x{ip:016x} (rva 0x{:x})\n", ip.wrapping_sub(base));
+    out += &format!("  addr  = 0x{addr:016x}\n");
+    out += &format!("  base  = 0x{base:016x}\n");
+    for (i, f) in frames.iter().take(count as usize).enumerate() {
+        out += &format!("  frame[{i}] = 0x{f:016x} (rva 0x{:x})\n", f.wrapping_sub(base));
+    }
+    if let Some(dir) = CRASH_LOG_DIR.get() {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("crash.log"))
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(out.as_bytes())
+            });
+    }
+    0 // EXCEPTION_CONTINUE_SEARCH
+}
+
+fn install_crash_handler(logs_dir: &Path) {
+    let _ = CRASH_LOG_DIR.set(logs_dir.to_path_buf());
+    unsafe {
+        AddVectoredExceptionHandler(1, Some(crash_handler));
+    }
+}
+
 fn main() -> Result<()> {
     let config = config::Config::load()?;
     logging::init_logging(&config.logs_dir());
+    install_crash_handler(&config.logs_dir());
     info!("starting Notch");
 
     if let Err(error) = autostart::apply(config.behavior.start_on_login) {
