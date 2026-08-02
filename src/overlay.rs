@@ -1,21 +1,22 @@
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo};
 use anyhow::{Context, Result};
+use fontdue::{Font, FontSettings};
 use image::imageops::FilterType;
 use log::{debug, error};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
     CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, ETO_CLIPPED, ExtTextOutW, FF_DONTCARE,
-    GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW, HBRUSH, HDC, MONITOR_DEFAULTTONEAREST,
-    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode,
-    SetTextColor, TEXTMETRICW, TRANSPARENT, ValidateRect,
+    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_DONTCARE, GetMonitorInfoW, HBRUSH, HDC,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS,
+    SelectObject, SetBkMode, SetTextColor, TRANSPARENT, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -68,6 +69,39 @@ const MARQUEE_HOLD: Duration = Duration::from_millis(600);
 const MARQUEE_GAP: f32 = 24.0;
 /// Scroll speed in logical px per second.
 const MARQUEE_SPEED: f32 = 30.0;
+
+/// Regular and bold faces loaded once from the system font directory. Segoe UI
+/// is the preferred family, with Tahoma and Arial as fallbacks.
+struct FontSet {
+    regular: Font,
+    bold: Font,
+}
+
+static TEXT_FONTS: OnceLock<Result<FontSet, String>> = OnceLock::new();
+/// Set once when the first text render failed to load fonts, so the error is
+/// logged exactly once instead of every frame.
+static FONT_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn load_font(path: &str) -> Option<Font> {
+    let bytes = std::fs::read(path).ok()?;
+    Font::from_bytes(bytes, FontSettings::default()).ok()
+}
+
+fn font_set() -> &'static Result<FontSet, String> {
+    TEXT_FONTS.get_or_init(|| {
+        const CANDIDATES: [(&str, &str); 3] = [
+            (r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\segoeuib.ttf"),
+            (r"C:\Windows\Fonts\tahoma.ttf", r"C:\Windows\Fonts\tahomabd.ttf"),
+            (r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\arialbd.ttf"),
+        ];
+        for (regular, bold) in CANDIDATES {
+            if let (Some(regular), Some(bold)) = (load_font(regular), load_font(bold)) {
+                return Ok(FontSet { regular, bold });
+            }
+        }
+        Err("no usable system font found (tried Segoe UI, Tahoma, Arial)".to_string())
+    })
+}
 
 struct OverlayState {
     hwnd: HWND,
@@ -547,7 +581,8 @@ fn render_layered(
     alpha: u8,
     position: POINT,
 ) -> Result<()> {
-    let pixels = draw_pixels(state, content, width as usize, height as usize, scale)?;
+    let mut pixels = draw_pixels(state, content, width as usize, height as usize, scale)?;
+    draw_text_pixels(state, &mut pixels, content, width, height, scale);
     let bitmap_info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -576,7 +611,6 @@ fn render_layered(
         std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast(), pixels.len());
     }
     let old_bitmap = unsafe { SelectObject(hdc, bitmap) };
-    draw_text(state, hdc, content, width, height, scale);
 
     let size = SIZE { cx: width, cy: height };
     let source = POINT { x: 0, y: 0 };
@@ -623,8 +657,17 @@ fn draw_pixels(state: &OverlayState, content: &MediaEvent, width: usize, height:
     let background = state.config.appearance.background_color;
     for y in 0..height {
         for x in 0..width {
-            if inside_round_rect(x as f32, y as f32, width as f32, height as f32, radius) {
-                set_pixel(&mut pixels, width, x, y, background);
+            let coverage = round_rect_coverage(x as f32, y as f32, width as f32, height as f32, radius);
+            if coverage > 0.0 {
+                let alpha = (background[3] as f32 * coverage) as u32;
+                composite(
+                    &mut pixels,
+                    width,
+                    x,
+                    y,
+                    [background[0], background[1], background[2]],
+                    alpha,
+                );
             }
         }
     }
@@ -637,16 +680,25 @@ fn draw_pixels(state: &OverlayState, content: &MediaEvent, width: usize, height:
             let art_y = height.saturating_sub(art_size) / 2;
             if let Some(artwork) = &track.artwork {
                 if let Some(decoded) = decode_artwork(artwork, art_size) {
+                    // Album art gets rounded corners (smaller radius than the
+                    // pill itself) via the same coverage mask as everything else.
+                    let art_radius = art_size as f32 * 0.2;
                     for y in 0..art_size {
                         for x in 0..art_size {
-                            let source = (y * art_size + x) * 4;
-                            let rgba = [
-                                decoded[source],
-                                decoded[source + 1],
-                                decoded[source + 2],
-                                decoded[source + 3],
-                            ];
-                            set_pixel(&mut pixels, width, art_x + x, art_y + y, rgba);
+                            let coverage =
+                                round_rect_coverage(x as f32, y as f32, art_size as f32, art_size as f32, art_radius);
+                            if coverage > 0.0 {
+                                let source = (y * art_size + x) * 4;
+                                let alpha = (decoded[source + 3] as f32 * coverage) as u32;
+                                composite(
+                                    &mut pixels,
+                                    width,
+                                    art_x + x,
+                                    art_y + y,
+                                    [decoded[source], decoded[source + 1], decoded[source + 2]],
+                                    alpha,
+                                );
+                            }
                         }
                     }
                 } else {
@@ -681,10 +733,18 @@ fn draw_pixels(state: &OverlayState, content: &MediaEvent, width: usize, height:
     Ok(pixels)
 }
 
-fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, height: i32, scale: f32) {
-    unsafe {
-        SetBkMode(hdc, TRANSPARENT);
-    }
+/// Draws the pill's text rows into the same premultiplied pixel buffer as the
+/// shapes: glyph coverage from fontdue becomes alpha, so text alpha-composites
+/// exactly like every other element (GDI text cannot do this on a layered
+/// window — it never touches the alpha channel).
+fn draw_text_pixels(
+    state: &OverlayState,
+    pixels: &mut [u8],
+    content: &MediaEvent,
+    width: i32,
+    height: i32,
+    scale: f32,
+) {
     match content {
         MediaEvent::TrackChanged(track) => {
             let appearance = &state.config.appearance;
@@ -734,14 +794,16 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
             };
 
             let title_rect = next_band(0);
-            draw_marquee_line(
-                hdc,
+            draw_text_line_pixels(
+                pixels,
+                width as usize,
                 &track.title,
                 &title_rect,
                 rows[0].1 as i32,
                 appearance.text_color,
                 true,
-                &state.scroll[0],
+                false,
+                Some(&state.scroll[0]),
             );
 
             let subtitle = if track.artist.trim().is_empty() {
@@ -750,38 +812,44 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
                 &track.artist
             };
             let artist_rect = next_band(1);
-            draw_marquee_line(
-                hdc,
+            draw_text_line_pixels(
+                pixels,
+                width as usize,
                 subtitle,
                 &artist_rect,
                 rows[1].1 as i32,
                 [0xCC, 0xCC, 0xCC, 0xFF],
                 false,
-                &state.scroll[1],
+                false,
+                Some(&state.scroll[1]),
             );
 
             if active[2] {
                 let meta_rect = next_band(2);
-                draw_marquee_line(
-                    hdc,
+                draw_text_line_pixels(
+                    pixels,
+                    width as usize,
                     &meta,
                     &meta_rect,
                     rows[2].1 as i32,
                     [0x99, 0x99, 0x99, 0xFF],
                     false,
-                    &state.scroll[2],
+                    false,
+                    Some(&state.scroll[2]),
                 );
             }
             if active[3] {
                 let app_rect = next_band(3);
-                draw_marquee_line(
-                    hdc,
+                draw_text_line_pixels(
+                    pixels,
+                    width as usize,
                     &track.source_app,
                     &app_rect,
                     rows[3].1 as i32,
                     [0x77, 0x77, 0x77, 0xFF],
                     false,
-                    &state.scroll[3],
+                    false,
+                    Some(&state.scroll[3]),
                 );
             }
         }
@@ -791,52 +859,58 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
                 PlaybackState::Paused => "Paused",
                 PlaybackState::Stopped => "Stopped",
             };
-            let mut state_rect = RECT {
+            let state_rect = RECT {
                 left: 0,
                 top: 0,
                 right: width,
                 bottom: (height as f32 * 0.35) as i32,
             };
-            draw_string(
-                hdc,
+            draw_text_line_pixels(
+                pixels,
+                width as usize,
                 label,
-                &mut state_rect,
+                &state_rect,
                 (state.config.appearance.font_size_title * scale) as i32,
                 state.config.appearance.accent_color,
                 true,
                 true,
+                None,
             );
             if let Some(track) = &state.last_track {
-                let mut title_rect = RECT {
+                let title_rect = RECT {
                     left: 0,
                     top: (height as f32 * 0.35) as i32,
                     right: width,
                     bottom: (height as f32 * 0.65) as i32,
                 };
-                draw_string(
-                    hdc,
+                draw_text_line_pixels(
+                    pixels,
+                    width as usize,
                     &track.title,
-                    &mut title_rect,
+                    &title_rect,
                     (state.config.appearance.font_size_artist * scale) as i32,
                     state.config.appearance.text_color,
                     true,
                     true,
+                    None,
                 );
                 if !track.artist.trim().is_empty() {
-                    let mut artist_rect = RECT {
+                    let artist_rect = RECT {
                         left: 0,
                         top: (height as f32 * 0.65) as i32,
                         right: width,
                         bottom: height,
                     };
-                    draw_string(
-                        hdc,
+                    draw_text_line_pixels(
+                        pixels,
+                        width as usize,
                         &track.artist,
-                        &mut artist_rect,
+                        &artist_rect,
                         ((state.config.appearance.font_size_artist * 0.85) as i32).max(1),
                         [0xCC, 0xCC, 0xCC, 0xFF],
                         false,
                         true,
+                        None,
                     );
                 }
             }
@@ -844,84 +918,152 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
     }
 }
 
-/// Draws one pill text line. Text that fits is drawn statically (left-aligned);
-/// overflowing text scrolls horizontally (marquee) using the line's scroll state.
+/// Rasterizes one pill text line into the pixel buffer. Text that fits is
+/// drawn statically (left-aligned); overflowing text scrolls horizontally
+/// (marquee) using the line's scroll state; the non-scrolling form trims with
+/// an ellipsis like DT_END_ELLIPSIS and honors the centered flag.
 /// Auto-dismiss timing is never involved — scroll is pure per-frame visual state.
-fn draw_marquee_line(
-    hdc: HDC,
+#[allow(clippy::too_many_arguments)]
+fn draw_text_line_pixels(
+    pixels: &mut [u8],
+    width: usize,
     value: &str,
     rect: &RECT,
     font_height: i32,
     color: [u8; 4],
     bold: bool,
-    scroll: &LineScroll,
+    centered: bool,
+    marquee: Option<&LineScroll>,
 ) {
-    let text = value.encode_utf16().collect::<Vec<_>>();
-    let font_name = wide("Segoe UI");
-    let font = unsafe {
-        CreateFontW(
-            -font_height.max(1),
-            0,
-            0,
-            0,
-            if bold { 600 } else { 400 },
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_DEFAULT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            ANTIALIASED_QUALITY.0 as u32,
-            DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
-            PCWSTR(font_name.as_ptr()),
-        )
+    if value.is_empty() || rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+    let fonts = match font_set() {
+        Ok(fonts) => fonts,
+        Err(message) => {
+            if !FONT_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+                error!("text rendering unavailable: {message}");
+            }
+            return;
+        }
     };
-    let old_font = unsafe { SelectObject(hdc, font) };
-    let color = COLORREF(color[0] as u32 | (color[1] as u32) << 8 | (color[2] as u32) << 16);
-    unsafe {
-        SetTextColor(hdc, color);
-        SetBkMode(hdc, TRANSPARENT);
+    let face = if bold { &fonts.bold } else { &fonts.regular };
+    let px = font_height.max(1) as f32;
+    let Some(line) = face.horizontal_line_metrics(px) else {
+        return;
+    };
+    let line_h = line.ascent - line.descent;
+    let rect_w = (rect.right - rect.left) as f32;
+    let rect_h = (rect.bottom - rect.top) as f32;
+    let baseline = rect.top as f32 + (rect_h - line_h) / 2.0 + line.ascent;
 
-        let mut size = SIZE::default();
-        let _ = GetTextExtentPoint32W(hdc, &text, &mut size);
-        let mut tm = TEXTMETRICW::default();
-        let _ = GetTextMetricsW(hdc, &mut tm);
-        let line_h = tm.tmHeight;
-        let y = rect.top + ((rect.bottom - rect.top - line_h) / 2).max(0);
-        let avail = (rect.right - rect.left).max(1);
-        let count = text.len() as u32;
+    let chars: Vec<char> = value.chars().collect();
+    let advances: Vec<f32> = chars.iter().map(|c| face.metrics(*c, px).advance_width).collect();
+    let total: f32 = advances.iter().sum();
 
-        if size.cx <= avail {
-            let _ = ExtTextOutW(
-                hdc,
-                rect.left,
-                y,
-                ETO_CLIPPED,
-                Some(rect),
-                PCWSTR(text.as_ptr()),
-                count,
-                None,
-            );
+    let mut draw_at = |start_x: f32, chars: &[char], advances: &[f32]| {
+        draw_glyphs(pixels, width, rect, face, px, chars, advances, start_x, baseline, color);
+    };
+
+    if let Some(scroll) = marquee {
+        if total <= rect_w {
+            draw_at(rect.left as f32, &chars, &advances);
+            return;
+        }
+        // Continuous loop: draw the text at a shifting offset plus a second
+        // copy after a gap, clipped to the row rect.
+        let span = total + MARQUEE_GAP;
+        let hold_elapsed = scroll.started_at.map(|t| t.elapsed()).unwrap_or_default();
+        let offset = if hold_elapsed < MARQUEE_HOLD {
+            0.0
         } else {
-            // Continuous loop: draw the text at a shifting offset plus a second
-            // copy after a gap, clipped to the row rect (ETO_CLIPPED).
-            let total = size.cx + MARQUEE_GAP as i32;
-            let hold_elapsed = scroll.started_at.map(|t| t.elapsed()).unwrap_or_default();
-            let offset = if hold_elapsed < MARQUEE_HOLD {
-                0.0
-            } else {
-                scroll.offset
-            };
-            let off = (offset % total as f32) as i32;
-            let x1 = rect.left - off;
-            let _ = ExtTextOutW(hdc, x1, y, ETO_CLIPPED, Some(rect), PCWSTR(text.as_ptr()), count, None);
-            let x2 = x1 + total;
-            if x2 < rect.right {
-                let _ = ExtTextOutW(hdc, x2, y, ETO_CLIPPED, Some(rect), PCWSTR(text.as_ptr()), count, None);
+            scroll.offset % span
+        };
+        let x1 = rect.left as f32 - offset;
+        draw_at(x1, &chars, &advances);
+        let x2 = x1 + span;
+        if x2 < rect.right as f32 {
+            draw_at(x2, &chars, &advances);
+        }
+        return;
+    }
+
+    // Static line: ellipsis-trim when the text does not fit.
+    if total > rect_w {
+        let ellipsis = '\u{2026}';
+        let ellipsis_w = face.metrics(ellipsis, px).advance_width;
+        let mut budget = rect_w - ellipsis_w;
+        let mut end = 0;
+        while end < chars.len() && budget >= advances[end] {
+            budget -= advances[end];
+            end += 1;
+        }
+        let mut shown: Vec<char> = chars[..end].to_vec();
+        let mut shown_adv: Vec<f32> = advances[..end].to_vec();
+        shown.push(ellipsis);
+        shown_adv.push(ellipsis_w);
+        let drawn: f32 = shown_adv.iter().sum();
+        let start_x = if centered {
+            rect.left as f32 + (rect_w - drawn) / 2.0
+        } else {
+            rect.left as f32
+        };
+        draw_at(start_x, &shown, &shown_adv);
+        return;
+    }
+    let start_x = if centered {
+        rect.left as f32 + (rect_w - total) / 2.0
+    } else {
+        rect.left as f32
+    };
+    draw_at(start_x, &chars, &advances);
+}
+
+/// Rasterizes glyphs with fontdue and composites their coverage as alpha.
+#[allow(clippy::too_many_arguments)]
+fn draw_glyphs(
+    pixels: &mut [u8],
+    width: usize,
+    rect: &RECT,
+    face: &Font,
+    px: f32,
+    chars: &[char],
+    advances: &[f32],
+    start_x: f32,
+    baseline: f32,
+    color: [u8; 4],
+) {
+    let mut pen = start_x;
+    for (c, advance) in chars.iter().zip(advances) {
+        let (metrics, coverage) = face.rasterize(*c, px);
+        let origin_x = (pen + metrics.xmin as f32).round() as i32;
+        // fontdue's ymin is the glyph's bottom edge in y-up coordinates
+        // (negative below the baseline), so the bitmap's top row sits at
+        // baseline - (ymin + height).
+        let origin_y = (baseline - metrics.ymin as f32 - metrics.height as f32).round() as i32;
+        for gy in 0..metrics.height {
+            for gx in 0..metrics.width {
+                let x = origin_x + gx as i32;
+                let y = origin_y + gy as i32;
+                if x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom {
+                    continue;
+                }
+                let coverage = coverage[gy * metrics.width + gx] as u32;
+                if coverage == 0 {
+                    continue;
+                }
+                let alpha = color[3] as u32 * coverage / 255;
+                composite(
+                    pixels,
+                    width,
+                    x as usize,
+                    y as usize,
+                    [color[0], color[1], color[2]],
+                    alpha,
+                );
             }
         }
-        SelectObject(hdc, old_font);
-        let _ = DeleteObject(font);
+        pen += advance;
     }
 }
 
@@ -982,49 +1124,54 @@ pub(crate) fn decode_artwork(data: &[u8], size: usize) -> Option<Vec<u8>> {
     Some(image.into_raw())
 }
 
-fn draw_placeholder(pixels: &mut [u8], width: usize, x: usize, y: usize, size: usize, color: [u8; 4]) {
-    for py in y..y.saturating_add(size) {
-        for px in x..x.saturating_add(size) {
-            let center_x = x + size / 2;
-            let center_y = y + size / 2;
-            let dx = px as isize - center_x as isize;
-            let dy = py as isize - center_y as isize;
-            if dx * dx + dy * dy <= (size as isize / 2).pow(2) {
-                set_pixel(pixels, width, px, py, color);
-            }
-        }
-    }
-}
-
-fn set_pixel(pixels: &mut [u8], width: usize, x: usize, y: usize, color: [u8; 4]) {
+/// Source-over composite of a premultiplied source (rgb, alpha) onto the
+/// buffer. The buffer holds premultiplied BGRA, exactly what
+/// UpdateLayeredWindow(ULW_ALPHA) consumes, so every shape and glyph goes
+/// through this single alpha-correct path.
+fn composite(pixels: &mut [u8], width: usize, x: usize, y: usize, rgb: [u8; 3], alpha: u32) {
     if x >= width || y >= pixels.len() / width / 4 {
         return;
     }
     let offset = (y * width + x) * 4;
-    let alpha = color[3] as u32;
-    pixels[offset] = (color[2] as u32 * alpha / 255) as u8;
-    pixels[offset + 1] = (color[1] as u32 * alpha / 255) as u8;
-    pixels[offset + 2] = (color[0] as u32 * alpha / 255) as u8;
-    pixels[offset + 3] = color[3];
+    let alpha = alpha.min(255);
+    let inv = 255 - alpha;
+    pixels[offset] = ((rgb[2] as u32 * alpha + pixels[offset] as u32 * inv) / 255) as u8;
+    pixels[offset + 1] = ((rgb[1] as u32 * alpha + pixels[offset + 1] as u32 * inv) / 255) as u8;
+    pixels[offset + 2] = ((rgb[0] as u32 * alpha + pixels[offset + 2] as u32 * inv) / 255) as u8;
+    pixels[offset + 3] = (alpha + pixels[offset + 3] as u32 * inv / 255) as u8;
 }
 
-fn inside_round_rect(x: f32, y: f32, width: f32, height: f32, radius: f32) -> bool {
+/// Anti-aliased coverage (0..=1) of a rounded rectangle at pixel (x, y):
+/// signed distance to the boundary smoothed over ~1.5 px. Used for the pill's
+/// outer shape, the placeholder art and the album-artwork corner mask.
+fn round_rect_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> f32 {
     let radius = radius.min(width / 2.0).min(height / 2.0);
-    let dx = if x < radius {
-        radius - x
-    } else if x >= width - radius {
-        x - (width - radius)
-    } else {
-        0.0
-    };
-    let dy = if y < radius {
-        radius - y
-    } else if y >= height - radius {
-        y - (height - radius)
-    } else {
-        0.0
-    };
-    dx == 0.0 || dy == 0.0 || dx * dx + dy * dy <= radius * radius
+    let qx = ((x + 0.5) - width / 2.0).abs() - (width / 2.0 - radius);
+    let qy = ((y + 0.5) - height / 2.0).abs() - (height / 2.0 - radius);
+    let dist = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
+    let t = (0.5 - dist / 1.5).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Anti-aliased coverage of a circle of the given pixel size, sampled at the
+/// pixel at (x, y) relative to the circle's top-left corner.
+fn circle_coverage(x: f32, y: f32, size: f32) -> f32 {
+    let radius = size / 2.0;
+    let dist = (x + 0.5 - radius).hypot(y + 0.5 - radius) - radius;
+    let t = (0.5 - dist / 1.5).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn draw_placeholder(pixels: &mut [u8], width: usize, x: usize, y: usize, size: usize, color: [u8; 4]) {
+    for py in y..y.saturating_add(size) {
+        for px in x..x.saturating_add(size) {
+            let coverage = circle_coverage((px - x) as f32, (py - y) as f32, size as f32);
+            if coverage > 0.0 {
+                let alpha = (color[3] as f32 * coverage) as u32;
+                composite(pixels, width, px, py, [color[0], color[1], color[2]], alpha);
+            }
+        }
+    }
 }
 
 fn register_window_class(instance: HINSTANCE, class_name: &[u16]) -> Result<()> {
@@ -1152,5 +1299,131 @@ mod tests {
         let text_h = config.appearance.font_size_title * 1.35 + fs * 1.35 + fs * 0.85 * 1.35 + fs * 0.75 * 1.35;
         let needed = text_h + 2.0 * config.appearance.padding + 8.0;
         assert!(height >= needed);
+    }
+
+    #[test]
+    fn round_rect_coverage_is_solid_inside_and_smooth_at_the_arc() {
+        // Center pixel: fully covered.
+        assert_eq!(round_rect_coverage(50.0, 20.0, 100.0, 40.0, 16.0), 1.0);
+        // Far corner outside the arc: fully transparent.
+        assert_eq!(round_rect_coverage(0.0, 0.0, 100.0, 40.0, 16.0), 0.0);
+        // On the corner arc (distance radius from its center): half coverage.
+        let edge = round_rect_coverage(4.19, 4.19, 100.0, 40.0, 16.0);
+        assert!((edge - 0.5).abs() < 0.2, "expected ~0.5 on the arc, got {edge}");
+        // Straight edge mid-pill: solid.
+        assert_eq!(round_rect_coverage(0.5, 20.0, 100.0, 40.0, 16.0), 1.0);
+    }
+
+    #[test]
+    fn circle_coverage_is_smooth() {
+        assert_eq!(circle_coverage(16.0, 16.0, 32.0), 1.0);
+        assert_eq!(circle_coverage(0.0, 0.0, 32.0), 0.0);
+        // On the circle boundary (radius from the center): half coverage.
+        let edge = circle_coverage(4.2, 4.2, 32.0);
+        assert!((edge - 0.5).abs() < 0.2, "expected ~0.5 on the boundary, got {edge}");
+    }
+
+    #[test]
+    fn text_line_rasterizes_into_pixels() {
+        let mut pixels = vec![0u8; 200 * 40 * 4];
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 40,
+        };
+        draw_text_line_pixels(
+            &mut pixels,
+            200,
+            "Hello World",
+            &rect,
+            12,
+            [255, 255, 255, 255],
+            false,
+            false,
+            None,
+        );
+        let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
+        assert!(lit > 100, "expected glyph pixels in the buffer, got {lit}");
+    }
+
+    #[test]
+    fn text_line_renders_with_marquee_state() {
+        let mut pixels = vec![0u8; 200 * 40 * 4];
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 40,
+        };
+        draw_text_line_pixels(
+            &mut pixels,
+            200,
+            "Hello World",
+            &rect,
+            12,
+            [255, 255, 255, 255],
+            false,
+            false,
+            Some(&LineScroll::default()),
+        );
+        let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
+        assert!(lit > 100, "expected glyph pixels with marquee state, got {lit}");
+    }
+
+    #[test]
+    fn track_pill_renders_text() {
+        let mut pixels = vec![0u8; 240 * 76 * 4];
+        let config = Config::default();
+        let state = OverlayState::new(config, EventQueue::default());
+        let track = TrackInfo {
+            title: "Everything, Everywhere".into(),
+            artist: "John Muirhead".into(),
+            ..TrackInfo::default()
+        };
+        draw_text_pixels(&state, &mut pixels, &MediaEvent::TrackChanged(track), 240, 76, 1.0);
+        let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
+        assert!(lit > 500, "expected text + art pixels, got {lit}");
+    }
+
+    #[test]
+    fn text_sits_inside_its_row_band() {
+        // Regression guard for the glyph vertical placement: with a 40px-tall
+        // row, glyph pixels must land in the upper two thirds, not below the
+        // baseline-clipped region (a sign error once pushed them out of the
+        // row entirely).
+        let mut pixels = vec![0u8; 200 * 40 * 4];
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 40,
+        };
+        draw_text_line_pixels(
+            &mut pixels,
+            200,
+            "Hello",
+            &rect,
+            12,
+            [255, 255, 255, 255],
+            false,
+            false,
+            None,
+        );
+        let upper = pixels
+            .chunks(4)
+            .enumerate()
+            .filter(|(i, p)| p[3] > 0 && *i / 200 < 27)
+            .count();
+        let lower = pixels
+            .chunks(4)
+            .enumerate()
+            .filter(|(i, p)| p[3] > 0 && *i / 200 >= 27)
+            .count();
+        assert!(upper > 50, "expected glyphs in the upper part of the row, got {upper}");
+        assert!(
+            lower < upper,
+            "glyphs must not sit at the bottom of the row (lower={lower})"
+        );
     }
 }

@@ -31,3 +31,12 @@ skip-tree = [
     { name = "iana-time-zone" },
     { name = "dirs-sys" },
 ]
+
+# RUSTSEC-2026-0192: ttf-parser (fontdue's font parser) is unmaintained.
+# Accepted: fontdue is the recommended dependency-light glyph rasterizer for
+# the pill; the parser only reads the local Segoe UI font file at startup —
+# no remote or untrusted input. Revisit if a maintained parser with the same
+# coverage-based rasterization API becomes available.
+[advisories]
+ignore = ["RUSTSEC-2026-0192"]
+
