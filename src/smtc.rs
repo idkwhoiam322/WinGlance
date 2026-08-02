@@ -1140,6 +1140,11 @@ fn non_empty(value: String, fallback: &str) -> String {
 fn source_app_label(value: &str) -> String {
     let value = value.rsplit('!').next().unwrap_or(value);
     let value = value.split('_').next().unwrap_or(value);
+    let value = if value.contains('.') {
+        value.rsplit('.').next().unwrap_or(value)
+    } else {
+        value
+    };
     non_empty(value.to_string(), "Media")
 }
 
@@ -1183,6 +1188,8 @@ mod tests {
         assert_eq!(source_app_label("SpotifyAB.SpotifyMusic_abc!Spotify"), "Spotify");
         assert_eq!(source_app_label("browser"), "browser");
         assert_eq!(source_app_label(""), "Media");
+        assert_eq!(source_app_label("com.github.th-ch.youtube-music"), "youtube-music");
+        assert_eq!(source_app_label("com.riotgames.RiotGames.RiotClient"), "RiotClient");
     }
 
     #[test]

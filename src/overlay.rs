@@ -147,6 +147,10 @@ struct OverlayState {
     /// session that is not current. The pill draws this name instead of the
     /// (wrong) last_track content.
     state_source: Option<String>,
+    /// Source app of the last TrackChanged shown, used as the label fallback
+    /// in state pills for current-session playback states so the pill always
+    /// names the app that owns the media — never another app's last track.
+    current_source: Option<String>,
     /// Scratch DC + DIB for GDI text rendering (cached across frames).
     text_scratch: Option<TextScratch>,
 }
@@ -233,6 +237,7 @@ impl OverlayState {
             dib: None,
             last_tick: Instant::now(),
             state_source: None,
+            current_source: None,
             text_scratch: None,
         }
     }
@@ -344,6 +349,7 @@ impl OverlayState {
         let mut pending = std::mem::take(&mut self.pending);
         if let Some(track) = pending.track {
             let is_update = pending.track_update;
+            self.current_source = Some(track.source_app.clone());
             self.last_track = Some(track.clone());
             if is_update && self.content.is_some() {
                 self.update_content(MediaEvent::TrackChanged(track));
@@ -1188,7 +1194,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 true,
                 None,
             );
-            if let Some(source_name) = state.state_source.as_deref() {
+            if let Some(source_name) = state.state_source.as_deref().or(state.current_source.as_deref()) {
                 // A state change from a session that is not current: show the
                 // app that produced it, never another app's track.
                 let title_rect = next_band(fs_artist * ROW_HEIGHT);
@@ -1329,6 +1335,16 @@ fn draw_text_line_pixels(
         let mut tm = TEXTMETRICW::default();
         let _ = GetTextMetricsW(hdc, &mut tm);
         let y = ((rh - tm.tmHeight) / 2).max(0);
+        let mut flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
+        if centered {
+            flags |= DT_CENTER;
+        }
+        let mut local = RECT {
+            left: 0,
+            top: 0,
+            right: rw,
+            bottom: rh,
+        };
         if let Some(scroll) = marquee {
             let mut measured = RECT::default();
             let mut measure_text = text.clone();
@@ -1340,35 +1356,27 @@ fn draw_text_line_pixels(
             );
             let text_w = measured.right - measured.left;
             let hold_elapsed = scroll.started_at.map(|t| t.elapsed()).unwrap_or_default();
-            let offset = if hold_elapsed < MARQUEE_HOLD {
-                0.0
+            if text_w <= rw && hold_elapsed < MARQUEE_HOLD {
+                // Text fits: render once statically (no scrolling needed).
+                let _ = DrawTextW(hdc, &mut text, &mut local, flags);
+            } else if hold_elapsed < MARQUEE_HOLD {
+                // Overflow but still in the static hold: render with ellipsis so
+                // the text is readable ("…") instead of hard-clipped at the edge.
+                let _ = DrawTextW(hdc, &mut text, &mut local, flags);
             } else {
-                scroll.offset
-            };
-            let total = text_w + MARQUEE_GAP as i32;
-            let off = (offset % total as f32) as i32;
-            let clip = RECT {
-                left: 0,
-                top: 0,
-                right: rw,
-                bottom: rh,
-            };
-            let x1 = -off;
-            let _ = ExtTextOutW(
-                hdc,
-                x1,
-                y,
-                ETO_CLIPPED,
-                Some(&clip),
-                PCWSTR(text.as_ptr()),
-                text.len() as u32,
-                None,
-            );
-            let x2 = x1 + total;
-            if x2 < rw {
+                // Scrolling active: draw two copies offset by the marquee delta.
+                let total = text_w + MARQUEE_GAP as i32;
+                let off = (scroll.offset % total as f32) as i32;
+                let clip = RECT {
+                    left: 0,
+                    top: 0,
+                    right: rw,
+                    bottom: rh,
+                };
+                let x1 = -off;
                 let _ = ExtTextOutW(
                     hdc,
-                    x2,
+                    x1,
                     y,
                     ETO_CLIPPED,
                     Some(&clip),
@@ -1376,18 +1384,21 @@ fn draw_text_line_pixels(
                     text.len() as u32,
                     None,
                 );
+                let x2 = x1 + total;
+                if x2 < rw {
+                    let _ = ExtTextOutW(
+                        hdc,
+                        x2,
+                        y,
+                        ETO_CLIPPED,
+                        Some(&clip),
+                        PCWSTR(text.as_ptr()),
+                        text.len() as u32,
+                        None,
+                    );
+                }
             }
         } else {
-            let mut flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
-            if centered {
-                flags |= DT_CENTER;
-            }
-            let mut local = RECT {
-                left: 0,
-                top: 0,
-                right: rw,
-                bottom: rh,
-            };
             let _ = DrawTextW(hdc, &mut text, &mut local, flags);
         }
         SelectObject(hdc, old_font);
