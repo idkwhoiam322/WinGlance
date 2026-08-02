@@ -20,8 +20,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 const CLASS_NAME: &str = "NotchPositioner";
-const WIDTH: i32 = 240;
+const WIDTH: i32 = 320;
 const HEIGHT: i32 = 60;
+const SNAP_THRESHOLD: i32 = 30;
+const CLOSE_BTN_W: i32 = 28;
+const CLOSE_BTN_H: i32 = 28;
 
 struct PositionerState {
     overlay: HWND,
@@ -30,8 +33,7 @@ struct PositionerState {
 }
 
 /// Opens a floating sample notification that the user can drag to set the notch's
-/// placement. On release the chosen X/Y are written to config and the live overlay
-/// is repositioned (and briefly previewed).
+/// placement. The window stays open until the user clicks X or presses Escape.
 pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
     unsafe {
         let instance = match GetModuleHandleW(None) {
@@ -101,8 +103,17 @@ fn monitor_work_area(hwnd: HWND) -> RECT {
     }
 }
 
+/// Snaps a value to the nearest edge if within SNAP_THRESHOLD.
+fn snap(val: i32, edge: i32) -> i32 {
+    if (val - edge).abs() <= SNAP_THRESHOLD {
+        edge
+    } else {
+        val
+    }
+}
+
 /// Persists the positioner window's current screen position as absolute overlay
-/// coordinates and nudges the live overlay, then dismisses the mini-window.
+/// coordinates and nudges the live overlay (without dismissing the window).
 fn commit(hwnd: HWND, state: &mut PositionerState) {
     let mut rect = RECT::default();
     if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
@@ -112,8 +123,18 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
     let work = monitor_work_area(state.overlay);
     let sample_w = (WIDTH as f32 * scale).round() as i32;
     let sample_h = (HEIGHT as f32 * scale).round() as i32;
-    let phys_x = rect.left.clamp(work.left, (work.right - sample_w).max(work.left));
-    let phys_y = rect.top.clamp(work.top, (work.bottom - sample_h).max(work.top));
+
+    // Snap to edges and center
+    let mut phys_x = rect.left;
+    let mut phys_y = rect.top;
+    phys_x = snap(phys_x, work.left);
+    phys_x = snap(phys_x, work.right - sample_w);
+    phys_x = snap(phys_x, work.left + (work.right - work.left - sample_w) / 2);
+    phys_y = snap(phys_y, work.top);
+    phys_y = snap(phys_y, work.bottom - sample_h);
+    phys_x = phys_x.clamp(work.left, (work.right - sample_w).max(work.left));
+    phys_y = phys_y.clamp(work.top, (work.bottom - sample_h).max(work.top));
+
     let log_x = (phys_x as f32 / scale).round() as i32;
     let log_y = (phys_y as f32 / scale).round() as i32;
 
@@ -126,6 +147,11 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
         let pos = OverlayPos::from_config(&config);
         overlay::set_position(state.overlay, pos);
     }
+}
+
+/// Returns true if the click point (in client coords) is on the X button area.
+fn hit_close_button(cx: i32, cy: i32) -> bool {
+    (WIDTH - CLOSE_BTN_W - 6..=WIDTH - 6).contains(&cx) && (6..=6 + CLOSE_BTN_H).contains(&cy)
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -142,6 +168,12 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
         }
         WM_LBUTTONDOWN => {
             if !state_ptr.is_null() {
+                let cx = (lparam.0 & 0xFFFF) as i32;
+                let cy = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                if hit_close_button(cx, cy) {
+                    let _ = DestroyWindow(hwnd);
+                    return LRESULT(0);
+                }
                 let state = &mut *state_ptr;
                 let mut cursor = POINT::default();
                 if GetCursorPos(&mut cursor).is_ok() {
@@ -182,7 +214,7 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
                 let _ = ReleaseCapture();
                 commit(hwnd, state);
             }
-            let _ = DestroyWindow(hwnd);
+            // Don't destroy — keep window open so user can fine-tune
             LRESULT(0)
         }
         WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
@@ -195,17 +227,41 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
             if !hdc.0.is_null() {
                 unsafe {
                     let brush: HBRUSH = CreateSolidBrush(COLORREF(0x00121212));
-                    let mut whole = RECT {
+                    let whole = RECT {
                         left: 0,
                         top: 0,
                         right: WIDTH,
                         bottom: HEIGHT,
                     };
                     let _ = FillRect(hdc, &whole, brush);
+
+                    // Draw instruction text
+                    let mut text_rect = RECT {
+                        left: 12,
+                        top: 0,
+                        right: WIDTH - CLOSE_BTN_W - 16,
+                        bottom: HEIGHT,
+                    };
                     let _ = SetBkMode(hdc, TRANSPARENT);
-                    let _ = SetTextColor(hdc, COLORREF(0xE6E6E6));
-                    let mut text = wide("Notch - drag to place");
-                    let _ = DrawTextW(hdc, &mut text, &mut whole, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+                    let _ = SetTextColor(hdc, COLORREF(0xCCCCCC));
+                    let mut text = wide("Drag to place the notch");
+                    let _ = DrawTextW(hdc, &mut text, &mut text_rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+
+                    // Draw X button
+                    let x_brush = CreateSolidBrush(COLORREF(0x333333));
+                    let mut x_rect = RECT {
+                        left: WIDTH - CLOSE_BTN_W - 6,
+                        top: 6,
+                        right: WIDTH - 6,
+                        bottom: 6 + CLOSE_BTN_H,
+                    };
+                    let _ = FillRect(hdc, &x_rect, x_brush);
+                    let _ = DeleteObject(HGDIOBJ(x_brush.0));
+
+                    let _ = SetTextColor(hdc, COLORREF(0x999999));
+                    let mut x_text = wide("X");
+                    let _ = DrawTextW(hdc, &mut x_text, &mut x_rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+
                     let _ = DeleteObject(HGDIOBJ(brush.0));
                 }
             }
