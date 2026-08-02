@@ -1050,7 +1050,7 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
             );
 
             let subtitle = if track.artist.trim().is_empty() {
-                &track.source_app
+                "Unknown"
             } else {
                 &track.artist
             };

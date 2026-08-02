@@ -345,7 +345,10 @@ impl ListenerState {
                     let state = read_playback_state(&session)?;
                     let source = read_source_app(&session);
                     if state != Some(PlaybackState::Stopped) {
-                        self.refresh_current_session(Some(&session), true, false)?;
+                        // Prefer the session that fired the event over a stale
+                        // current one, so a new source actually takes the pill
+                        // (eligibility still filters placeholder sessions).
+                        self.refresh_current_session(Some(&session), true, true)?;
                     }
                     if self.current_key != Some(key)
                         && let Some(state) = state
@@ -963,7 +966,10 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession) -> Resul
     let source_app = read_source_app(session);
     let properties = session.TryGetMediaPropertiesAsync()?.get()?;
     let title = non_empty(properties.Title()?.to_string(), &source_app);
-    let artist = non_empty(properties.Artist()?.to_string(), &source_app);
+    // Keep artist empty when the app has not provided it yet; renderers show
+    // "Unknown" instead of substituting the source app (which would duplicate
+    // the source row).
+    let artist = non_empty(properties.Artist()?.to_string(), "");
     // Keep album empty when the app has not provided it yet; renderers hide the
     // album line until real data arrives (prevents a bogus "Unknown album").
     let album = non_empty(properties.AlbumTitle()?.to_string(), "");

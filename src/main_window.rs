@@ -927,7 +927,7 @@ impl MainWindowState {
             );
 
             let subtitle = if current.track.artist.trim().is_empty() {
-                &current.track.source_app
+                "Unknown"
             } else {
                 &current.track.artist
             };
@@ -1666,7 +1666,7 @@ impl MainWindowState {
                 PlaybackState::Stopped => "■",
             };
             let artist = if entry.track.artist.trim().is_empty() {
-                &entry.track.source_app
+                "Unknown"
             } else {
                 &entry.track.artist
             };
@@ -1789,7 +1789,7 @@ impl MainWindowState {
 
 fn history_row(track: &TrackInfo, at: DateTime<Local>, state: PlaybackState) -> String {
     let artist = if track.artist.trim().is_empty() {
-        &track.source_app
+        "Unknown"
     } else {
         &track.artist
     };
@@ -2518,12 +2518,12 @@ mod tests {
     }
 
     #[test]
-    fn row_falls_back_to_source_app_when_artist_is_blank() {
+    fn row_falls_back_to_unknown_when_artist_is_blank() {
         let mut blank = track("Song");
         blank.artist = "   ".into();
         let row = history_row(&blank, Local::now(), PlaybackState::Playing);
         assert!(row.contains("Song"));
-        assert!(row.contains("Spotify"));
+        assert!(row.contains("Unknown"));
 
         let titled = track("Song");
         let row = history_row(&titled, Local::now(), PlaybackState::Paused);
