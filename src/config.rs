@@ -107,9 +107,11 @@ impl Default for AppearanceConfig {
         Self {
             background_color: [0x00, 0x00, 0x00, 0xFF],
             text_color: [0xFF, 0xFF, 0xFF, 0xFF],
-            // Follow the user's Windows theme accent when it can be read;
-            // fall back to a neutral white.
-            accent_color: windows_accent_color(),
+            // Single hardcoded pink accent, used across the pill, the sidebar
+            // highlights and the window title bar. Deliberately not derived
+            // from the Windows theme: arbitrary accent colors clash with the
+            // pill's white text.
+            accent_color: [0xE0, 0x6C, 0x9F, 0xFF],
             corner_radius: 18.0,
             padding: 12.0,
             art_size: 48,
@@ -117,25 +119,6 @@ impl Default for AppearanceConfig {
             font_size_artist: 13.0,
         }
     }
-}
-
-/// The user's Windows accent color (DwmGetColorizationColor), or white when
-/// it cannot be read.
-fn windows_accent_color() -> [u8; 4] {
-    unsafe {
-        let mut color = 0u32;
-        let mut opaque = windows::Win32::Foundation::BOOL::default();
-        if windows::Win32::Graphics::Dwm::DwmGetColorizationColor(&mut color, &mut opaque).is_ok() {
-            // 0xAARRGGBB.
-            return [
-                ((color >> 16) & 0xFF) as u8,
-                ((color >> 8) & 0xFF) as u8,
-                (color & 0xFF) as u8,
-                0xFF,
-            ];
-        }
-    }
-    [0xFF, 0xFF, 0xFF, 0xFF]
 }
 
 impl Config {

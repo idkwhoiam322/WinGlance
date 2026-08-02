@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
     DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteObject, EndPaint, FF_DONTCARE, FillRect, GetStockObject,
@@ -414,6 +415,18 @@ pub fn create_window(config: Config, queue: EventQueue, overlay_hwnd: HWND) -> R
             return Err(error.into());
         }
     };
+
+    // Color the window title bar with the pill's pink accent so the app
+    // reads as one theme.
+    unsafe {
+        let color = COLORREF(0x00E0_6C9F);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            &color as *const COLORREF as *const c_void,
+            std::mem::size_of::<COLORREF>() as u32,
+        );
+    }
 
     unsafe {
         if config.behavior.start_in_tray {

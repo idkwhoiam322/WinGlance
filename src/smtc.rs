@@ -336,18 +336,19 @@ impl ListenerState {
                 } else {
                     // A session other than the current one changed state. If it
                     // started playing, try to make it current (eligibility
-                    // filters placeholder sessions). Whether adopted or not, the
-                    // change is recorded for the history — the pill follows the
-                    // current session, but every state change is visible.
+                    // filters placeholder sessions). If it is not adopted, the
+                    // change is still recorded for the history — the pill
+                    // follows the current session, but every state change is
+                    // visible.
                     let state = read_playback_state(&session)?;
-                    let became_current = if state == Some(PlaybackState::Playing) {
-                        let before = self.current_key;
+                    if state == Some(PlaybackState::Playing) {
                         self.refresh_current_session(Some(&session), true, false)?;
-                        self.current_key != before
-                    } else {
-                        false
-                    };
-                    if !became_current && let Some(state) = state {
+                    }
+                    // Record only when the session did not become current; an
+                    // adopted session's state is handled by the adoption path.
+                    if self.current_key != Some(key)
+                        && let Some(state) = state
+                    {
                         self.queue_history_state(state, read_source_app(&session));
                     }
                 }
@@ -438,14 +439,11 @@ impl ListenerState {
     /// Queues a playback state for held emission, or drops it when a track was
     /// just emitted for the same session — the state is then the song-change
     /// blip, not a real change. The held deadline lets a handoff's Stopped/
-    /// Playing pair collapse into the track notification.
+    /// Playing pair collapse into the track notification. A pending track does
+    /// NOT suppress the state: the artwork wait can hold a track pending for
+    /// seconds, and suppressing on it would swallow genuine pause/play events;
+    /// the track arrival itself drops a held state via `pending_playback`.
     fn queue_playback_state(&mut self, key: usize, state: PlaybackState, source: String) {
-        // Coalescing: drop a state that is the transition blip of a song
-        // change — a track was just emitted for this session. Anything later
-        // is a genuine user action (pause/play) and is held for emission even
-        // while a track happens to be pending: session churn keeps tracks
-        // pending for seconds, and suppressing on that would swallow real
-        // pauses and plays.
         let just_emitted = self
             .last_track_emitted
             .is_some_and(|(k, at)| k == key && at.elapsed() < Duration::from_millis(TRACK_TRANSITION_MS));
