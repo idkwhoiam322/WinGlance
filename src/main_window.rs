@@ -641,7 +641,7 @@ impl MainWindowState {
                     // A state change from a non-current session: record it with
                     // the app that produced it (title/artist are unknown here).
                     let track = TrackInfo {
-                        title: source.clone(),
+                        title: "Unknown".into(),
                         source_app: source,
                         ..TrackInfo::default()
                     };
