@@ -608,7 +608,10 @@ impl OverlayState {
         self.phase = Phase::Hidden;
         self.delete_anim_timer();
         unsafe {
-            let _ = KillTimer(self.hwnd, TIMER_DEBOUNCE);
+            // Do NOT kill the debounce timer here: an event that arrived while
+            // the pill was collapsing still has a pending debounce, and killing
+            // it here silently drops that event (a pill that never shows).
+            // toggle_enabled clears the pending events explicitly instead.
             if !ShowWindow(self.hwnd, SW_HIDE).as_bool() {
                 debug!("ShowWindow(SW_HIDE) failed");
             }
