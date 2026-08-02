@@ -40,6 +40,7 @@ struct ListenerState {
     track_pending_since: Option<Instant>,
     last_content_fingerprint: Option<TrackFingerprint>,
     last_playback: Option<(usize, PlaybackState)>,
+    last_session_check: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,10 +108,12 @@ impl ListenerState {
             track_pending_since: None,
             last_content_fingerprint: None,
             last_playback: None,
+            last_session_check: Instant::now(),
         }
     }
 
     fn event_loop(&mut self, signal_rx: Receiver<Signal>) -> Result<()> {
+        let session_check_interval = Duration::from_secs(2);
         loop {
             let timeout = self
                 .pending_deadline
@@ -119,7 +122,14 @@ impl ListenerState {
 
             match signal_rx.recv_timeout(timeout) {
                 Ok(signal) => self.handle_signal(signal)?,
-                Err(mpsc::RecvTimeoutError::Timeout) => self.flush_pending(),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.flush_pending();
+                    // Periodically re-check sessions to catch missed changes
+                    if self.last_session_check.elapsed() >= session_check_interval {
+                        self.last_session_check = Instant::now();
+                        let _ = self.refresh_current_session(None, false);
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }

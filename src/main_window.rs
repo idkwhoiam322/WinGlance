@@ -662,20 +662,12 @@ impl MainWindowState {
     }
 
     fn paint_settings(&self, hdc: HDC, content_left: i32, client_w: i32, _client_h: i32, scale: f32, pad: i32) {
-        let mut y = pad;
         let label_color = [0x99, 0x99, 0x99, 0xFF];
         let value_color = self.config.appearance.text_color;
         let accent = self.config.appearance.accent_color;
-        let value_rect = |y: i32, text: &str, color: [u8; 4]| {
-            let mut rect = RECT {
-                left: content_left + pad,
-                top: y,
-                right: client_w - pad,
-                bottom: y + (20.0 * scale) as i32,
-            };
-            draw_string(hdc, text, &mut rect, (12.0 * scale) as i32, color, false, false);
-        };
+        let row_h = (48.0 * scale) as i32;
 
+        let mut y = pad;
         // Header
         let mut hdr = RECT {
             left: content_left + pad,
@@ -686,27 +678,101 @@ impl MainWindowState {
         draw_string(hdc, "SETTINGS", &mut hdr, (13.0 * scale) as i32, accent, true, false);
         y += (36.0 * scale) as i32;
 
+        // Each row: label at y, value at y+20
+        let label_y = y;
+        let val_y = y + (20.0 * scale) as i32;
+
         // Notifications
-        value_rect(y, "Notifications", label_color);
-        y += (18.0 * scale) as i32;
-        let notif_text = if self.notifications_enabled { "ON" } else { "OFF" };
+        let mut lbl = RECT {
+            left: content_left + pad,
+            top: label_y,
+            right: client_w - pad,
+            bottom: label_y + (18.0 * scale) as i32,
+        };
+        draw_string(
+            hdc,
+            "Notifications",
+            &mut lbl,
+            (10.0 * scale) as i32,
+            label_color,
+            false,
+            false,
+        );
         let notif_color = if self.notifications_enabled {
             accent
         } else {
             [0x66, 0x66, 0x66, 0xFF]
         };
-        value_rect(y, notif_text, notif_color);
-        y += (28.0 * scale) as i32;
+        let mut val = RECT {
+            left: content_left + pad,
+            top: val_y,
+            right: client_w - pad,
+            bottom: val_y + (20.0 * scale) as i32,
+        };
+        draw_string(
+            hdc,
+            if self.notifications_enabled { "ON" } else { "OFF" },
+            &mut val,
+            (12.0 * scale) as i32,
+            notif_color,
+            false,
+            false,
+        );
+        y += row_h;
 
         // Duration
-        value_rect(y, "Duration", label_color);
-        y += (18.0 * scale) as i32;
-        value_rect(y, &format!("{}s", self.config.overlay.duration_ms / 1000), value_color);
-        y += (28.0 * scale) as i32;
+        let label_y = y;
+        let val_y = y + (20.0 * scale) as i32;
+        let mut lbl = RECT {
+            left: content_left + pad,
+            top: label_y,
+            right: client_w - pad,
+            bottom: label_y + (18.0 * scale) as i32,
+        };
+        draw_string(
+            hdc,
+            "Duration",
+            &mut lbl,
+            (10.0 * scale) as i32,
+            label_color,
+            false,
+            false,
+        );
+        let mut val = RECT {
+            left: content_left + pad,
+            top: val_y,
+            right: client_w - pad,
+            bottom: val_y + (20.0 * scale) as i32,
+        };
+        draw_string(
+            hdc,
+            &format!("{}s", self.config.overlay.duration_ms / 1000),
+            &mut val,
+            (12.0 * scale) as i32,
+            value_color,
+            false,
+            false,
+        );
+        y += row_h;
 
         // Position
-        value_rect(y, "Position", label_color);
-        y += (18.0 * scale) as i32;
+        let label_y = y;
+        let val_y = y + (20.0 * scale) as i32;
+        let mut lbl = RECT {
+            left: content_left + pad,
+            top: label_y,
+            right: client_w - pad,
+            bottom: label_y + (18.0 * scale) as i32,
+        };
+        draw_string(
+            hdc,
+            "Position",
+            &mut lbl,
+            (10.0 * scale) as i32,
+            label_color,
+            false,
+            false,
+        );
         let pos_text = if self.config.overlay.position_x.is_some() {
             format!(
                 "Custom ({}, {})",
@@ -727,43 +793,109 @@ impl MainWindowState {
                 }
             )
         };
-        value_rect(y, &pos_text, value_color);
-        y += (28.0 * scale) as i32;
+        let mut val = RECT {
+            left: content_left + pad,
+            top: val_y,
+            right: client_w - pad,
+            bottom: val_y + (20.0 * scale) as i32,
+        };
+        draw_string(
+            hdc,
+            &pos_text,
+            &mut val,
+            (12.0 * scale) as i32,
+            value_color,
+            false,
+            false,
+        );
+        y += row_h;
 
         // Start on login
-        value_rect(y, "Start on login", label_color);
-        y += (18.0 * scale) as i32;
-        let login_text = if self.config.behavior.start_on_login {
-            "ON"
-        } else {
-            "OFF"
+        let label_y = y;
+        let val_y = y + (20.0 * scale) as i32;
+        let mut lbl = RECT {
+            left: content_left + pad,
+            top: label_y,
+            right: client_w - pad,
+            bottom: label_y + (18.0 * scale) as i32,
         };
+        draw_string(
+            hdc,
+            "Start on login",
+            &mut lbl,
+            (10.0 * scale) as i32,
+            label_color,
+            false,
+            false,
+        );
         let login_color = if self.config.behavior.start_on_login {
             accent
         } else {
             [0x66, 0x66, 0x66, 0xFF]
         };
-        value_rect(y, login_text, login_color);
-        y += (28.0 * scale) as i32;
+        let mut val = RECT {
+            left: content_left + pad,
+            top: val_y,
+            right: client_w - pad,
+            bottom: val_y + (20.0 * scale) as i32,
+        };
+        draw_string(
+            hdc,
+            if self.config.behavior.start_on_login {
+                "ON"
+            } else {
+                "OFF"
+            },
+            &mut val,
+            (12.0 * scale) as i32,
+            login_color,
+            false,
+            false,
+        );
+        y += row_h;
 
         // Close to tray
-        value_rect(y, "Close to tray", label_color);
-        y += (18.0 * scale) as i32;
-        let tray_text = if self.config.behavior.close_to_tray {
-            "ON"
-        } else {
-            "OFF"
+        let label_y = y;
+        let val_y = y + (20.0 * scale) as i32;
+        let mut lbl = RECT {
+            left: content_left + pad,
+            top: label_y,
+            right: client_w - pad,
+            bottom: label_y + (18.0 * scale) as i32,
         };
+        draw_string(
+            hdc,
+            "Close to tray",
+            &mut lbl,
+            (10.0 * scale) as i32,
+            label_color,
+            false,
+            false,
+        );
         let tray_color = if self.config.behavior.close_to_tray {
             accent
         } else {
             [0x66, 0x66, 0x66, 0xFF]
         };
-        value_rect(y, tray_text, tray_color);
-        y += (28.0 * scale) as i32;
-
-        // Hint
-        value_rect(y, "Adjust via tray menu", [0x55, 0x55, 0x55, 0xFF]);
+        let mut val = RECT {
+            left: content_left + pad,
+            top: val_y,
+            right: client_w - pad,
+            bottom: val_y + (20.0 * scale) as i32,
+        };
+        draw_string(
+            hdc,
+            if self.config.behavior.close_to_tray {
+                "ON"
+            } else {
+                "OFF"
+            },
+            &mut val,
+            (12.0 * scale) as i32,
+            tray_color,
+            false,
+            false,
+        );
     }
 
     fn layout(&self) {
@@ -1248,53 +1380,25 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                         let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
                     }
                 } else if state.active_pane == Pane::Settings {
-                    // Check settings item clicks
-                    let mut sy = pad;
-                    sy += (36.0 * scale) as i32; // Header
-                    sy += (18.0 * scale) as i32; // "Notifications" label
-                    sy += (18.0 * scale) as i32; // value
-                    let notif_row_y = sy;
-                    sy += (28.0 * scale) as i32; // gap
+                    // Check settings item clicks - must match paint_settings layout exactly
+                    let mut sy = pad + (36.0 * scale) as i32; // header height
+                    let row_h = (48.0 * scale) as i32;
+                    let val_top = sy + (20.0 * scale) as i32;
+                    let val_bot = val_top + (20.0 * scale) as i32;
 
-                    sy += (18.0 * scale) as i32; // "Duration" label
-                    sy += (18.0 * scale) as i32; // value
-                    let dur_row_y = sy;
-                    sy += (28.0 * scale) as i32; // gap
-
-                    sy += (18.0 * scale) as i32; // "Position" label
-                    sy += (18.0 * scale) as i32; // value
-                    let pos_row_y = sy;
-                    sy += (28.0 * scale) as i32; // gap
-
-                    sy += (18.0 * scale) as i32; // "Start on login" label
-                    sy += (18.0 * scale) as i32; // value
-                    let login_row_y = sy;
-                    sy += (28.0 * scale) as i32; // gap
-
-                    sy += (18.0 * scale) as i32; // "Close to tray" label
-                    sy += (18.0 * scale) as i32; // value
-                    let tray_row_y = sy;
-
-                    let row_h = (20.0 * scale) as i32;
-                    if y >= notif_row_y && y < notif_row_y + row_h {
+                    // Notifications
+                    if y >= val_top && y < val_bot {
                         state.notifications_enabled = !state.notifications_enabled;
                         let _ = PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0));
                         state.invalidate();
-                    } else if y >= login_row_y && y < login_row_y + row_h {
-                        state.config.behavior.start_on_login = !state.config.behavior.start_on_login;
-                        let _ = state.config.save();
-                        if let Err(error) = autostart::apply(state.config.behavior.start_on_login) {
-                            error!("start-on-login update failed: {error:#}");
-                        }
-                        state.invalidate();
-                    } else if y >= tray_row_y && y < tray_row_y + row_h {
-                        state.config.behavior.close_to_tray = !state.config.behavior.close_to_tray;
-                        let _ = state.config.save();
-                        state.invalidate();
-                    } else if y >= pos_row_y && y < pos_row_y + row_h {
-                        let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
-                    } else if y >= dur_row_y && y < dur_row_y + row_h {
-                        // Cycle duration: 2 -> 3 -> 5 -> 10 -> 2
+                        return LRESULT(0);
+                    }
+                    sy += row_h;
+                    let val_top = sy + (20.0 * scale) as i32;
+                    let val_bot = val_top + (20.0 * scale) as i32;
+
+                    // Duration
+                    if y >= val_top && y < val_bot {
                         state.config.overlay.duration_ms = match state.config.overlay.duration_ms {
                             2000 => 3000,
                             3000 => 5000,
@@ -1303,6 +1407,41 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                         };
                         let _ = state.config.save();
                         state.invalidate();
+                        return LRESULT(0);
+                    }
+                    sy += row_h;
+                    let val_top = sy + (20.0 * scale) as i32;
+                    let val_bot = val_top + (20.0 * scale) as i32;
+
+                    // Position
+                    if y >= val_top && y < val_bot {
+                        let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
+                        return LRESULT(0);
+                    }
+                    sy += row_h;
+                    let val_top = sy + (20.0 * scale) as i32;
+                    let val_bot = val_top + (20.0 * scale) as i32;
+
+                    // Start on login
+                    if y >= val_top && y < val_bot {
+                        state.config.behavior.start_on_login = !state.config.behavior.start_on_login;
+                        let _ = state.config.save();
+                        if let Err(error) = autostart::apply(state.config.behavior.start_on_login) {
+                            error!("start-on-login update failed: {error:#}");
+                        }
+                        state.invalidate();
+                        return LRESULT(0);
+                    }
+                    sy += row_h;
+                    let val_top = sy + (20.0 * scale) as i32;
+                    let val_bot = val_top + (20.0 * scale) as i32;
+
+                    // Close to tray
+                    if y >= val_top && y < val_bot {
+                        state.config.behavior.close_to_tray = !state.config.behavior.close_to_tray;
+                        let _ = state.config.save();
+                        state.invalidate();
+                        return LRESULT(0);
                     }
                 }
             }
