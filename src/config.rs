@@ -50,6 +50,10 @@ pub struct BehaviorConfig {
     pub start_on_login: bool,
     pub start_in_tray: bool,
     pub close_to_tray: bool,
+    /// Source apps (substrings, case-insensitive, matched against the AUMID and
+    /// its derived label) whose SMTC sessions are never followed. For apps that
+    /// spam session changes, like Riot Client.
+    pub ignored_sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +93,7 @@ impl Default for BehaviorConfig {
             start_on_login: false,
             start_in_tray: true,
             close_to_tray: true,
+            ignored_sources: Vec::new(),
         }
     }
 }

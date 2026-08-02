@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::events::{MediaEvent, PlaybackState, TrackInfo};
-use anyhow::{Context, Result};
-use log::{debug, info};
-use std::collections::{HashMap, HashSet};
+use anyhow::{Context, Result, anyhow};
+use log::{debug, info, warn};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
@@ -75,6 +75,23 @@ struct ListenerState {
     /// still carry it. Insert replaces — a new cover for the same item replaces
     /// the old cached one.
     artwork_cache: HashMap<(String, String), Vec<u8>>,
+    /// Session keys that have ever produced readable track metadata (non-empty
+    /// title). A Paused session is only current-eligible when it has real
+    /// content; placeholder sessions (e.g. a client churning empty sessions)
+    /// must never displace an actively playing one.
+    known_content: HashSet<usize>,
+    /// Session keys recently removed from the subscription map (churned out),
+    /// with the removal time, so a re-added key is recognized and re-read.
+    recently_removed: HashMap<usize, Instant>,
+    /// Session-creation counts per source app within a rolling window, for the
+    /// churn cool-down.
+    churn: HashMap<String, VecDeque<Instant>>,
+    /// Source apps currently on cool-down (their sessions are not
+    /// current-eligible) until the stored time.
+    churn_cooldown: HashMap<String, Instant>,
+    /// A SessionsChanged burst is pending its debounce window; the next flush
+    /// performs the re-sync + re-resolve once per burst instead of per event.
+    sessions_pending: bool,
 }
 
 /// How long a playback state change is held before emission, so a song-change
@@ -89,6 +106,16 @@ const TRACK_TRANSITION_MS: u64 = 400;
 /// within this window in practice; a real replay of the same song later is not
 /// suppressed.
 const HANDOFF_SUPPRESS_MS: u64 = 2000;
+/// Rolling window, threshold and cool-down for the per-source session-churn
+/// guard. A source creating more than `CHURN_THRESHOLD` new sessions within
+/// `CHURN_WINDOW_MS` (a real client was observed doing ~20 in 8.5s) is
+/// excluded from current-session resolution for the cool-down period.
+const CHURN_WINDOW_MS: u64 = 2000;
+const CHURN_THRESHOLD: usize = 5;
+const CHURN_COOLDOWN_MS: u64 = 30_000;
+/// How long a removed session key stays "recently removed", so re-adding it
+/// triggers a proactive metadata re-read.
+const RESUBSCRIBE_WINDOW_MS: u64 = 10_000;
 /// Upper bound for the album/artwork caches; beyond it they are cleared (the
 /// caches are a convenience, not critical state).
 const CACHE_CAP: usize = 32;
@@ -170,6 +197,11 @@ impl ListenerState {
             current_playing: false,
             album_cache: HashMap::new(),
             artwork_cache: HashMap::new(),
+            known_content: HashSet::new(),
+            recently_removed: HashMap::new(),
+            churn: HashMap::new(),
+            churn_cooldown: HashMap::new(),
+            sessions_pending: false,
         }
     }
 
@@ -201,12 +233,17 @@ impl ListenerState {
     fn handle_signal(&mut self, signal: Signal) -> Result<()> {
         match signal {
             Signal::Sessions => {
-                debug!("SMTC SessionsChanged/CurrentSessionChanged");
-                // Re-sync subscriptions with the current session list, then re-resolve
-                // the current session against GetCurrentSession() — the pointer
-                // Windows itself maintains.
-                self.sync_subscriptions();
-                self.refresh_current_session(None, true, false)?;
+                // A session storm (one app recreating its SMTC session many
+                // times a second) fires these in bursts. Debounce: collapse a
+                // burst into one re-sync + re-resolve at the next flush.
+                if self.sessions_pending {
+                    debug!("SMTC SessionsChanged/CurrentSessionChanged (coalesced)");
+                } else {
+                    self.sessions_pending = true;
+                    debug!("SMTC SessionsChanged/CurrentSessionChanged (debounced)");
+                }
+                let deadline = Instant::now() + debounce_duration(&self.config);
+                self.pending_deadline = Some(self.pending_deadline.map_or(deadline, |d| d.min(deadline)));
             }
             Signal::MediaProperties(session) => {
                 // emit_initial=true: when this event changes the current session,
@@ -219,6 +256,7 @@ impl ListenerState {
                 {
                     self.apply_cache(&mut track);
                     let key = session_key(&session);
+                    self.remember_content(key, &track);
                     // SMTC fills metadata progressively (title -> artist -> album ->
                     // artwork). If a read for the same song arrives, merge the richer
                     // fields into the pending track instead of replacing it, so the
@@ -315,6 +353,14 @@ impl ListenerState {
         }
     }
 
+    /// Marks a session as having produced real content, making it eligible as
+    /// current even while paused.
+    fn remember_content(&mut self, key: usize, track: &TrackInfo) {
+        if !track.title.trim().is_empty() {
+            self.known_content.insert(key);
+        }
+    }
+
     /// Queues a playback state for held emission, or drops it when a track for
     /// the same session is pending or was just emitted — the state is then the
     /// song-change blip, not a real change. The held deadline lets a handoff's
@@ -378,6 +424,7 @@ impl ListenerState {
                     && let Ok(mut track) = read_track_info(&session)
                 {
                     self.apply_cache(&mut track);
+                    self.remember_content(session_key(&session), &track);
                     // Same-content handoff: adopt the re-created session silently
                     // (the pill keeps tracking it) and let its property events
                     // emit only when the content actually differs.
@@ -414,6 +461,69 @@ impl ListenerState {
         Ok(())
     }
 
+    /// Whether a session may become (or keep) current: actively playing, or
+    /// paused but with real content this run has seen. A placeholder session
+    /// that is perpetually Paused with no metadata (a client churning empty
+    /// sessions) is never eligible, regardless of what GetCurrentSession()
+    /// reports. Ignored and cool-down sources are excluded outright.
+    fn session_is_eligible(&self, session: &GlobalSystemMediaTransportControlsSession) -> bool {
+        if self.session_source_ignored(session) {
+            return false;
+        }
+        match read_playback_state(session) {
+            Ok(Some(PlaybackState::Playing)) => true,
+            Ok(Some(PlaybackState::Paused)) => self.known_content.contains(&session_key(session)),
+            _ => false,
+        }
+    }
+
+    /// Whether a session's source app is excluded: on the churn cool-down, or
+    /// listed in the user's `ignored_sources` config (case-insensitive
+    /// substring against both the raw AUMID and its derived label).
+    fn session_source_ignored(&self, session: &GlobalSystemMediaTransportControlsSession) -> bool {
+        let aumid = session
+            .SourceAppUserModelId()
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let label = source_app_label(&aumid);
+        if self.source_on_cooldown(&label) {
+            return true;
+        }
+        self.config.behavior.ignored_sources.iter().any(|pattern| {
+            let pattern = pattern.to_lowercase();
+            aumid.to_lowercase().contains(&pattern) || label.to_lowercase().contains(&pattern)
+        })
+    }
+
+    /// True while a source app is on the churn cool-down.
+    fn source_on_cooldown(&self, source: &str) -> bool {
+        self.churn_cooldown
+            .get(source)
+            .is_some_and(|until| *until > Instant::now())
+    }
+
+    /// Counts a newly-created session for its source; trips the cool-down once
+    /// the threshold is exceeded within the window, logging a WARN so the log
+    /// explains the exclusion without manual analysis.
+    fn record_churn(&mut self, source: &str) {
+        let now = Instant::now();
+        let events = self.churn.entry(source.to_string()).or_default();
+        events.push_back(now);
+        while events
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > Duration::from_millis(CHURN_WINDOW_MS))
+        {
+            events.pop_front();
+        }
+        if events.len() >= CHURN_THRESHOLD && !self.source_on_cooldown(source) {
+            self.churn_cooldown
+                .insert(source.to_string(), now + Duration::from_millis(CHURN_COOLDOWN_MS));
+            warn!(
+                "source {source} is churning sessions ({CHURN_THRESHOLD}+ new sessions in {CHURN_WINDOW_MS}ms); excluding it from current-session resolution for {CHURN_COOLDOWN_MS}ms"
+            );
+        }
+    }
+
     fn resolve_current_session(
         &mut self,
         hint: Option<&GlobalSystemMediaTransportControlsSession>,
@@ -425,38 +535,38 @@ impl ListenerState {
         // native GetCurrentSession() pointer instead.
         if prefer_hint
             && let Some(session) = hint
-            && !matches!(read_playback_state(session), Ok(Some(PlaybackState::Stopped)))
+            && self.session_is_eligible(session)
         {
             return Some(session.clone());
         }
 
         // 1. GetCurrentSession() is the pointer Windows itself maintains (the
         //    native media widget follows it); consult it fresh on every resolve.
+        //    It must be eligible, not merely "not Stopped": a Paused, empty
+        //    placeholder session must never displace one that is playing.
         if let Ok(session) = self.manager.GetCurrentSession()
-            && !matches!(read_playback_state(&session), Ok(Some(PlaybackState::Stopped)))
+            && self.session_is_eligible(&session)
         {
             return Some(session);
         }
 
-        // 2. The session that caused the event, when it is not stopped.
+        // 2. The session that caused the event, when it is eligible.
         if let Some(session) = hint
-            && !matches!(read_playback_state(session), Ok(Some(PlaybackState::Stopped)))
+            && self.session_is_eligible(session)
         {
             return Some(session.clone());
         }
 
         // 3. The last observed playing session (keeps the current one stable).
         if let Some(session) = self.recent_playing.clone()
-            && matches!(read_playback_state(&session), Ok(Some(PlaybackState::Playing)))
+            && self.session_is_eligible(&session)
         {
             return Some(session);
         }
 
-        // 4. Any playing session.
+        // 4. Any eligible session.
         if let Ok(sessions) = self.manager.GetSessions()
-            && let Some(playing) = sessions
-                .into_iter()
-                .find(|s| matches!(read_playback_state(s), Ok(Some(PlaybackState::Playing))))
+            && let Some(playing) = sessions.into_iter().find(|s| self.session_is_eligible(s))
         {
             return Some(playing);
         }
@@ -500,25 +610,52 @@ impl ListenerState {
         })
     }
 
-    /// Subscribes to a session unless it is already subscribed.
+    /// Subscribes to a session unless it is already subscribed. A key that
+    /// churned out and back (recently removed) is re-read proactively: it may
+    /// have changed its metadata while briefly unsubscribed, and re-subscribing
+    /// alone would wait for the next event that may never come.
     fn ensure_subscribed(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<()> {
         let key = session_key(session);
         if self.subscriptions.contains_key(&key) {
             return Ok(());
         }
+        let was_removed_recently = self.recently_removed.remove(&key).is_some();
         let subscription = self.subscribe(session)?;
         self.subscriptions.insert(key, subscription);
+        if was_removed_recently && self.current_key == Some(key) {
+            debug!("resubscribed session {key}; re-reading its state");
+            if let Ok(Some(state)) = read_playback_state(session)
+                && state != PlaybackState::Stopped
+            {
+                if let Ok(mut track) = read_track_info(session) {
+                    self.apply_cache(&mut track);
+                    self.remember_content(key, &track);
+                    self.pending_track = Some((key, track));
+                    self.schedule_flush();
+                } else {
+                    self.queue_playback_state(key, state, read_source_app(session));
+                }
+            }
+        }
         Ok(())
     }
 
     /// Re-syncs the subscription map with the current session list: subscribes
-    /// to every open session and drops subscriptions for removed sessions.
+    /// to every open (non-ignored) session, drops subscriptions for removed
+    /// sessions, and accounts per-source session churn for the cool-down.
     fn sync_subscriptions(&mut self) {
         let Some(sessions) = self.manager.GetSessions().ok() else {
             return;
         };
         let sessions: Vec<_> = sessions.into_iter().collect();
+        let before: HashSet<usize> = self.subscriptions.keys().copied().collect();
         for session in &sessions {
+            if self.session_source_ignored(session) {
+                continue;
+            }
+            if !before.contains(&session_key(session)) {
+                self.record_churn(&read_source_app(session));
+            }
             if let Err(error) = self.ensure_subscribed(session) {
                 debug!("subscribe failed for a session: {error:#}");
             }
@@ -533,10 +670,15 @@ impl ListenerState {
         for key in stale {
             self.remove_subscription(key);
         }
+        self.churn_cooldown.retain(|_, until| *until > Instant::now());
+        self.recently_removed
+            .retain(|_, at| at.elapsed() < Duration::from_millis(RESUBSCRIBE_WINDOW_MS));
+        self.known_content.retain(|key| self.subscriptions.contains_key(key));
     }
 
     fn remove_subscription(&mut self, key: usize) {
         if let Some(subscription) = self.subscriptions.remove(&key) {
+            self.recently_removed.insert(key, Instant::now());
             let _ = subscription
                 .session
                 .RemoveMediaPropertiesChanged(subscription.properties_token);
@@ -562,6 +704,16 @@ impl ListenerState {
 
     fn flush_pending(&mut self) {
         self.pending_deadline = None;
+
+        // Debounced session-list changes: one re-sync + re-resolve per burst
+        // instead of one per SessionsChanged/CurrentSessionChanged event.
+        if self.sessions_pending {
+            self.sessions_pending = false;
+            self.sync_subscriptions();
+            if let Err(error) = self.refresh_current_session(None, true, false) {
+                debug!("session re-sync after burst failed: {error:#}");
+            }
+        }
 
         // Held playback state: emit once its hold window expires. State changes
         // never wait for track completeness — a play/pause is delivered even
@@ -701,10 +853,22 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession) -> Resul
     // Keep album empty when the app has not provided it yet; renderers hide the
     // album line until real data arrives (prevents a bogus "Unknown album").
     let album = non_empty(properties.AlbumTitle()?.to_string(), "");
-    let artwork = read_artwork(&properties).unwrap_or_else(|error| {
-        debug!("album-art read failed: {error:#}");
-        None
-    });
+    // Artwork reads fail transiently under heavy session churn (overlapping
+    // async WinRT calls on one thread); retry once before giving up, and log
+    // which call failed with its raw HRESULT.
+    let artwork = match read_artwork(&properties) {
+        Ok(artwork) => artwork,
+        Err(first) => {
+            debug!("album-art read failed (attempt 1): {first:#}");
+            match read_artwork(&properties) {
+                Ok(artwork) => artwork,
+                Err(second) => {
+                    debug!("album-art read failed (attempt 2): {second:#}");
+                    None
+                }
+            }
+        }
+    };
     let track_number = {
         let n = properties.TrackNumber()?;
         if n > 0 { Some(n as u32) } else { None }
@@ -762,18 +926,34 @@ fn read_playback_state(session: &GlobalSystemMediaTransportControlsSession) -> R
 fn read_artwork(
     properties: &windows::Media::Control::GlobalSystemMediaTransportControlsSessionMediaProperties,
 ) -> Result<Option<Vec<u8>>> {
-    let reference = properties.Thumbnail()?;
-    let stream = reference.OpenReadAsync()?.get()?;
-    let size = stream.Size()?;
+    let reference = properties
+        .Thumbnail()
+        .map_err(|e| anyhow!("Thumbnail failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
+    let stream = reference
+        .OpenReadAsync()
+        .map_err(|e| anyhow!("OpenReadAsync failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?
+        .get()
+        .map_err(|e| anyhow!("OpenReadAsync get failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
+    let size = stream
+        .Size()
+        .map_err(|e| anyhow!("Size failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
     if size == 0 || size > 8 * 1024 * 1024 || size > u32::MAX as u64 {
         return Ok(None);
     }
     let size = size as u32;
-    let buffer = Buffer::Create(size)?;
-    stream.ReadAsync(&buffer, size, InputStreamOptions::None)?.get()?;
-    let reader = DataReader::FromBuffer(&buffer)?;
+    let buffer =
+        Buffer::Create(size).map_err(|e| anyhow!("Buffer::Create failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
+    stream
+        .ReadAsync(&buffer, size, InputStreamOptions::None)
+        .map_err(|e| anyhow!("ReadAsync failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?
+        .get()
+        .map_err(|e| anyhow!("ReadAsync get failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
+    let reader = DataReader::FromBuffer(&buffer)
+        .map_err(|e| anyhow!("DataReader::FromBuffer failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
     let mut data = vec![0u8; size as usize];
-    reader.ReadBytes(&mut data)?;
+    reader
+        .ReadBytes(&mut data)
+        .map_err(|e| anyhow!("ReadBytes failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
     Ok(Some(data))
 }
 

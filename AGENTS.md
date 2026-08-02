@@ -59,6 +59,14 @@ verified headless.
 - Smoke test against the log after changing SMTC logic: one song change should
   produce one `track changed` line (with `artwork=` present), no repeated
   `track emit skipped` lines.
+- Churn-storm smoke check (after touching `smtc.rs` session handling): start
+  an app that recreates its SMTC session rapidly (Riot Client was observed at
+  ~20 sessions in 8.5s). Confirm the log shows one
+  `SessionsChanged/CurrentSessionChanged (debounced)` line per burst with
+  `(coalesced)` lines in between (not one resolve per event), that the
+  churning source gets one `WARN ... churning sessions ... excluding it` line
+  when it trips the cool-down, and that `current_key` never leaves the
+  actually-playing session (no adoption of the churning source).
 
 ## Git
 
