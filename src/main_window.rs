@@ -26,8 +26,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOWMAXIMIZED,
     SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE,
-    WM_CTLCOLORLISTBOX, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT,
-    WM_SIZE, WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    WM_CTLCOLORLISTBOX, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -503,6 +504,43 @@ impl MainWindowState {
             false,
         );
 
+        let pos_y = history_rect.bottom + (4.0 * scale) as i32;
+        let pos_label = if self.config.overlay.position_x.is_some() {
+            format!(
+                "Position: custom ({}, {})",
+                self.config.overlay.position_x.unwrap_or(0),
+                self.config.overlay.position_y.unwrap_or(0)
+            )
+        } else {
+            format!(
+                "Position: {}-{}",
+                match self.config.overlay.vertical {
+                    VerticalPosition::Top => "top",
+                    VerticalPosition::Bottom => "bottom",
+                },
+                match self.config.overlay.horizontal {
+                    HorizontalPosition::Left => "left",
+                    HorizontalPosition::Center => "center",
+                    HorizontalPosition::Right => "right",
+                }
+            )
+        };
+        let mut pos_rect = RECT {
+            left: pad,
+            top: pos_y,
+            right: client_w - pad,
+            bottom: pos_y + (16.0 * scale) as i32,
+        };
+        draw_string(
+            hdc,
+            &pos_label,
+            &mut pos_rect,
+            (10.0 * scale) as i32,
+            [0x66, 0x66, 0x66, 0xFF],
+            false,
+            false,
+        );
+
         unsafe {
             let _ = EndPaint(self.hwnd, &paint);
         }
@@ -892,6 +930,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_SIZE => {
             if !state_ptr.is_null() {
                 (*state_ptr).layout();
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            if !state_ptr.is_null() {
+                let state = &*state_ptr;
+                let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+                let y = (lparam.0 >> 16) as i32;
+                let pos_y =
+                    ((ART_Y + ART_SIZE + SEP_GAP + HIST_GAP + HIST_H) * scale).round() as i32 + (4.0 * scale) as i32;
+                let pos_bottom = pos_y + (16.0 * scale) as i32;
+                if y >= pos_y && y <= pos_bottom {
+                    let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
+                }
             }
             LRESULT(0)
         }
