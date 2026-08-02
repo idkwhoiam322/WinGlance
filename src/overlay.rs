@@ -705,10 +705,24 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
                 (fs_meta * 1.35, fs_meta),
                 (fs_app * 1.35, fs_app),
             ];
-            let total: f32 = rows.iter().map(|(h, _)| *h).sum();
+            // Only rows that will actually be drawn participate in the band
+            // split, so title/artist expand to fill the pill when the meta or
+            // source-app line is absent.
+            let meta = track.meta_line(true);
+            let active: [bool; 4] = [true, true, !meta.is_empty(), !track.source_app.trim().is_empty()];
+            let total: f32 = rows
+                .iter()
+                .zip(active)
+                .filter(|(_, active)| *active)
+                .map(|((h, _), _)| *h)
+                .sum();
             let mut y = 0.0f32;
             let mut next_band = |i: usize| -> RECT {
-                let band_h = rows[i].0 / total * height as f32;
+                let band_h = if active[i] {
+                    rows[i].0 / total * height as f32
+                } else {
+                    0.0
+                };
                 let r = RECT {
                     left,
                     top: y as i32,
@@ -746,8 +760,7 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
                 &state.scroll[1],
             );
 
-            let meta = track.meta_line(true);
-            if !meta.is_empty() {
+            if active[2] {
                 let meta_rect = next_band(2);
                 draw_marquee_line(
                     hdc,
@@ -759,7 +772,7 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
                     &state.scroll[2],
                 );
             }
-            if !track.source_app.trim().is_empty() {
+            if active[3] {
                 let app_rect = next_band(3);
                 draw_marquee_line(
                     hdc,
