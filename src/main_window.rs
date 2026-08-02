@@ -75,6 +75,7 @@ const BOTTOM_GAP: f32 = 16.0;
 struct HistoryEntry {
     at: DateTime<Local>,
     track: TrackInfo,
+    state: PlaybackState,
 }
 
 struct History {
@@ -272,6 +273,7 @@ impl MainWindowState {
                 MediaEvent::PlaybackStateChanged(state) => {
                     if let Some(current) = &mut self.current {
                         current.state = state;
+                        self.add_state_change(state);
                         self.invalidate();
                     }
                 }
@@ -279,16 +281,48 @@ impl MainWindowState {
         }
     }
 
-    fn add_track(&mut self, track: TrackInfo) {
+    fn add_state_change(&mut self, state: PlaybackState) {
+        let track = self.current.as_ref().map(|c| c.track.clone()).unwrap_or(TrackInfo {
+            title: "Unknown".into(),
+            artist: String::new(),
+            album: String::new(),
+            artwork: None,
+            source_app: "Media".into(),
+        });
         let before = self.history.len();
         self.history.push(HistoryEntry {
             at: Local::now(),
             track: track.clone(),
+            state,
         });
         if self.history.len() <= before && before > 0 {
             let _ = unsafe { SendMessageW(self.listbox, LB_DELETESTRING, WPARAM(0), LPARAM(0)) };
         }
-        let row = history_row(&track, Local::now());
+        let row = history_row(&track, Local::now(), state);
+        let row = wide(&row);
+        if !self.listbox.0.is_null() {
+            unsafe {
+                let _ = SendMessageW(self.listbox, LB_ADDSTRING, WPARAM(0), LPARAM(row.as_ptr() as isize));
+                let count = SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
+                if count > 0 {
+                    let _ = SendMessageW(self.listbox, LB_SETTOPINDEX, WPARAM(count - 1), LPARAM(0));
+                }
+            }
+        }
+    }
+
+    fn add_track(&mut self, track: TrackInfo) {
+        let state = self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing);
+        let before = self.history.len();
+        self.history.push(HistoryEntry {
+            at: Local::now(),
+            track: track.clone(),
+            state,
+        });
+        if self.history.len() <= before && before > 0 {
+            let _ = unsafe { SendMessageW(self.listbox, LB_DELETESTRING, WPARAM(0), LPARAM(0)) };
+        }
+        let row = history_row(&track, Local::now(), state);
         let row = wide(&row);
         if !self.listbox.0.is_null() {
             unsafe {
@@ -629,13 +663,18 @@ impl MainWindowState {
     }
 }
 
-fn history_row(track: &TrackInfo, at: DateTime<Local>) -> String {
+fn history_row(track: &TrackInfo, at: DateTime<Local>, state: PlaybackState) -> String {
     let artist = if track.artist.trim().is_empty() {
         &track.source_app
     } else {
         &track.artist
     };
-    format!("{}  {} — {}", at.format("%H:%M:%S"), track.title, artist)
+    let status = match state {
+        PlaybackState::Playing => "▶",
+        PlaybackState::Paused => "‖",
+        PlaybackState::Stopped => "■",
+    };
+    format!("{}  {}  {} — {}", at.format("%H:%M:%S"), status, track.title, artist)
 }
 
 fn draw_art(hdc: HDC, rgba: &[u8], px: i32, x: i32, y: i32) {
@@ -1085,6 +1124,7 @@ mod tests {
             history.push(HistoryEntry {
                 at: Local::now(),
                 track: track(&format!("Track {index}")),
+                state: PlaybackState::Playing,
             });
         }
         assert_eq!(history.len(), 3);
@@ -1096,12 +1136,12 @@ mod tests {
     fn row_falls_back_to_source_app_when_artist_is_blank() {
         let mut blank = track("Song");
         blank.artist = "   ".into();
-        let row = history_row(&blank, Local::now());
+        let row = history_row(&blank, Local::now(), PlaybackState::Playing);
         assert!(row.contains("Song"));
         assert!(row.contains("Spotify"));
 
         let titled = track("Song");
-        let row = history_row(&titled, Local::now());
+        let row = history_row(&titled, Local::now(), PlaybackState::Paused);
         assert!(row.contains("The Artist"));
     }
 }
