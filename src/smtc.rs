@@ -45,6 +45,9 @@ struct ListenerState {
     /// a track is not flushed until its album is present; sessions that never
     /// provide album (e.g. browsers) flush as soon as artwork is ready.
     session_has_album: bool,
+    /// Whether the tracked session is currently Playing. Used to decide when a
+    /// new source may take over the pill (only when nothing we track is active).
+    current_playing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +117,7 @@ impl ListenerState {
             last_playback: None,
             last_session_check: Instant::now(),
             session_has_album: false,
+            current_playing: false,
         }
     }
 
@@ -188,15 +192,23 @@ impl ListenerState {
                 }
             }
             Signal::PlaybackInfo(session) => {
-                self.refresh_current_session(Some(&session), true)?;
-                if self.current_key == Some(session_key(&session))
-                    && let Some(state) = read_playback_state(&session)?
-                {
-                    if state == PlaybackState::Playing {
-                        self.recent_playing = Some(session.clone());
+                let key = session_key(&session);
+                if self.current_key == Some(key) {
+                    if let Some(state) = read_playback_state(&session)? {
+                        if state == PlaybackState::Playing {
+                            self.recent_playing = Some(session.clone());
+                        }
+                        self.current_playing = state == PlaybackState::Playing;
+                        self.pending_playback = Some((key, state));
+                        self.schedule_flush();
                     }
-                    self.pending_playback = Some((session_key(&session), state));
-                    self.schedule_flush();
+                } else if !self.current_playing
+                    && matches!(read_playback_state(&session)?, Some(PlaybackState::Playing))
+                {
+                    // A new source started playing while nothing we track is active.
+                    // Adopt it; the pill only follows actively playing media, so a
+                    // paused/stale session never steals the current one.
+                    self.refresh_current_session(Some(&session), true)?;
                 }
             }
         }
@@ -217,10 +229,12 @@ impl ListenerState {
         self.unsubscribe();
         self.current_key = new_key;
         self.session_has_album = false;
+        self.current_playing = false;
         if let Some(session) = resolved {
             self.subscribe(&session)?;
+            let playback = read_playback_state(&session)?;
+            self.current_playing = matches!(playback, Some(PlaybackState::Playing));
             if emit_initial {
-                let playback = read_playback_state(&session)?;
                 if playback != Some(PlaybackState::Stopped)
                     && let Ok(track) = read_track_info(&session)
                 {
@@ -251,7 +265,25 @@ impl ListenerState {
         &mut self,
         hint: Option<&GlobalSystemMediaTransportControlsSession>,
     ) -> Option<GlobalSystemMediaTransportControlsSession> {
-        // First, try to find any Playing session from all sessions.
+        // 1. The session that caused the event wins when it is not stopped. This
+        //    makes the pill follow media changes from ANY source, matching the
+        //    native media widget, instead of being stuck on the first playing
+        //    session in the enumeration.
+        if let Some(session) = hint
+            && !matches!(read_playback_state(session), Ok(Some(PlaybackState::Stopped)))
+        {
+            return Some(session.clone());
+        }
+
+        // 2. Keep the tracked session while it is still playing; otherwise the
+        //    periodic re-check could flap between two concurrently playing sources.
+        if let Some(session) = self.recent_playing.clone()
+            && matches!(read_playback_state(&session), Ok(Some(PlaybackState::Playing)))
+        {
+            return Some(session);
+        }
+
+        // 3. Any playing session.
         if let Ok(sessions) = self.manager.GetSessions()
             && let Some(playing) = sessions
                 .into_iter()
@@ -260,22 +292,8 @@ impl ListenerState {
             return Some(playing);
         }
 
-        // Fall back to the current session if it's not Stopped.
+        // 4. The current session if it is not stopped.
         if let Ok(session) = self.manager.GetCurrentSession()
-            && !matches!(read_playback_state(&session), Ok(Some(PlaybackState::Stopped)))
-        {
-            return Some(session);
-        }
-
-        // Prefer the hint session if it's not Stopped.
-        if let Some(session) = hint
-            && !matches!(read_playback_state(session), Ok(Some(PlaybackState::Stopped)))
-        {
-            return Some(session.clone());
-        }
-
-        // Fall back to the last observed playing session.
-        if let Some(session) = self.recent_playing.clone()
             && !matches!(read_playback_state(&session), Ok(Some(PlaybackState::Stopped)))
         {
             return Some(session);
