@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
 use windows::Media::Control::{
@@ -104,6 +105,9 @@ struct ListenerState {
     /// Last observed timeline position per tracked session, for restart
     /// detection (a position collapse to ~0 on unchanged content).
     last_position: Option<(usize, Duration)>,
+    /// Heartbeat touched each loop iteration so the supervisor can detect a
+    /// stall and restart the listener.
+    heartbeat: Arc<Mutex<Instant>>,
 }
 
 /// How long a playback state change is held before emission, so a song-change
@@ -146,11 +150,19 @@ struct TrackFingerprint {
 pub struct SmtcListener {
     output: Sender<MediaEvent>,
     config: Config,
+    /// Updated by the event loop every few seconds so a supervisor can detect
+    /// a stalled worker (a WinRT call hanging under session churn) and
+    /// restart the listener.
+    heartbeat: Arc<Mutex<Instant>>,
 }
 
 impl SmtcListener {
-    pub fn new(output: Sender<MediaEvent>, config: Config) -> Self {
-        Self { output, config }
+    pub fn new(output: Sender<MediaEvent>, config: Config, heartbeat: Arc<Mutex<Instant>>) -> Self {
+        Self {
+            output,
+            config,
+            heartbeat,
+        }
     }
 
     pub fn run(self) -> Result<()> {
@@ -169,7 +181,7 @@ impl SmtcListener {
         let (signal_tx, signal_rx) = mpsc::channel();
         let sessions_token = register_sessions_handler(&manager, signal_tx.clone())?;
         let current_token = register_current_session_handler(&manager, signal_tx.clone())?;
-        let mut state = ListenerState::new(manager, self.config, self.output, signal_tx);
+        let mut state = ListenerState::new(manager, self.config, self.output, signal_tx, self.heartbeat);
 
         state.sync_subscriptions();
         state.refresh_current_session(None, true, false)?;
@@ -188,6 +200,7 @@ impl ListenerState {
         config: Config,
         output: Sender<MediaEvent>,
         signal_tx: Sender<Signal>,
+        heartbeat: Arc<Mutex<Instant>>,
     ) -> Self {
         Self {
             manager,
@@ -217,16 +230,21 @@ impl ListenerState {
             pending_noncurrent_state: None,
             last_noncurrent_state: HashMap::new(),
             last_position: None,
+            heartbeat,
         }
     }
 
     fn event_loop(&mut self, signal_rx: Receiver<Signal>) -> Result<()> {
         let session_check_interval = Duration::from_secs(2);
         loop {
+            *self.heartbeat.lock().unwrap() = Instant::now();
             let timeout = self
                 .pending_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or(Duration::from_secs(24 * 60 * 60));
+                .unwrap_or(Duration::from_secs(24 * 60 * 60))
+                // Wake at least every 5s so the heartbeat stays fresh even
+                // when nothing is pending.
+                .min(Duration::from_secs(5));
 
             match signal_rx.recv_timeout(timeout) {
                 Ok(signal) => self.handle_signal(signal)?,

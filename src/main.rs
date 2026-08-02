@@ -17,6 +17,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
@@ -124,9 +125,46 @@ fn main() -> Result<()> {
 
     let (event_tx, event_rx) = mpsc::channel();
     let listener_config = config.clone();
+    let heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+    let supervisor_heartbeat = heartbeat.clone();
+    // Supervisor: runs the SMTC worker and restarts it when it stalls (a WinRT
+    // call can hang under heavy session churn, which would otherwise silently
+    // stop all events and pills). The hung worker thread is leaked; a fresh
+    // worker with its own manager takes over.
     thread::Builder::new().name("notch-smtc".to_string()).spawn(move || {
-        if let Err(error) = smtc::SmtcListener::new(event_tx, listener_config).run() {
-            error!("SMTC listener stopped: {error:#}");
+        loop {
+            let worker_heartbeat = supervisor_heartbeat.clone();
+            let event_tx_worker = event_tx.clone();
+            let listener_config_worker = listener_config.clone();
+            let worker = thread::Builder::new()
+                .name("notch-smtc-worker".to_string())
+                .spawn(move || {
+                    let _ = smtc::SmtcListener::new(event_tx_worker, listener_config_worker, worker_heartbeat).run();
+                });
+            let Ok(worker) = worker else {
+                warn!("could not start the SMTC worker; retrying in 5s");
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            };
+            let mut stalled = false;
+            while !worker.is_finished() {
+                std::thread::sleep(Duration::from_secs(2));
+                let last = *supervisor_heartbeat.lock().unwrap();
+                if last.elapsed() > Duration::from_secs(30) {
+                    stalled = true;
+                    break;
+                }
+            }
+            if stalled {
+                // Do not join: the worker may be blocked inside COM forever.
+                error!("SMTC worker stalled; restarting it");
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+            let _ = worker.join();
+            // The worker exited on its own (an error): restart it.
+            warn!("SMTC worker exited; restarting it");
+            std::thread::sleep(Duration::from_secs(5));
         }
     })?;
 
