@@ -92,10 +92,11 @@ struct ListenerState {
     /// A SessionsChanged burst is pending its debounce window; the next flush
     /// performs the re-sync + re-resolve once per burst instead of per event.
     sessions_pending: bool,
-    /// Playback-state changes from sessions that are not current, awaiting the
-    /// next flush. Emitted as HistoryPlaybackState (history only, never the
-    /// pill).
-    pending_noncurrent_states: Vec<(PlaybackState, String)>,
+    /// Held playback-state change from a session that is not current, with the
+    /// deadline after which it may be recorded. The short hold collapses the
+    /// rapid Paused/Playing alternation of session churn into the final state.
+    /// Emitted as HistoryPlaybackState (history only, never the pill).
+    pending_noncurrent_state: Option<(usize, PlaybackState, Instant, String)>,
     /// Last history-recorded state per source app, for dedup of non-current
     /// session changes. Separate from `last_state_by_source` so background
     /// state never pollutes the current session's pill dedup.
@@ -213,7 +214,7 @@ impl ListenerState {
             churn: HashMap::new(),
             churn_cooldown: HashMap::new(),
             sessions_pending: false,
-            pending_noncurrent_states: Vec::new(),
+            pending_noncurrent_state: None,
             last_noncurrent_state: HashMap::new(),
             last_position: None,
         }
@@ -349,7 +350,7 @@ impl ListenerState {
                     if self.current_key != Some(key)
                         && let Some(state) = state
                     {
-                        self.queue_history_state(state, source);
+                        self.queue_history_state(key, state, source);
                     }
                 }
             }
@@ -391,15 +392,24 @@ impl ListenerState {
     }
 
     /// Queues a playback-state change from a session that is not current. It is
-    /// recorded for the history only (never shown in the pill), deduplicated
-    /// per source app.
-    fn queue_history_state(&mut self, state: PlaybackState, source: String) {
-        if self.last_noncurrent_state.get(&source) == Some(&state) {
-            debug!("history state suppressed | state={state:?} | source={source}");
+    /// held like the pill's state, so a churn burst (Paused/Playing alternating
+    /// within microseconds) collapses into its final state before being
+    /// recorded for the history only (never shown in the pill).
+    fn queue_history_state(&mut self, key: usize, state: PlaybackState, source: String) {
+        let just_emitted = self
+            .last_track_emitted
+            .is_some_and(|(k, at)| k == key && at.elapsed() < Duration::from_millis(TRACK_TRANSITION_MS));
+        if just_emitted {
+            self.last_noncurrent_state.insert(source.clone(), state);
             return;
         }
-        self.last_noncurrent_state.insert(source.clone(), state);
-        self.pending_noncurrent_states.push((state, source));
+        self.pending_noncurrent_state = Some((
+            key,
+            state,
+            Instant::now() + Duration::from_millis(STATE_HOLD_MS),
+            source,
+        ));
+        self.schedule_flush();
     }
 
     /// Updates the album/artwork caches from a fresh read (replacing any older
@@ -790,11 +800,23 @@ impl ListenerState {
     fn flush_pending(&mut self) {
         self.pending_deadline = None;
 
-        // History-only state changes from sessions that are not current: logged,
-        // never shown in the pill (dedup already happened at queue time).
-        for (state, source) in self.pending_noncurrent_states.drain(..) {
-            info!("history: playback state changed | state={state:?} | source={source}");
-            let _ = self.output.send(MediaEvent::HistoryPlaybackState(state, source));
+        // History-only state changes from sessions that are not current: held
+        // like the pill's state, so a churn burst (Paused/Playing alternating
+        // within microseconds) collapses into its final state. Never shown in
+        // the pill.
+        if let Some((_key, state, deadline, source)) = self.pending_noncurrent_state.as_ref().cloned() {
+            if Instant::now() < deadline {
+                self.pending_deadline = Some(deadline);
+            } else {
+                self.pending_noncurrent_state = None;
+                if self.last_noncurrent_state.get(&source) != Some(&state) {
+                    self.last_noncurrent_state.insert(source.clone(), state);
+                    info!("history: playback state changed | state={state:?} | source={source}");
+                    let _ = self.output.send(MediaEvent::HistoryPlaybackState(state, source));
+                } else {
+                    debug!("history state suppressed | state={state:?} | source={source}");
+                }
+            }
         }
 
         // Debounced session-list changes: one re-sync + re-resolve per burst

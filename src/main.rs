@@ -17,18 +17,20 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW, TranslateMessage,
 };
+use windows::core::PCWSTR;
 
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent};
-use crate::overlay::EventQueue;
+use crate::overlay::{EventQueue, wide};
 
 static CRASH_LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -85,10 +87,29 @@ fn install_crash_handler(logs_dir: &Path) {
     }
 }
 
+/// Acquires a named mutex owned by the process. When another instance already
+/// holds it, CreateMutexW succeeds with ERROR_ALREADY_EXISTS, and the app
+/// exits without touching the existing instance's windows.
+fn is_already_running() -> bool {
+    unsafe {
+        let name = wide("NotchSingleInstance");
+        let _ = CreateMutexW(None, true, PCWSTR(name.as_ptr())).ok();
+        GetLastError() == ERROR_ALREADY_EXISTS
+    }
+}
+
 fn main() -> Result<()> {
     let config = config::Config::load()?;
     logging::init_logging(&config.logs_dir());
     install_crash_handler(&config.logs_dir());
+
+    // Only one instance may run at a time; the mutex lives for the process
+    // lifetime and is released automatically when the process exits.
+    if is_already_running() {
+        warn!("another instance of Notch is already running; exiting");
+        return Ok(());
+    }
+
     info!("starting Notch");
 
     if let Err(error) = autostart::apply(config.behavior.start_on_login) {

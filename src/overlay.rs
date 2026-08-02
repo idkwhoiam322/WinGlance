@@ -647,7 +647,7 @@ fn track_content_size(config: &Config, track: &TrackInfo) -> (f32, f32) {
         appearance.font_size_title * ROW_HEIGHT,
         fs_artist * ROW_HEIGHT,
         fs_artist * 0.85 * ROW_HEIGHT,
-        fs_artist * 0.75 * ROW_HEIGHT,
+        fs_artist * 0.85 * ROW_HEIGHT,
     ];
     let meta = track.meta_line(true);
     let active = [true, true, !meta.is_empty(), !track.source_app.trim().is_empty()];
@@ -670,7 +670,7 @@ fn state_content_size(config: &Config, last_track: Option<&TrackInfo>) -> (f32, 
             text_h += appearance.font_size_artist * 0.85 * ROW_HEIGHT;
         }
         if !track.source_app.trim().is_empty() {
-            text_h += appearance.font_size_artist * 0.75 * ROW_HEIGHT;
+            text_h += appearance.font_size_artist * 0.85 * ROW_HEIGHT;
         }
     }
     let height = text_h + 2.0 * appearance.padding + 8.0;
@@ -1011,7 +1011,7 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
             let fs_title = appearance.font_size_title * scale;
             let fs_artist = appearance.font_size_artist * scale;
             let fs_meta = fs_artist * 0.85;
-            let fs_app = fs_artist * 0.75;
+            let fs_app = fs_artist * 0.85;
             let rows: [(f32, f32); 4] = [
                 (fs_title * ROW_HEIGHT, fs_title),
                 (fs_artist * ROW_HEIGHT, fs_artist),
@@ -1178,13 +1178,13 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
                     );
                 }
                 if !track.source_app.trim().is_empty() {
-                    let source_rect = next_band(fs_artist * 0.75 * ROW_HEIGHT);
+                    let source_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
                     draw_text_line_pixels(
                         pixels,
                         width as usize,
                         &track.source_app,
                         &source_rect,
-                        (fs_artist * 0.75) as i32,
+                        (fs_artist * 0.85) as i32,
                         [0x77, 0x77, 0x77, 0xFF],
                         false,
                         true,
@@ -1594,7 +1594,7 @@ mod tests {
             config.appearance.font_size_title * ROW_HEIGHT + fs * ROW_HEIGHT
         } else {
             config.appearance.font_size_title * ROW_HEIGHT + fs * ROW_HEIGHT + fs * 0.85 * ROW_HEIGHT
-        } + fs * 0.75 * ROW_HEIGHT;
+        } + fs * 0.85 * ROW_HEIGHT;
         let needed = text_h + 2.0 * config.appearance.padding + 8.0;
         assert!(height >= needed);
         // Without meta/source rows the pill is shorter, not bloated.
