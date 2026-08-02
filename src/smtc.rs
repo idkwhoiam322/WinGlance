@@ -1,0 +1,421 @@
+use crate::config::Config;
+use crate::events::{MediaEvent, PlaybackState, TrackInfo};
+use anyhow::{Context, Result};
+use log::{debug, info};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
+use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
+use windows::Media::Control::{
+    GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
+    GlobalSystemMediaTransportControlsSessionPlaybackStatus, MediaPropertiesChangedEventArgs,
+    PlaybackInfoChangedEventArgs, SessionsChangedEventArgs,
+};
+use windows::Storage::Streams::{Buffer, DataReader, InputStreamOptions};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+use windows::core::Interface;
+
+enum Signal {
+    Sessions,
+    MediaProperties(GlobalSystemMediaTransportControlsSession),
+    PlaybackInfo(GlobalSystemMediaTransportControlsSession),
+}
+
+struct SessionSubscription {
+    session: GlobalSystemMediaTransportControlsSession,
+    properties_token: EventRegistrationToken,
+    playback_token: EventRegistrationToken,
+}
+
+struct ListenerState {
+    manager: GlobalSystemMediaTransportControlsSessionManager,
+    config: Config,
+    output: Sender<MediaEvent>,
+    signal_tx: Sender<Signal>,
+    subscription: Option<SessionSubscription>,
+    current_key: Option<usize>,
+    recent_playing: Option<GlobalSystemMediaTransportControlsSession>,
+    pending_track: Option<(usize, TrackInfo)>,
+    pending_playback: Option<(usize, PlaybackState)>,
+    pending_deadline: Option<Instant>,
+    last_track: Option<(usize, TrackFingerprint)>,
+    last_playback: Option<(usize, PlaybackState)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrackFingerprint {
+    title: String,
+    artist: String,
+    album: String,
+    artwork_hash: u64,
+}
+
+pub struct SmtcListener {
+    output: Sender<MediaEvent>,
+    config: Config,
+}
+
+impl SmtcListener {
+    pub fn new(output: Sender<MediaEvent>, config: Config) -> Self {
+        Self { output, config }
+    }
+
+    pub fn run(self) -> Result<()> {
+        // WinRT factory calls and blocking IAsyncOperation::get require an apartment
+        // on this worker. Keeping it MTA avoids coupling the UI thread to COM.
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
+        let result = self.run_initialized();
+        unsafe { CoUninitialize() };
+        result
+    }
+
+    fn run_initialized(self) -> Result<()> {
+        let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?
+            .get()
+            .context("requesting the SMTC session manager")?;
+        let (signal_tx, signal_rx) = mpsc::channel();
+        let sessions_token = register_sessions_handler(&manager, signal_tx.clone())?;
+        let mut state = ListenerState::new(manager, self.config, self.output, signal_tx);
+
+        state.refresh_current_session(None, true)?;
+        state.event_loop(signal_rx)?;
+
+        let _ = state.manager.RemoveSessionsChanged(sessions_token);
+        state.unsubscribe();
+        Ok(())
+    }
+}
+
+impl ListenerState {
+    fn new(
+        manager: GlobalSystemMediaTransportControlsSessionManager,
+        config: Config,
+        output: Sender<MediaEvent>,
+        signal_tx: Sender<Signal>,
+    ) -> Self {
+        Self {
+            manager,
+            config,
+            output,
+            signal_tx,
+            subscription: None,
+            current_key: None,
+            recent_playing: None,
+            pending_track: None,
+            pending_playback: None,
+            pending_deadline: None,
+            last_track: None,
+            last_playback: None,
+        }
+    }
+
+    fn event_loop(&mut self, signal_rx: Receiver<Signal>) -> Result<()> {
+        loop {
+            let timeout = self
+                .pending_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_secs(24 * 60 * 60));
+
+            match signal_rx.recv_timeout(timeout) {
+                Ok(signal) => self.handle_signal(signal)?,
+                Err(mpsc::RecvTimeoutError::Timeout) => self.flush_pending(),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_signal(&mut self, signal: Signal) -> Result<()> {
+        match signal {
+            Signal::Sessions => {
+                debug!("SMTC SessionsChanged");
+                self.refresh_current_session(None, true)?;
+            }
+            Signal::MediaProperties(session) => {
+                self.refresh_current_session(Some(&session), false)?;
+                if self.current_key == Some(session_key(&session))
+                    && read_playback_state(&session)? != Some(PlaybackState::Stopped)
+                    && let Ok(track) = read_track_info(&session)
+                {
+                    self.pending_track = Some((session_key(&session), track));
+                    self.schedule_flush();
+                }
+            }
+            Signal::PlaybackInfo(session) => {
+                self.refresh_current_session(Some(&session), false)?;
+                if self.current_key == Some(session_key(&session))
+                    && let Some(state) = read_playback_state(&session)?
+                {
+                    if state == PlaybackState::Playing {
+                        self.recent_playing = Some(session.clone());
+                    }
+                    self.pending_playback = Some((session_key(&session), state));
+                    self.schedule_flush();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_current_session(
+        &mut self,
+        hint: Option<&GlobalSystemMediaTransportControlsSession>,
+        emit_initial: bool,
+    ) -> Result<()> {
+        let resolved = self.resolve_current_session(hint);
+        let new_key = resolved.as_ref().map(session_key);
+        if new_key == self.current_key {
+            return Ok(());
+        }
+
+        self.unsubscribe();
+        self.current_key = new_key;
+        if let Some(session) = resolved {
+            self.subscribe(&session)?;
+            if emit_initial {
+                let playback = read_playback_state(&session)?;
+                if playback != Some(PlaybackState::Stopped)
+                    && let Ok(track) = read_track_info(&session)
+                {
+                    self.pending_track = Some((session_key(&session), track));
+                }
+                if let Some(state) = playback {
+                    if state == PlaybackState::Playing {
+                        self.recent_playing = Some(session.clone());
+                    }
+                    if state == PlaybackState::Stopped {
+                        // Establish a baseline without showing an empty/stopped
+                        // notification when the app starts with no active media.
+                        self.last_playback = Some((session_key(&session), state));
+                    } else {
+                        self.pending_playback = Some((session_key(&session), state));
+                    }
+                }
+                self.flush_pending();
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_current_session(
+        &mut self,
+        hint: Option<&GlobalSystemMediaTransportControlsSession>,
+    ) -> Option<GlobalSystemMediaTransportControlsSession> {
+        // Windows' current-session pointer is authoritative when available.
+        if let Ok(session) = self.manager.GetCurrentSession() {
+            return Some(session);
+        }
+
+        // Some providers do not update that pointer. Prefer the session that
+        // caused the callback, then the last session observed as Playing.
+        if let Some(session) = hint
+            && matches!(read_playback_state(session), Ok(Some(PlaybackState::Playing)))
+        {
+            return Some(session.clone());
+        }
+        if let Some(session) = self.recent_playing.clone()
+            && matches!(read_playback_state(&session), Ok(Some(PlaybackState::Playing)))
+        {
+            return Some(session);
+        }
+
+        let sessions = self.manager.GetSessions().ok()?;
+        sessions
+            .into_iter()
+            .find(|session| matches!(read_playback_state(session), Ok(Some(PlaybackState::Playing))))
+    }
+
+    fn subscribe(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<()> {
+        let properties_session = session.clone();
+        let playback_session = session.clone();
+        let properties_tx = self.signal_tx.clone();
+        let playback_tx = self.signal_tx.clone();
+        let properties_handler: TypedEventHandler<
+            GlobalSystemMediaTransportControlsSession,
+            MediaPropertiesChangedEventArgs,
+        > = TypedEventHandler::new(move |_, _| {
+            let _ = properties_tx.send(Signal::MediaProperties(properties_session.clone()));
+            Ok(())
+        });
+        let playback_handler: TypedEventHandler<
+            GlobalSystemMediaTransportControlsSession,
+            PlaybackInfoChangedEventArgs,
+        > = TypedEventHandler::new(move |_, _| {
+            let _ = playback_tx.send(Signal::PlaybackInfo(playback_session.clone()));
+            Ok(())
+        });
+
+        let properties_token = session.MediaPropertiesChanged(&properties_handler)?;
+        let playback_token = match session.PlaybackInfoChanged(&playback_handler) {
+            Ok(token) => token,
+            Err(error) => {
+                let _ = session.RemoveMediaPropertiesChanged(properties_token);
+                return Err(error.into());
+            }
+        };
+        self.subscription = Some(SessionSubscription {
+            session: session.clone(),
+            properties_token,
+            playback_token,
+        });
+        info!("subscribed to SMTC session {}", session_key(session));
+        Ok(())
+    }
+
+    fn unsubscribe(&mut self) {
+        if let Some(subscription) = self.subscription.take() {
+            let _ = subscription
+                .session
+                .RemoveMediaPropertiesChanged(subscription.properties_token);
+            let _ = subscription
+                .session
+                .RemovePlaybackInfoChanged(subscription.playback_token);
+        }
+    }
+
+    fn schedule_flush(&mut self) {
+        self.pending_deadline = Some(Instant::now() + debounce_duration(&self.config));
+    }
+
+    fn flush_pending(&mut self) {
+        self.pending_deadline = None;
+        if let Some((key, track)) = self.pending_track.take() {
+            let fingerprint = track_fingerprint(&track);
+            if self.last_track.as_ref() != Some(&(key, fingerprint.clone())) {
+                self.last_track = Some((key, fingerprint));
+                info!(
+                    "track changed | title={:?} | artist={:?} | album={:?} | source={:?}",
+                    track.title, track.artist, track.album, track.source_app
+                );
+                let _ = self.output.send(MediaEvent::TrackChanged(track));
+            }
+        }
+        if let Some((key, state)) = self.pending_playback.take()
+            && self.last_playback != Some((key, state))
+        {
+            self.last_playback = Some((key, state));
+            info!("playback state changed | state={state:?}");
+            let _ = self.output.send(MediaEvent::PlaybackStateChanged(state));
+        }
+    }
+}
+
+fn register_sessions_handler(
+    manager: &GlobalSystemMediaTransportControlsSessionManager,
+    signal_tx: Sender<Signal>,
+) -> Result<EventRegistrationToken> {
+    let handler: TypedEventHandler<GlobalSystemMediaTransportControlsSessionManager, SessionsChangedEventArgs> =
+        TypedEventHandler::new(move |_, _| {
+            let _ = signal_tx.send(Signal::Sessions);
+            Ok(())
+        });
+    Ok(manager.SessionsChanged(&handler)?)
+}
+
+fn session_key(session: &GlobalSystemMediaTransportControlsSession) -> usize {
+    session.as_raw() as usize
+}
+
+fn read_track_info(session: &GlobalSystemMediaTransportControlsSession) -> Result<TrackInfo> {
+    let source_app = session
+        .SourceAppUserModelId()
+        .map(|value| source_app_label(&value.to_string()))
+        .unwrap_or_else(|_| "Media".to_string());
+    let properties = session.TryGetMediaPropertiesAsync()?.get()?;
+    let title = non_empty(properties.Title()?.to_string(), &source_app);
+    let artist = non_empty(properties.Artist()?.to_string(), &source_app);
+    let album = non_empty(properties.AlbumTitle()?.to_string(), "Unknown album");
+    let artwork = read_artwork(&properties).unwrap_or_else(|error| {
+        debug!("album-art read failed: {error:#}");
+        None
+    });
+    Ok(TrackInfo {
+        title,
+        artist,
+        album,
+        artwork,
+        source_app,
+    })
+}
+
+fn read_playback_state(session: &GlobalSystemMediaTransportControlsSession) -> Result<Option<PlaybackState>> {
+    let status = session.GetPlaybackInfo()?.PlaybackStatus()?;
+    Ok(match status {
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing => Some(PlaybackState::Playing),
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused => Some(PlaybackState::Paused),
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped
+        | GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed => Some(PlaybackState::Stopped),
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Opened
+        | GlobalSystemMediaTransportControlsSessionPlaybackStatus::Changing => None,
+        _ => None,
+    })
+}
+
+fn read_artwork(
+    properties: &windows::Media::Control::GlobalSystemMediaTransportControlsSessionMediaProperties,
+) -> Result<Option<Vec<u8>>> {
+    let reference = properties.Thumbnail()?;
+    let stream = reference.OpenReadAsync()?.get()?;
+    let size = stream.Size()?;
+    if size == 0 || size > 8 * 1024 * 1024 || size > u32::MAX as u64 {
+        return Ok(None);
+    }
+    let size = size as u32;
+    let buffer = Buffer::Create(size)?;
+    stream.ReadAsync(&buffer, size, InputStreamOptions::None)?.get()?;
+    let reader = DataReader::FromBuffer(&buffer)?;
+    let mut data = vec![0u8; size as usize];
+    reader.ReadBytes(&mut data)?;
+    Ok(Some(data))
+}
+
+fn non_empty(value: String, fallback: &str) -> String {
+    if value.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        value
+    }
+}
+
+fn source_app_label(value: &str) -> String {
+    let value = value.rsplit('!').next().unwrap_or(value);
+    let value = value.split('_').next().unwrap_or(value);
+    non_empty(value.to_string(), "Media")
+}
+
+fn track_fingerprint(track: &TrackInfo) -> TrackFingerprint {
+    let mut hasher = DefaultHasher::new();
+    track.artwork.hash(&mut hasher);
+    TrackFingerprint {
+        title: track.title.clone(),
+        artist: track.artist.clone(),
+        album: track.album.clone(),
+        artwork_hash: hasher.finish(),
+    }
+}
+
+fn debounce_duration(config: &Config) -> Duration {
+    Duration::from_millis(config.behavior.debounce_ms.clamp(150, 250))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_app_label_uses_a_readable_fallback() {
+        assert_eq!(source_app_label("SpotifyAB.SpotifyMusic_abc!Spotify"), "Spotify");
+        assert_eq!(source_app_label("browser"), "browser");
+        assert_eq!(source_app_label(""), "Media");
+    }
+
+    #[test]
+    fn debounce_window_is_clamped_to_the_coalescing_range() {
+        let mut config = Config::default();
+        config.behavior.debounce_ms = 1;
+        assert_eq!(debounce_duration(&config), Duration::from_millis(150));
+        config.behavior.debounce_ms = 1000;
+        assert_eq!(debounce_duration(&config), Duration::from_millis(250));
+    }
+}

@@ -1,0 +1,24 @@
+[overlay]
+duration_ms = 3000
+animation_ms = 200
+position = "top-center"
+max_width = 240
+margin_top = 8
+
+[behavior]
+enable_track_change = true
+enable_playback_state_change = true
+debounce_ms = 200
+
+[appearance]
+background_color = [0, 0, 0, 230]
+text_color = [255, 255, 255, 255]
+accent_color = [0, 212, 170, 255]
+corner_radius = 16.0
+padding = 8.0
+art_size = 32
+font_size_title = 12.0
+font_size_artist = 10.0
+
+[logging]
+keep_files = 5

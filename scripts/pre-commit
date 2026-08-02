@@ -1,0 +1,34 @@
+#!/usr/bin/env sh
+set -e
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+# Match the NewsAggregator workflow: format staged Rust changes automatically.
+staged_rs=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')
+if [ -n "$staged_rs" ]; then
+    if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+        echo "cargo fmt: reformatting..."
+        cargo fmt --all
+        printf '%s\n' "$staged_rs" | xargs git add --
+    fi
+fi
+
+# Security and dependency policy checks are advisory, matching NewsAggregator.
+if command -v cargo-audit >/dev/null 2>&1; then
+    if ! cargo audit >/dev/null 2>&1; then
+        echo "cargo-audit: issues found (advisory):"
+        cargo audit || true
+    fi
+else
+    echo "cargo-audit: not installed (install with 'cargo install cargo-audit')"
+fi
+
+if command -v cargo-deny >/dev/null 2>&1; then
+    if [ -f deny.toml ] && ! cargo deny check >/dev/null 2>&1; then
+        echo "cargo-deny: issues found (advisory):"
+        cargo deny check || true
+    fi
+else
+    echo "cargo-deny: not installed (install with 'cargo install cargo-deny')"
+fi
