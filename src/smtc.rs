@@ -341,7 +341,10 @@ impl ListenerState {
                     // re-resolve picks up same-source session churn); only a
                     // session that is still not current afterwards is recorded
                     // as a history event — the pill follows the current session,
-                    // but every state change is visible.
+                    // but every state change is visible. A Stopped report from a
+                    // non-current session is the song-change blip of the session
+                    // that just yielded (the new track pill covers it), so it is
+                    // never recorded or shown.
                     let state = read_playback_state(&session)?;
                     let source = read_source_app(&session);
                     if state != Some(PlaybackState::Stopped) {
@@ -349,11 +352,11 @@ impl ListenerState {
                         // current one, so a new source actually takes the pill
                         // (eligibility still filters placeholder sessions).
                         self.refresh_current_session(Some(&session), true, true)?;
-                    }
-                    if self.current_key != Some(key)
-                        && let Some(state) = state
-                    {
-                        self.queue_history_state(key, state, source);
+                        if self.current_key != Some(key)
+                            && let Some(state) = state
+                        {
+                            self.queue_history_state(key, state, source);
+                        }
                     }
                 }
             }
