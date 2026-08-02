@@ -69,6 +69,13 @@ const HIST_GAP: f32 = 14.0;
 const HIST_H: f32 = 18.0;
 const LIST_GAP: f32 = 8.0;
 const BOTTOM_GAP: f32 = 16.0;
+const SIDEBAR_W: f32 = 48.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Pane {
+    Activity,
+    Settings,
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -127,6 +134,7 @@ struct MainWindowState {
     gray_brush: HBRUSH,
     accent_brush: HBRUSH,
     notifications_enabled: bool,
+    active_pane: Pane,
 }
 
 /// Creates the main window: a maximized tracker with current activity,
@@ -194,6 +202,7 @@ impl MainWindowState {
             gray_brush: HBRUSH::default(),
             accent_brush: HBRUSH::default(),
             notifications_enabled: true,
+            active_pane: Pane::Activity,
         }
     }
 
@@ -353,6 +362,8 @@ impl MainWindowState {
         }
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (client_w, client_h) = client_size(self.hwnd);
+        let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+        let content_left = sidebar_w;
         let whole = RECT {
             left: 0,
             top: 0,
@@ -360,14 +371,75 @@ impl MainWindowState {
             bottom: client_h,
         };
         let pad = (PAD * scale) as i32;
+
+        // Fill background
         unsafe {
             let black = CreateSolidBrush(COLORREF(0));
             let _ = FillRect(hdc, &whole, black);
             let _ = DeleteObject(black);
         }
 
+        // Draw sidebar
+        let sidebar_rect = RECT {
+            left: 0,
+            top: 0,
+            right: sidebar_w,
+            bottom: client_h,
+        };
+        unsafe {
+            let sidebar_bg = CreateSolidBrush(COLORREF(0x0A0A0A));
+            let _ = FillRect(hdc, &sidebar_rect, sidebar_bg);
+            let _ = DeleteObject(sidebar_bg);
+        }
+
+        // Sidebar items
+        let item_h = (32.0 * scale) as i32;
+        let items = [("Now Playing", Pane::Activity), ("Settings", Pane::Settings)];
+        for (i, (label, pane)) in items.iter().enumerate() {
+            let y = (40.0 * scale) as i32 + (i as i32) * (item_h + (4.0 * scale) as i32);
+            let item_rect = RECT {
+                left: 4,
+                top: y,
+                right: sidebar_w - 4,
+                bottom: y + item_h,
+            };
+            if *pane == self.active_pane {
+                unsafe {
+                    let highlight = CreateSolidBrush(COLORREF(0x1A1A2E));
+                    let _ = FillRect(hdc, &item_rect, highlight);
+                    let _ = DeleteObject(highlight);
+                }
+            }
+            let mut text_rect = item_rect;
+            draw_string(
+                hdc,
+                label,
+                &mut text_rect,
+                (10.0 * scale) as i32,
+                if *pane == self.active_pane {
+                    self.config.appearance.accent_color
+                } else {
+                    [0x88, 0x88, 0x88, 0xFF]
+                },
+                *pane == self.active_pane,
+                true,
+            );
+        }
+
+        // Draw content based on active pane
+        match self.active_pane {
+            Pane::Activity => self.paint_activity(hdc, content_left, client_w, client_h, scale, pad),
+            Pane::Settings => self.paint_settings(hdc, content_left, client_w, client_h, scale, pad),
+        }
+
+        unsafe {
+            let _ = EndPaint(self.hwnd, &paint);
+        }
+    }
+
+    fn paint_activity(&mut self, hdc: HDC, content_left: i32, client_w: i32, _client_h: i32, scale: f32, pad: i32) {
         let mut header_rect = RECT {
-            left: pad,
+            left: content_left + pad,
             top: pad,
             right: client_w - pad,
             bottom: pad + (HEADER_H * scale) as i32,
@@ -383,7 +455,7 @@ impl MainWindowState {
         );
 
         let art = (ART_SIZE * scale).round() as i32;
-        let art_x = pad;
+        let art_x = content_left + pad;
         let art_y = (ART_Y * scale) as i32;
         let text_left = art_x + art + (12.0 * scale) as i32;
         let text_right = client_w - pad;
@@ -450,6 +522,7 @@ impl MainWindowState {
                 true,
                 false,
             );
+
             let subtitle = if current.track.artist.trim().is_empty() {
                 &current.track.source_app
             } else {
@@ -470,6 +543,7 @@ impl MainWindowState {
                 false,
                 false,
             );
+
             if !current.track.album.trim().is_empty() {
                 let mut album_rect = RECT {
                     left: text_left,
@@ -524,7 +598,7 @@ impl MainWindowState {
 
         let sep_y = art_y + art + (SEP_GAP * scale) as i32;
         let separator = RECT {
-            left: 0,
+            left: content_left,
             top: sep_y,
             right: client_w,
             bottom: sep_y + 1,
@@ -534,7 +608,7 @@ impl MainWindowState {
         }
 
         let mut history_rect = RECT {
-            left: pad,
+            left: content_left + pad,
             top: sep_y + (HIST_GAP * scale) as i32,
             right: client_w - pad,
             bottom: sep_y + ((HIST_GAP + HIST_H) * scale) as i32,
@@ -571,7 +645,7 @@ impl MainWindowState {
             )
         };
         let mut pos_rect = RECT {
-            left: pad,
+            left: content_left + pad,
             top: pos_y,
             right: client_w - pad,
             bottom: pos_y + (16.0 * scale) as i32,
@@ -585,10 +659,111 @@ impl MainWindowState {
             false,
             false,
         );
+    }
 
-        unsafe {
-            let _ = EndPaint(self.hwnd, &paint);
-        }
+    fn paint_settings(&self, hdc: HDC, content_left: i32, client_w: i32, _client_h: i32, scale: f32, pad: i32) {
+        let mut y = pad;
+        let label_color = [0x99, 0x99, 0x99, 0xFF];
+        let value_color = self.config.appearance.text_color;
+        let accent = self.config.appearance.accent_color;
+        let value_rect = |y: i32, text: &str, color: [u8; 4]| {
+            let mut rect = RECT {
+                left: content_left + pad,
+                top: y,
+                right: client_w - pad,
+                bottom: y + (20.0 * scale) as i32,
+            };
+            draw_string(hdc, text, &mut rect, (12.0 * scale) as i32, color, false, false);
+        };
+
+        // Header
+        let mut hdr = RECT {
+            left: content_left + pad,
+            top: y,
+            right: client_w - pad,
+            bottom: y + (24.0 * scale) as i32,
+        };
+        draw_string(hdc, "SETTINGS", &mut hdr, (13.0 * scale) as i32, accent, true, false);
+        y += (36.0 * scale) as i32;
+
+        // Notifications
+        value_rect(y, "Notifications", label_color);
+        y += (18.0 * scale) as i32;
+        let notif_text = if self.notifications_enabled { "ON" } else { "OFF" };
+        let notif_color = if self.notifications_enabled {
+            accent
+        } else {
+            [0x66, 0x66, 0x66, 0xFF]
+        };
+        value_rect(y, notif_text, notif_color);
+        y += (28.0 * scale) as i32;
+
+        // Duration
+        value_rect(y, "Duration", label_color);
+        y += (18.0 * scale) as i32;
+        value_rect(y, &format!("{}s", self.config.overlay.duration_ms / 1000), value_color);
+        y += (28.0 * scale) as i32;
+
+        // Position
+        value_rect(y, "Position", label_color);
+        y += (18.0 * scale) as i32;
+        let pos_text = if self.config.overlay.position_x.is_some() {
+            format!(
+                "Custom ({}, {})",
+                self.config.overlay.position_x.unwrap_or(0),
+                self.config.overlay.position_y.unwrap_or(0)
+            )
+        } else {
+            format!(
+                "{}-{}",
+                match self.config.overlay.vertical {
+                    VerticalPosition::Top => "top",
+                    VerticalPosition::Bottom => "bottom",
+                },
+                match self.config.overlay.horizontal {
+                    HorizontalPosition::Left => "left",
+                    HorizontalPosition::Center => "center",
+                    HorizontalPosition::Right => "right",
+                }
+            )
+        };
+        value_rect(y, &pos_text, value_color);
+        y += (28.0 * scale) as i32;
+
+        // Start on login
+        value_rect(y, "Start on login", label_color);
+        y += (18.0 * scale) as i32;
+        let login_text = if self.config.behavior.start_on_login {
+            "ON"
+        } else {
+            "OFF"
+        };
+        let login_color = if self.config.behavior.start_on_login {
+            accent
+        } else {
+            [0x66, 0x66, 0x66, 0xFF]
+        };
+        value_rect(y, login_text, login_color);
+        y += (28.0 * scale) as i32;
+
+        // Close to tray
+        value_rect(y, "Close to tray", label_color);
+        y += (18.0 * scale) as i32;
+        let tray_text = if self.config.behavior.close_to_tray {
+            "ON"
+        } else {
+            "OFF"
+        };
+        let tray_color = if self.config.behavior.close_to_tray {
+            accent
+        } else {
+            [0x66, 0x66, 0x66, 0xFF]
+        };
+        value_rect(y, tray_text, tray_color);
+        y += (28.0 * scale) as i32;
+
+        // Hint
+        value_rect(y, "Adjust via tray menu", [0x55, 0x55, 0x55, 0xFF]);
     }
 
     fn layout(&self) {
@@ -1046,14 +1221,31 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         }
         WM_LBUTTONDOWN => {
             if !state_ptr.is_null() {
-                let state = &*state_ptr;
+                let state = &mut *state_ptr;
                 let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
-                let y = (lparam.0 >> 16) as i32;
-                let pos_y =
-                    ((ART_Y + ART_SIZE + SEP_GAP + HIST_GAP + HIST_H) * scale).round() as i32 + (4.0 * scale) as i32;
-                let pos_bottom = pos_y + (16.0 * scale) as i32;
-                if y >= pos_y && y <= pos_bottom {
-                    let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
+                let x = (lparam.0 & 0xFFFF) as i32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+
+                // Check sidebar clicks
+                if x < sidebar_w {
+                    let item_h = (32.0 * scale) as i32;
+                    let item0_y = (40.0 * scale) as i32;
+                    let item1_y = item0_y + item_h + (4.0 * scale) as i32;
+                    if y >= item0_y && y < item0_y + item_h {
+                        state.active_pane = Pane::Activity;
+                    } else if y >= item1_y && y < item1_y + item_h {
+                        state.active_pane = Pane::Settings;
+                    }
+                    state.invalidate();
+                } else if state.active_pane == Pane::Activity {
+                    // Check position area click in Activity pane
+                    let pos_y = ((ART_Y + ART_SIZE + SEP_GAP + HIST_GAP + HIST_H) * scale).round() as i32
+                        + (4.0 * scale) as i32;
+                    let pos_bottom = pos_y + (16.0 * scale) as i32;
+                    if y >= pos_y && y <= pos_bottom {
+                        let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
+                    }
                 }
             }
             LRESULT(0)
