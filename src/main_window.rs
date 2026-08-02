@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, IDC_ARROW, IDI_APPLICATION, LB_ADDSTRING,
     LB_DELETESTRING, LB_GETCOUNT, LB_GETTEXT, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS,
     LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY,
     WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP,
@@ -445,6 +445,17 @@ impl MainWindowState {
         let hdc = unsafe { BeginPaint(self.hwnd, &mut paint) };
         if hdc.0.is_null() {
             return;
+        }
+        // The history listbox belongs to the Activity pane only.
+        unsafe {
+            let _ = ShowWindow(
+                self.listbox,
+                if self.active_pane == Pane::Activity {
+                    SW_SHOW
+                } else {
+                    SW_HIDE
+                },
+            );
         }
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (client_w, client_h) = client_size(self.hwnd);
@@ -1100,7 +1111,8 @@ impl MainWindowState {
         scale: f32,
     ) -> Option<(usize, Option<usize>)> {
         let items = self.settings_items(content_left, client_w, pad, scale);
-        for (row_index, item) in items.iter().enumerate() {
+        let mut row_index = 0usize;
+        for item in &items {
             if let SettingsItem::Row { id, rect } = item
                 && y >= rect.top
                 && y < rect.bottom
@@ -1119,6 +1131,11 @@ impl MainWindowState {
                     return Some((row_index, seg));
                 }
                 return Some((row_index, None));
+            }
+            // Row index must count rows only, matching paint_settings; headers
+            // are skipped here.
+            if matches!(item, SettingsItem::Row { .. }) {
+                row_index += 1;
             }
         }
         None
