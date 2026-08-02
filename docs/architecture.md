@@ -10,10 +10,15 @@ the top of the screen when the track or the playback state changes.
   GDI. No `winit`, no `tiny-skia`, no `tokio`. This keeps the dependency tree
   small and the binary lean.
 - **Two isolated threads.** SMTC work (COM, WinRT async, artwork decoding)
-  runs on a dedicated worker thread. The overlay runs on the UI thread with a
-  classic `GetMessageW` loop. They communicate only through an `mpsc` channel
-  and one `PostMessageW` per event.
-- **Passive window.** The overlay never takes focus, never appears in
+  runs on a dedicated worker thread. The Windows UI runs on the UI thread with a
+  classic `GetMessageW` loop. They communicate only through an `mpsc` channel and
+  `PostMessageW`.
+- **Two windows, one queue.** There is a borderless "notch" pill overlay window
+  and a maximized "tracking" window; both register a `WM_MEDIA_EVENT` handler.
+  A single forwarder thread drains the SMTC `mpsc` receiver into a shared
+  `Arc<Mutex<VecDeque<MediaEvent>>` and pokes **both** windows with
+  `PostMessageW`, so each can render from the same event stream without owning SMTC.
+- **Passive pill.** The overlay never takes focus, never appears in
   Alt-Tab, never intercepts mouse clicks, and stays on top of the active
   monitor's work area.
 - **Config over code.** All visual and behavioral knobs live in
@@ -22,22 +27,27 @@ the top of the screen when the track or the playback state changes.
 ## Threading model
 
 ```
-SMTC worker thread                         UI thread (message loop)
-─────────────────────                      ─────────────────────────
-CoInitializeEx(MTA)                        RegisterClassExW
-SystemMediaTransportControls               CreateWindowExW (layered, popup)
-  ├─ GetCurrentSession()                   install tray icon
-  ├─ get_playback_info()                   spawn event forwarder
-  ├─ subscribe PlaybackInfoChanged         GetMessageW loop
+SMTC worker thread                      UI thread (message loop)
+────────────────────—                      ─────────────────────────
+CoInitializeEx(MTA)                      RegisterClassExW x2
+SystemMediaTransportControls            create_window x2 (pill + main)
+  ├─ GetCurrentSession()               install tray icon (main window)
+  ├─ get_playback_info()               GetMessageW loop
+  ├─ subscribe PlaybackInfoChanged
   ├─ subscribe MediaPropertiesChanged
   │
-  │  events → mpsc channel ──────────────► forwarder thread ──► PostMessageW
-  │                                            │                     │
-  │                                            └──► queue (Mutex) ──┘
-  │                                                     │
-  │                                          WM_MEDIA_EVENT → receive_events()
-  │                                          WM_TIMER (debounce) → flush_pending()
-  │                                          WM_TIMER (16 ms) → tick() → render()
+  │  events → mpsc channel ─────────► forwarder thread
+  │                                       │
+  │                                       ├──► queue (Arc<Mutex<VecDeque>>)
+  │                                       │       ├──► both windows read it
+  │                                       │       └──► PostMessageW(WM_MEDIA_EVENT) to BOTH
+  │                                       │       └──► PostMessageW(WM_TOGGLE) to overlay only
+  │                                       └──► shared queue + both HWNDs
+  │
+  │  WM_MEDIA_EVENT → receive_events()  (pill + main)
+  │  WM_TIMER (debounce) → flush_pending()  (pill)
+  │  WM_TIMER (16 ms) → tick() → render()   (pill)
+  │  WM_TOGGLE → toggle_enabled()           (pill, from tray menu)
 ```
 
 - The SMTC worker owns all COM state for its lifetime and initializes COM as
@@ -98,6 +108,24 @@ be clicked through to, activated, or tabbed to.
 
 Animation is a simple three-phase ease-out: expanding (grow + fade in), light
 (short fade for playback-state changes), collapsing (shrink + fade out).
+
+## Placement and resolution
+
+`overlay::position()` resolves the pill's screen top-left from `[overlay]`:
+
+- `vertical` (`top`/`bottom`) × `horizontal` (`left`/`center`/`right`) pick an
+  anchor on the active monitor's work area (the monitor of `GetForegroundWindow`);
+- `margin` offsets from the chosen edge in 96-DPI logical pixels (scaled by the
+  window DPI);
+- `position_x`/`position_y`, when set, override the anchor with an absolute
+  location and are clamped to the work area so they stay on-screen.
+
+Because the 16 ms `WM_TIMER` recomputes geometry each tick while the pill is
+shown, a monitor removal or resolution change moves the pill back onto the new
+work area on the next frame. The tray **Position → Adjust position…** command
+opens `src/positioner.rs`, a draggable sample that writes `position_x`/`position_y`
+to `config.toml` and nudges the live overlay via `overlay::set_position` (which
+calls `reposition()` without a full redraw).
 
 ## Configuration
 

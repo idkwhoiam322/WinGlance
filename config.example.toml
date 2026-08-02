@@ -1,14 +1,28 @@
 [overlay]
 duration_ms = 3000
 animation_ms = 200
-position = "top-center"
+# Vertical edge: "top" | "bottom".
+vertical = "top"
+# Horizontal placement: "left" | "center" | "right".
+horizontal = "center"
+# Logical-pixel margin from the chosen edge (after DPI scaling).
+margin = 8
 max_width = 240
-margin_top = 8
+# Optional absolute overrides (96-DPI logical pixels). When set, the pill is
+# placed here instead of the anchor above; set by the "Adjust position" drag.
+# position_x = 0
+# position_y = 0
 
 [behavior]
 enable_track_change = true
 enable_playback_state_change = true
 debounce_ms = 200
+# Launch quietly to the system tray: no window pops up, just the notch + tray icon.
+start_in_tray = true
+# Create a startup registry entry so Windows launches notch at logon.
+start_on_login = false
+# Instead of closing the app, hide the window to the tray when its X is pressed.
+close_to_tray = true
 
 [appearance]
 background_color = [0, 0, 0, 230]

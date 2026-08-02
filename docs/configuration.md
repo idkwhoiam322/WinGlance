@@ -11,9 +11,12 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 |----------------|---------|---------|---------------------------------------------------|
 | `duration_ms`  | `3000`  | 500–60000 | How long the pill stays visible before collapsing |
 | `animation_ms` | `200`   | 100–500 | Expand/collapse animation length                  |
-| `position`     | `"top-center"` | `top-center` \| `top-right` \| `top-left` | Horizontal placement within the monitor work area |
+| `vertical`     | `"top"` | `top` \| `bottom` | Which monitor edge the pill anchors to |
+| `horizontal`   | `"center"` | `left` \| `center` \| `right` | Horizontal anchor within the work area |
+| `margin`       | `8`     | 0–500   | Distance from the chosen edge (logical px)        |
 | `max_width`    | `240`   | 180–800 | Maximum pill width in logical pixels              |
-| `margin_top`   | `8`     | 0–500   | Distance from the top edge of the work area       |
+| `position_x`   | *(unset)* | integer | Absolute X override (96-DPI logical px); set by *Adjust position…* |
+| `position_y`   | *(unset)* | integer | Absolute Y override (96-DPI logical px); set by *Adjust position…* |
 
 ## [behavior]
 
@@ -22,6 +25,9 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `enable_track_change`           | `true`  | bool   | Show the pill when the track changes    |
 | `enable_playback_state_change`  | `true`  | bool   | Show a small state pill on play/pause   |
 | `debounce_ms`                   | `200`   | 150–250 | Coalescing window for bursty SMTC events |
+| `start_in_tray`                 | `true`  | bool   | Start silently: no window, only the tray icon + pill |
+| `start_on_login`                | `false` | bool   | Register a Windows startup entry to launch notch at logon |
+| `close_to_tray`                 | `true`  | bool   | Hide (instead of close) the window when its X is pressed |
 
 ## [appearance]
 
@@ -44,6 +50,21 @@ for compositing; a value below 255 makes the pill slightly translucent.
 Logging has no configuration. A single `log-Live.log` file in
 `<data_dir>\logs` captures the current run and is truncated at startup; no
 history is retained.
+
+## [main window] and the system tray
+
+Notch keeps a maximized tracking window alongside the notch pill. The window shows
+the current activity (art, state, title/artist/album) and the per-session history;
+it is opened from the tray icon (double-click, or the **Open Notch** menu item).
+It is never shown as a pop-up on launch.
+
+The tray menu mirrors the `[behavior]` toggles in real time:
+
+- **Open Notch** — restore the tracking window.
+- **Toggle notifications** — enable/disable SMTC track-change + state-change events.
+- **Start with Windows** — write/remove the `%APPDATA%\...\Run` registry entry.
+- **Close window to tray** — on-off (mirrors `close_to_tray`).
+- **Quit** — stop the process and remove the tray icon.
 
 ## Compact notch defaults
 

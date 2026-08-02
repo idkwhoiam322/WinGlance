@@ -14,19 +14,31 @@ pub struct Config {
 pub struct OverlayConfig {
     pub duration_ms: u64,
     pub animation_ms: u64,
-    pub position: OverlayPosition,
+    pub vertical: VerticalPosition,
+    pub horizontal: HorizontalPosition,
+    pub margin: i32,
     pub max_width: u32,
-    pub margin_top: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_x: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_y: Option<i32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-#[allow(clippy::enum_variant_names)]
-pub enum OverlayPosition {
+pub enum VerticalPosition {
     #[default]
-    TopCenter,
-    TopRight,
-    TopLeft,
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HorizontalPosition {
+    #[default]
+    Center,
+    Left,
+    Right,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +47,9 @@ pub struct BehaviorConfig {
     pub enable_track_change: bool,
     pub enable_playback_state_change: bool,
     pub debounce_ms: u64,
+    pub start_on_login: bool,
+    pub start_in_tray: bool,
+    pub close_to_tray: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,9 +70,12 @@ impl Default for OverlayConfig {
         Self {
             duration_ms: 3000,
             animation_ms: 200,
-            position: OverlayPosition::TopCenter,
+            vertical: VerticalPosition::Top,
+            horizontal: HorizontalPosition::Center,
+            margin: 8,
             max_width: 240,
-            margin_top: 8,
+            position_x: None,
+            position_y: None,
         }
     }
 }
@@ -68,6 +86,9 @@ impl Default for BehaviorConfig {
             enable_track_change: true,
             enable_playback_state_change: true,
             debounce_ms: 200,
+            start_on_login: false,
+            start_in_tray: true,
+            close_to_tray: true,
         }
     }
 }
@@ -130,7 +151,7 @@ impl Config {
         self.overlay.duration_ms = self.overlay.duration_ms.clamp(500, 60_000);
         self.overlay.animation_ms = self.overlay.animation_ms.clamp(100, 500);
         self.overlay.max_width = self.overlay.max_width.clamp(180, 800);
-        self.overlay.margin_top = self.overlay.margin_top.clamp(0, 500);
+        self.overlay.margin = self.overlay.margin.clamp(0, 500);
         self.behavior.debounce_ms = self.behavior.debounce_ms.clamp(150, 250);
         self.appearance.corner_radius = self.appearance.corner_radius.clamp(4.0, 48.0);
         self.appearance.padding = self.appearance.padding.clamp(4.0, 32.0);
@@ -154,5 +175,13 @@ mod tests {
         assert_eq!(config.overlay.max_width, 800);
         assert_eq!(config.appearance.art_size, 24);
         assert_eq!(config.behavior.debounce_ms, 150);
+    }
+
+    #[test]
+    fn session_behaviors_default_to_silent_tray() {
+        let config = Config::default();
+        assert!(!config.behavior.start_on_login);
+        assert!(config.behavior.start_in_tray);
+        assert!(config.behavior.close_to_tray);
     }
 }

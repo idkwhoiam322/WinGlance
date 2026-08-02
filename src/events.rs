@@ -1,3 +1,12 @@
+use windows::Win32::UI::WindowsAndMessaging::WM_APP;
+
+/// Posted by the event forwarder to wake the main window and the overlay
+/// when SMTC events arrive. Both windows keep their own queue and drain it
+/// on this message.
+pub const MEDIA_EVENT_MSG: u32 = WM_APP + 1;
+/// Posted by the main window's tray menu to toggle overlay notifications.
+pub const TOGGLE_MSG: u32 = WM_APP + 3;
+
 #[derive(Debug, Clone)]
 pub struct TrackInfo {
     pub title: String,

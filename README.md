@@ -9,8 +9,23 @@ changes.
 - `src/smtc.rs` owns `GlobalSystemMediaTransportControlsSessionManager` and
   registers `SessionsChanged`, `MediaPropertiesChanged`, and
   `PlaybackInfoChanged` callbacks.
-- `src/overlay.rs` owns the raw Win32 popup and its message loop. It uses
-  `UpdateLayeredWindow` with a software-rendered 32-bit premultiplied bitmap.
+- `src/overlay.rs` owns the raw Win32 layered popup, its timer-driven
+  expand/light/collapse animation, and GDI rendering. Click-through and
+  focus-avoidance match the spec above.
+- `src/main_window.rs` owns a maximized tracking window (current activity + a
+  per-session history listbox) and the tray icon/menu. The window starts
+  hidden when `behavior.start_in_tray` is on (the default), so launching the
+  app produces no pop-up — only the tray icon and the always-visible pill.
+- `src/autostart.rs` toggles the `HKCU ...\Run` entry for start-on-login.
+- `src/positioner.rs` is a small floating sample window opened from the tray
+  **Position → Adjust position…** menu item; dragging it writes the absolute
+  `position_x`/`position_y` to `config.toml` and repositions the live overlay.
+  The overlay re-anchors on resolution/monitor changes.
+
+Events cross the worker/UI boundary through a channel and `PostMessageW`; the UI
+thread blocks in `GetMessageW` when idle. A foreground monitor (`GetForegroundWindow`)
+picks the monitor the user is on, and `WM_TIMER` (16 ms) keeps the pill anchored to
+that monitor's work area, so placement tracks monitor/resolution changes.
 - The overlay uses `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW |
   WS_EX_NOACTIVATE`, returns `HTTRANSPARENT`, and handles
   `WM_MOUSEACTIVATE` with `MA_NOACTIVATE`.
@@ -20,8 +35,23 @@ changes.
   overlay itself has no input controls.
 
 Rendering uses Option A from the build specification: raw Win32 plus GDI and
-`UpdateLayeredWindow`. The `image` crate only decodes SMTC's encoded artwork;
-it does not add a GPU or webview runtime.
+`UpdateLayeredWindow`. The `image` crate only decodes SMTC's encoded artwork; it
+does not add a GPU or webview runtime.
+
+## Positioning the notification
+
+The pill can be anchored to any of six edges:
+
+- **top-left / top-center / top-right**
+- **bottom-left / bottom-center / bottom-right**
+
+Choose one from the tray **Position** submenu. The edge offset is `overlay.margin`
+(logical pixels). For a custom spot, open **Position → Adjust position…**: a
+floating sample appears; drag it where you want the pill, release, and the app
+writes `overlay.position_x`/`position_y` to `config.toml` and repositions the
+live overlay (preview it with **Position → Show sample**, or **Reset position**
+to return to the anchor). Absolute overrides are clamped to the current monitor
+work area, so they stay valid after a resolution change or monitor switch.
 
 ## Configuration and logs
 
@@ -29,8 +59,10 @@ The first run creates:
 
 `%APPDATA%\notch\notch\data\config.toml`
 
-Copy the values from `config.example.toml` to edit them. Logging is a single
-per-run file, truncated at startup:
+Copy the values from `config.example.toml` to edit them. The defaults launch the
+app quietly to the tray (`start_in_tray = true`), start only on explicit launch
+(`start_on_login = false`), and hide the tracking window to the tray on close
+(`close_to_tray = true`). Logging is a single per-run file, truncated at startup:
 
 - `data\logs\log-Live.log` contains the current run.
 

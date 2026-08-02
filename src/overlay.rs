@@ -1,13 +1,12 @@
-use crate::config::{Config, OverlayPosition};
-use crate::events::{MediaEvent, PlaybackState, TrackInfo};
+use crate::config::{Config, HorizontalPosition, VerticalPosition};
+use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo};
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
-use log::{error, warn};
+use log::error;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::sync::{Arc, Mutex, mpsc::Receiver};
-use std::thread;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -18,35 +17,22 @@ use windows::Win32::Graphics::Gdi::{
     SelectObject, SetBkMode, SetTextColor, TRANSPARENT, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
-};
-use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
-};
-use windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, HTTRANSPARENT, HWND_TOPMOST,
-    IDC_ARROW, IDI_APPLICATION, KillTimer, LoadCursorW, LoadIconW, MA_NOACTIVATE, MF_SEPARATOR, MF_STRING,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, ULW_ALPHA, WM_APP, WM_DESTROY, WM_MOUSEACTIVATE, WM_NCCREATE,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetForegroundWindow, GetWindowLongPtrW,
+    HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, MA_NOACTIVATE, RegisterClassExW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA, WM_DESTROY, WM_MOUSEACTIVATE, WM_NCCREATE,
     WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASS_STYLES, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
-const WM_MEDIA_EVENT: u32 = WM_APP + 1;
-const WM_TRAY: u32 = WM_APP + 2;
 const TIMER_DEBOUNCE: usize = 1;
 const TIMER_ANIMATION: usize = 2;
-const TRAY_ID: u32 = 1;
-const TRAY_TOGGLE_ID: usize = 1001;
-const TRAY_QUIT_ID: usize = 1002;
 const LIGHT_DURATION: Duration = Duration::from_millis(120);
 
-type EventQueue = Arc<Mutex<VecDeque<MediaEvent>>>;
+pub(crate) type EventQueue = Arc<Mutex<VecDeque<MediaEvent>>>;
 
 enum Phase {
     Hidden,
@@ -71,64 +57,53 @@ struct OverlayState {
     content: Option<MediaEvent>,
     phase: Phase,
     dismiss_at: Option<Instant>,
+    position: OverlayPos,
 }
 
-pub fn run(config: Config, event_rx: Receiver<MediaEvent>) -> Result<()> {
+/// Resolved placement for the notch pill, pulled from [overlay] config. `x`/`y`
+/// are absolute overrides (96-DPI logical pixels) that take precedence over the
+/// vertical/horizontal anchors when `Some`; the pill snaps back to the anchor when
+/// they are cleared.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OverlayPos {
+    vertical: VerticalPosition,
+    horizontal: HorizontalPosition,
+    margin: i32,
+    x: Option<i32>,
+    y: Option<i32>,
+}
+
+impl OverlayPos {
+    pub(crate) fn from_config(config: &Config) -> Self {
+        Self {
+            vertical: config.overlay.vertical,
+            horizontal: config.overlay.horizontal,
+            margin: config.overlay.margin,
+            x: config.overlay.position_x,
+            y: config.overlay.position_y,
+        }
+    }
+}
+
+/// Updates the live overlay's placement from a resolved position.
+pub(crate) fn set_position(hwnd: HWND, pos: OverlayPos) {
+    if hwnd.0.is_null() {
+        return;
+    }
     unsafe {
-        if let Err(error) = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
-            warn!("per-monitor DPI awareness unavailable: {error}");
+        let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverlayState;
+        if state_ptr.is_null() {
+            return;
         }
+        let state = &mut *state_ptr;
+        state.position = pos;
+        state.reposition();
     }
-
-    let module = unsafe { GetModuleHandleW(None) }.context("getting the process module")?;
-    let instance: HINSTANCE = module.into();
-    let class_name = wide("NotchOverlayWindow");
-    register_window_class(instance, &class_name)?;
-
-    let queue = Arc::new(Mutex::new(VecDeque::new()));
-    let state = Box::new(OverlayState::new(config.clone(), queue.clone()));
-    let state_ptr = Box::into_raw(state);
-    let hwnd = unsafe {
-        CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            PCWSTR(class_name.as_ptr()),
-            PCWSTR(wide("Notch").as_ptr()),
-            WS_POPUP,
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            instance,
-            Some(state_ptr.cast()),
-        )
-    };
-    let hwnd = match hwnd {
-        Ok(hwnd) => hwnd,
-        Err(error) => {
-            unsafe { drop(Box::from_raw(state_ptr)) };
-            return Err(error.into());
-        }
-    };
-
-    if let Err(error) = install_tray_icon(hwnd) {
-        unsafe {
-            let _ = DestroyWindow(hwnd);
-        }
-        return Err(error);
-    }
-    spawn_event_forwarder(hwnd, queue, event_rx);
-    let message_result = message_loop();
-    unsafe {
-        let _ = DestroyWindow(hwnd);
-    }
-    remove_tray_icon(hwnd);
-    message_result
 }
 
 impl OverlayState {
     fn new(config: Config, queue: EventQueue) -> Self {
+        let position = OverlayPos::from_config(&config);
         Self {
             hwnd: HWND::default(),
             config,
@@ -138,6 +113,7 @@ impl OverlayState {
             content: None,
             phase: Phase::Hidden,
             dismiss_at: None,
+            position,
         }
     }
 
@@ -268,7 +244,7 @@ impl OverlayState {
         }
     }
 
-    fn position(&self, width: i32, _height: i32) -> Option<POINT> {
+    fn position(&self, width: i32, height: i32) -> Option<POINT> {
         let foreground = unsafe { GetForegroundWindow() };
         let monitor = unsafe {
             let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
@@ -290,16 +266,54 @@ impl OverlayState {
         }
         let work = info.rcWork;
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
-        let margin = (self.config.overlay.margin_top as f32 * scale).round() as i32;
-        let x = match self.config.overlay.position {
-            OverlayPosition::TopCenter => work.left + (work.right - work.left - width) / 2,
-            OverlayPosition::TopRight => work.right - width - margin,
-            OverlayPosition::TopLeft => work.left + margin,
+        let margin = (self.position.margin as f32 * scale).round() as i32;
+        let span_w = work.right - work.left;
+        let x = if let Some(px) = self.position.x {
+            (px as f32 * scale).round() as i32
+        } else {
+            match self.position.horizontal {
+                HorizontalPosition::Left => work.left + margin,
+                HorizontalPosition::Center => work.left + (span_w - width) / 2,
+                HorizontalPosition::Right => work.right - width - margin,
+            }
         };
-        Some(POINT {
-            x,
-            y: work.top + margin,
-        })
+        let y = if let Some(py) = self.position.y {
+            (py as f32 * scale).round() as i32
+        } else {
+            match self.position.vertical {
+                VerticalPosition::Top => work.top + margin,
+                VerticalPosition::Bottom => work.bottom - height - margin,
+            }
+        };
+        // Clamp to the current work area so absolute overrides stay usable after a
+        // resolution or monitor change.
+        let x = x.clamp(work.left, (work.right - width).max(work.left));
+        let y = y.clamp(work.top, (work.bottom - height).max(work.top));
+        Some(POINT { x, y })
+    }
+
+    /// Moves the live overlay window to its resolved position without a full redraw.
+    fn reposition(&mut self) {
+        if matches!(self.phase, Phase::Hidden) {
+            return;
+        }
+        let Some((width, height)) = self.content_size() else {
+            return;
+        };
+        let Some(point) = self.position(width, height) else {
+            return;
+        };
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                point.x,
+                point.y,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOOWNERZORDER,
+            );
+        }
     }
 
     fn hide(&mut self) {
@@ -327,6 +341,85 @@ impl OverlayState {
         if !self.enabled {
             self.pending = PendingEvents::default();
             self.hide();
+        }
+    }
+
+    /// Current (scaled) pixel size of the shown content, or `None` while hidden.
+    fn content_size(&self) -> Option<(i32, i32)> {
+        let content = self.content.as_ref()?;
+        let (_, shape) = self.frame();
+        let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
+        let (logical_width, logical_height) = match content {
+            MediaEvent::TrackChanged(_) => (
+                self.config.overlay.max_width.max(180) as f32,
+                (self.config.appearance.art_size as f32 + 2.0 * self.config.appearance.padding + 4.0).max(40.0),
+            ),
+            MediaEvent::PlaybackStateChanged(_) => (120.0, 44.0),
+        };
+        let width = (logical_width * dpi * shape).round().max(1.0) as i32;
+        let height = (logical_height * dpi * shape).round().max(1.0) as i32;
+        Some((width, height))
+    }
+
+    /// Shows a short-lived preview of the overlay at its current position, used by
+    /// the tray "Show sample" command to preview placement without real media.
+    fn show_sample(&mut self) {
+        self.content = Some(MediaEvent::PlaybackStateChanged(PlaybackState::Playing));
+        let now = Instant::now();
+        self.dismiss_at = Some(now + Duration::from_millis(1500));
+        self.phase = Phase::Light(now);
+        unsafe {
+            let _ = SetTimer(self.hwnd, TIMER_ANIMATION, 16, None);
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+        self.render();
+    }
+}
+
+/// Forces the live overlay at `hwnd` to preview its current placement.
+pub(crate) fn show_sample(hwnd: HWND) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverlayState;
+        if !state_ptr.is_null() {
+            (*state_ptr).show_sample();
+        }
+    }
+}
+
+/// Creates the passive notch overlay window. It owns no message loop: the caller
+/// runs the loop and destroys the window at exit.
+pub(crate) fn create_window(config: Config, queue: EventQueue) -> Result<HWND> {
+    let module = unsafe { GetModuleHandleW(None) }.context("getting the process module")?;
+    let instance: HINSTANCE = module.into();
+    let class_name = wide("NotchOverlayWindow");
+    register_window_class(instance, &class_name)?;
+
+    let state = Box::new(OverlayState::new(config, queue));
+    let state_ptr = Box::into_raw(state);
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(wide("Notch").as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            instance,
+            Some(state_ptr.cast()),
+        )
+    };
+    match hwnd {
+        Ok(hwnd) => Ok(hwnd),
+        Err(error) => {
+            unsafe { drop(Box::from_raw(state_ptr)) };
+            Err(error.into())
         }
     }
 }
@@ -544,7 +637,15 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
     }
 }
 
-fn draw_string(hdc: HDC, value: &str, rect: &mut RECT, height: i32, color: [u8; 4], bold: bool, centered: bool) {
+pub(crate) fn draw_string(
+    hdc: HDC,
+    value: &str,
+    rect: &mut RECT,
+    height: i32,
+    color: [u8; 4],
+    bold: bool,
+    centered: bool,
+) {
     let mut text = value.encode_utf16().collect::<Vec<_>>();
     let font_name = wide("Segoe UI");
     let font = unsafe {
@@ -579,7 +680,7 @@ fn draw_string(hdc: HDC, value: &str, rect: &mut RECT, height: i32, color: [u8; 
     }
 }
 
-fn decode_artwork(data: &[u8], size: usize) -> Option<Vec<u8>> {
+pub(crate) fn decode_artwork(data: &[u8], size: usize) -> Option<Vec<u8>> {
     let image = image::load_from_memory(data).ok()?.to_rgba8();
     let image = image::imageops::resize(&image, size as u32, size as u32, FilterType::Triangle);
     Some(image.into_raw())
@@ -671,9 +772,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             let _ = ValidateRect(hwnd, None);
             LRESULT(0)
         }
-        WM_MEDIA_EVENT => {
+        MEDIA_EVENT_MSG => {
             if !state_ptr.is_null() {
                 (*state_ptr).receive_events();
+            }
+            LRESULT(0)
+        }
+        TOGGLE_MSG => {
+            if !state_ptr.is_null() {
+                (*state_ptr).toggle_enabled();
             }
             LRESULT(0)
         }
@@ -689,16 +796,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             LRESULT(0)
         }
-        WM_TRAY => {
-            if lparam.0 as u32 == WM_RBUTTONUP && !state_ptr.is_null() {
-                show_tray_menu(hwnd, &mut *state_ptr);
-            }
-            LRESULT(0)
-        }
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            LRESULT(0)
-        }
+        WM_DESTROY => LRESULT(0),
         WM_NCDESTROY => {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             if !state_ptr.is_null() {
@@ -710,115 +808,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
     }
 }
 
-fn spawn_event_forwarder(hwnd: HWND, queue: EventQueue, receiver: Receiver<MediaEvent>) {
-    let raw_hwnd = hwnd.0 as isize;
-    thread::Builder::new()
-        .name("notch-events".to_string())
-        .spawn(move || {
-            while let Ok(event) = receiver.recv() {
-                if let Ok(mut events) = queue.lock() {
-                    events.push_back(event);
-                }
-                let hwnd = HWND(raw_hwnd as *mut c_void);
-                if unsafe { PostMessageW(hwnd, WM_MEDIA_EVENT, WPARAM(0), LPARAM(0)) }.is_err() {
-                    break;
-                }
-            }
-        })
-        .expect("event forwarder thread should start");
-}
-
-fn install_tray_icon(hwnd: HWND) -> Result<()> {
-    let data = tray_data(hwnd)?;
-    if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
-        anyhow::bail!("Shell_NotifyIconW(NIM_ADD) failed");
-    }
-    Ok(())
-}
-
-fn remove_tray_icon(hwnd: HWND) {
-    if let Ok(data) = tray_data(hwnd) {
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
-        }
-    }
-}
-
-fn tray_data(hwnd: HWND) -> Result<NOTIFYICONDATAW> {
-    let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }?;
-    let mut data = NOTIFYICONDATAW {
-        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-        hWnd: hwnd,
-        uID: TRAY_ID,
-        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
-        uCallbackMessage: WM_TRAY,
-        hIcon: icon,
-        ..Default::default()
-    };
-    let tip = wide("Notch media overlay");
-    let count = tip.len().min(data.szTip.len());
-    data.szTip[..count].copy_from_slice(&tip[..count]);
-    Ok(data)
-}
-
-fn show_tray_menu(hwnd: HWND, state: &mut OverlayState) {
-    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
-        return;
-    };
-    let toggle = if state.enabled {
-        "Disable notifications"
-    } else {
-        "Enable notifications"
-    };
-    let toggle_text = wide(toggle);
-    let quit_text = wide("Quit Notch");
-    unsafe {
-        let _ = AppendMenuW(menu, MF_STRING, TRAY_TOGGLE_ID, PCWSTR(toggle_text.as_ptr()));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, TRAY_QUIT_ID, PCWSTR(quit_text.as_ptr()));
-        let mut point = POINT::default();
-        if GetCursorPos(&mut point).is_ok() {
-            let command = TrackPopupMenu(
-                menu,
-                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                point.x,
-                point.y,
-                0,
-                hwnd,
-                None,
-            )
-            .0 as usize;
-            match command {
-                TRAY_TOGGLE_ID => state.toggle_enabled(),
-                TRAY_QUIT_ID => {
-                    remove_tray_icon(hwnd);
-                    PostQuitMessage(0);
-                }
-                _ => {}
-            }
-        }
-        let _ = windows::Win32::UI::WindowsAndMessaging::DestroyMenu(menu);
-    }
-}
-
-fn message_loop() -> Result<()> {
-    let mut message = windows::Win32::UI::WindowsAndMessaging::MSG::default();
-    loop {
-        let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
-        if result.0 == -1 {
-            anyhow::bail!("GetMessageW failed");
-        }
-        if result.0 == 0 {
-            break;
-        }
-        unsafe {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-    }
-    Ok(())
-}
-
 fn animation_duration(config: &Config) -> Duration {
     Duration::from_millis(config.overlay.animation_ms.clamp(100, 500))
 }
@@ -828,6 +817,6 @@ fn ease_out(value: f32) -> f32 {
     1.0 - (1.0 - value).powi(3)
 }
 
-fn wide(value: &str) -> Vec<u16> {
+pub(crate) fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
