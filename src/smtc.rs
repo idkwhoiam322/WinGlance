@@ -41,6 +41,10 @@ struct ListenerState {
     last_content_fingerprint: Option<TrackFingerprint>,
     last_playback: Option<(usize, PlaybackState)>,
     last_session_check: Instant,
+    /// Whether the current session is known to provide album titles. When true,
+    /// a track is not flushed until its album is present; sessions that never
+    /// provide album (e.g. browsers) flush as soon as artwork is ready.
+    session_has_album: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +113,7 @@ impl ListenerState {
             last_content_fingerprint: None,
             last_playback: None,
             last_session_check: Instant::now(),
+            session_has_album: false,
         }
     }
 
@@ -161,6 +166,9 @@ impl ListenerState {
                         .pending_track
                         .as_ref()
                         .is_some_and(|(k, p)| *k == key && p.title == track.title && p.artist == track.artist);
+                    if !track.album.trim().is_empty() {
+                        self.session_has_album = true;
+                    }
                     if is_merge {
                         if let Some((_, p)) = self.pending_track.as_mut() {
                             if !track.album.trim().is_empty() {
@@ -208,6 +216,7 @@ impl ListenerState {
 
         self.unsubscribe();
         self.current_key = new_key;
+        self.session_has_album = false;
         if let Some(session) = resolved {
             self.subscribe(&session)?;
             if emit_initial {
@@ -215,6 +224,9 @@ impl ListenerState {
                 if playback != Some(PlaybackState::Stopped)
                     && let Ok(track) = read_track_info(&session)
                 {
+                    if !track.album.trim().is_empty() {
+                        self.session_has_album = true;
+                    }
                     self.pending_track = Some((session_key(&session), track));
                 }
                 if let Some(state) = playback {
@@ -329,11 +341,17 @@ impl ListenerState {
 
     fn flush_pending(&mut self) {
         self.pending_deadline = None;
-        // Only send when artwork is ready. Re-schedule every 100ms up to 3s.
-        if let Some((_, track)) = &self.pending_track
-            && track.artwork.is_none()
-        {
-            let elapsed = self.track_pending_since.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+        // Wait until the track is complete before sending: artwork must be ready,
+        // and the album too when this session is known to provide one. Re-schedule
+        // every 100ms up to 3s from the first read of this track.
+        let incomplete = self.pending_track.as_ref().is_some_and(|(_, track)| {
+            track.artwork.is_none() || (self.session_has_album && track.album.trim().is_empty())
+        });
+        if incomplete {
+            if self.track_pending_since.is_none() {
+                self.track_pending_since = Some(Instant::now());
+            }
+            let elapsed = self.track_pending_since.unwrap().elapsed();
             if elapsed < Duration::from_millis(3000) {
                 self.pending_deadline = Some(Instant::now() + Duration::from_millis(100));
                 return;
