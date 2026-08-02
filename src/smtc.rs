@@ -39,6 +39,7 @@ struct ListenerState {
     pending_track: Option<(usize, TrackInfo)>,
     pending_playback: Option<(usize, PlaybackState)>,
     pending_deadline: Option<Instant>,
+    track_pending_since: Option<Instant>,
     last_track: Option<(usize, TrackFingerprint)>,
     last_playback: Option<(usize, PlaybackState)>,
 }
@@ -105,6 +106,7 @@ impl ListenerState {
             pending_track: None,
             pending_playback: None,
             pending_deadline: None,
+            track_pending_since: None,
             last_track: None,
             last_playback: None,
         }
@@ -275,11 +277,26 @@ impl ListenerState {
     }
 
     fn schedule_flush(&mut self) {
+        if self.track_pending_since.is_none() {
+            self.track_pending_since = Some(Instant::now());
+        }
         self.pending_deadline = Some(Instant::now() + debounce_duration(&self.config));
     }
 
     fn flush_pending(&mut self) {
         self.pending_deadline = None;
+        // Wait for artwork before sending — skip flush if artwork is missing
+        // and we haven't exceeded the max wait (1s).
+        if let Some((_, track)) = &self.pending_track
+            && track.artwork.is_none()
+        {
+            let elapsed = self.track_pending_since.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+            if elapsed < Duration::from_millis(1000) {
+                self.pending_deadline = Some(Instant::now() + Duration::from_millis(100));
+                return;
+            }
+        }
+        self.track_pending_since = None;
         if let Some((key, track)) = self.pending_track.take() {
             let fingerprint = track_fingerprint(&track);
             if self.last_track.as_ref() != Some(&(key, fingerprint.clone())) {

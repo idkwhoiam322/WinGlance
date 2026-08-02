@@ -15,13 +15,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, HWND_TOPMOST, IDC_ARROW, LoadCursorW, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
     SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASS_STYLES, WNDCLASSEXW,
-    WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
 const CLASS_NAME: &str = "NotchPositioner";
 const WIDTH: i32 = 240;
-const HEIGHT: i32 = 110;
+const HEIGHT: i32 = 60;
 
 struct PositionerState {
     overlay: HWND,
@@ -51,7 +51,7 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             PCWSTR(class_name.as_ptr()),
             PCWSTR(wide("Place the notch").as_ptr()),
-            WS_POPUP | WS_CAPTION | WS_VISIBLE,
+            WS_POPUP | WS_VISIBLE,
             0,
             0,
             WIDTH,

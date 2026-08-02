@@ -55,6 +55,7 @@ struct OverlayState {
     pending: PendingEvents,
     enabled: bool,
     content: Option<MediaEvent>,
+    last_track: Option<TrackInfo>,
     phase: Phase,
     dismiss_at: Option<Instant>,
     position: OverlayPos,
@@ -97,7 +98,11 @@ pub(crate) fn set_position(hwnd: HWND, pos: OverlayPos) {
         }
         let state = &mut *state_ptr;
         state.position = pos;
-        state.reposition();
+        if matches!(state.phase, Phase::Hidden) {
+            state.show_sample();
+        } else {
+            state.reposition();
+        }
     }
 }
 
@@ -111,6 +116,7 @@ impl OverlayState {
             pending: PendingEvents::default(),
             enabled: true,
             content: None,
+            last_track: None,
             phase: Phase::Hidden,
             dismiss_at: None,
             position,
@@ -151,6 +157,7 @@ impl OverlayState {
         }
         let pending = std::mem::take(&mut self.pending);
         if let Some(track) = pending.track {
+            self.last_track = Some(track.clone());
             self.show(MediaEvent::TrackChanged(track), true);
         } else if let Some(playback) = pending.playback
             && self.config.behavior.enable_playback_state_change
@@ -611,28 +618,82 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
                 false,
                 false,
             );
+            if !track.source_app.trim().is_empty() {
+                let source_top =
+                    (padding as f32 + art as f32 + (12.0 + state.config.appearance.font_size_artist * 2.0) * scale)
+                        as i32;
+                let mut app_rect = RECT {
+                    left,
+                    top: source_top,
+                    right: width - padding,
+                    bottom: height - padding,
+                };
+                draw_string(
+                    hdc,
+                    &track.source_app,
+                    &mut app_rect,
+                    ((state.config.appearance.font_size_artist * 0.8) as i32).max(1),
+                    [0x88, 0x88, 0x88, 0xFF],
+                    false,
+                    false,
+                );
+            }
         }
         MediaEvent::PlaybackStateChanged(playback) => {
             let label = match playback {
-                PlaybackState::Playing => ">  Playing",
-                PlaybackState::Paused => "||  Paused",
-                PlaybackState::Stopped => "[]  Stopped",
+                PlaybackState::Playing => "Playing",
+                PlaybackState::Paused => "Paused",
+                PlaybackState::Stopped => "Stopped",
             };
-            let mut rect = RECT {
+            let mut state_rect = RECT {
                 left: 0,
                 top: 0,
                 right: width,
-                bottom: height,
+                bottom: (height as f32 * 0.35) as i32,
             };
             draw_string(
                 hdc,
                 label,
-                &mut rect,
+                &mut state_rect,
                 (state.config.appearance.font_size_title * scale) as i32,
-                state.config.appearance.text_color,
+                state.config.appearance.accent_color,
                 true,
                 true,
             );
+            if let Some(track) = &state.last_track {
+                let mut title_rect = RECT {
+                    left: 0,
+                    top: (height as f32 * 0.35) as i32,
+                    right: width,
+                    bottom: (height as f32 * 0.65) as i32,
+                };
+                draw_string(
+                    hdc,
+                    &track.title,
+                    &mut title_rect,
+                    (state.config.appearance.font_size_artist * scale) as i32,
+                    state.config.appearance.text_color,
+                    true,
+                    true,
+                );
+                if !track.artist.trim().is_empty() {
+                    let mut artist_rect = RECT {
+                        left: 0,
+                        top: (height as f32 * 0.65) as i32,
+                        right: width,
+                        bottom: height,
+                    };
+                    draw_string(
+                        hdc,
+                        &track.artist,
+                        &mut artist_rect,
+                        ((state.config.appearance.font_size_artist * 0.85) as i32).max(1),
+                        [0xCC, 0xCC, 0xCC, 0xFF],
+                        false,
+                        true,
+                    );
+                }
+            }
         }
     }
 }
@@ -670,6 +731,7 @@ pub(crate) fn draw_string(
     let color = COLORREF(color[0] as u32 | (color[1] as u32) << 8 | (color[2] as u32) << 16);
     unsafe {
         SetTextColor(hdc, color);
+        SetBkMode(hdc, TRANSPARENT);
         let mut flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
         if centered {
             flags |= windows::Win32::Graphics::Gdi::DT_CENTER;

@@ -47,6 +47,7 @@ const MENU_POSITION_BOTTOM_RIGHT: usize = 1012;
 const MENU_POSITION_CUSTOM: usize = 1013;
 const MENU_POSITION_SAMPLE: usize = 1014;
 const MENU_POSITION_RESET: usize = 1015;
+const MENU_DURATION: usize = 1016;
 const LISTBOX_ID: usize = 2;
 const HISTORY_CAP: usize = 500;
 
@@ -120,6 +121,7 @@ struct MainWindowState {
     listbox_font: HFONT,
     gray_brush: HBRUSH,
     accent_brush: HBRUSH,
+    notifications_enabled: bool,
 }
 
 /// Creates the main window: a maximized tracker with current activity,
@@ -186,6 +188,7 @@ impl MainWindowState {
             listbox_font: HFONT::default(),
             gray_brush: HBRUSH::default(),
             accent_brush: HBRUSH::default(),
+            notifications_enabled: true,
         }
     }
 
@@ -426,7 +429,7 @@ impl MainWindowState {
                     left: text_left,
                     top: art_y + (70.0 * scale) as i32,
                     right: text_right,
-                    bottom: art_y + (90.0 * scale) as i32,
+                    bottom: art_y + (86.0 * scale) as i32,
                 };
                 draw_string(
                     hdc,
@@ -434,6 +437,23 @@ impl MainWindowState {
                     &mut album_rect,
                     (12.0 * scale) as i32,
                     [0x99, 0x99, 0x99, 0xFF],
+                    false,
+                    false,
+                );
+            }
+            if !current.track.source_app.trim().is_empty() {
+                let mut app_rect = RECT {
+                    left: text_left,
+                    top: art_y + (86.0 * scale) as i32,
+                    right: text_right,
+                    bottom: art_y + (100.0 * scale) as i32,
+                };
+                draw_string(
+                    hdc,
+                    &current.track.source_app,
+                    &mut app_rect,
+                    (10.0 * scale) as i32,
+                    [0x77, 0x77, 0x77, 0xFF],
                     false,
                     false,
                 );
@@ -682,7 +702,10 @@ fn show_tray_menu(state: &mut MainWindowState) {
         return;
     };
     let open_flags = MF_STRING;
-    let notify_flags = MF_STRING;
+    let mut notify_flags = MF_STRING;
+    if state.notifications_enabled {
+        notify_flags |= MF_CHECKED;
+    }
     let mut autostart_flags = MF_STRING;
     if state.config.behavior.start_on_login {
         autostart_flags |= MF_CHECKED;
@@ -768,6 +791,9 @@ fn show_tray_menu(state: &mut MainWindowState) {
             PCWSTR(wide("Reset position").as_ptr()),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let duration_label = format!("Duration: {}s", state.config.overlay.duration_ms / 1000);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_DURATION, PCWSTR(wide(&duration_label).as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT_ID, PCWSTR(wide("Quit").as_ptr()));
 
         let mut point = POINT::default();
@@ -785,6 +811,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
             match command {
                 MENU_OPEN_ID => state.show_window(),
                 MENU_NOTIFY_ID => {
+                    state.notifications_enabled = !state.notifications_enabled;
                     let _ = PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0));
                 }
                 MENU_AUTOSTART_ID => {
@@ -820,6 +847,15 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     state.config.overlay.position_y = None;
                     let _ = state.config.save();
                     set_position(state.overlay_hwnd, OverlayPos::from_config(&state.config));
+                }
+                MENU_DURATION => {
+                    state.config.overlay.duration_ms = match state.config.overlay.duration_ms {
+                        2000 => 3000,
+                        3000 => 5000,
+                        5000 => 10000,
+                        _ => 2000,
+                    };
+                    let _ = state.config.save();
                 }
                 _ => {}
             }
