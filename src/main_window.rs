@@ -113,6 +113,162 @@ fn mix(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
     ]
 }
 
+/// Which sub-control of a settings row is being hovered/clicked.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SettingSub {
+    None,
+    Seg(usize),
+    Anchor(usize),
+    Reset,
+    Adjust,
+}
+
+/// Sub-rects of the Position row: value text, the six anchor segments, the
+/// Reset button and the Adjust button. Paint, hit-test and hover all use this.
+struct PositionParts {
+    value_row: RECT,
+    anchors: Vec<RECT>,
+    reset: RECT,
+    adjust: RECT,
+}
+
+fn position_parts(rect: &RECT, scale: f32) -> PositionParts {
+    let label_w = (((rect.right - rect.left) as f32) * 0.42) as i32;
+    let control_left = rect.left + label_w + (10.0 * scale) as i32;
+    let control_right = rect.right - (10.0 * scale) as i32;
+    let row1_h = (30.0 * scale) as i32;
+    let gap = (6.0 * scale) as i32;
+    let reset_w = (64.0 * scale) as i32;
+
+    let value_row = RECT {
+        left: control_left,
+        top: rect.top,
+        right: control_right - reset_w - (8.0 * scale) as i32,
+        bottom: rect.top + row1_h,
+    };
+    let reset = RECT {
+        left: control_right - reset_w,
+        top: rect.top,
+        right: control_right,
+        bottom: rect.top + row1_h,
+    };
+
+    let row2_top = rect.top + row1_h + gap;
+    let row2_bottom = rect.bottom - (4.0 * scale) as i32;
+    let row2 = RECT {
+        left: control_left,
+        top: row2_top,
+        right: control_right,
+        bottom: row2_bottom,
+    };
+    let seg_gap = (4.0 * scale) as i32;
+    let total = row2.right - row2.left;
+    let w = (total - seg_gap * 6) / 7;
+    let mut anchors = Vec::with_capacity(6);
+    for i in 0..6 {
+        anchors.push(RECT {
+            left: row2.left + i * (w + seg_gap),
+            top: row2.top,
+            right: row2.left + (i + 1) * (w + seg_gap) - seg_gap,
+            bottom: row2.bottom,
+        });
+    }
+    let adjust = RECT {
+        left: row2.left + 6 * (w + seg_gap),
+        top: row2.top,
+        right: row2.left + 7 * (w + seg_gap) - seg_gap,
+        bottom: row2.bottom,
+    };
+    PositionParts {
+        value_row,
+        anchors,
+        reset,
+        adjust,
+    }
+}
+
+const ANCHOR_LABELS: [&str; 6] = ["TL", "TC", "TR", "BL", "BC", "BR"];
+
+/// Draws a small bordered button (active/hover highlighted with accent).
+#[allow(clippy::too_many_arguments)]
+fn draw_segment_button(
+    hdc: HDC,
+    rect: &RECT,
+    label: &str,
+    active: bool,
+    hovered: bool,
+    accent: [u8; 4],
+    accent_soft: [u8; 4],
+    scale: f32,
+) {
+    let border = if active {
+        colorref(accent[0], accent[1], accent[2])
+    } else {
+        colorref(SETTINGS_BORDER[0], SETTINGS_BORDER[1], SETTINGS_BORDER[2])
+    };
+    let b = unsafe { CreateSolidBrush(border) };
+    unsafe {
+        let _ = FillRect(hdc, rect, b);
+    }
+    unsafe {
+        let _ = DeleteObject(HGDIOBJ(b.0));
+    }
+    let inner = RECT {
+        left: rect.left + 1,
+        top: rect.top + 1,
+        right: rect.right - 1,
+        bottom: rect.bottom - 1,
+    };
+    let fill = if active {
+        accent_soft
+    } else if hovered {
+        SETTINGS_HOVER
+    } else {
+        SETTINGS_SURFACE
+    };
+    let f = unsafe { CreateSolidBrush(colorref(fill[0], fill[1], fill[2])) };
+    unsafe {
+        let _ = FillRect(hdc, &inner, f);
+    }
+    unsafe {
+        let _ = DeleteObject(HGDIOBJ(f.0));
+    }
+    let mut t = inner;
+    let tc = if active { SETTINGS_TEXT } else { SETTINGS_MUTED };
+    draw_string(hdc, label, &mut t, (10.0 * scale) as i32, tc, active, true);
+}
+
+/// Draws an outline button (accent border, dark fill, accent label).
+fn draw_small_button(hdc: HDC, rect: &RECT, label: &str, accent: [u8; 4], hovered: bool, scale: f32) {
+    let b = unsafe { CreateSolidBrush(colorref(accent[0], accent[1], accent[2])) };
+    unsafe {
+        let _ = FillRect(hdc, rect, b);
+    }
+    unsafe {
+        let _ = DeleteObject(HGDIOBJ(b.0));
+    }
+    let inner = RECT {
+        left: rect.left + 1,
+        top: rect.top + 1,
+        right: rect.right - 1,
+        bottom: rect.bottom - 1,
+    };
+    let fill = if hovered {
+        mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], 0.35)
+    } else {
+        [0x12, 0x12, 0x12, 0xFF]
+    };
+    let f = unsafe { CreateSolidBrush(colorref(fill[0], fill[1], fill[2])) };
+    unsafe {
+        let _ = FillRect(hdc, &inner, f);
+    }
+    unsafe {
+        let _ = DeleteObject(HGDIOBJ(f.0));
+    }
+    let mut t = inner;
+    draw_string(hdc, label, &mut t, (10.0 * scale) as i32, accent, true, true);
+}
+
 fn segment_rects(rect: &RECT, count: usize, gap: i32) -> Vec<RECT> {
     let total = rect.right - rect.left;
     let w = (total - gap * (count as i32 - 1)) / count as i32;
@@ -184,8 +340,8 @@ struct MainWindowState {
     accent_brush: HBRUSH,
     notifications_enabled: bool,
     active_pane: Pane,
-    /// Hovered settings row (row index, optional segment index) for highlight.
-    settings_hover: Option<(usize, Option<usize>)>,
+    /// Hovered settings row (row index, sub-control) for highlight.
+    settings_hover: Option<(usize, SettingSub)>,
 }
 
 /// Creates the main window: a maximized tracker with current activity,
@@ -831,7 +987,8 @@ impl MainWindowState {
                 left,
                 top: y,
                 right,
-                bottom: y + row_h,
+                // Taller row: value/Reset line + anchor segments line.
+                bottom: y + (70.0 * scale) as i32,
             },
         });
         items
@@ -975,7 +1132,7 @@ impl MainWindowState {
                             let values = [2000u64, 3000, 5000, 10000];
                             for (i, seg) in segments.iter().enumerate() {
                                 let active = self.config.overlay.duration_ms == values[i];
-                                let seg_hovered = self.settings_hover == Some((row_index, Some(i)));
+                                let seg_hovered = self.settings_hover == Some((row_index, SettingSub::Seg(i)));
                                 let border = if active {
                                     colorref(accent[0], accent[1], accent[2])
                                 } else {
@@ -1022,14 +1179,23 @@ impl MainWindowState {
                             }
                         }
                         SettingId::Position => {
-                            let adjust_w = (72.0 * scale) as i32;
-                            let value_rect = RECT {
-                                left: control_rect.left,
-                                top: control_rect.top,
-                                right: control_rect.right - adjust_w - (8.0 * scale) as i32,
-                                bottom: control_rect.bottom,
+                            let parts = position_parts(rect, scale);
+                            let custom = self.config.overlay.position_x.is_some();
+                            let active_anchor = if custom {
+                                None
+                            } else {
+                                Some(match (self.config.overlay.vertical, self.config.overlay.horizontal) {
+                                    (VerticalPosition::Top, HorizontalPosition::Left) => 0,
+                                    (VerticalPosition::Top, HorizontalPosition::Center) => 1,
+                                    (VerticalPosition::Top, HorizontalPosition::Right) => 2,
+                                    (VerticalPosition::Bottom, HorizontalPosition::Left) => 3,
+                                    (VerticalPosition::Bottom, HorizontalPosition::Center) => 4,
+                                    (VerticalPosition::Bottom, HorizontalPosition::Right) => 5,
+                                })
                             };
-                            let mut v = value_rect;
+
+                            // Value + Reset button row
+                            let mut v = parts.value_row;
                             draw_string(
                                 hdc,
                                 &value_text,
@@ -1039,34 +1205,40 @@ impl MainWindowState {
                                 false,
                                 false,
                             );
-                            let btn = RECT {
-                                left: control_rect.right - adjust_w,
-                                top: control_rect.top,
-                                right: control_rect.right,
-                                bottom: control_rect.bottom,
+                            let reset_hovered = self.settings_hover == Some((row_index, SettingSub::Reset));
+                            draw_small_button(hdc, &parts.reset, "Reset", accent, reset_hovered, scale);
+
+                            // Anchor segments + Adjust button row
+                            for (i, seg) in parts.anchors.iter().enumerate() {
+                                let active = active_anchor == Some(i);
+                                let seg_hovered = self.settings_hover == Some((row_index, SettingSub::Anchor(i)));
+                                draw_segment_button(
+                                    hdc,
+                                    seg,
+                                    ANCHOR_LABELS[i],
+                                    active,
+                                    seg_hovered,
+                                    accent,
+                                    accent_soft,
+                                    scale,
+                                );
+                            }
+                            let adjust_hovered = self.settings_hover == Some((row_index, SettingSub::Adjust));
+                            let adjust_fill = if adjust_hovered {
+                                mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], 0.45)
+                            } else {
+                                accent_soft
                             };
-                            let b = unsafe { CreateSolidBrush(colorref(accent[0], accent[1], accent[2])) };
+                            let b =
+                                unsafe { CreateSolidBrush(colorref(adjust_fill[0], adjust_fill[1], adjust_fill[2])) };
                             unsafe {
-                                let _ = FillRect(hdc, &btn, b);
+                                let _ = FillRect(hdc, &parts.adjust, b);
                             }
                             unsafe {
                                 let _ = DeleteObject(HGDIOBJ(b.0));
                             }
-                            let b_inner = RECT {
-                                left: btn.left + 1,
-                                top: btn.top + 1,
-                                right: btn.right - 1,
-                                bottom: btn.bottom - 1,
-                            };
-                            let bf = unsafe { CreateSolidBrush(COLORREF(0x00121212)) };
-                            unsafe {
-                                let _ = FillRect(hdc, &b_inner, bf);
-                            }
-                            unsafe {
-                                let _ = DeleteObject(HGDIOBJ(bf.0));
-                            }
-                            let mut bt = b_inner;
-                            draw_string(hdc, "Adjust", &mut bt, (10.0 * scale) as i32, accent, true, true);
+                            let mut bt = parts.adjust;
+                            draw_string(hdc, "Adjust…", &mut bt, (10.0 * scale) as i32, accent, true, true);
                         }
                     }
                     row_index += 1;
@@ -1109,7 +1281,7 @@ impl MainWindowState {
         client_w: i32,
         pad: i32,
         scale: f32,
-    ) -> Option<(usize, Option<usize>)> {
+    ) -> Option<(usize, SettingSub)> {
         let items = self.settings_items(content_left, client_w, pad, scale);
         let mut row_index = 0usize;
         for item in &items {
@@ -1128,9 +1300,31 @@ impl MainWindowState {
                 if *id == SettingId::Duration {
                     let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
                     let seg = segments.iter().position(|s| x >= s.left && x < s.right);
-                    return Some((row_index, seg));
+                    return Some((row_index, SettingSub::Seg(seg.unwrap_or(0))));
                 }
-                return Some((row_index, None));
+                if *id == SettingId::Position {
+                    let parts = position_parts(rect, scale);
+                    if let Some(i) = parts
+                        .anchors
+                        .iter()
+                        .position(|a| x >= a.left && x < a.right && y >= a.top && y < a.bottom)
+                    {
+                        return Some((row_index, SettingSub::Anchor(i)));
+                    }
+                    if x >= parts.reset.left && x < parts.reset.right && y >= parts.reset.top && y < parts.reset.bottom
+                    {
+                        return Some((row_index, SettingSub::Reset));
+                    }
+                    if x >= parts.adjust.left
+                        && x < parts.adjust.right
+                        && y >= parts.adjust.top
+                        && y < parts.adjust.bottom
+                    {
+                        return Some((row_index, SettingSub::Adjust));
+                    }
+                    return Some((row_index, SettingSub::None));
+                }
+                return Some((row_index, SettingSub::None));
             }
             // Row index must count rows only, matching paint_settings; headers
             // are skipped here.
@@ -1267,6 +1461,11 @@ impl MainWindowState {
         self.config.overlay.position_y = None;
         let _ = self.config.save();
         set_position(self.overlay_hwnd, OverlayPos::from_config(&self.config));
+    }
+
+    /// Clears any custom X/Y override and returns to the default top-center anchor.
+    fn reset_position(&mut self) {
+        self.apply_anchor(VerticalPosition::Top, HorizontalPosition::Center);
     }
 }
 
@@ -1590,12 +1789,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     show_sample(state.overlay_hwnd);
                 }
                 MENU_POSITION_RESET => {
-                    state.config.overlay.vertical = VerticalPosition::Top;
-                    state.config.overlay.horizontal = HorizontalPosition::Center;
-                    state.config.overlay.position_x = None;
-                    state.config.overlay.position_y = None;
-                    let _ = state.config.save();
-                    set_position(state.overlay_hwnd, OverlayPos::from_config(&state.config));
+                    state.reset_position();
                 }
                 MENU_DURATION_2S => {
                     state.config.overlay.duration_ms = 2000;
@@ -1719,7 +1913,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
                                     let values = [2000u64, 3000, 5000, 10000];
                                     if let Some((i, _)) =
-                                        segments.iter().enumerate().find(|(_, s)| y >= s.top && y < s.bottom)
+                                        segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right)
                                     {
                                         state.config.overlay.duration_ms = values[i];
                                         let _ = state.config.save();
@@ -1727,7 +1921,35 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     }
                                 }
                                 SettingId::Position => {
-                                    let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
+                                    let parts = position_parts(rect, scale);
+                                    if let Some((i, _)) = parts
+                                        .anchors
+                                        .iter()
+                                        .enumerate()
+                                        .find(|(_, a)| x >= a.left && x < a.right && y >= a.top && y < a.bottom)
+                                    {
+                                        let (v, h) = match i {
+                                            0 => (VerticalPosition::Top, HorizontalPosition::Left),
+                                            1 => (VerticalPosition::Top, HorizontalPosition::Center),
+                                            2 => (VerticalPosition::Top, HorizontalPosition::Right),
+                                            3 => (VerticalPosition::Bottom, HorizontalPosition::Left),
+                                            4 => (VerticalPosition::Bottom, HorizontalPosition::Center),
+                                            _ => (VerticalPosition::Bottom, HorizontalPosition::Right),
+                                        };
+                                        state.apply_anchor(v, h);
+                                    } else if x >= parts.reset.left
+                                        && x < parts.reset.right
+                                        && y >= parts.reset.top
+                                        && y < parts.reset.bottom
+                                    {
+                                        state.reset_position();
+                                    } else if x >= parts.adjust.left
+                                        && x < parts.adjust.right
+                                        && y >= parts.adjust.top
+                                        && y < parts.adjust.bottom
+                                    {
+                                        let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
+                                    }
                                 }
                             }
                             return LRESULT(0);
