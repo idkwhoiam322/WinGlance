@@ -26,7 +26,10 @@ pub fn init_logging(logs_dir: &Path) {
     };
     static LOGGER: OnceLock<FileLogger> = OnceLock::new();
     if LOGGER.set(logger).is_ok() && log::set_logger(LOGGER.get().expect("logger initialized")).is_ok() {
-        log::set_max_level(LevelFilter::Info);
+        // Debug level: session churn, dedup skips and suppressed states are all
+        // logged, which is what makes "why did/didn't a notification fire"
+        // answerable from the log file.
+        log::set_max_level(LevelFilter::Debug);
     }
     log::info!("logging initialized | live log: {live_path:?}");
 }

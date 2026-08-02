@@ -44,14 +44,17 @@ struct ListenerState {
     /// Held playback state with the deadline after which it may be emitted. The
     /// short hold coalesces the Paused→track→Playing burst of a song change into
     /// a single track notification: a state change that is overtaken by a track
-    /// event within the hold window is dropped.
-    pending_playback: Option<(usize, PlaybackState, Instant)>,
+    /// event within the hold window is dropped. Carries the source app label for
+    /// per-source dedup.
+    pending_playback: Option<(usize, PlaybackState, Instant, String)>,
     pending_deadline: Option<Instant>,
     track_pending_since: Option<Instant>,
     last_content_fingerprint: Option<TrackFingerprint>,
-    /// Last emitted playback state (global, not per-session): duplicate state
-    /// events from any session are noise for the pill.
-    last_playback: Option<PlaybackState>,
+    /// Last emitted playback state per source app. Sessions of the same app are
+    /// re-created constantly (each tab/video = a new session pointer), so a
+    /// paused app that re-registers re-fires the same Paused over and over;
+    /// keying by (source, state) absorbs that without missing real changes.
+    last_state_by_source: HashMap<String, PlaybackState>,
     /// When the last TrackChanged was emitted, to suppress the transition state
     /// blip that follows a song change.
     last_track_emitted: Option<(usize, Instant)>,
@@ -149,7 +152,7 @@ impl ListenerState {
             pending_deadline: None,
             track_pending_since: None,
             last_content_fingerprint: None,
-            last_playback: None,
+            last_state_by_source: HashMap::new(),
             last_track_emitted: None,
             last_session_check: Instant::now(),
             current_playing: false,
@@ -235,6 +238,7 @@ impl ListenerState {
             }
             Signal::PlaybackInfo(session) => {
                 let key = session_key(&session);
+                let source = read_source_app(&session);
                 if self.current_key == Some(key) {
                     if let Some(state) = read_playback_state(&session)? {
                         if state == PlaybackState::Stopped {
@@ -245,7 +249,7 @@ impl ListenerState {
                             if self.current_key == before {
                                 // Nothing else took over — report the stop.
                                 self.current_playing = false;
-                                self.pending_playback = Some((key, state, Instant::now()));
+                                self.pending_playback = Some((key, state, Instant::now(), source));
                                 self.schedule_flush();
                             }
                             return Ok(());
@@ -263,11 +267,15 @@ impl ListenerState {
                             k == key && at.elapsed() < Duration::from_millis(TRACK_TRANSITION_MS)
                         });
                         if track_pending || just_emitted {
-                            self.last_playback = Some(state);
+                            self.last_state_by_source.insert(source, state);
                             return Ok(());
                         }
-                        self.pending_playback =
-                            Some((key, state, Instant::now() + Duration::from_millis(STATE_HOLD_MS)));
+                        self.pending_playback = Some((
+                            key,
+                            state,
+                            Instant::now() + Duration::from_millis(STATE_HOLD_MS),
+                            source,
+                        ));
                         self.schedule_flush();
                     }
                 } else if !self.current_playing
@@ -341,9 +349,10 @@ impl ListenerState {
                     if state == PlaybackState::Stopped {
                         // Establish a baseline without showing an empty/stopped
                         // notification when the app starts with no active media.
-                        self.last_playback = Some(state);
+                        self.last_state_by_source.insert(read_source_app(&session), state);
                     } else {
-                        self.pending_playback = Some((session_key(&session), state, Instant::now()));
+                        self.pending_playback =
+                            Some((session_key(&session), state, Instant::now(), read_source_app(&session)));
                     }
                 }
                 self.flush_pending();
@@ -503,15 +512,17 @@ impl ListenerState {
 
         // Held playback state: emit once its hold window expires. State changes
         // never wait for track completeness — a play/pause is delivered even
-        // while artwork/album of a slow track is pending. Duplicate states from
-        // any session are deduplicated globally.
-        if let Some((_key, state, deadline)) = self.pending_playback.take()
-            && Instant::now() >= deadline
-            && self.last_playback != Some(state)
-        {
-            self.last_playback = Some(state);
-            info!("playback state changed | state={state:?}");
-            let _ = self.output.send(MediaEvent::PlaybackStateChanged(state));
+        // while artwork/album of a slow track is pending. Duplicate states for
+        // the same source are deduplicated (sessions of an app are re-created
+        // constantly, so the same state re-fires over and over).
+        if let Some((_key, state, deadline, source)) = self.pending_playback.take() {
+            if Instant::now() >= deadline && self.last_state_by_source.get(&source) != Some(&state) {
+                self.last_state_by_source.insert(source.clone(), state);
+                info!("playback state changed | state={state:?} | source={source}");
+                let _ = self.output.send(MediaEvent::PlaybackStateChanged(state));
+            } else {
+                debug!("playback state suppressed | state={state:?} | source={source}");
+            }
         }
 
         // Track: wait until complete before sending. Artwork must be ready, and a
@@ -550,14 +561,36 @@ impl ListenerState {
             if differs && !artwork_only_removed {
                 self.last_content_fingerprint = Some(fingerprint);
                 self.last_track_emitted = Some((key, Instant::now()));
-                info!(
-                    "track changed | title={:?} | artist={:?} | album={:?} | source={:?}",
-                    track.title, track.artist, track.album, track.source_app
-                );
+                let track_label = track_label(&track);
+                info!("track changed | {track_label}");
                 let _ = self.output.send(MediaEvent::TrackChanged(track));
+            } else if artwork_only_removed {
+                let label = track_label(&track);
+                info!("track emit skipped | reason=artwork-removed | {label}");
+            } else {
+                let label = track_label(&track);
+                debug!("track emit skipped | reason=duplicate-fingerprint | {label}");
             }
         }
     }
+}
+
+/// Every field that is actually displayed, for diagnosable logs.
+fn track_label(track: &TrackInfo) -> String {
+    let track_no = track
+        .track_number
+        .map(|n| format!("{n}/{}", track.track_count.unwrap_or(0)))
+        .unwrap_or_else(|| "-".into());
+    format!(
+        "title={:?} | artist={:?} | album={:?} | artwork={} | duration={:?}s | track={track_no} | genre={:?} | source={:?}",
+        track.title,
+        track.artist,
+        track.album,
+        if track.artwork.is_some() { "yes" } else { "no" },
+        track.duration_secs,
+        track.genre,
+        track.source_app,
+    )
 }
 
 fn register_sessions_handler(
@@ -591,11 +624,15 @@ fn session_key(session: &GlobalSystemMediaTransportControlsSession) -> usize {
     session.as_raw() as usize
 }
 
-fn read_track_info(session: &GlobalSystemMediaTransportControlsSession) -> Result<TrackInfo> {
-    let source_app = session
+fn read_source_app(session: &GlobalSystemMediaTransportControlsSession) -> String {
+    session
         .SourceAppUserModelId()
         .map(|value| source_app_label(&value.to_string()))
-        .unwrap_or_else(|_| "Media".to_string());
+        .unwrap_or_else(|_| "Media".to_string())
+}
+
+fn read_track_info(session: &GlobalSystemMediaTransportControlsSession) -> Result<TrackInfo> {
+    let source_app = read_source_app(session);
     let properties = session.TryGetMediaPropertiesAsync()?.get()?;
     let title = non_empty(properties.Title()?.to_string(), &source_app);
     let artist = non_empty(properties.Artist()?.to_string(), &source_app);
