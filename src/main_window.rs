@@ -22,13 +22,13 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, IDC_ARROW, IDI_APPLICATION, LB_ADDSTRING,
-    LB_DELETESTRING, LB_GETCOUNT, LB_SETTOPINDEX, LBS_NOINTEGRALHEIGHT, LoadCursorW, LoadIconW, MF_CHECKED,
-    MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOWMAXIMIZED,
-    SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE,
-    WM_CTLCOLORLISTBOX, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE, WS_VSCROLL,
+    LB_DELETESTRING, LB_GETCOUNT, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT,
+    LBS_OWNERDRAWFIXED, LoadCursorW, LoadIconW, MF_CHECKED, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SW_HIDE, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WNDCLASS_STYLES,
+    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -223,7 +223,10 @@ impl MainWindowState {
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
                 PCWSTR(wide("LISTBOX").as_ptr()),
                 PCWSTR::null(),
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WINDOW_STYLE(LBS_NOINTEGRALHEIGHT as u32),
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_VSCROLL
+                    | WINDOW_STYLE(LBS_OWNERDRAWFIXED as u32 | LBS_HASSTRINGS as u32 | LBS_NOINTEGRALHEIGHT as u32),
                 0,
                 0,
                 0,
@@ -237,12 +240,17 @@ impl MainWindowState {
         .unwrap_or_default();
         if !self.listbox.0.is_null() {
             unsafe {
+                let scale = GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0;
+                let item_h = (18.0 * scale).round() as i32;
+                let _ = SendMessageW(self.listbox, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(item_h as isize));
                 let _ = SendMessageW(
                     self.listbox,
                     WM_SETFONT,
                     WPARAM(self.listbox_font.0 as usize),
                     LPARAM(1),
                 );
+                let header = wide("TIME     EVENT");
+                let _ = SendMessageW(self.listbox, LB_ADDSTRING, WPARAM(0), LPARAM(header.as_ptr() as isize));
             }
             self.layout();
         }

@@ -2,8 +2,6 @@ use crate::config::Config;
 use crate::events::{MediaEvent, PlaybackState, TrackInfo};
 use anyhow::{Context, Result};
 use log::{debug, info};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
@@ -40,7 +38,7 @@ struct ListenerState {
     pending_playback: Option<(usize, PlaybackState)>,
     pending_deadline: Option<Instant>,
     track_pending_since: Option<Instant>,
-    last_track: Option<(usize, TrackFingerprint)>,
+    last_content_fingerprint: Option<TrackFingerprint>,
     last_playback: Option<(usize, PlaybackState)>,
 }
 
@@ -107,7 +105,7 @@ impl ListenerState {
             pending_playback: None,
             pending_deadline: None,
             track_pending_since: None,
-            last_track: None,
+            last_content_fingerprint: None,
             last_playback: None,
         }
     }
@@ -285,22 +283,21 @@ impl ListenerState {
 
     fn flush_pending(&mut self) {
         self.pending_deadline = None;
-        // Wait for artwork before sending — skip flush if artwork is missing
-        // and we haven't exceeded the max wait (1s).
+        // Only send when artwork is ready. Re-schedule every 100ms up to 3s.
         if let Some((_, track)) = &self.pending_track
             && track.artwork.is_none()
         {
             let elapsed = self.track_pending_since.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
-            if elapsed < Duration::from_millis(1000) {
+            if elapsed < Duration::from_millis(3000) {
                 self.pending_deadline = Some(Instant::now() + Duration::from_millis(100));
                 return;
             }
         }
         self.track_pending_since = None;
-        if let Some((key, track)) = self.pending_track.take() {
+        if let Some((_key, track)) = self.pending_track.take() {
             let fingerprint = track_fingerprint(&track);
-            if self.last_track.as_ref() != Some(&(key, fingerprint.clone())) {
-                self.last_track = Some((key, fingerprint));
+            if self.last_content_fingerprint.as_ref() != Some(&fingerprint) {
+                self.last_content_fingerprint = Some(fingerprint);
                 info!(
                     "track changed | title={:?} | artist={:?} | album={:?} | source={:?}",
                     track.title, track.artist, track.album, track.source_app
@@ -402,13 +399,13 @@ fn source_app_label(value: &str) -> String {
 }
 
 fn track_fingerprint(track: &TrackInfo) -> TrackFingerprint {
-    let mut hasher = DefaultHasher::new();
-    track.artwork.hash(&mut hasher);
+    // Content-only fingerprint: title+artist+album. Artwork is excluded so the
+    // same track is recognized even when the thumbnail arrives on a later event.
     TrackFingerprint {
         title: track.title.clone(),
         artist: track.artist.clone(),
         album: track.album.clone(),
-        artwork_hash: hasher.finish(),
+        artwork_hash: 0,
     }
 }
 
