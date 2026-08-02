@@ -510,26 +510,46 @@ impl ListenerState {
             let playback = read_playback_state(&session)?;
             self.current_playing = matches!(playback, Some(PlaybackState::Playing));
             if emit_initial {
-                let track_queued = if playback != Some(PlaybackState::Stopped)
-                    && let Ok(mut track) = read_track_info(&session)
-                {
-                    self.apply_cache(&mut track);
-                    self.remember_content(session_key(&session), &track);
-                    // Same-content handoff: adopt the re-created session silently
-                    // (the pill keeps tracking it) and let its property events
-                    // emit only when the content actually differs.
-                    if self.handoff_is_same_content(&track) {
-                        if playback == Some(PlaybackState::Playing) {
-                            self.recent_playing = Some(session.clone());
+                let track_queued = if playback != Some(PlaybackState::Stopped) {
+                    match read_track_info(&session) {
+                        Ok(mut track) => {
+                            self.apply_cache(&mut track);
+                            self.remember_content(session_key(&session), &track);
+                            // Same-content handoff: adopt the re-created session
+                            // silently (the pill keeps tracking it) and let its
+                            // property events emit only when the content differs.
+                            if self.handoff_is_same_content(&track) {
+                                if playback == Some(PlaybackState::Playing) {
+                                    self.recent_playing = Some(session.clone());
+                                }
+                                debug!(
+                                    "session handoff, content unchanged | source={}",
+                                    read_source_app(&session)
+                                );
+                                return Ok(());
+                            }
+                            self.pending_track = Some((session_key(&session), track));
+                            true
                         }
-                        debug!(
-                            "session handoff, content unchanged | source={}",
-                            read_source_app(&session)
-                        );
-                        return Ok(());
+                        Err(_) => {
+                            // The new session's metadata is not readable yet
+                            // (transitional state). Announce the source app so
+                            // the pill never shows the previous session's track
+                            // for this adoption; the real metadata replaces it
+                            // when MediaProperties arrives.
+                            let key = session_key(&session);
+                            let source = read_source_app(&session);
+                            self.pending_track = Some((
+                                key,
+                                TrackInfo {
+                                    title: source.clone(),
+                                    source_app: source,
+                                    ..TrackInfo::default()
+                                },
+                            ));
+                            true
+                        }
                     }
-                    self.pending_track = Some((session_key(&session), track));
-                    true
                 } else {
                     false
                 };

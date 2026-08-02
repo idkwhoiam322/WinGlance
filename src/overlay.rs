@@ -312,12 +312,15 @@ impl OverlayState {
                     self.pending.track_update = is_update;
                 }
                 MediaEvent::PlaybackStateChanged(state) => self.pending.playback = Some(state),
+                // A state change from a session that is not current: still show
+                // the pill so no pause/play from any app is missed (the main
+                // window records the source in its history).
+                MediaEvent::HistoryPlaybackState(state, _) => self.pending.playback = Some(state),
                 MediaEvent::TrackRestarted(track) if self.config.behavior.enable_track_change => {
                     // A restart (Prev/repeat) re-shows the pill briefly.
                     self.show_restart(track);
                 }
                 MediaEvent::TrackRestarted(_) => {}
-                MediaEvent::HistoryPlaybackState(_, _) => {}
                 MediaEvent::TrackChanged(_) => {}
             }
         }
