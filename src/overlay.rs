@@ -547,6 +547,9 @@ fn state_content_size(config: &Config, last_track: Option<&TrackInfo>) -> (f32, 
         if !track.artist.trim().is_empty() {
             text_h += appearance.font_size_artist * 0.85 * ROW_HEIGHT;
         }
+        if !track.meta_line(true).is_empty() {
+            text_h += appearance.font_size_artist * 0.85 * ROW_HEIGHT;
+        }
     }
     let height = text_h + 2.0 * appearance.padding + 8.0;
     (config.overlay.max_width.max(180) as f32, height)
@@ -704,61 +707,71 @@ fn draw_pixels(state: &OverlayState, content: &MediaEvent, width: usize, height:
         MediaEvent::TrackChanged(track) => {
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
-            let art_x = padding;
-            let art_y = height.saturating_sub(art_size) / 2;
-            if let Some(artwork) = &track.artwork {
-                if let Some(decoded) = decode_artwork(artwork, art_size) {
-                    // Album art gets rounded corners (smaller radius than the
-                    // pill itself) via the same coverage mask as everything else.
-                    let art_radius = art_size as f32 * 0.2;
-                    for y in 0..art_size {
-                        for x in 0..art_size {
-                            let coverage =
-                                round_rect_coverage(x as f32, y as f32, art_size as f32, art_size as f32, art_radius);
-                            if coverage > 0.0 {
-                                let source = (y * art_size + x) * 4;
-                                let alpha = (decoded[source + 3] as f32 * coverage) as u32;
-                                composite(
-                                    &mut pixels,
-                                    width,
-                                    art_x + x,
-                                    art_y + y,
-                                    [decoded[source], decoded[source + 1], decoded[source + 2]],
-                                    alpha,
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    draw_placeholder(
-                        &mut pixels,
-                        width,
-                        art_x,
-                        art_y,
-                        art_size,
-                        state.config.appearance.accent_color,
-                    );
-                }
-            } else {
-                draw_placeholder(
-                    &mut pixels,
-                    width,
-                    art_x,
-                    art_y,
-                    art_size,
-                    state.config.appearance.accent_color,
-                );
-            }
+            draw_art_tile(
+                &mut pixels,
+                width,
+                track.artwork.as_deref(),
+                padding,
+                height.saturating_sub(art_size) / 2,
+                art_size,
+                state.config.appearance.accent_color,
+            );
         }
         MediaEvent::PlaybackStateChanged(_) => {
-            let accent = state.config.appearance.accent_color;
-            let size = (16.0 * scale).round() as usize;
-            let x = (12.0 * scale).round() as usize;
-            let y = height.saturating_sub(size) / 2;
-            draw_placeholder(&mut pixels, width, x, y, size, accent);
+            // The state pill reuses the current track's artwork and details so
+            // a pause/play notification still shows what is playing (cached
+            // from the last emitted track; falls back to the placeholder).
+            let padding = (state.config.appearance.padding * scale).round() as usize;
+            let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
+            let art_size = art_size.min(height.saturating_sub(2 * padding));
+            let artwork = state.last_track.as_ref().and_then(|t| t.artwork.as_deref());
+            draw_art_tile(
+                &mut pixels,
+                width,
+                artwork,
+                padding,
+                height.saturating_sub(art_size) / 2,
+                art_size,
+                state.config.appearance.accent_color,
+            );
         }
     }
     Ok(pixels)
+}
+
+/// Draws the album-art tile (rounded corners via coverage) or the accent
+/// placeholder when no artwork is available.
+fn draw_art_tile(
+    pixels: &mut [u8],
+    width: usize,
+    artwork: Option<&[u8]>,
+    x: usize,
+    y: usize,
+    size: usize,
+    accent: [u8; 4],
+) {
+    let Some(decoded) = artwork.and_then(|a| decode_artwork(a, size)) else {
+        draw_placeholder(pixels, width, x, y, size, accent);
+        return;
+    };
+    let art_radius = size as f32 * 0.2;
+    for py in 0..size {
+        for px in 0..size {
+            let coverage = round_rect_coverage(px as f32, py as f32, size as f32, size as f32, art_radius);
+            if coverage > 0.0 {
+                let source = (py * size + px) * 4;
+                let alpha = (decoded[source + 3] as f32 * coverage) as u32;
+                composite(
+                    pixels,
+                    width,
+                    x + px,
+                    y + py,
+                    [decoded[source], decoded[source + 1], decoded[source + 2]],
+                    alpha,
+                );
+            }
+        }
+    }
 }
 
 /// Draws the pill's text rows into the same premultiplied pixel buffer as the
@@ -920,6 +933,21 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
                         &artist_rect,
                         (fs_artist * 0.85) as i32,
                         [0xCC, 0xCC, 0xCC, 0xFF],
+                        false,
+                        true,
+                        None,
+                    );
+                }
+                let meta = track.meta_line(true);
+                if !meta.is_empty() {
+                    let meta_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
+                    draw_text_line_pixels(
+                        pixels,
+                        width as usize,
+                        &meta,
+                        &meta_rect,
+                        (fs_artist * 0.85) as i32,
+                        [0x99, 0x99, 0x99, 0xFF],
                         false,
                         true,
                         None,

@@ -361,16 +361,21 @@ impl ListenerState {
         }
     }
 
-    /// Queues a playback state for held emission, or drops it when a track for
-    /// the same session is pending or was just emitted — the state is then the
-    /// song-change blip, not a real change. The held deadline lets a handoff's
-    /// Stopped/Playing pair collapse into the track notification.
+    /// Queues a playback state for held emission, or drops it when a track was
+    /// just emitted for the same session — the state is then the song-change
+    /// blip, not a real change. The held deadline lets a handoff's Stopped/
+    /// Playing pair collapse into the track notification.
     fn queue_playback_state(&mut self, key: usize, state: PlaybackState, source: String) {
-        let track_pending = self.pending_track.as_ref().is_some_and(|(k, _)| *k == key);
+        // Coalescing: drop a state that is the transition blip of a song
+        // change — a track was just emitted for this session. Anything later
+        // is a genuine user action (pause/play) and is held for emission even
+        // while a track happens to be pending: session churn keeps tracks
+        // pending for seconds, and suppressing on that would swallow real
+        // pauses and plays.
         let just_emitted = self
             .last_track_emitted
             .is_some_and(|(k, at)| k == key && at.elapsed() < Duration::from_millis(TRACK_TRANSITION_MS));
-        if track_pending || just_emitted {
+        if just_emitted {
             self.last_state_by_source.insert(source.clone(), state);
             debug!("playback state suppressed | state={state:?} | source={source}");
             return;
