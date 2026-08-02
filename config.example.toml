@@ -1,5 +1,7 @@
 [overlay]
 duration_ms = 3000
+# How long the pill stays for a track restart (repeat/Prev), capped at 2000.
+restart_duration_ms = 2000
 animation_ms = 200
 # Vertical edge: "top" | "bottom".
 vertical = "top"
@@ -7,7 +9,7 @@ vertical = "top"
 horizontal = "center"
 # Logical-pixel margin from the chosen edge (after DPI scaling).
 margin = 8
-max_width = 240
+max_width = 340
 # Optional absolute overrides (96-DPI logical pixels). When set, the pill is
 # placed here instead of the anchor above; set by the "Adjust position" drag.
 # position_x = 0
@@ -23,14 +25,18 @@ start_in_tray = true
 start_on_login = false
 # Instead of closing the app, hide the window to the tray when its X is pressed.
 close_to_tray = true
+# Source apps to ignore entirely (case-insensitive substrings against the
+# AUMID and its label). For apps that spam SMTC session changes.
+# ignored_sources = ["riotgames"]
 
 [appearance]
 # Opaque pill background (alpha 255). Lower the alpha for translucency.
 background_color = [0, 0, 0, 255]
 text_color = [255, 255, 255, 255]
-accent_color = [0, 212, 170, 255]
-corner_radius = 16.0
-padding = 8.0
-art_size = 32
-font_size_title = 12.0
-font_size_artist = 10.0
+# Accent color. When unset, the Windows theme accent is used (white fallback).
+# accent_color = [0, 212, 170, 255]
+corner_radius = 18.0
+padding = 12.0
+art_size = 48
+font_size_title = 16.0
+font_size_artist = 13.0

@@ -10,30 +10,58 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::BOOLEAN;
+use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
     CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_DONTCARE, GetMonitorInfoW, HBRUSH, HDC,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS,
+    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_DONTCARE, GetMonitorInfoW, HBITMAP, HBRUSH, HDC,
+    HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS,
     SelectObject, SetBkMode, SetTextColor, TRANSPARENT, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetForegroundWindow, GetWindowLongPtrW,
     HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, MA_NOACTIVATE, RegisterClassExW, SW_HIDE,
     SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA, WM_DESTROY, WM_MOUSEACTIVATE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASS_STYLES, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA, WM_APP, WM_DESTROY,
+    WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASS_STYLES, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
 const TIMER_DEBOUNCE: usize = 1;
-const TIMER_ANIMATION: usize = 2;
 const LIGHT_DURATION: Duration = Duration::from_millis(120);
 
+/// Posted by the high-resolution animation timer to drive pill frames.
+const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
+/// Animation timer period in ms. On a 300Hz display a full frame is ~3.3ms;
+/// 4ms targets that without flooding slower machines (the effective frame
+/// rate self-throttles to the UI thread's render speed).
+const ANIM_TICK_MS: u32 = 4;
+
+/// Reusable device context + DIB section for the pill's frames. The overlay
+/// redraws every animation tick; recreating the DIB per frame is pure waste.
+struct DibCache {
+    hdc: HDC,
+    bitmap: HBITMAP,
+    old_bitmap: HGDIOBJ,
+    bits: *mut c_void,
+    width: i32,
+    height: i32,
+}
+
+/// Animation tick driver. Fires from the timer queue and dispatches the tick
+/// to the UI thread; SendMessage blocks the timer thread until the frame is
+/// rendered, so the effective frame rate follows the UI thread's speed.
+unsafe extern "system" fn animation_timer_proc(parameter: *mut c_void, _fired: BOOLEAN) {
+    let hwnd = HWND(parameter);
+    unsafe {
+        let _ = SendMessageW(hwnd, TIMER_ANIMATION_MSG, WPARAM(0), LPARAM(0));
+    }
+}
 pub(crate) type EventQueue = Arc<Mutex<VecDeque<MediaEvent>>>;
 
 enum Phase {
@@ -120,6 +148,17 @@ struct OverlayState {
     position: OverlayPos,
     /// Per-row marquee state for the four track lines (title/subtitle/meta/app).
     scroll: [LineScroll; 4],
+    /// High-resolution timer driving the pill animation.
+    anim_timer: HANDLE,
+    /// Cached decoded artwork for the current track (RGBA8 at the full art
+    /// size), so animation frames never re-decode the JPEG/PNG.
+    decoded_art: Option<Vec<u8>>,
+    decoded_art_key: Option<(String, String)>,
+    /// Cached DIB (DC + bitmap) reused across frames of the same size.
+    dib: Option<DibCache>,
+    /// Timestamp of the previous animation tick, for time-based marquee
+    /// scrolling.
+    last_tick: Instant,
 }
 
 /// Resolved placement for the notch pill, pulled from [overlay] config. `x`/`y`
@@ -198,6 +237,11 @@ impl OverlayState {
             dismiss_at: None,
             position,
             scroll: [LineScroll::default(); 4],
+            anim_timer: HANDLE::default(),
+            decoded_art: None,
+            decoded_art_key: None,
+            dib: None,
+            last_tick: Instant::now(),
         }
     }
 
@@ -209,24 +253,72 @@ impl OverlayState {
         }
     }
 
+    /// Decodes (once per track) and caches the artwork bitmap at the full art
+    /// size, so animation frames never re-decode the JPEG/PNG.
+    fn ensure_art(&mut self, track: &TrackInfo, base_size: usize) {
+        let key = (track.title.clone(), track.artist.clone());
+        if self.decoded_art_key.as_ref() != Some(&key) || self.decoded_art.is_none() {
+            self.decoded_art = track.artwork.as_deref().and_then(|a| decode_artwork(a, base_size));
+            self.decoded_art_key = Some(key);
+        }
+    }
+
+    fn ensure_anim_timer(&mut self) {
+        if !self.anim_timer.0.is_null() {
+            return;
+        }
+        let mut handle = HANDLE::default();
+        unsafe {
+            let _ = CreateTimerQueueTimer(
+                &mut handle,
+                None,
+                Some(animation_timer_proc),
+                Some(self.hwnd.0 as *const c_void),
+                ANIM_TICK_MS,
+                ANIM_TICK_MS,
+                WT_EXECUTEDEFAULT,
+            );
+        }
+        self.anim_timer = handle;
+    }
+
+    fn delete_anim_timer(&mut self) {
+        if !self.anim_timer.0.is_null() {
+            unsafe {
+                let _ = DeleteTimerQueueTimer(None, self.anim_timer, None);
+            }
+            self.anim_timer = HANDLE::default();
+        }
+    }
+
     fn receive_events(&mut self) {
+        let mut batch = Vec::new();
         if let Ok(mut queue) = self.queue.lock() {
             while let Some(event) = queue.pop_front() {
-                if !self.enabled {
-                    continue;
+                batch.push(event);
+            }
+        }
+        for event in batch {
+            if !self.enabled {
+                continue;
+            }
+            match event {
+                MediaEvent::TrackChanged(track) if self.config.behavior.enable_track_change => {
+                    let is_update = self
+                        .last_track
+                        .as_ref()
+                        .is_some_and(|last| last.title == track.title && last.artist == track.artist);
+                    self.pending.track = Some(track);
+                    self.pending.track_update = is_update;
                 }
-                match event {
-                    MediaEvent::TrackChanged(track) if self.config.behavior.enable_track_change => {
-                        let is_update = self
-                            .last_track
-                            .as_ref()
-                            .is_some_and(|last| last.title == track.title && last.artist == track.artist);
-                        self.pending.track = Some(track);
-                        self.pending.track_update = is_update;
-                    }
-                    MediaEvent::PlaybackStateChanged(state) => self.pending.playback = Some(state),
-                    MediaEvent::TrackChanged(_) => {}
+                MediaEvent::PlaybackStateChanged(state) => self.pending.playback = Some(state),
+                MediaEvent::TrackRestarted(track) if self.config.behavior.enable_track_change => {
+                    // A restart (Prev/repeat) re-shows the pill briefly.
+                    self.show_restart(track);
                 }
+                MediaEvent::TrackRestarted(_) => {}
+                MediaEvent::HistoryPlaybackState(_, _) => {}
+                MediaEvent::TrackChanged(_) => {}
             }
         }
         if self.pending.track.is_some() || self.pending.playback.is_some() {
@@ -274,27 +366,41 @@ impl OverlayState {
     }
 
     fn show(&mut self, event: MediaEvent, full_animation: bool) {
+        self.show_with_duration(event, full_animation, self.config.overlay.duration_ms.max(500));
+    }
+
+    fn show_with_duration(&mut self, event: MediaEvent, full_animation: bool, duration_ms: u64) {
         if !self.enabled {
             return;
         }
         self.content = Some(event);
         self.reset_scroll();
         let now = Instant::now();
-        self.dismiss_at = Some(now + Duration::from_millis(self.config.overlay.duration_ms.max(500)));
+        self.dismiss_at = Some(now + Duration::from_millis(duration_ms));
         self.phase = if full_animation {
             Phase::Expanding(now)
         } else {
             Phase::Light(now)
         };
+        self.ensure_anim_timer();
         unsafe {
-            let _ = SetTimer(self.hwnd, TIMER_ANIMATION, 16, None);
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
         self.render();
     }
 
+    /// Re-shows the pill for a track restart (Prev button, or a looping track)
+    /// with the shorter restart duration.
+    fn show_restart(&mut self, track: TrackInfo) {
+        self.last_track = Some(track.clone());
+        let duration = self.config.overlay.restart_duration_ms.clamp(500, 2000);
+        self.show_with_duration(MediaEvent::TrackChanged(track), true, duration);
+    }
+
     fn tick(&mut self) {
         let now = Instant::now();
+        let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
+        self.last_tick = now;
         if self.dismiss_at.is_some_and(|deadline| deadline <= now)
             && !matches!(self.phase, Phase::Collapsing(_) | Phase::Hidden)
         {
@@ -315,10 +421,11 @@ impl OverlayState {
             _ => {}
         }
 
-        // Advance marquee offsets (driven by this same 16ms tick, entirely
-        // independent of the dismiss countdown).
+        // Advance marquee offsets (driven by this same tick, entirely
+        // independent of the dismiss countdown). Time-based so the scroll
+        // speed is identical at any frame rate.
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
-        let per_tick = MARQUEE_SPEED * scale * (0.016);
+        let per_tick = MARQUEE_SPEED * scale * dt;
         for line in &mut self.scroll {
             if let Some(started) = line.started_at
                 && started.elapsed() >= MARQUEE_HOLD
@@ -330,21 +437,29 @@ impl OverlayState {
     }
 
     fn render(&mut self) {
-        let Some(content) = self.content.as_ref() else {
+        let Some(content) = self.content.take() else {
             return;
         };
         let (alpha, shape) = self.frame();
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
-        let (logical_width, logical_height) = match content {
-            MediaEvent::TrackChanged(track) => track_content_size(&self.config, track),
-            MediaEvent::PlaybackStateChanged(_) => state_content_size(&self.config, self.last_track.as_ref()),
+        let (logical_width, logical_height) = match &content {
+            MediaEvent::TrackChanged(track) | MediaEvent::TrackRestarted(track) => {
+                track_content_size(&self.config, track)
+            }
+            MediaEvent::PlaybackStateChanged(_) | MediaEvent::HistoryPlaybackState(_, _) => {
+                state_content_size(&self.config, self.last_track.as_ref())
+            }
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
         let Some(position) = self.position(width, height) else {
+            self.content = Some(content);
             return;
         };
-        if let Err(error) = render_layered(self, content, width, height, dpi * shape, alpha, position) {
+        let art_base = (self.config.appearance.art_size as f32 * dpi).round() as usize;
+        let result = render_layered(self, &content, width, height, dpi * shape, art_base, alpha, position);
+        self.content = Some(content);
+        if let Err(error) = result {
             error!("rendering overlay: {error:#}");
         }
     }
@@ -446,8 +561,8 @@ impl OverlayState {
         self.content = None;
         self.dismiss_at = None;
         self.phase = Phase::Hidden;
+        self.delete_anim_timer();
         unsafe {
-            let _ = KillTimer(self.hwnd, TIMER_ANIMATION);
             let _ = KillTimer(self.hwnd, TIMER_DEBOUNCE);
             if !ShowWindow(self.hwnd, SW_HIDE).as_bool() {
                 debug!("ShowWindow(SW_HIDE) failed");
@@ -480,8 +595,12 @@ impl OverlayState {
         let (_, shape) = self.frame();
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (logical_width, logical_height) = match content {
-            MediaEvent::TrackChanged(track) => track_content_size(&self.config, track),
-            MediaEvent::PlaybackStateChanged(_) => state_content_size(&self.config, self.last_track.as_ref()),
+            MediaEvent::TrackChanged(track) | MediaEvent::TrackRestarted(track) => {
+                track_content_size(&self.config, track)
+            }
+            MediaEvent::PlaybackStateChanged(_) | MediaEvent::HistoryPlaybackState(_, _) => {
+                state_content_size(&self.config, self.last_track.as_ref())
+            }
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
@@ -496,8 +615,8 @@ impl OverlayState {
         let now = Instant::now();
         self.dismiss_at = Some(now + sample_duration(&self.config));
         self.phase = Phase::Light(now);
+        self.ensure_anim_timer();
         unsafe {
-            let _ = SetTimer(self.hwnd, TIMER_ANIMATION, 16, None);
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
         self.render();
@@ -603,17 +722,19 @@ pub(crate) fn create_window(config: Config, queue: EventQueue) -> Result<HWND> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_layered(
-    state: &OverlayState,
+    state: &mut OverlayState,
     content: &MediaEvent,
     width: i32,
     height: i32,
     scale: f32,
+    art_base: usize,
     alpha: u8,
     position: POINT,
 ) -> Result<()> {
-    let mut pixels = draw_pixels(state, content, width as usize, height as usize, scale)?;
-    draw_text_pixels(state, &mut pixels, content, width, scale);
+    let mut pixels = draw_pixels(state, content, width as usize, height as usize, scale, art_base)?;
+    draw_text_pixels(&*state, &mut pixels, content, width, scale);
     let bitmap_info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -626,22 +747,10 @@ fn render_layered(
         },
         ..Default::default()
     };
-    let hdc = unsafe { CreateCompatibleDC(None) };
-    if hdc.0.is_null() {
-        anyhow::bail!("CreateCompatibleDC failed");
-    }
-    let mut bits: *mut c_void = null_mut();
-    let bitmap = unsafe { CreateDIBSection(hdc, &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0) }?;
-    if bits.is_null() {
-        unsafe {
-            let _ = DeleteDC(hdc);
-        }
-        anyhow::bail!("CreateDIBSection returned no pixel buffer");
-    }
+    let (hdc, _bitmap, bits) = dib_for(state, &bitmap_info, width, height)?;
     unsafe {
         std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast(), pixels.len());
     }
-    let old_bitmap = unsafe { SelectObject(hdc, bitmap) };
 
     let size = SIZE { cx: width, cy: height };
     let source = POINT { x: 0, y: 0 };
@@ -665,9 +774,6 @@ fn render_layered(
         )
     };
     unsafe {
-        SelectObject(hdc, old_bitmap);
-        let _ = DeleteObject(bitmap);
-        let _ = DeleteDC(hdc);
         let _ = ShowWindow(state.hwnd, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(
             state.hwnd,
@@ -682,7 +788,58 @@ fn render_layered(
     result.context("UpdateLayeredWindow")
 }
 
-fn draw_pixels(state: &OverlayState, content: &MediaEvent, width: usize, height: usize, scale: f32) -> Result<Vec<u8>> {
+/// Returns the cached DIB for the given size, creating (or replacing) it when
+/// the size changed. The DIB stays alive across frames and is released at
+/// window destruction.
+fn dib_for(
+    state: &mut OverlayState,
+    info: &BITMAPINFO,
+    width: i32,
+    height: i32,
+) -> Result<(HDC, HBITMAP, *mut c_void)> {
+    if let Some(dib) = &state.dib {
+        if dib.width == width && dib.height == height {
+            return Ok((dib.hdc, dib.bitmap, dib.bits));
+        }
+        unsafe {
+            let _ = SelectObject(dib.hdc, dib.old_bitmap);
+            let _ = DeleteObject(dib.bitmap);
+            let _ = DeleteDC(dib.hdc);
+        }
+        state.dib = None;
+    }
+    let hdc = unsafe { CreateCompatibleDC(None) };
+    if hdc.0.is_null() {
+        anyhow::bail!("CreateCompatibleDC failed");
+    }
+    let mut bits: *mut c_void = null_mut();
+    let bitmap = unsafe { CreateDIBSection(hdc, info, DIB_RGB_COLORS, &mut bits, None, 0) }?;
+    if bits.is_null() {
+        unsafe {
+            let _ = DeleteDC(hdc);
+        }
+        anyhow::bail!("CreateDIBSection returned no pixel buffer");
+    }
+    let old_bitmap = unsafe { SelectObject(hdc, bitmap) };
+    state.dib = Some(DibCache {
+        hdc,
+        bitmap,
+        old_bitmap,
+        bits,
+        width,
+        height,
+    });
+    Ok((hdc, bitmap, bits))
+}
+
+fn draw_pixels(
+    state: &mut OverlayState,
+    content: &MediaEvent,
+    width: usize,
+    height: usize,
+    scale: f32,
+    art_base: usize,
+) -> Result<Vec<u8>> {
     let mut pixels = vec![0u8; width * height * 4];
     let radius = state.config.appearance.corner_radius * scale;
     let background = state.config.appearance.background_color;
@@ -704,74 +861,131 @@ fn draw_pixels(state: &OverlayState, content: &MediaEvent, width: usize, height:
     }
 
     match content {
-        MediaEvent::TrackChanged(track) => {
+        MediaEvent::TrackChanged(track) | MediaEvent::TrackRestarted(track) => {
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
-            draw_art_tile(
-                &mut pixels,
-                width,
-                track.artwork.as_deref(),
-                padding,
-                height.saturating_sub(art_size) / 2,
-                art_size,
-                state.config.appearance.accent_color,
-            );
+            let art_x = padding;
+            let art_y = height.saturating_sub(art_size) / 2;
+            state.ensure_art(track, art_base);
+            if let Some(art) = state.decoded_art.as_deref() {
+                draw_art_scaled(
+                    &mut pixels,
+                    width,
+                    art,
+                    art_base,
+                    art_x,
+                    art_y,
+                    art_size,
+                    state.config.appearance.accent_color,
+                );
+            } else {
+                draw_placeholder(
+                    &mut pixels,
+                    width,
+                    art_x,
+                    art_y,
+                    art_size,
+                    state.config.appearance.accent_color,
+                );
+            }
         }
-        MediaEvent::PlaybackStateChanged(_) => {
+        MediaEvent::PlaybackStateChanged(_) | MediaEvent::HistoryPlaybackState(_, _) => {
             // The state pill reuses the current track's artwork and details so
-            // a pause/play notification still shows what is playing (cached
-            // from the last emitted track; falls back to the placeholder).
+            // a pause/play notification still shows what is playing (the cache
+            // was populated when the track was shown; falls back to the accent
+            // placeholder when nothing has been shown yet).
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
             let art_size = art_size.min(height.saturating_sub(2 * padding));
-            let artwork = state.last_track.as_ref().and_then(|t| t.artwork.as_deref());
-            draw_art_tile(
-                &mut pixels,
-                width,
-                artwork,
-                padding,
-                height.saturating_sub(art_size) / 2,
-                art_size,
-                state.config.appearance.accent_color,
-            );
+            let art_x = padding;
+            let art_y = height.saturating_sub(art_size) / 2;
+            if let Some(art) = state.decoded_art.as_deref() {
+                draw_art_scaled(
+                    &mut pixels,
+                    width,
+                    art,
+                    art_base,
+                    art_x,
+                    art_y,
+                    art_size,
+                    state.config.appearance.accent_color,
+                );
+            } else {
+                draw_placeholder(
+                    &mut pixels,
+                    width,
+                    art_x,
+                    art_y,
+                    art_size,
+                    state.config.appearance.accent_color,
+                );
+            }
         }
     }
     Ok(pixels)
 }
 
-/// Draws the album-art tile (rounded corners via coverage) or the accent
-/// placeholder when no artwork is available.
-fn draw_art_tile(
+/// Draws the cached artwork bitmap into the tile region, bilinear-scaled from
+/// the cached base size to the current (animation-scaled) size, with the
+/// rounded-corner mask. Falls back to the accent placeholder on decode errors.
+#[allow(clippy::too_many_arguments)]
+fn draw_art_scaled(
     pixels: &mut [u8],
     width: usize,
-    artwork: Option<&[u8]>,
+    art: &[u8],
+    base: usize,
     x: usize,
     y: usize,
     size: usize,
     accent: [u8; 4],
 ) {
-    let Some(decoded) = artwork.and_then(|a| decode_artwork(a, size)) else {
+    if size == 0 || base == 0 || art.len() < base * base * 4 {
         draw_placeholder(pixels, width, x, y, size, accent);
         return;
-    };
-    let art_radius = size as f32 * 0.2;
-    for py in 0..size {
-        for px in 0..size {
-            let coverage = round_rect_coverage(px as f32, py as f32, size as f32, size as f32, art_radius);
-            if coverage > 0.0 {
-                let source = (py * size + px) * 4;
-                let alpha = (decoded[source + 3] as f32 * coverage) as u32;
-                composite(
-                    pixels,
-                    width,
-                    x + px,
-                    y + py,
-                    [decoded[source], decoded[source + 1], decoded[source + 2]],
-                    alpha,
-                );
+    }
+    let radius = size as f32 * 0.2;
+    for dy in 0..size {
+        for dx in 0..size {
+            let coverage = round_rect_coverage(dx as f32, dy as f32, size as f32, size as f32, radius);
+            if coverage <= 0.0 {
+                continue;
             }
+            let sx = (dx as f32 + 0.5) * base as f32 / size as f32 - 0.5;
+            let sy = (dy as f32 + 0.5) * base as f32 / size as f32 - 0.5;
+            let x0 = sx.max(0.0) as usize;
+            let y0 = sy.max(0.0) as usize;
+            let x1 = (x0 + 1).min(base - 1);
+            let y1 = (y0 + 1).min(base - 1);
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+            let p00 = (y0 * base + x0) * 4;
+            let p10 = (y0 * base + x1) * 4;
+            let p01 = (y1 * base + x0) * 4;
+            let p11 = (y1 * base + x1) * 4;
+            let r = lerp(lerp(art[p00], art[p10], fx), lerp(art[p01], art[p11], fx), fy);
+            let g = lerp(
+                lerp(art[p00 + 1], art[p10 + 1], fx),
+                lerp(art[p01 + 1], art[p11 + 1], fx),
+                fy,
+            );
+            let b = lerp(
+                lerp(art[p00 + 2], art[p10 + 2], fx),
+                lerp(art[p01 + 2], art[p11 + 2], fx),
+                fy,
+            );
+            let a = lerp(
+                lerp(art[p00 + 3], art[p10 + 3], fx),
+                lerp(art[p01 + 3], art[p11 + 3], fx),
+                fy,
+            );
+            let alpha = (a as f32 * coverage) as u32;
+            composite(pixels, width, x + dx, y + dy, [r, g, b], alpha);
         }
     }
+}
+
+fn lerp(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
 /// Draws the pill's text rows into the same premultiplied pixel buffer as the
@@ -780,12 +994,22 @@ fn draw_art_tile(
 /// window — it never touches the alpha channel).
 fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEvent, width: i32, scale: f32) {
     match content {
-        MediaEvent::TrackChanged(track) => {
+        MediaEvent::TrackChanged(track) | MediaEvent::TrackRestarted(track) => {
             let appearance = &state.config.appearance;
             let padding = (appearance.padding * scale) as i32;
             let art = (appearance.art_size as f32 * scale) as i32;
             let left = padding + art + (12.0 * scale) as i32;
-            let right = width - padding;
+            // Right-edge zone: the track duration, right-aligned on the first
+            // row. The text rows reserve the zone so nothing overlaps it.
+            let dur_text = track.duration_secs.map(|d| format!("{}:{:02}", d / 60, d % 60));
+            let dur_w = match (&dur_text, font_set()) {
+                (Some(text), Ok(fonts)) => {
+                    text_advance(text, &fonts.regular, appearance.font_size_artist * scale * 0.85).ceil() as i32
+                }
+                _ => 0,
+            };
+            let zone_w = if dur_w > 0 { dur_w + (8.0 * scale) as i32 } else { 0 };
+            let right = width - padding - zone_w;
 
             // Font-driven row heights: bands are sized from the actual fonts, so
             // rows can never overlap at any pill size (including mid-animation)
@@ -878,8 +1102,28 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
                     Some(&state.scroll[3]),
                 );
             }
+
+            if let Some(text) = dur_text {
+                let dur_rect = RECT {
+                    left: right + (4.0 * scale) as i32,
+                    top: title_rect.top,
+                    right: width - padding,
+                    bottom: title_rect.bottom,
+                };
+                draw_text_line_pixels(
+                    pixels,
+                    width as usize,
+                    &text,
+                    &dur_rect,
+                    rows[2].1 as i32,
+                    [0x99, 0x99, 0x99, 0xFF],
+                    false,
+                    false,
+                    None,
+                );
+            }
         }
-        MediaEvent::PlaybackStateChanged(playback) => {
+        MediaEvent::PlaybackStateChanged(playback) | MediaEvent::HistoryPlaybackState(playback, _) => {
             let label = match playback {
                 PlaybackState::Playing => "Playing",
                 PlaybackState::Paused => "Paused",
@@ -887,6 +1131,32 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
             };
             let fs_title = state.config.appearance.font_size_title * scale;
             let fs_artist = state.config.appearance.font_size_artist * scale;
+            // Right-edge zone: track duration + a state glyph on the label row.
+            let glyph = match playback {
+                PlaybackState::Playing => "▶",
+                PlaybackState::Paused => "‖",
+                PlaybackState::Stopped => "■",
+            };
+            let meta_px = fs_artist * 0.85;
+            let (dur_w, glyph_w) = match font_set() {
+                Ok(fonts) => {
+                    let dur_w = state
+                        .last_track
+                        .as_ref()
+                        .and_then(|t| t.duration_secs)
+                        .map(|d| text_advance(&format!("{}:{:02}", d / 60, d % 60), &fonts.regular, meta_px))
+                        .unwrap_or(0.0);
+                    (
+                        dur_w.ceil() as i32,
+                        text_advance(glyph, &fonts.regular, meta_px).ceil() as i32,
+                    )
+                }
+                Err(_) => (0, 0),
+            };
+            let gap = (8.0 * scale) as i32;
+            let zone_w = if dur_w > 0 { dur_w + glyph_w + gap } else { 0 };
+            let base_right = width - (state.config.appearance.padding * scale) as i32;
+
             let text_top = state.config.appearance.padding * scale;
             let mut y = text_top;
             let mut next_band = |h: f32| -> RECT {
@@ -911,6 +1181,49 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
                 true,
                 None,
             );
+            if zone_w > 0 {
+                let glyph_rect = RECT {
+                    left: base_right - glyph_w,
+                    top: label_rect.top,
+                    right: base_right,
+                    bottom: label_rect.bottom,
+                };
+                draw_text_line_pixels(
+                    pixels,
+                    width as usize,
+                    glyph,
+                    &glyph_rect,
+                    meta_px as i32,
+                    state.config.appearance.accent_color,
+                    true,
+                    false,
+                    None,
+                );
+                let dur = state
+                    .last_track
+                    .as_ref()
+                    .and_then(|t| t.duration_secs)
+                    .map(|d| format!("{}:{:02}", d / 60, d % 60));
+                if let Some(text) = dur {
+                    let dur_rect = RECT {
+                        left: base_right - glyph_w - dur_w - gap,
+                        top: label_rect.top,
+                        right: base_right - glyph_w - gap,
+                        bottom: label_rect.bottom,
+                    };
+                    draw_text_line_pixels(
+                        pixels,
+                        width as usize,
+                        &text,
+                        &dur_rect,
+                        meta_px as i32,
+                        [0x99, 0x99, 0x99, 0xFF],
+                        false,
+                        false,
+                        None,
+                    );
+                }
+            }
             if let Some(track) = &state.last_track {
                 let title_rect = next_band(fs_artist * ROW_HEIGHT);
                 draw_text_line_pixels(
@@ -956,6 +1269,12 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
             }
         }
     }
+}
+
+/// Total advance width of a text line in the given face and size, for
+/// right-edge layout.
+fn text_advance(value: &str, face: &Font, px: f32) -> f32 {
+    value.chars().map(|c| face.metrics(c, px).advance_width).sum()
 }
 
 /// Rasterizes one pill text line into the pixel buffer. Text that fits is
@@ -1273,7 +1592,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             LRESULT(0)
         }
-        WM_TIMER if wparam.0 == TIMER_ANIMATION => {
+        TIMER_ANIMATION_MSG => {
             if !state_ptr.is_null() {
                 (*state_ptr).tick();
             }
@@ -1281,10 +1600,19 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         }
         WM_DESTROY => LRESULT(0),
         WM_NCDESTROY => {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.delete_anim_timer();
+                if let Some(dib) = state.dib.take() {
+                    unsafe {
+                        let _ = SelectObject(dib.hdc, dib.old_bitmap);
+                        let _ = DeleteObject(dib.bitmap);
+                        let _ = DeleteDC(dib.hdc);
+                    }
+                }
                 drop(Box::from_raw(state_ptr));
             }
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),

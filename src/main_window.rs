@@ -628,6 +628,7 @@ impl MainWindowState {
         for event in batch {
             match event {
                 MediaEvent::TrackChanged(track) => self.add_track(track),
+                MediaEvent::TrackRestarted(track) => self.add_track(track),
                 MediaEvent::PlaybackStateChanged(state) => {
                     if let Some(current) = &mut self.current {
                         current.state = state;
@@ -635,12 +636,24 @@ impl MainWindowState {
                         self.invalidate();
                     }
                 }
+                MediaEvent::HistoryPlaybackState(state, source) => {
+                    // A state change from a non-current session: record it with
+                    // the app that produced it (title/artist are unknown here).
+                    let track = TrackInfo {
+                        source_app: source,
+                        ..TrackInfo::default()
+                    };
+                    self.push_history(track, state);
+                }
             }
         }
     }
 
-    fn add_state_change(&mut self, state: PlaybackState) {
-        let track = self.current.as_ref().map(|c| c.track.clone()).unwrap_or_default();
+    /// Appends a history row and syncs the listbox + tooltips. Artwork is
+    /// stripped before storing — the history is text-only, and the raw image
+    /// bytes would be pure waste across hundreds of rows.
+    fn push_history(&mut self, mut track: TrackInfo, state: PlaybackState) {
+        track.artwork = None;
         let before = self.history.len();
         self.history.push(HistoryEntry {
             at: Local::now(),
@@ -664,6 +677,11 @@ impl MainWindowState {
         self.sync_tooltips();
     }
 
+    fn add_state_change(&mut self, state: PlaybackState) {
+        let track = self.current.as_ref().map(|c| c.track.clone()).unwrap_or_default();
+        self.push_history(track, state);
+    }
+
     fn add_track(&mut self, track: TrackInfo) {
         // Metadata refresh for the same song (album/artwork arriving late): update
         // the current activity and the last history row in place instead of
@@ -680,6 +698,7 @@ impl MainWindowState {
             }
             if let Some(last) = self.history.entries.back_mut() {
                 last.track = track.clone();
+                last.track.artwork = None;
             }
             let row = history_row(
                 &track,
@@ -707,27 +726,7 @@ impl MainWindowState {
         }
 
         let state = self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing);
-        let before = self.history.len();
-        self.history.push(HistoryEntry {
-            at: Local::now(),
-            track: track.clone(),
-            state,
-        });
-        if self.history.len() <= before && before > 0 {
-            let _ = unsafe { SendMessageW(self.listbox, LB_DELETESTRING, WPARAM(0), LPARAM(0)) };
-        }
-        let row = history_row(&track, Local::now(), state);
-        let row = wide(&row);
-        if !self.listbox.0.is_null() {
-            unsafe {
-                let _ = SendMessageW(self.listbox, LB_ADDSTRING, WPARAM(0), LPARAM(row.as_ptr() as isize));
-                let count = SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
-                if count > 0 {
-                    let _ = SendMessageW(self.listbox, LB_SETTOPINDEX, WPARAM(count - 1), LPARAM(0));
-                }
-            }
-        }
-        self.sync_tooltips();
+        self.push_history(track.clone(), state);
         self.current = Some(CurrentActivity {
             track,
             state: self

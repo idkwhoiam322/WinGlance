@@ -13,6 +13,9 @@ pub struct Config {
 #[serde(default)]
 pub struct OverlayConfig {
     pub duration_ms: u64,
+    /// How long the pill stays for a track restart (repeat/Prev). Bounded at
+    /// 2s so a restart is a brief nudge, not a full notification.
+    pub restart_duration_ms: u64,
     pub animation_ms: u64,
     pub vertical: VerticalPosition,
     pub horizontal: HorizontalPosition,
@@ -73,6 +76,7 @@ impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             duration_ms: 3000,
+            restart_duration_ms: 2000,
             animation_ms: 200,
             vertical: VerticalPosition::Top,
             horizontal: HorizontalPosition::Center,
@@ -103,7 +107,9 @@ impl Default for AppearanceConfig {
         Self {
             background_color: [0x00, 0x00, 0x00, 0xFF],
             text_color: [0xFF, 0xFF, 0xFF, 0xFF],
-            accent_color: [0x00, 0xD4, 0xAA, 0xFF],
+            // Follow the user's Windows theme accent when it can be read;
+            // fall back to a neutral white.
+            accent_color: windows_accent_color(),
             corner_radius: 18.0,
             padding: 12.0,
             art_size: 48,
@@ -111,6 +117,25 @@ impl Default for AppearanceConfig {
             font_size_artist: 13.0,
         }
     }
+}
+
+/// The user's Windows accent color (DwmGetColorizationColor), or white when
+/// it cannot be read.
+fn windows_accent_color() -> [u8; 4] {
+    unsafe {
+        let mut color = 0u32;
+        let mut opaque = windows::Win32::Foundation::BOOL::default();
+        if windows::Win32::Graphics::Dwm::DwmGetColorizationColor(&mut color, &mut opaque).is_ok() {
+            // 0xAARRGGBB.
+            return [
+                ((color >> 16) & 0xFF) as u8,
+                ((color >> 8) & 0xFF) as u8,
+                (color & 0xFF) as u8,
+                0xFF,
+            ];
+        }
+    }
+    [0xFF, 0xFF, 0xFF, 0xFF]
 }
 
 impl Config {
@@ -154,6 +179,7 @@ impl Config {
 
     fn normalize(&mut self) {
         self.overlay.duration_ms = self.overlay.duration_ms.clamp(500, 60_000);
+        self.overlay.restart_duration_ms = self.overlay.restart_duration_ms.clamp(500, 2000);
         self.overlay.animation_ms = self.overlay.animation_ms.clamp(100, 500);
         self.overlay.max_width = self.overlay.max_width.clamp(180, 800);
         self.overlay.margin = self.overlay.margin.clamp(0, 500);
