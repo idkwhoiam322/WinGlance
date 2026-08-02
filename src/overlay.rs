@@ -76,6 +76,10 @@ enum Phase {
 struct PendingEvents {
     track: Option<TrackInfo>,
     playback: Option<PlaybackState>,
+    /// Source app of a playback-state change from a session that is not
+    /// current. The state pill then shows the source instead of whatever track
+    /// is in `last_track`, so it never displays another app's media data.
+    source: Option<String>,
     /// True when the pending track matches the currently shown track (same
     /// title+artist) and only metadata changed — e.g. album/artwork arriving a
     /// moment after the initial notification. Such refreshes update the pill in
@@ -159,6 +163,10 @@ struct OverlayState {
     /// Timestamp of the previous animation tick, for time-based marquee
     /// scrolling.
     last_tick: Instant,
+    /// Source app of the currently shown state pill, when it came from a
+    /// session that is not current. The pill draws this name instead of the
+    /// (wrong) last_track content.
+    state_source: Option<String>,
 }
 
 /// Resolved placement for the notch pill, pulled from [overlay] config. `x`/`y`
@@ -242,6 +250,7 @@ impl OverlayState {
             decoded_art_key: None,
             dib: None,
             last_tick: Instant::now(),
+            state_source: None,
         }
     }
 
@@ -318,8 +327,12 @@ impl OverlayState {
                 MediaEvent::PlaybackStateChanged(state) => self.pending.playback = Some(state),
                 // A state change from a session that is not current: still show
                 // the pill so no pause/play from any app is missed (the main
-                // window records the source in its history).
-                MediaEvent::HistoryPlaybackState(state, _) => self.pending.playback = Some(state),
+                // window records the source in its history). The source is
+                // carried so the pill shows this app, never another app's track.
+                MediaEvent::HistoryPlaybackState(state, source) => {
+                    self.pending.playback = Some(state);
+                    self.pending.source = Some(source);
+                }
                 MediaEvent::TrackRestarted(track) if self.config.behavior.enable_track_change => {
                     // A restart (Prev/repeat) re-shows the pill briefly.
                     self.show_restart(track);
@@ -345,7 +358,7 @@ impl OverlayState {
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_DEBOUNCE);
         }
-        let pending = std::mem::take(&mut self.pending);
+        let mut pending = std::mem::take(&mut self.pending);
         if let Some(track) = pending.track {
             let is_update = pending.track_update;
             self.last_track = Some(track.clone());
@@ -357,6 +370,9 @@ impl OverlayState {
         } else if let Some(playback) = pending.playback
             && self.config.behavior.enable_playback_state_change
         {
+            // A non-current session's state pill shows its source name, not
+            // whatever track was last emitted by another app.
+            self.state_source = pending.source.take();
             self.show(MediaEvent::PlaybackStateChanged(playback), false);
         }
     }
@@ -606,6 +622,7 @@ impl OverlayState {
         self.content = None;
         self.dismiss_at = None;
         self.phase = Phase::Hidden;
+        self.state_source = None;
         self.delete_anim_timer();
         unsafe {
             // Do NOT kill the debounce timer here: an event that arrived while
@@ -1183,7 +1200,34 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
                 true,
                 None,
             );
-            if let Some(track) = &state.last_track {
+            if let Some(source_name) = state.state_source.as_deref() {
+                // A state change from a session that is not current: show the
+                // app that produced it, never another app's track.
+                let title_rect = next_band(fs_artist * ROW_HEIGHT);
+                draw_text_line_pixels(
+                    pixels,
+                    width as usize,
+                    source_name,
+                    &title_rect,
+                    fs_artist as i32,
+                    appearance.text_color,
+                    true,
+                    true,
+                    None,
+                );
+                let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
+                draw_text_line_pixels(
+                    pixels,
+                    width as usize,
+                    "Unknown",
+                    &artist_rect,
+                    (fs_artist * 0.85) as i32,
+                    [0xCC, 0xCC, 0xCC, 0xFF],
+                    false,
+                    true,
+                    None,
+                );
+            } else if let Some(track) = &state.last_track {
                 let title_rect = next_band(fs_artist * ROW_HEIGHT);
                 draw_text_line_pixels(
                     pixels,
