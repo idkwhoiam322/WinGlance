@@ -88,6 +88,34 @@ fn install_crash_handler(logs_dir: &Path) {
     }
 }
 
+/// Writes Rust panics to crash.log. A panic in a window-proc unwinds across
+/// the extern "C" boundary, which aborts the process silently (no access
+/// violation, so the vectored handler never fires) — without this hook a
+/// panic looks like the app "stopped running randomly".
+fn install_panic_hook(logs_dir: &Path) {
+    let dir = logs_dir.to_path_buf();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown payload".to_string()
+        };
+        let location = info.location().map(|l| l.to_string()).unwrap_or_default();
+        let message = format!("PANIC {payload} at {location}\n");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("crash.log"))
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(message.as_bytes())
+            });
+    }));
+}
+
 /// Acquires a named mutex owned by the process. When another instance already
 /// holds it, CreateMutexW succeeds with ERROR_ALREADY_EXISTS, and the app
 /// exits without touching the existing instance's windows.
@@ -103,6 +131,7 @@ fn main() -> Result<()> {
     let config = config::Config::load()?;
     logging::init_logging(&config.logs_dir());
     install_crash_handler(&config.logs_dir());
+    install_panic_hook(&config.logs_dir());
 
     // Only one instance may run at a time; the mutex lives for the process
     // lifetime and is released automatically when the process exits.
@@ -161,8 +190,14 @@ fn main() -> Result<()> {
                 std::thread::sleep(Duration::from_secs(5));
                 continue;
             }
-            let _ = worker.join();
-            // The worker exited on its own (an error): restart it.
+            match worker.join() {
+                Ok(()) => {}
+                Err(panic) => {
+                    let payload = panic.downcast_ref::<&str>().copied().unwrap_or("unknown panic");
+                    error!("SMTC worker panicked: {payload}");
+                }
+            }
+            // The worker exited on its own (an error or a panic): restart it.
             warn!("SMTC worker exited; restarting it");
             std::thread::sleep(Duration::from_secs(5));
         }
