@@ -11,12 +11,13 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POI
 use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
     DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteObject, EndPaint, FF_DONTCARE, FillRect, GetStockObject,
-    HBRUSH, HDC, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, SetBkColor, SetTextColor,
+    HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, SetBkColor, SetTextColor,
     StretchDIBits,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
@@ -28,8 +29,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY,
-    WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT,
-    WM_SIZE, WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP,
+    WM_SETFONT, WM_SIZE, WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -76,6 +78,52 @@ const SIDEBAR_W: f32 = 80.0;
 enum Pane {
     Activity,
     Settings,
+}
+
+/// Settings rows, mirroring NewsAggregator's settings layout: section headers
+/// with label-left / control-right card rows.
+#[derive(Clone, Copy, PartialEq)]
+enum SettingId {
+    Notifications,
+    Duration,
+    StartOnLogin,
+    CloseToTray,
+    Position,
+}
+
+enum SettingsItem {
+    Header { text: &'static str, rect: RECT },
+    Row { id: SettingId, rect: RECT },
+}
+
+const SETTINGS_SURFACE: [u8; 4] = [0x1B, 0x1B, 0x1B, 0xFF];
+const SETTINGS_BORDER: [u8; 4] = [0x2D, 0x2D, 0x2D, 0xFF];
+const SETTINGS_HOVER: [u8; 4] = [0x24, 0x24, 0x24, 0xFF];
+const SETTINGS_TEXT: [u8; 4] = [0xF0, 0xF0, 0xF0, 0xFF];
+const SETTINGS_MUTED: [u8; 4] = [0xC8, 0xC8, 0xC8, 0xFF];
+const SETTINGS_FAINT: [u8; 4] = [0x7A, 0x7A, 0x7A, 0xFF];
+
+/// Blends `a` over `b` (0.0 = b, 1.0 = a).
+fn mix(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
+    [
+        (a[0] as f32 * t + b[0] as f32 * (1.0 - t)) as u8,
+        (a[1] as f32 * t + b[1] as f32 * (1.0 - t)) as u8,
+        (a[2] as f32 * t + b[2] as f32 * (1.0 - t)) as u8,
+        0xFF,
+    ]
+}
+
+fn segment_rects(rect: &RECT, count: usize, gap: i32) -> Vec<RECT> {
+    let total = rect.right - rect.left;
+    let w = (total - gap * (count as i32 - 1)) / count as i32;
+    (0..count)
+        .map(|i| RECT {
+            left: rect.left + (i as i32) * (w + gap),
+            top: rect.top,
+            right: (rect.left + ((i as i32) + 1) * (w + gap) - gap).min(rect.right),
+            bottom: rect.bottom,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +184,8 @@ struct MainWindowState {
     accent_brush: HBRUSH,
     notifications_enabled: bool,
     active_pane: Pane,
+    /// Hovered settings row (row index, optional segment index) for highlight.
+    settings_hover: Option<(usize, Option<usize>)>,
 }
 
 /// Creates the main window: a maximized tracker with current activity,
@@ -204,6 +254,7 @@ impl MainWindowState {
             accent_brush: HBRUSH::default(),
             notifications_enabled: true,
             active_pane: Pane::Activity,
+            settings_hover: None,
         }
     }
 
@@ -714,119 +765,307 @@ impl MainWindowState {
         );
     }
 
-    fn paint_settings(&self, hdc: HDC, content_left: i32, client_w: i32, _client_h: i32, scale: f32, pad: i32) {
-        let label_color = [0x99, 0x99, 0x99, 0xFF];
-        let value_color = self.config.appearance.text_color;
-        let accent = self.config.appearance.accent_color;
-        let row_h = (48.0 * scale) as i32;
+    /// Builds the settings pane items (section headers + interactive rows).
+    /// Both painting and hit-testing use this single source of layout truth.
+    fn settings_items(&self, content_left: i32, client_w: i32, pad: i32, scale: f32) -> Vec<SettingsItem> {
+        let row_h = (34.0 * scale) as i32;
+        let gap = (8.0 * scale) as i32;
+        let header_h = (18.0 * scale) as i32;
+        let left = content_left + pad;
+        let right = client_w - pad;
+        let mut y = pad + (36.0 * scale) as i32;
+        let mut items = Vec::new();
 
-        let mut y = pad;
-        // Header
+        items.push(SettingsItem::Header {
+            text: "Behavior",
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + header_h,
+            },
+        });
+        y += (22.0 * scale) as i32;
+        for id in [
+            SettingId::Notifications,
+            SettingId::Duration,
+            SettingId::StartOnLogin,
+            SettingId::CloseToTray,
+        ] {
+            items.push(SettingsItem::Row {
+                id,
+                rect: RECT {
+                    left,
+                    top: y,
+                    right,
+                    bottom: y + row_h,
+                },
+            });
+            y += row_h + gap;
+        }
+        y += (14.0 * scale) as i32;
+        items.push(SettingsItem::Header {
+            text: "Overlay",
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + header_h,
+            },
+        });
+        y += (22.0 * scale) as i32;
+        items.push(SettingsItem::Row {
+            id: SettingId::Position,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        items
+    }
+
+    fn paint_settings(&self, hdc: HDC, content_left: i32, client_w: i32, _client_h: i32, scale: f32, pad: i32) {
+        let accent = self.config.appearance.accent_color;
+        let accent_soft = mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], 0.28);
+
         let mut hdr = RECT {
             left: content_left + pad,
-            top: y,
+            top: pad,
             right: client_w - pad,
-            bottom: y + (24.0 * scale) as i32,
+            bottom: pad + (24.0 * scale) as i32,
         };
         draw_string(hdc, "SETTINGS", &mut hdr, (13.0 * scale) as i32, accent, true, false);
-        y += (36.0 * scale) as i32;
 
-        // Each row: label at y, value at y+20
-        let label_y = y;
-        let val_y = y + (20.0 * scale) as i32;
+        let items = self.settings_items(content_left, client_w, pad, scale);
+        let mut row_index = 0usize;
+        for item in &items {
+            match item {
+                SettingsItem::Header { text, rect } => {
+                    let mut hr = *rect;
+                    draw_string(hdc, text, &mut hr, (9.0 * scale) as i32, SETTINGS_FAINT, true, false);
+                }
+                SettingsItem::Row { id, rect } => {
+                    let hovered_row = self.settings_hover.is_some_and(|(r, _)| r == row_index);
+                    let label_w = (((rect.right - rect.left) as f32) * 0.42) as i32;
+                    let label_rect = RECT {
+                        left: rect.left + (12.0 * scale) as i32,
+                        top: rect.top,
+                        right: rect.left + label_w,
+                        bottom: rect.bottom,
+                    };
+                    let control_left = rect.left + label_w + (10.0 * scale) as i32;
+                    let control_rect = RECT {
+                        left: control_left,
+                        top: rect.top,
+                        right: rect.right - (10.0 * scale) as i32,
+                        bottom: rect.bottom,
+                    };
 
-        // Notifications
-        let mut lbl = RECT {
-            left: content_left + pad,
-            top: label_y,
-            right: client_w - pad,
-            bottom: label_y + (18.0 * scale) as i32,
-        };
-        draw_string(
-            hdc,
-            "Notifications",
-            &mut lbl,
-            (10.0 * scale) as i32,
-            label_color,
-            false,
-            false,
-        );
-        let notif_color = if self.notifications_enabled {
-            accent
-        } else {
-            [0x66, 0x66, 0x66, 0xFF]
-        };
-        let mut val = RECT {
-            left: content_left + pad,
-            top: val_y,
-            right: client_w - pad,
-            bottom: val_y + (20.0 * scale) as i32,
-        };
-        draw_string(
-            hdc,
-            if self.notifications_enabled { "ON" } else { "OFF" },
-            &mut val,
-            (12.0 * scale) as i32,
-            notif_color,
-            false,
-            false,
-        );
-        y += row_h;
+                    // Card: border + surface fill (+ hover tint)
+                    let border_brush = unsafe {
+                        CreateSolidBrush(colorref(SETTINGS_BORDER[0], SETTINGS_BORDER[1], SETTINGS_BORDER[2]))
+                    };
+                    unsafe {
+                        let _ = FillRect(hdc, rect, border_brush);
+                    }
+                    unsafe {
+                        let _ = DeleteObject(HGDIOBJ(border_brush.0));
+                    }
+                    let inner = RECT {
+                        left: rect.left + 1,
+                        top: rect.top + 1,
+                        right: rect.right - 1,
+                        bottom: rect.bottom - 1,
+                    };
+                    let bg = if hovered_row { SETTINGS_HOVER } else { SETTINGS_SURFACE };
+                    let bg_brush = unsafe { CreateSolidBrush(colorref(bg[0], bg[1], bg[2])) };
+                    unsafe {
+                        let _ = FillRect(hdc, &inner, bg_brush);
+                    }
+                    unsafe {
+                        let _ = DeleteObject(HGDIOBJ(bg_brush.0));
+                    }
 
-        // Duration
-        let label_y = y;
-        let val_y = y + (20.0 * scale) as i32;
-        let mut lbl = RECT {
-            left: content_left + pad,
-            top: label_y,
-            right: client_w - pad,
-            bottom: label_y + (18.0 * scale) as i32,
-        };
-        draw_string(
-            hdc,
-            "Duration",
-            &mut lbl,
-            (10.0 * scale) as i32,
-            label_color,
-            false,
-            false,
-        );
-        let mut val = RECT {
-            left: content_left + pad,
-            top: val_y,
-            right: client_w - pad,
-            bottom: val_y + (20.0 * scale) as i32,
-        };
-        draw_string(
-            hdc,
-            &format!("{}s", self.config.overlay.duration_ms / 1000),
-            &mut val,
-            (12.0 * scale) as i32,
-            value_color,
-            false,
-            false,
-        );
-        y += row_h;
+                    let (label, value_text, value_color) = match id {
+                        SettingId::Notifications => (
+                            "Notifications",
+                            if self.notifications_enabled {
+                                "ON".to_string()
+                            } else {
+                                "OFF".to_string()
+                            },
+                            if self.notifications_enabled {
+                                accent
+                            } else {
+                                SETTINGS_FAINT
+                            },
+                        ),
+                        SettingId::StartOnLogin => (
+                            "Start on login",
+                            if self.config.behavior.start_on_login {
+                                "ON".to_string()
+                            } else {
+                                "OFF".to_string()
+                            },
+                            if self.config.behavior.start_on_login {
+                                accent
+                            } else {
+                                SETTINGS_FAINT
+                            },
+                        ),
+                        SettingId::CloseToTray => (
+                            "Close to tray",
+                            if self.config.behavior.close_to_tray {
+                                "ON".to_string()
+                            } else {
+                                "OFF".to_string()
+                            },
+                            if self.config.behavior.close_to_tray {
+                                accent
+                            } else {
+                                SETTINGS_FAINT
+                            },
+                        ),
+                        SettingId::Duration => (
+                            "Duration",
+                            format!("{}s", self.config.overlay.duration_ms / 1000),
+                            SETTINGS_MUTED,
+                        ),
+                        SettingId::Position => ("Position", self.position_label(), SETTINGS_MUTED),
+                    };
+                    let mut lbl_rect = label_rect;
+                    draw_string(
+                        hdc,
+                        label,
+                        &mut lbl_rect,
+                        (11.0 * scale) as i32,
+                        SETTINGS_MUTED,
+                        false,
+                        false,
+                    );
 
-        // Position
-        let label_y = y;
-        let val_y = y + (20.0 * scale) as i32;
-        let mut lbl = RECT {
-            left: content_left + pad,
-            top: label_y,
-            right: client_w - pad,
-            bottom: label_y + (18.0 * scale) as i32,
-        };
-        draw_string(
-            hdc,
-            "Position",
-            &mut lbl,
-            (10.0 * scale) as i32,
-            label_color,
-            false,
-            false,
-        );
-        let pos_text = if self.config.overlay.position_x.is_some() {
+                    match id {
+                        SettingId::Notifications | SettingId::StartOnLogin | SettingId::CloseToTray => {
+                            let mut val_rect = control_rect;
+                            draw_string(
+                                hdc,
+                                &value_text,
+                                &mut val_rect,
+                                (11.0 * scale) as i32,
+                                value_color,
+                                true,
+                                false,
+                            );
+                        }
+                        SettingId::Duration => {
+                            let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
+                            let values = [2000u64, 3000, 5000, 10000];
+                            for (i, seg) in segments.iter().enumerate() {
+                                let active = self.config.overlay.duration_ms == values[i];
+                                let seg_hovered = self.settings_hover == Some((row_index, Some(i)));
+                                let border = if active {
+                                    colorref(accent[0], accent[1], accent[2])
+                                } else {
+                                    colorref(SETTINGS_BORDER[0], SETTINGS_BORDER[1], SETTINGS_BORDER[2])
+                                };
+                                let b = unsafe { CreateSolidBrush(border) };
+                                unsafe {
+                                    let _ = FillRect(hdc, seg, b);
+                                }
+                                unsafe {
+                                    let _ = DeleteObject(HGDIOBJ(b.0));
+                                }
+                                let s_inner = RECT {
+                                    left: seg.left + 1,
+                                    top: seg.top + 1,
+                                    right: seg.right - 1,
+                                    bottom: seg.bottom - 1,
+                                };
+                                let fill = if active {
+                                    accent_soft
+                                } else if seg_hovered {
+                                    SETTINGS_HOVER
+                                } else {
+                                    SETTINGS_SURFACE
+                                };
+                                let f = unsafe { CreateSolidBrush(colorref(fill[0], fill[1], fill[2])) };
+                                unsafe {
+                                    let _ = FillRect(hdc, &s_inner, f);
+                                }
+                                unsafe {
+                                    let _ = DeleteObject(HGDIOBJ(f.0));
+                                }
+                                let mut t = s_inner;
+                                let tc = if active { SETTINGS_TEXT } else { SETTINGS_MUTED };
+                                draw_string(
+                                    hdc,
+                                    &format!("{}s", values[i] / 1000),
+                                    &mut t,
+                                    (10.0 * scale) as i32,
+                                    tc,
+                                    active,
+                                    true,
+                                );
+                            }
+                        }
+                        SettingId::Position => {
+                            let adjust_w = (72.0 * scale) as i32;
+                            let value_rect = RECT {
+                                left: control_rect.left,
+                                top: control_rect.top,
+                                right: control_rect.right - adjust_w - (8.0 * scale) as i32,
+                                bottom: control_rect.bottom,
+                            };
+                            let mut v = value_rect;
+                            draw_string(
+                                hdc,
+                                &value_text,
+                                &mut v,
+                                (10.0 * scale) as i32,
+                                SETTINGS_FAINT,
+                                false,
+                                false,
+                            );
+                            let btn = RECT {
+                                left: control_rect.right - adjust_w,
+                                top: control_rect.top,
+                                right: control_rect.right,
+                                bottom: control_rect.bottom,
+                            };
+                            let b = unsafe { CreateSolidBrush(colorref(accent[0], accent[1], accent[2])) };
+                            unsafe {
+                                let _ = FillRect(hdc, &btn, b);
+                            }
+                            unsafe {
+                                let _ = DeleteObject(HGDIOBJ(b.0));
+                            }
+                            let b_inner = RECT {
+                                left: btn.left + 1,
+                                top: btn.top + 1,
+                                right: btn.right - 1,
+                                bottom: btn.bottom - 1,
+                            };
+                            let bf = unsafe { CreateSolidBrush(COLORREF(0x00121212)) };
+                            unsafe {
+                                let _ = FillRect(hdc, &b_inner, bf);
+                            }
+                            unsafe {
+                                let _ = DeleteObject(HGDIOBJ(bf.0));
+                            }
+                            let mut bt = b_inner;
+                            draw_string(hdc, "Adjust", &mut bt, (10.0 * scale) as i32, accent, true, true);
+                        }
+                    }
+                    row_index += 1;
+                }
+            }
+        }
+    }
+
+    fn position_label(&self) -> String {
+        if self.config.overlay.position_x.is_some() {
             format!(
                 "Custom ({}, {})",
                 self.config.overlay.position_x.unwrap_or(0),
@@ -845,110 +1084,44 @@ impl MainWindowState {
                     HorizontalPosition::Right => "right",
                 }
             )
-        };
-        let mut val = RECT {
-            left: content_left + pad,
-            top: val_y,
-            right: client_w - pad,
-            bottom: val_y + (20.0 * scale) as i32,
-        };
-        draw_string(
-            hdc,
-            &pos_text,
-            &mut val,
-            (12.0 * scale) as i32,
-            value_color,
-            false,
-            false,
-        );
-        y += row_h;
+        }
+    }
 
-        // Start on login
-        let label_y = y;
-        let val_y = y + (20.0 * scale) as i32;
-        let mut lbl = RECT {
-            left: content_left + pad,
-            top: label_y,
-            right: client_w - pad,
-            bottom: label_y + (18.0 * scale) as i32,
-        };
-        draw_string(
-            hdc,
-            "Start on login",
-            &mut lbl,
-            (10.0 * scale) as i32,
-            label_color,
-            false,
-            false,
-        );
-        let login_color = if self.config.behavior.start_on_login {
-            accent
-        } else {
-            [0x66, 0x66, 0x66, 0xFF]
-        };
-        let mut val = RECT {
-            left: content_left + pad,
-            top: val_y,
-            right: client_w - pad,
-            bottom: val_y + (20.0 * scale) as i32,
-        };
-        draw_string(
-            hdc,
-            if self.config.behavior.start_on_login {
-                "ON"
-            } else {
-                "OFF"
-            },
-            &mut val,
-            (12.0 * scale) as i32,
-            login_color,
-            false,
-            false,
-        );
-        y += row_h;
-
-        // Close to tray
-        let label_y = y;
-        let val_y = y + (20.0 * scale) as i32;
-        let mut lbl = RECT {
-            left: content_left + pad,
-            top: label_y,
-            right: client_w - pad,
-            bottom: label_y + (18.0 * scale) as i32,
-        };
-        draw_string(
-            hdc,
-            "Close to tray",
-            &mut lbl,
-            (10.0 * scale) as i32,
-            label_color,
-            false,
-            false,
-        );
-        let tray_color = if self.config.behavior.close_to_tray {
-            accent
-        } else {
-            [0x66, 0x66, 0x66, 0xFF]
-        };
-        let mut val = RECT {
-            left: content_left + pad,
-            top: val_y,
-            right: client_w - pad,
-            bottom: val_y + (20.0 * scale) as i32,
-        };
-        draw_string(
-            hdc,
-            if self.config.behavior.close_to_tray {
-                "ON"
-            } else {
-                "OFF"
-            },
-            &mut val,
-            (12.0 * scale) as i32,
-            tray_color,
-            false,
-            false,
-        );
+    /// Computes which settings control is under a client-space point, for hover
+    /// highlighting. Returns (row index, segment index) where segment is None for
+    /// whole-row controls and Some(i) for the i-th duration segment.
+    fn settings_hover_at(
+        &self,
+        x: i32,
+        y: i32,
+        content_left: i32,
+        client_w: i32,
+        pad: i32,
+        scale: f32,
+    ) -> Option<(usize, Option<usize>)> {
+        let items = self.settings_items(content_left, client_w, pad, scale);
+        for (row_index, item) in items.iter().enumerate() {
+            if let SettingsItem::Row { id, rect } = item
+                && y >= rect.top
+                && y < rect.bottom
+            {
+                let label_w = (((rect.right - rect.left) as f32) * 0.42) as i32;
+                let control_left = rect.left + label_w + (10.0 * scale) as i32;
+                let control_rect = RECT {
+                    left: control_left,
+                    top: rect.top,
+                    right: rect.right - (10.0 * scale) as i32,
+                    bottom: rect.bottom,
+                };
+                if *id == SettingId::Duration {
+                    let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
+                    let seg = segments.iter().position(|s| x >= s.left && x < s.right);
+                    return Some((row_index, seg));
+                }
+                return Some((row_index, None));
+            }
+        }
+        None
     }
 
     fn layout(&self) {
@@ -1469,6 +1642,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                 let sidebar_w = (SIDEBAR_W * scale).round() as i32;
                 let pad = (PAD * scale) as i32;
+                let (client_w, _client_h) = client_size(hwnd);
 
                 // Check sidebar clicks
                 if x < sidebar_w {
@@ -1490,69 +1664,101 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                         let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
                     }
                 } else if state.active_pane == Pane::Settings {
-                    // Check settings item clicks - must match paint_settings layout exactly
-                    let mut sy = pad + (36.0 * scale) as i32; // header height
-                    let row_h = (48.0 * scale) as i32;
-                    let val_top = sy + (20.0 * scale) as i32;
-                    let val_bot = val_top + (20.0 * scale) as i32;
-
-                    // Notifications
-                    if y >= val_top && y < val_bot {
-                        state.notifications_enabled = !state.notifications_enabled;
-                        let _ = PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0));
-                        state.invalidate();
-                        return LRESULT(0);
-                    }
-                    sy += row_h;
-                    let val_top = sy + (20.0 * scale) as i32;
-                    let val_bot = val_top + (20.0 * scale) as i32;
-
-                    // Duration
-                    if y >= val_top && y < val_bot {
-                        state.config.overlay.duration_ms = match state.config.overlay.duration_ms {
-                            2000 => 3000,
-                            3000 => 5000,
-                            5000 => 10000,
-                            _ => 2000,
-                        };
-                        let _ = state.config.save();
-                        state.invalidate();
-                        return LRESULT(0);
-                    }
-                    sy += row_h;
-                    let val_top = sy + (20.0 * scale) as i32;
-                    let val_bot = val_top + (20.0 * scale) as i32;
-
-                    // Position
-                    if y >= val_top && y < val_bot {
-                        let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
-                        return LRESULT(0);
-                    }
-                    sy += row_h;
-                    let val_top = sy + (20.0 * scale) as i32;
-                    let val_bot = val_top + (20.0 * scale) as i32;
-
-                    // Start on login
-                    if y >= val_top && y < val_bot {
-                        state.config.behavior.start_on_login = !state.config.behavior.start_on_login;
-                        let _ = state.config.save();
-                        if let Err(error) = autostart::apply(state.config.behavior.start_on_login) {
-                            error!("start-on-login update failed: {error:#}");
+                    // Hit-test against the same layout used by paint_settings.
+                    let items = state.settings_items(sidebar_w, client_w, pad, scale);
+                    for item in &items {
+                        if let SettingsItem::Row { id, rect } = item
+                            && y >= rect.top
+                            && y < rect.bottom
+                        {
+                            let label_w = (((rect.right - rect.left) as f32) * 0.42) as i32;
+                            let control_left = rect.left + label_w + (10.0 * scale) as i32;
+                            let control_rect = RECT {
+                                left: control_left,
+                                top: rect.top,
+                                right: rect.right - (10.0 * scale) as i32,
+                                bottom: rect.bottom,
+                            };
+                            match id {
+                                SettingId::Notifications => {
+                                    state.notifications_enabled = !state.notifications_enabled;
+                                    let _ = PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0));
+                                    state.invalidate();
+                                }
+                                SettingId::StartOnLogin => {
+                                    state.config.behavior.start_on_login = !state.config.behavior.start_on_login;
+                                    let _ = state.config.save();
+                                    if let Err(error) = autostart::apply(state.config.behavior.start_on_login) {
+                                        error!("start-on-login update failed: {error:#}");
+                                    }
+                                    state.invalidate();
+                                }
+                                SettingId::CloseToTray => {
+                                    state.config.behavior.close_to_tray = !state.config.behavior.close_to_tray;
+                                    let _ = state.config.save();
+                                    state.invalidate();
+                                }
+                                SettingId::Duration => {
+                                    let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
+                                    let values = [2000u64, 3000, 5000, 10000];
+                                    if let Some((i, _)) =
+                                        segments.iter().enumerate().find(|(_, s)| y >= s.top && y < s.bottom)
+                                    {
+                                        state.config.overlay.duration_ms = values[i];
+                                        let _ = state.config.save();
+                                        state.invalidate();
+                                    }
+                                }
+                                SettingId::Position => {
+                                    let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
+                                }
+                            }
+                            return LRESULT(0);
                         }
-                        state.invalidate();
-                        return LRESULT(0);
                     }
-                    sy += row_h;
-                    let val_top = sy + (20.0 * scale) as i32;
-                    let val_bot = val_top + (20.0 * scale) as i32;
-
-                    // Close to tray
-                    if y >= val_top && y < val_bot {
-                        state.config.behavior.close_to_tray = !state.config.behavior.close_to_tray;
-                        let _ = state.config.save();
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                if state.active_pane == Pane::Settings {
+                    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+                    let x = (lparam.0 & 0xFFFF) as i32;
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+                    let pad = (PAD * scale) as i32;
+                    let (client_w, _) = client_size(hwnd);
+                    let hover = if x < sidebar_w {
+                        None
+                    } else {
+                        state.settings_hover_at(x, y, sidebar_w, client_w, pad, scale)
+                    };
+                    if hover != state.settings_hover {
+                        state.settings_hover = hover;
                         state.invalidate();
-                        return LRESULT(0);
                     }
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut tme);
+                } else if state.settings_hover.is_some() {
+                    state.settings_hover = None;
+                    state.invalidate();
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                if state.settings_hover.is_some() {
+                    state.settings_hover = None;
+                    state.invalidate();
                 }
             }
             LRESULT(0)
