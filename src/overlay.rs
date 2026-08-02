@@ -24,9 +24,9 @@ use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueT
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetForegroundWindow, GetWindowLongPtrW,
-    HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, KillTimer, LoadCursorW, MA_NOACTIVATE, RegisterClassExW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA, WM_APP, WM_DESTROY,
+    HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW, MA_NOACTIVATE, RegisterClassExW,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA, WM_APP, WM_DESTROY,
     WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASS_STYLES, WNDCLASSEXW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -389,6 +389,7 @@ impl OverlayState {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
+        debug!("pill shown | duration_ms={duration_ms}");
         self.render();
     }
 
@@ -404,6 +405,13 @@ impl OverlayState {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
         self.last_tick = now;
+        // A layered popup can be hidden by fullscreen transitions or external
+        // ShowWindow calls; re-assert visibility while a pill should be up.
+        if !matches!(self.phase, Phase::Hidden) && !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
         if self.dismiss_at.is_some_and(|deadline| deadline <= now)
             && !matches!(self.phase, Phase::Collapsing(_) | Phase::Hidden)
         {
