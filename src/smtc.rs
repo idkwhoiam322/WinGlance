@@ -41,16 +41,43 @@ struct ListenerState {
     current_key: Option<usize>,
     recent_playing: Option<GlobalSystemMediaTransportControlsSession>,
     pending_track: Option<(usize, TrackInfo)>,
-    pending_playback: Option<(usize, PlaybackState)>,
+    /// Held playback state with the deadline after which it may be emitted. The
+    /// short hold coalesces the Paused→track→Playing burst of a song change into
+    /// a single track notification: a state change that is overtaken by a track
+    /// event within the hold window is dropped.
+    pending_playback: Option<(usize, PlaybackState, Instant)>,
     pending_deadline: Option<Instant>,
     track_pending_since: Option<Instant>,
     last_content_fingerprint: Option<TrackFingerprint>,
-    last_playback: Option<(usize, PlaybackState)>,
+    /// Last emitted playback state (global, not per-session): duplicate state
+    /// events from any session are noise for the pill.
+    last_playback: Option<PlaybackState>,
+    /// When the last TrackChanged was emitted, to suppress the transition state
+    /// blip that follows a song change.
+    last_track_emitted: Option<(usize, Instant)>,
     last_session_check: Instant,
     /// Whether the tracked session is currently Playing. Used to decide when a
     /// new source may take over the pill (only when nothing we track is active).
     current_playing: bool,
+    /// Album title by (title, artist), so a track read that omits the album can
+    /// still carry it. Insert replaces — a newer album always wins over a stale
+    /// cached one.
+    album_cache: HashMap<(String, String), String>,
+    /// Artwork bytes by (title, artist), so a read that omits the thumbnail can
+    /// still carry it. Insert replaces — a new cover for the same item replaces
+    /// the old cached one.
+    artwork_cache: HashMap<(String, String), Vec<u8>>,
 }
+
+/// How long a playback state change is held before emission, so a song-change
+/// burst (Paused → track → Playing) collapses into the track notification.
+const STATE_HOLD_MS: u64 = 500;
+/// Window after a TrackChanged in which same-session playback state changes are
+/// suppressed (they are the transition blips of the song change itself).
+const TRACK_TRANSITION_MS: u64 = 400;
+/// Upper bound for the album/artwork caches; beyond it they are cleared (the
+/// caches are a convenience, not critical state).
+const CACHE_CAP: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrackFingerprint {
@@ -123,8 +150,11 @@ impl ListenerState {
             track_pending_since: None,
             last_content_fingerprint: None,
             last_playback: None,
+            last_track_emitted: None,
             last_session_check: Instant::now(),
             current_playing: false,
+            album_cache: HashMap::new(),
+            artwork_cache: HashMap::new(),
         }
     }
 
@@ -170,8 +200,9 @@ impl ListenerState {
                 self.refresh_current_session(Some(&session), true, true)?;
                 if self.current_key == Some(session_key(&session))
                     && read_playback_state(&session)? != Some(PlaybackState::Stopped)
-                    && let Ok(track) = read_track_info(&session)
+                    && let Ok(mut track) = read_track_info(&session)
                 {
+                    self.apply_cache(&mut track);
                     let key = session_key(&session);
                     // SMTC fills metadata progressively (title -> artist -> album ->
                     // artwork). If a read for the same song arrives, merge the richer
@@ -196,6 +227,9 @@ impl ListenerState {
                     } else {
                         self.pending_track = Some((key, track));
                     }
+                    // A track change is imminent: drop any held state so the song
+                    // change collapses into a single track notification.
+                    self.pending_playback = None;
                     self.schedule_flush();
                 }
             }
@@ -211,7 +245,7 @@ impl ListenerState {
                             if self.current_key == before {
                                 // Nothing else took over — report the stop.
                                 self.current_playing = false;
-                                self.pending_playback = Some((key, state));
+                                self.pending_playback = Some((key, state, Instant::now()));
                                 self.schedule_flush();
                             }
                             return Ok(());
@@ -220,7 +254,20 @@ impl ListenerState {
                             self.recent_playing = Some(session.clone());
                         }
                         self.current_playing = state == PlaybackState::Playing;
-                        self.pending_playback = Some((key, state));
+                        // Coalescing: skip state changes that are part of a song
+                        // change — a track is pending, or one was just emitted for
+                        // this session. Genuine pauses (no track activity) pass
+                        // through the hold window.
+                        let track_pending = self.pending_track.as_ref().is_some_and(|(k, _)| *k == key);
+                        let just_emitted = self.last_track_emitted.is_some_and(|(k, at)| {
+                            k == key && at.elapsed() < Duration::from_millis(TRACK_TRANSITION_MS)
+                        });
+                        if track_pending || just_emitted {
+                            self.last_playback = Some(state);
+                            return Ok(());
+                        }
+                        self.pending_playback =
+                            Some((key, state, Instant::now() + Duration::from_millis(STATE_HOLD_MS)));
                         self.schedule_flush();
                     }
                 } else if !self.current_playing
@@ -234,6 +281,32 @@ impl ListenerState {
             }
         }
         Ok(())
+    }
+
+    /// Updates the album/artwork caches from a fresh read (replacing any older
+    /// entries for the same item) and back-fills any missing fields from cache,
+    /// so a notification can carry album/cover even when the event itself omits
+    /// them.
+    fn apply_cache(&mut self, track: &mut TrackInfo) {
+        let key = (track.title.clone(), track.artist.clone());
+        if !track.album.trim().is_empty() {
+            self.album_cache.insert(key.clone(), track.album.clone());
+        } else if let Some(album) = self.album_cache.get(&key) {
+            track.album = album.clone();
+        }
+        if track.artwork.is_some() {
+            if let Some(bytes) = &track.artwork {
+                self.artwork_cache.insert(key.clone(), bytes.clone());
+            }
+        } else if let Some(bytes) = self.artwork_cache.get(&key) {
+            track.artwork = Some(bytes.clone());
+        }
+        if self.album_cache.len() > CACHE_CAP {
+            self.album_cache.clear();
+        }
+        if self.artwork_cache.len() > CACHE_CAP {
+            self.artwork_cache.clear();
+        }
     }
 
     fn refresh_current_session(
@@ -256,8 +329,9 @@ impl ListenerState {
             self.current_playing = matches!(playback, Some(PlaybackState::Playing));
             if emit_initial {
                 if playback != Some(PlaybackState::Stopped)
-                    && let Ok(track) = read_track_info(&session)
+                    && let Ok(mut track) = read_track_info(&session)
                 {
+                    self.apply_cache(&mut track);
                     self.pending_track = Some((session_key(&session), track));
                 }
                 if let Some(state) = playback {
@@ -267,9 +341,9 @@ impl ListenerState {
                     if state == PlaybackState::Stopped {
                         // Establish a baseline without showing an empty/stopped
                         // notification when the app starts with no active media.
-                        self.last_playback = Some((session_key(&session), state));
+                        self.last_playback = Some(state);
                     } else {
-                        self.pending_playback = Some((session_key(&session), state));
+                        self.pending_playback = Some((session_key(&session), state, Instant::now()));
                     }
                 }
                 self.flush_pending();
@@ -356,7 +430,7 @@ impl ListenerState {
                 return Err(error.into());
             }
         };
-        info!("subscribed to SMTC session {}", session_key(session));
+        debug!("subscribed to SMTC session {}", session_key(session));
         Ok(SessionSubscription {
             session: session.clone(),
             properties_token,
@@ -427,12 +501,15 @@ impl ListenerState {
     fn flush_pending(&mut self) {
         self.pending_deadline = None;
 
-        // Playback state changes never wait for track completeness: a play/pause
-        // must be delivered even while artwork/album of a slow track is pending.
-        if let Some((key, state)) = self.pending_playback.take()
-            && self.last_playback != Some((key, state))
+        // Held playback state: emit once its hold window expires. State changes
+        // never wait for track completeness — a play/pause is delivered even
+        // while artwork/album of a slow track is pending. Duplicate states from
+        // any session are deduplicated globally.
+        if let Some((_key, state, deadline)) = self.pending_playback.take()
+            && Instant::now() >= deadline
+            && self.last_playback != Some(state)
         {
-            self.last_playback = Some((key, state));
+            self.last_playback = Some(state);
             info!("playback state changed | state={state:?}");
             let _ = self.output.send(MediaEvent::PlaybackStateChanged(state));
         }
@@ -457,10 +534,22 @@ impl ListenerState {
             }
         }
         self.track_pending_since = None;
-        if let Some((_key, track)) = self.pending_track.take() {
+        if let Some((key, track)) = self.pending_track.take() {
             let fingerprint = track_fingerprint(&track);
-            if self.last_content_fingerprint.as_ref() != Some(&fingerprint) {
+            let differs = self.last_content_fingerprint.as_ref() != Some(&fingerprint);
+            // Do not re-emit when only the artwork disappeared (thumbnail reads
+            // toggle): absence is already shown as a placeholder, and re-emitting
+            // it would produce the repeated notifications seen in the logs.
+            let artwork_only_removed = self.last_content_fingerprint.as_ref().is_some_and(|last| {
+                last.has_artwork
+                    && !fingerprint.has_artwork
+                    && last.title == fingerprint.title
+                    && last.artist == fingerprint.artist
+                    && last.album == fingerprint.album
+            });
+            if differs && !artwork_only_removed {
                 self.last_content_fingerprint = Some(fingerprint);
+                self.last_track_emitted = Some((key, Instant::now()));
                 info!(
                     "track changed | title={:?} | artist={:?} | album={:?} | source={:?}",
                     track.title, track.artist, track.album, track.source_app
