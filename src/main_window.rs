@@ -6,10 +6,11 @@ use crate::overlay::{
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
-use log::error;
+use log::{debug, error};
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use std::time::{Duration, Instant};
+use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, ClientToScreen, CreateFontW,
     CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_TOP,
@@ -17,7 +18,10 @@ use windows::Win32::Graphics::Gdi::{
     HFONT, HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS,
     PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
 };
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
@@ -27,15 +31,15 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, HWND_TOPMOST,
-    IDC_ARROW, IDI_APPLICATION, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETTEXT, LB_INSERTSTRING,
+    IDC_ARROW, IDI_APPLICATION, KillTimer, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETTEXT, LB_INSERTSTRING,
     LB_ITEMFROMPOINT, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED,
     LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage,
     RegisterClassExW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP,
-    WM_SETFONT, WM_SIZE, WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY,
+    WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
+    WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -62,6 +66,8 @@ const MENU_DURATION_10S: usize = 1020;
 const LISTBOX_ID: usize = 2;
 const HISTORY_CAP: usize = 500;
 const TOOLTIP_CLASS: &str = "NotchTooltip";
+/// Timer used to clear the "Copied" feedback on the Copy logs button.
+const TIMER_LOGS_ID: usize = 101;
 
 const fn colorref(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
@@ -95,6 +101,7 @@ enum SettingId {
     CloseToTray,
     Position,
     ShowSample,
+    CopyLogs,
 }
 
 enum SettingsItem {
@@ -354,6 +361,8 @@ struct MainWindowState {
     tooltip_hwnd: HWND,
     /// Full details text of the currently shown tooltip.
     tooltip_text: String,
+    /// When the last "Copy logs" click happened, for the transient "Copied" label.
+    logs_copied_at: Option<Instant>,
 }
 
 /// Creates the main window: a maximized tracker with current activity,
@@ -427,6 +436,7 @@ impl MainWindowState {
             listbox_prev_proc: 0,
             tooltip_hwnd: HWND::default(),
             tooltip_text: String::new(),
+            logs_copied_at: None,
         }
     }
 
@@ -1028,6 +1038,27 @@ impl MainWindowState {
                 bottom: y + row_h,
             },
         });
+        y += row_h + gap;
+        y += (14.0 * scale) as i32;
+        items.push(SettingsItem::Header {
+            text: "Diagnostics",
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + header_h,
+            },
+        });
+        y += (22.0 * scale) as i32;
+        items.push(SettingsItem::Row {
+            id: SettingId::CopyLogs,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
         items
     }
 
@@ -1140,6 +1171,7 @@ impl MainWindowState {
                         ),
                         SettingId::Position => ("Position", self.position_label(), SETTINGS_MUTED),
                         SettingId::ShowSample => ("Show sample", String::new(), SETTINGS_MUTED),
+                        SettingId::CopyLogs => ("Logs", String::new(), SETTINGS_MUTED),
                     };
                     let mut lbl_rect = label_rect;
                     draw_string(
@@ -1299,6 +1331,26 @@ impl MainWindowState {
                             };
                             let hovered = self.settings_hover == Some((row_index, SettingSub::None));
                             draw_small_button(hdc, &btn_rect, "Preview the notification", accent, hovered, scale);
+                        }
+                        SettingId::CopyLogs => {
+                            let btn_rect = RECT {
+                                left: control_rect.left,
+                                top: control_rect.top,
+                                right: control_rect.right,
+                                bottom: control_rect.bottom,
+                            };
+                            let hovered = self.settings_hover == Some((row_index, SettingSub::None));
+                            let copied = self
+                                .logs_copied_at
+                                .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
+                            draw_small_button(
+                                hdc,
+                                &btn_rect,
+                                if copied { "Copied" } else { "Copy logs" },
+                                accent,
+                                hovered,
+                                scale,
+                            );
                         }
                     }
                     row_index += 1;
@@ -1617,6 +1669,55 @@ impl MainWindowState {
                 let _ = ShowWindow(self.tooltip_hwnd, SW_HIDE);
             }
         }
+    }
+
+    /// Copies the current run's log file to the clipboard (UTF-16 with per-line
+    /// newlines preserved) and shows a transient "Copied" state.
+    fn copy_logs(&mut self) {
+        let path = self.config.logs_dir().join("log-Live.log");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                debug!("copy logs: reading {path:?} failed: {error}");
+                return;
+            }
+        };
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        wide.push(0);
+        let bytes = wide.len() * 2;
+
+        unsafe {
+            if OpenClipboard(None).is_err() {
+                debug!("copy logs: OpenClipboard failed");
+                return;
+            }
+            let _ = EmptyClipboard();
+            let ok = GlobalAlloc(GMEM_MOVEABLE, bytes).is_ok_and(|hmem| {
+                let ptr = GlobalLock(hmem);
+                if !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr.cast(), wide.len());
+                    let _ = GlobalUnlock(hmem);
+                }
+                if SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0)).is_ok() {
+                    true
+                } else {
+                    // Transfer failed; the memory is still ours to release.
+                    let _ = GlobalFree(hmem);
+                    false
+                }
+            });
+            let _ = CloseClipboard();
+            if !ok {
+                debug!("copy logs: clipboard set failed");
+                return;
+            }
+        }
+
+        self.logs_copied_at = Some(Instant::now());
+        unsafe {
+            let _ = SetTimer(self.hwnd, TIMER_LOGS_ID, 2000, None);
+        }
+        self.invalidate();
     }
 
     /// Pins the overlay to a vertical/horizontal anchor: clears any absolute
@@ -2216,6 +2317,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 as usize == TIMER_LOGS_ID => {
+            unsafe {
+                let _ = KillTimer(hwnd, TIMER_LOGS_ID);
+            }
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.logs_copied_at = None;
+                state.invalidate();
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONDOWN => {
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
@@ -2325,6 +2437,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                 }
                                 SettingId::ShowSample => {
                                     show_sample(state.overlay_hwnd);
+                                }
+                                SettingId::CopyLogs => {
+                                    state.copy_logs();
                                 }
                             }
                             return LRESULT(0);
