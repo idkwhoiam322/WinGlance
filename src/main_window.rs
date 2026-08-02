@@ -69,7 +69,7 @@ const HIST_GAP: f32 = 14.0;
 const HIST_H: f32 = 18.0;
 const LIST_GAP: f32 = 8.0;
 const BOTTOM_GAP: f32 = 16.0;
-const SIDEBAR_W: f32 = 48.0;
+const SIDEBAR_W: f32 = 80.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Pane {
@@ -1226,6 +1226,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 let x = (lparam.0 & 0xFFFF) as i32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                 let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+                let pad = (PAD * scale) as i32;
 
                 // Check sidebar clicks
                 if x < sidebar_w {
@@ -1245,6 +1246,63 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     let pos_bottom = pos_y + (16.0 * scale) as i32;
                     if y >= pos_y && y <= pos_bottom {
                         let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
+                    }
+                } else if state.active_pane == Pane::Settings {
+                    // Check settings item clicks
+                    let mut sy = pad;
+                    sy += (36.0 * scale) as i32; // Header
+                    sy += (18.0 * scale) as i32; // "Notifications" label
+                    sy += (18.0 * scale) as i32; // value
+                    let notif_row_y = sy;
+                    sy += (28.0 * scale) as i32; // gap
+
+                    sy += (18.0 * scale) as i32; // "Duration" label
+                    sy += (18.0 * scale) as i32; // value
+                    let dur_row_y = sy;
+                    sy += (28.0 * scale) as i32; // gap
+
+                    sy += (18.0 * scale) as i32; // "Position" label
+                    sy += (18.0 * scale) as i32; // value
+                    let pos_row_y = sy;
+                    sy += (28.0 * scale) as i32; // gap
+
+                    sy += (18.0 * scale) as i32; // "Start on login" label
+                    sy += (18.0 * scale) as i32; // value
+                    let login_row_y = sy;
+                    sy += (28.0 * scale) as i32; // gap
+
+                    sy += (18.0 * scale) as i32; // "Close to tray" label
+                    sy += (18.0 * scale) as i32; // value
+                    let tray_row_y = sy;
+
+                    let row_h = (20.0 * scale) as i32;
+                    if y >= notif_row_y && y < notif_row_y + row_h {
+                        state.notifications_enabled = !state.notifications_enabled;
+                        let _ = PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0));
+                        state.invalidate();
+                    } else if y >= login_row_y && y < login_row_y + row_h {
+                        state.config.behavior.start_on_login = !state.config.behavior.start_on_login;
+                        let _ = state.config.save();
+                        if let Err(error) = autostart::apply(state.config.behavior.start_on_login) {
+                            error!("start-on-login update failed: {error:#}");
+                        }
+                        state.invalidate();
+                    } else if y >= tray_row_y && y < tray_row_y + row_h {
+                        state.config.behavior.close_to_tray = !state.config.behavior.close_to_tray;
+                        let _ = state.config.save();
+                        state.invalidate();
+                    } else if y >= pos_row_y && y < pos_row_y + row_h {
+                        let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
+                    } else if y >= dur_row_y && y < dur_row_y + row_h {
+                        // Cycle duration: 2 -> 3 -> 5 -> 10 -> 2
+                        state.config.overlay.duration_ms = match state.config.overlay.duration_ms {
+                            2000 => 3000,
+                            3000 => 5000,
+                            5000 => 10000,
+                            _ => 2000,
+                        };
+                        let _ = state.config.save();
+                        state.invalidate();
                     }
                 }
             }

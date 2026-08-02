@@ -220,7 +220,7 @@ impl OverlayState {
                 self.config.overlay.max_width.max(180) as f32,
                 (self.config.appearance.art_size as f32 + 2.0 * self.config.appearance.padding + 4.0).max(40.0),
             ),
-            MediaEvent::PlaybackStateChanged(_) => (120.0, 44.0),
+            MediaEvent::PlaybackStateChanged(_) => (240.0, 80.0),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
@@ -361,7 +361,7 @@ impl OverlayState {
                 self.config.overlay.max_width.max(180) as f32,
                 (self.config.appearance.art_size as f32 + 2.0 * self.config.appearance.padding + 4.0).max(40.0),
             ),
-            MediaEvent::PlaybackStateChanged(_) => (120.0, 44.0),
+            MediaEvent::PlaybackStateChanged(_) => (240.0, 80.0),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;

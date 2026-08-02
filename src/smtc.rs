@@ -202,28 +202,37 @@ impl ListenerState {
         &mut self,
         hint: Option<&GlobalSystemMediaTransportControlsSession>,
     ) -> Option<GlobalSystemMediaTransportControlsSession> {
-        // Windows' current-session pointer is authoritative when available.
-        if let Ok(session) = self.manager.GetCurrentSession() {
+        // First, try to find any Playing session from all sessions.
+        if let Ok(sessions) = self.manager.GetSessions()
+            && let Some(playing) = sessions
+                .into_iter()
+                .find(|s| matches!(read_playback_state(s), Ok(Some(PlaybackState::Playing))))
+        {
+            return Some(playing);
+        }
+
+        // Fall back to the current session if it's not Stopped.
+        if let Ok(session) = self.manager.GetCurrentSession()
+            && !matches!(read_playback_state(&session), Ok(Some(PlaybackState::Stopped)))
+        {
             return Some(session);
         }
 
-        // Some providers do not update that pointer. Prefer the session that
-        // caused the callback, then the last session observed as Playing.
+        // Prefer the hint session if it's not Stopped.
         if let Some(session) = hint
-            && matches!(read_playback_state(session), Ok(Some(PlaybackState::Playing)))
+            && !matches!(read_playback_state(session), Ok(Some(PlaybackState::Stopped)))
         {
             return Some(session.clone());
         }
+
+        // Fall back to the last observed playing session.
         if let Some(session) = self.recent_playing.clone()
-            && matches!(read_playback_state(&session), Ok(Some(PlaybackState::Playing)))
+            && !matches!(read_playback_state(&session), Ok(Some(PlaybackState::Stopped)))
         {
             return Some(session);
         }
 
-        let sessions = self.manager.GetSessions().ok()?;
-        sessions
-            .into_iter()
-            .find(|session| matches!(read_playback_state(session), Ok(Some(PlaybackState::Playing))))
+        None
     }
 
     fn subscribe(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<()> {
