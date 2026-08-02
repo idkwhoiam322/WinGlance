@@ -57,7 +57,10 @@ struct TrackFingerprint {
     title: String,
     artist: String,
     album: String,
-    artwork_hash: u64,
+    /// Whether artwork was present. Artwork often arrives in a later event than
+    /// title/artist; including its presence means that late artwork re-emits the
+    /// track (the UI updates it in place) instead of being deduplicated away.
+    has_artwork: bool,
 }
 
 pub struct SmtcListener {
@@ -89,7 +92,7 @@ impl SmtcListener {
         let mut state = ListenerState::new(manager, self.config, self.output, signal_tx);
 
         state.sync_subscriptions();
-        state.refresh_current_session(None, true)?;
+        state.refresh_current_session(None, true, false)?;
         state.event_loop(signal_rx)?;
 
         let _ = state.manager.RemoveSessionsChanged(sessions_token);
@@ -141,7 +144,7 @@ impl ListenerState {
                     // so a newly-detected current session reports its track+state immediately.
                     if self.last_session_check.elapsed() >= session_check_interval {
                         self.last_session_check = Instant::now();
-                        let _ = self.refresh_current_session(None, true);
+                        let _ = self.refresh_current_session(None, true, false);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -158,13 +161,13 @@ impl ListenerState {
                 // the current session against GetCurrentSession() — the pointer
                 // Windows itself maintains.
                 self.sync_subscriptions();
-                self.refresh_current_session(None, true)?;
+                self.refresh_current_session(None, true, false)?;
             }
             Signal::MediaProperties(session) => {
                 // emit_initial=true: when this event changes the current session,
                 // immediately report the new session's track+state instead of
                 // showing stale info from the previous app.
-                self.refresh_current_session(Some(&session), true)?;
+                self.refresh_current_session(Some(&session), true, true)?;
                 if self.current_key == Some(session_key(&session))
                     && read_playback_state(&session)? != Some(PlaybackState::Stopped)
                     && let Ok(track) = read_track_info(&session)
@@ -204,7 +207,7 @@ impl ListenerState {
                             // The tracked session stopped: hand off to whatever else
                             // is playing right now instead of waiting for the poll.
                             let before = self.current_key;
-                            self.refresh_current_session(None, true)?;
+                            self.refresh_current_session(None, true, false)?;
                             if self.current_key == before {
                                 // Nothing else took over — report the stop.
                                 self.current_playing = false;
@@ -226,7 +229,7 @@ impl ListenerState {
                     // A new source started playing while nothing we track is active.
                     // Adopt it; the pill only follows actively playing media, so a
                     // paused/stale session never steals the current one.
-                    self.refresh_current_session(Some(&session), true)?;
+                    self.refresh_current_session(Some(&session), true, false)?;
                 }
             }
         }
@@ -237,8 +240,9 @@ impl ListenerState {
         &mut self,
         hint: Option<&GlobalSystemMediaTransportControlsSession>,
         emit_initial: bool,
+        prefer_hint: bool,
     ) -> Result<()> {
-        let resolved = self.resolve_current_session(hint);
+        let resolved = self.resolve_current_session(hint, prefer_hint);
         let new_key = resolved.as_ref().map(session_key);
         if new_key == self.current_key {
             return Ok(());
@@ -277,7 +281,19 @@ impl ListenerState {
     fn resolve_current_session(
         &mut self,
         hint: Option<&GlobalSystemMediaTransportControlsSession>,
+        prefer_hint: bool,
     ) -> Option<GlobalSystemMediaTransportControlsSession> {
+        // Media-property events (a track/media change) follow the event source
+        // itself: the pill should reflect the app + media that CHANGED, like the
+        // native widget's per-session entries. State/periodic paths use the
+        // native GetCurrentSession() pointer instead.
+        if prefer_hint
+            && let Some(session) = hint
+            && !matches!(read_playback_state(session), Ok(Some(PlaybackState::Stopped)))
+        {
+            return Some(session.clone());
+        }
+
         // 1. GetCurrentSession() is the pointer Windows itself maintains (the
         //    native media widget follows it); consult it fresh on every resolve.
         if let Ok(session) = self.manager.GetCurrentSession()
@@ -410,11 +426,21 @@ impl ListenerState {
 
     fn flush_pending(&mut self) {
         self.pending_deadline = None;
-        // Wait until the track is complete before sending: artwork must be ready,
-        // and a freshly-pending track also gets a short unconditional grace window
-        // for its album field (title/artist/artwork and album frequently arrive as
-        // separate MediaPropertiesChanged events, so gating on learned history
-        // raced on the very first track of a session). Re-schedule every 100ms;
+
+        // Playback state changes never wait for track completeness: a play/pause
+        // must be delivered even while artwork/album of a slow track is pending.
+        if let Some((key, state)) = self.pending_playback.take()
+            && self.last_playback != Some((key, state))
+        {
+            self.last_playback = Some((key, state));
+            info!("playback state changed | state={state:?}");
+            let _ = self.output.send(MediaEvent::PlaybackStateChanged(state));
+        }
+
+        // Track: wait until complete before sending. Artwork must be ready, and a
+        // freshly-pending track also gets a short unconditional grace window for
+        // its album field (title/artist/artwork and album frequently arrive as
+        // separate MediaPropertiesChanged events). Re-schedule every 100ms;
         // artwork waits up to 3s, album grace is fixed and short.
         let incomplete = self.pending_track.as_ref().is_some_and(|(_, track)| {
             let elapsed = self.track_pending_since.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
@@ -441,13 +467,6 @@ impl ListenerState {
                 );
                 let _ = self.output.send(MediaEvent::TrackChanged(track));
             }
-        }
-        if let Some((key, state)) = self.pending_playback.take()
-            && self.last_playback != Some((key, state))
-        {
-            self.last_playback = Some((key, state));
-            info!("playback state changed | state={state:?}");
-            let _ = self.output.send(MediaEvent::PlaybackStateChanged(state));
         }
     }
 }
@@ -585,13 +604,15 @@ fn source_app_label(value: &str) -> String {
 }
 
 fn track_fingerprint(track: &TrackInfo) -> TrackFingerprint {
-    // Content-only fingerprint: title+artist+album. Artwork is excluded so the
-    // same track is recognized even when the thumbnail arrives on a later event.
+    // Content fingerprint: title+artist+album plus artwork presence. Artwork
+    // presence is part of the fingerprint so a thumbnail arriving on a later
+    // event re-emits the track (the UI refreshes it in place) instead of being
+    // deduplicated away forever.
     TrackFingerprint {
         title: track.title.clone(),
         artist: track.artist.clone(),
         album: track.album.clone(),
-        artwork_hash: 0,
+        has_artwork: track.artwork.is_some(),
     }
 }
 

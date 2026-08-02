@@ -12,9 +12,10 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POI
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
     CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_DONTCARE, GetMonitorInfoW, HBRUSH, HDC,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT, ValidateRect,
+    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, ETO_CLIPPED, ExtTextOutW, FF_DONTCARE,
+    GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW, HBRUSH, HDC, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode,
+    SetTextColor, TEXTMETRICW, TRANSPARENT, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -53,6 +54,21 @@ struct PendingEvents {
     track_update: bool,
 }
 
+/// Per-line marquee state for the pill's text rows. The offset advances on the
+/// 16ms animation tick; a short hold before the first movement reads better.
+#[derive(Default, Clone, Copy)]
+struct LineScroll {
+    offset: f32,
+    started_at: Option<Instant>,
+}
+
+/// Hold time before an overflowing line starts scrolling.
+const MARQUEE_HOLD: Duration = Duration::from_millis(600);
+/// Horizontal gap between the end of the text and its repeated copy.
+const MARQUEE_GAP: f32 = 24.0;
+/// Scroll speed in logical px per second.
+const MARQUEE_SPEED: f32 = 30.0;
+
 struct OverlayState {
     hwnd: HWND,
     config: Config,
@@ -64,6 +80,8 @@ struct OverlayState {
     phase: Phase,
     dismiss_at: Option<Instant>,
     position: OverlayPos,
+    /// Per-row marquee state for the four track lines (title/subtitle/meta/app).
+    scroll: [LineScroll; 4],
 }
 
 /// Resolved placement for the notch pill, pulled from [overlay] config. `x`/`y`
@@ -141,6 +159,15 @@ impl OverlayState {
             phase: Phase::Hidden,
             dismiss_at: None,
             position,
+            scroll: [LineScroll::default(); 4],
+        }
+    }
+
+    fn reset_scroll(&mut self) {
+        let now = Instant::now();
+        for line in &mut self.scroll {
+            line.offset = 0.0;
+            line.started_at = Some(now);
         }
     }
 
@@ -201,6 +228,7 @@ impl OverlayState {
     /// current animation phase, extends the visible time, and re-renders.
     fn update_content(&mut self, event: MediaEvent) {
         self.content = Some(event);
+        self.reset_scroll();
         if let Some(deadline) = self.dismiss_at {
             self.dismiss_at = Some(deadline.max(Instant::now() + update_min_duration(&self.config)));
         }
@@ -212,6 +240,7 @@ impl OverlayState {
             return;
         }
         self.content = Some(event);
+        self.reset_scroll();
         let now = Instant::now();
         self.dismiss_at = Some(now + Duration::from_millis(self.config.overlay.duration_ms.max(500)));
         self.phase = if full_animation {
@@ -246,6 +275,18 @@ impl OverlayState {
                 return;
             }
             _ => {}
+        }
+
+        // Advance marquee offsets (driven by this same 16ms tick, entirely
+        // independent of the dismiss countdown).
+        let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
+        let per_tick = MARQUEE_SPEED * scale * (0.016);
+        for line in &mut self.scroll {
+            if let Some(started) = line.started_at
+                && started.elapsed() >= MARQUEE_HOLD
+            {
+                line.offset += per_tick;
+            }
         }
         self.render();
     }
@@ -413,6 +454,7 @@ impl OverlayState {
     /// the tray "Show sample" command to preview placement without real media.
     fn show_sample(&mut self) {
         self.content = Some(MediaEvent::PlaybackStateChanged(PlaybackState::Playing));
+        self.reset_scroll();
         let now = Instant::now();
         self.dismiss_at = Some(now + sample_duration(&self.config));
         self.phase = Phase::Light(now);
@@ -645,77 +687,88 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
     }
     match content {
         MediaEvent::TrackChanged(track) => {
-            let padding = (state.config.appearance.padding * scale) as i32;
-            let art = (state.config.appearance.art_size as f32 * scale) as i32;
+            let appearance = &state.config.appearance;
+            let padding = (appearance.padding * scale) as i32;
+            let art = (appearance.art_size as f32 * scale) as i32;
             let left = padding + art + (12.0 * scale) as i32;
-            let mut title_rect = RECT {
-                left,
-                top: (height as f32 * 0.16) as i32,
-                right: width - padding,
-                bottom: (height as f32 * 0.38) as i32,
+            let right = width - padding;
+
+            // Font-driven row heights: bands are sized from the actual fonts, so
+            // rows can never overlap at any pill size (including mid-animation).
+            let fs_title = appearance.font_size_title * scale;
+            let fs_artist = appearance.font_size_artist * scale;
+            let fs_meta = fs_artist * 0.85;
+            let fs_app = fs_artist * 0.75;
+            let rows: [(f32, f32); 4] = [
+                (fs_title * 1.35, fs_title),
+                (fs_artist * 1.35, fs_artist),
+                (fs_meta * 1.35, fs_meta),
+                (fs_app * 1.35, fs_app),
+            ];
+            let total: f32 = rows.iter().map(|(h, _)| *h).sum();
+            let mut y = 0.0f32;
+            let mut next_band = |i: usize| -> RECT {
+                let band_h = rows[i].0 / total * height as f32;
+                let r = RECT {
+                    left,
+                    top: y as i32,
+                    right,
+                    bottom: (y + band_h) as i32,
+                };
+                y += band_h;
+                r
             };
-            let mut artist_rect = RECT {
-                left,
-                top: (height as f32 * 0.38) as i32,
-                right: width - padding,
-                bottom: (height as f32 * 0.60) as i32,
-            };
-            let mut meta_rect = RECT {
-                left,
-                top: (height as f32 * 0.60) as i32,
-                right: width - padding,
-                bottom: (height as f32 * 0.82) as i32,
-            };
-            draw_string(
+
+            let title_rect = next_band(0);
+            draw_marquee_line(
                 hdc,
                 &track.title,
-                &mut title_rect,
-                (state.config.appearance.font_size_title * scale) as i32,
-                state.config.appearance.text_color,
+                &title_rect,
+                rows[0].1 as i32,
+                appearance.text_color,
                 true,
-                false,
+                &state.scroll[0],
             );
+
             let subtitle = if track.artist.trim().is_empty() {
                 &track.source_app
             } else {
                 &track.artist
             };
-            draw_string(
+            let artist_rect = next_band(1);
+            draw_marquee_line(
                 hdc,
                 subtitle,
-                &mut artist_rect,
-                (state.config.appearance.font_size_artist * scale) as i32,
+                &artist_rect,
+                rows[1].1 as i32,
                 [0xCC, 0xCC, 0xCC, 0xFF],
                 false,
-                false,
+                &state.scroll[1],
             );
+
             let meta = track.meta_line(true);
             if !meta.is_empty() {
-                draw_string(
+                let meta_rect = next_band(2);
+                draw_marquee_line(
                     hdc,
                     &meta,
-                    &mut meta_rect,
-                    ((state.config.appearance.font_size_artist * 0.85 * scale) as i32).max(1),
+                    &meta_rect,
+                    rows[2].1 as i32,
                     [0x99, 0x99, 0x99, 0xFF],
                     false,
-                    false,
+                    &state.scroll[2],
                 );
             }
             if !track.source_app.trim().is_empty() {
-                let mut app_rect = RECT {
-                    left,
-                    top: (height as f32 * 0.82) as i32,
-                    right: width - padding,
-                    bottom: height - padding,
-                };
-                draw_string(
+                let app_rect = next_band(3);
+                draw_marquee_line(
                     hdc,
                     &track.source_app,
-                    &mut app_rect,
-                    ((state.config.appearance.font_size_artist * 0.75 * scale) as i32).max(1),
+                    &app_rect,
+                    rows[3].1 as i32,
                     [0x77, 0x77, 0x77, 0xFF],
                     false,
-                    false,
+                    &state.scroll[3],
                 );
             }
         }
@@ -775,6 +828,87 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
                 }
             }
         }
+    }
+}
+
+/// Draws one pill text line. Text that fits is drawn statically (left-aligned);
+/// overflowing text scrolls horizontally (marquee) using the line's scroll state.
+/// Auto-dismiss timing is never involved — scroll is pure per-frame visual state.
+fn draw_marquee_line(
+    hdc: HDC,
+    value: &str,
+    rect: &RECT,
+    font_height: i32,
+    color: [u8; 4],
+    bold: bool,
+    scroll: &LineScroll,
+) {
+    let text = value.encode_utf16().collect::<Vec<_>>();
+    let font_name = wide("Segoe UI");
+    let font = unsafe {
+        CreateFontW(
+            -font_height.max(1),
+            0,
+            0,
+            0,
+            if bold { 600 } else { 400 },
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_DEFAULT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            ANTIALIASED_QUALITY.0 as u32,
+            DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+            PCWSTR(font_name.as_ptr()),
+        )
+    };
+    let old_font = unsafe { SelectObject(hdc, font) };
+    let color = COLORREF(color[0] as u32 | (color[1] as u32) << 8 | (color[2] as u32) << 16);
+    unsafe {
+        SetTextColor(hdc, color);
+        SetBkMode(hdc, TRANSPARENT);
+
+        let mut size = SIZE::default();
+        let _ = GetTextExtentPoint32W(hdc, &text, &mut size);
+        let mut tm = TEXTMETRICW::default();
+        let _ = GetTextMetricsW(hdc, &mut tm);
+        let line_h = tm.tmHeight;
+        let y = rect.top + ((rect.bottom - rect.top - line_h) / 2).max(0);
+        let avail = (rect.right - rect.left).max(1);
+        let count = text.len() as u32;
+
+        if size.cx <= avail {
+            let _ = ExtTextOutW(
+                hdc,
+                rect.left,
+                y,
+                ETO_CLIPPED,
+                Some(rect),
+                PCWSTR(text.as_ptr()),
+                count,
+                None,
+            );
+        } else {
+            // Continuous loop: draw the text at a shifting offset plus a second
+            // copy after a gap, clipped to the row rect (ETO_CLIPPED).
+            let total = size.cx + MARQUEE_GAP as i32;
+            let hold_elapsed = scroll.started_at.map(|t| t.elapsed()).unwrap_or_default();
+            let offset = if hold_elapsed < MARQUEE_HOLD {
+                0.0
+            } else {
+                scroll.offset
+            };
+            let off = (offset % total as f32) as i32;
+            let x1 = rect.left - off;
+            let _ = ExtTextOutW(hdc, x1, y, ETO_CLIPPED, Some(rect), PCWSTR(text.as_ptr()), count, None);
+            let x2 = x1 + total;
+            if x2 < rect.right {
+                let _ = ExtTextOutW(hdc, x2, y, ETO_CLIPPED, Some(rect), PCWSTR(text.as_ptr()), count, None);
+            }
+        }
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
     }
 }
 
