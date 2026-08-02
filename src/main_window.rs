@@ -15,6 +15,7 @@ use windows::Win32::Graphics::Gdi::{
     StretchDIBits,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
@@ -22,13 +23,13 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, IDC_ARROW, IDI_APPLICATION, LB_ADDSTRING,
-    LB_DELETESTRING, LB_GETCOUNT, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS,
+    LB_DELETESTRING, LB_GETCOUNT, LB_GETTEXT, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS,
     LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING,
     PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE,
-    WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT,
+    WM_SIZE, WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -970,6 +971,63 @@ impl MainWindowState {
         }
     }
 
+    /// Owner-draw handler for the history listbox: paints light text on
+    /// alternating black/grey rows, with a distinct header row. Without this,
+    /// LBS_OWNERDRAWFIXED items render with default black text on the black
+    /// background and are unreadable.
+    fn draw_history_item(&self, item: &DRAWITEMSTRUCT) {
+        let hdc = item.hDC;
+        let index = item.itemID as usize;
+        let selected = (item.itemState.0 & ODS_SELECTED.0) != 0;
+        let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
+
+        let bg = if index == 0 {
+            COLORREF(0x00141414)
+        } else if selected {
+            COLORREF(0x001D2B26)
+        } else if index.is_multiple_of(2) {
+            COLORREF(0x00000000)
+        } else {
+            COLORREF(0x000E0E0E)
+        };
+        unsafe {
+            let brush = CreateSolidBrush(bg);
+            let _ = FillRect(hdc, &item.rcItem, brush);
+            let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
+        }
+
+        let mut buf = vec![0u16; 512];
+        let len = unsafe {
+            SendMessageW(
+                item.hwndItem,
+                LB_GETTEXT,
+                WPARAM(index),
+                LPARAM(buf.as_mut_ptr() as isize),
+            )
+            .0 as usize
+        };
+        buf.truncate(len.min(buf.len()));
+        let text = String::from_utf16_lossy(&buf);
+
+        let mut text_rect = item.rcItem;
+        text_rect.left += (8.0 * scale) as i32;
+        text_rect.right -= (8.0 * scale) as i32;
+        let color = if index == 0 {
+            [0x9A, 0x9A, 0x9A, 0xFF]
+        } else {
+            [0xE6, 0xE6, 0xE6, 0xFF]
+        };
+        draw_string(
+            hdc,
+            &text,
+            &mut text_rect,
+            ((if index == 0 { 11.0 } else { 13.0 }) * scale) as i32,
+            color,
+            index == 0,
+            false,
+        );
+    }
+
     fn on_destroy(&mut self) {
         remove_tray_icon(self.hwnd);
         unsafe {
@@ -1492,6 +1550,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             SetTextColor(hdc, colorref(0xE6, 0xE6, 0xE6));
             SetBkColor(hdc, colorref(0, 0, 0));
             LRESULT(GetStockObject(windows::Win32::Graphics::Gdi::BLACK_BRUSH).0 as isize)
+        }
+        WM_DRAWITEM => {
+            if !state_ptr.is_null() && lparam.0 != 0 {
+                let item = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+                if item.CtlID as usize == LISTBOX_ID && item.hwndItem == (*state_ptr).listbox {
+                    (*state_ptr).draw_history_item(item);
+                }
+            }
+            LRESULT(1)
         }
         MEDIA_EVENT_MSG => {
             if !state_ptr.is_null() {
