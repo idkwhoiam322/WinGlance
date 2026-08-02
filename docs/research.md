@@ -53,27 +53,29 @@ useful artifact. Key takeaways:
 
 ## Improvement roadmap for Notch
 
-Prioritized by impact/effort:
+Prioritized by impact/effort.
+
+**Scope constraint (decision):** Notch stays a passive, state-change-driven
+notification overlay. No clickable in-pill controls (play/pause/next/stop) and no
+continuous visual updates (progress bar / timeline). The pill appears and changes
+only when the media state changes (track change, play/pause/stop).
 
 1. **Source-app icon** — obtain a real app icon from `SourceAppUserModelId`:
    resolve the AUMID to a display name + icon via
    `IShellItemImageFactory` / package manager. Uncertain results for browsers
    (matrix says incomplete) but should work for Store/UWP apps (Spotify, Groove).
    Fallback: draw a colored letter avatar (first letter of source-app name).
-2. **Progress bar / timeline** — subscribe to `PlaybackInfoChanged` and render
-   `Position/EndTime` when both are non-zero; hide the bar for apps that report
-   none (most browsers). Requires a lightweight 1 Hz re-render while visible.
-3. **Clickable pill controls** — play/pause, next/prev, stop via
-   `GlobalSystemMediaTransportControlsSession::TryPlayAsync` etc. Requires making
-   the pill hit-testable (it is currently `WS_EX_TRANSPARENT` / click-through);
-   an opt-in mode.
-4. **Monitor pinning** — setting to lock the pill to a specific monitor instead of
+2. **Monitor pinning** — setting to lock the pill to a specific monitor instead of
    the foreground one.
-5. **Content stacking direction + alignment** — horizontal (art left, text right)
+3. **Content stacking direction + alignment** — horizontal (art left, text right)
    vs vertical layout, mirroring ModernFlyouts.
-6. **Light/dark appearance presets** — one-key `[appearance]` presets.
-7. **Taskbar deskband / compact widget** — long term, a mini always-visible
-   indicator using the Deskband11Lib approach.
+4. **Light/dark appearance presets** — one-key `[appearance]` presets.
+5. **Taskbar deskband / compact widget** — long term, a mini always-visible
+   indicator using the Deskband11Lib approach (config-only, no interaction).
+
+Explicitly **not** planned (per scope constraint): progress bar/timeline,
+clickable transport controls, shuffle/repeat/stop in the pill, per-frame visual
+updates while playing.
 
 ## What we already do that matches or beats the reference
 
