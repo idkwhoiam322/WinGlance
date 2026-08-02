@@ -1,11 +1,12 @@
 use crate::config::Config;
 use crate::overlay::{self, OverlayPos};
 use log::error;
+use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GetMonitorInfoW, HBRUSH, HDC, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT,
-    SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, CreatePen, CreateSolidBrush, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint,
+    FillRect, GetMonitorInfoW, HBRUSH, HDC, HGDIOBJ, LineTo, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    MoveToEx, PAINTSTRUCT, PS_SOLID, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -25,6 +26,12 @@ const HEIGHT: i32 = 60;
 const SNAP_THRESHOLD: i32 = 30;
 const CLOSE_BTN_W: i32 = 28;
 const CLOSE_BTN_H: i32 = 28;
+const DEFAULT_MARGIN: f32 = 8.0;
+
+/// Tracks the currently open positioner window and its overlay, so the settings
+/// Reset action can move the adjustor back to the default spot. Stored as raw
+/// handle values: HWND is not Send, so the static holds usize.
+static OPEN_POSITIONER: OnceLock<Mutex<(usize, usize)>> = OnceLock::new(); // (positioner, overlay)
 
 struct PositionerState {
     overlay: HWND,
@@ -65,6 +72,9 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
         );
         match hwnd {
             Ok(hwnd) => {
+                if let Ok(mut guard) = OPEN_POSITIONER.get_or_init(|| Mutex::new((0, 0))).lock() {
+                    *guard = (hwnd.0 as usize, overlay.0 as usize);
+                }
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 true
             }
@@ -73,6 +83,41 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
                 false
             }
         }
+    }
+}
+
+/// Moves the open positioner window back to the default top-center spot (the
+/// same place the settings Reset applies to the pill). No-op when the positioner
+/// is not open.
+pub(crate) fn reset_position() {
+    let Some(m) = OPEN_POSITIONER.get() else {
+        return;
+    };
+    let Ok(guard) = m.lock() else {
+        return;
+    };
+    let (hwnd, overlay) = *guard;
+    if hwnd == 0 || overlay == 0 {
+        return;
+    }
+    let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+    let overlay = HWND(overlay as *mut std::ffi::c_void);
+    unsafe {
+        let scale = GetDpiForWindow(overlay).max(96) as f32 / 96.0;
+        let work = monitor_work_area(overlay);
+        let w = (WIDTH as f32 * scale).round() as i32;
+        let margin = (DEFAULT_MARGIN * scale).round() as i32;
+        let x = work.left + (work.right - work.left - w) / 2;
+        let y = work.top + margin;
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
     }
 }
 
@@ -247,9 +292,10 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
                     let mut text = wide("Drag to place the notch");
                     let _ = DrawTextW(hdc, &mut text, &mut text_rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
-                    // Draw X button
+                    // Draw X button (cross lines — always perfectly centered,
+                    // unlike a glyph drawn with the default window font)
                     let x_brush = CreateSolidBrush(COLORREF(0x333333));
-                    let mut x_rect = RECT {
+                    let x_rect = RECT {
                         left: WIDTH - CLOSE_BTN_W - 6,
                         top: 6,
                         right: WIDTH - 6,
@@ -258,9 +304,15 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
                     let _ = FillRect(hdc, &x_rect, x_brush);
                     let _ = DeleteObject(HGDIOBJ(x_brush.0));
 
-                    let _ = SetTextColor(hdc, COLORREF(0x999999));
-                    let mut x_text = wide("X");
-                    let _ = DrawTextW(hdc, &mut x_text, &mut x_rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+                    let pen = CreatePen(PS_SOLID, 2, COLORREF(0x999999));
+                    let old_pen = SelectObject(hdc, pen);
+                    let inset = 8;
+                    let _ = MoveToEx(hdc, x_rect.left + inset, x_rect.top + inset, None);
+                    let _ = LineTo(hdc, x_rect.right - inset, x_rect.bottom - inset);
+                    let _ = MoveToEx(hdc, x_rect.right - inset, x_rect.top + inset, None);
+                    let _ = LineTo(hdc, x_rect.left + inset, x_rect.bottom - inset);
+                    SelectObject(hdc, old_pen);
+                    let _ = DeleteObject(HGDIOBJ(pen.0));
 
                     let _ = DeleteObject(HGDIOBJ(brush.0));
                 }
@@ -275,6 +327,12 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
         WM_NCDESTROY => {
             if !state_ptr.is_null() {
                 drop(Box::from_raw(state_ptr));
+            }
+            if let Some(m) = OPEN_POSITIONER.get()
+                && let Ok(mut guard) = m.lock()
+                && guard.0 == hwnd.0 as usize
+            {
+                *guard = (0, 0);
             }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             DefWindowProcW(hwnd, message, wparam, lparam)

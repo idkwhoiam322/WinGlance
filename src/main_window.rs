@@ -1,7 +1,9 @@
 use crate::autostart;
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo};
-use crate::overlay::{EventQueue, OverlayPos, decode_artwork, draw_string, set_position, show_sample, wide};
+use crate::overlay::{
+    EventQueue, OverlayPos, decode_artwork, draw_string, set_duration, set_position, show_sample, wide,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use log::error;
@@ -89,6 +91,7 @@ enum SettingId {
     StartOnLogin,
     CloseToTray,
     Position,
+    ShowSample,
 }
 
 enum SettingsItem {
@@ -991,6 +994,16 @@ impl MainWindowState {
                 bottom: y + (70.0 * scale) as i32,
             },
         });
+        y += (70.0 * scale) as i32 + gap;
+        items.push(SettingsItem::Row {
+            id: SettingId::ShowSample,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
         items
     }
 
@@ -1102,6 +1115,7 @@ impl MainWindowState {
                             SETTINGS_MUTED,
                         ),
                         SettingId::Position => ("Position", self.position_label(), SETTINGS_MUTED),
+                        SettingId::ShowSample => ("Show sample", String::new(), SETTINGS_MUTED),
                     };
                     let mut lbl_rect = label_rect;
                     draw_string(
@@ -1239,6 +1253,16 @@ impl MainWindowState {
                             }
                             let mut bt = parts.adjust;
                             draw_string(hdc, "Adjust…", &mut bt, (10.0 * scale) as i32, accent, true, true);
+                        }
+                        SettingId::ShowSample => {
+                            let btn_rect = RECT {
+                                left: control_rect.left,
+                                top: control_rect.top,
+                                right: control_rect.right,
+                                bottom: control_rect.bottom,
+                            };
+                            let hovered = self.settings_hover == Some((row_index, SettingSub::None));
+                            draw_small_button(hdc, &btn_rect, "Preview the notification", accent, hovered, scale);
                         }
                     }
                     row_index += 1;
@@ -1466,6 +1490,8 @@ impl MainWindowState {
     /// Clears any custom X/Y override and returns to the default top-center anchor.
     fn reset_position(&mut self) {
         self.apply_anchor(VerticalPosition::Top, HorizontalPosition::Center);
+        // If the position adjustor is open, move it back to the default spot too.
+        crate::positioner::reset_position();
     }
 }
 
@@ -1794,18 +1820,22 @@ fn show_tray_menu(state: &mut MainWindowState) {
                 MENU_DURATION_2S => {
                     state.config.overlay.duration_ms = 2000;
                     let _ = state.config.save();
+                    set_duration(state.overlay_hwnd, 2000);
                 }
                 MENU_DURATION_3S => {
                     state.config.overlay.duration_ms = 3000;
                     let _ = state.config.save();
+                    set_duration(state.overlay_hwnd, 3000);
                 }
                 MENU_DURATION_5S => {
                     state.config.overlay.duration_ms = 5000;
                     let _ = state.config.save();
+                    set_duration(state.overlay_hwnd, 5000);
                 }
                 MENU_DURATION_10S => {
                     state.config.overlay.duration_ms = 10000;
                     let _ = state.config.save();
+                    set_duration(state.overlay_hwnd, 10000);
                 }
                 _ => {}
             }
@@ -1917,6 +1947,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     {
                                         state.config.overlay.duration_ms = values[i];
                                         let _ = state.config.save();
+                                        set_duration(state.overlay_hwnd, values[i]);
                                         state.invalidate();
                                     }
                                 }
@@ -1950,6 +1981,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     {
                                         let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
                                     }
+                                }
+                                SettingId::ShowSample => {
+                                    show_sample(state.overlay_hwnd);
                                 }
                             }
                             return LRESULT(0);

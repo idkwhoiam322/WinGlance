@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
+    ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
     CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_NOPREFIX,
     DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_DONTCARE, GetMonitorInfoW, HBRUSH, HDC,
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS,
@@ -108,6 +108,22 @@ pub(crate) fn set_position(hwnd: HWND, pos: OverlayPos) {
         } else {
             state.reposition();
         }
+    }
+}
+
+/// Updates the live overlay's notification duration. The overlay keeps its own
+/// config snapshot, so settings changes must be pushed here to take effect.
+pub(crate) fn set_duration(hwnd: HWND, duration_ms: u64) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverlayState;
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        state.config.overlay.duration_ms = duration_ms.clamp(500, 60_000);
     }
 }
 
@@ -762,7 +778,9 @@ pub(crate) fn draw_string(
             DEFAULT_CHARSET.0 as u32,
             OUT_DEFAULT_PRECIS.0 as u32,
             CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
+            // ClearType subpixel rendering is incorrect on layered windows;
+            // grayscale antialiasing keeps the pill text crisp.
+            ANTIALIASED_QUALITY.0 as u32,
             DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
             PCWSTR(font_name.as_ptr()),
         )
