@@ -2,7 +2,7 @@ use crate::config::{Config, HorizontalPosition, VerticalPosition};
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo};
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
-use log::error;
+use log::{debug, error};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -202,7 +202,7 @@ impl OverlayState {
     fn update_content(&mut self, event: MediaEvent) {
         self.content = Some(event);
         if let Some(deadline) = self.dismiss_at {
-            self.dismiss_at = Some(deadline.max(Instant::now() + Duration::from_millis(1500)));
+            self.dismiss_at = Some(deadline.max(Instant::now() + update_min_duration(&self.config)));
         }
         self.render();
     }
@@ -257,10 +257,7 @@ impl OverlayState {
         let (alpha, shape) = self.frame();
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (logical_width, logical_height) = match content {
-            MediaEvent::TrackChanged(_) => (
-                self.config.overlay.max_width.max(180) as f32,
-                (self.config.appearance.art_size as f32 + 2.0 * self.config.appearance.padding + 12.0).max(48.0),
-            ),
+            MediaEvent::TrackChanged(_) => track_content_size(&self.config),
             MediaEvent::PlaybackStateChanged(_) => (240.0, 80.0),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
@@ -352,7 +349,7 @@ impl OverlayState {
             return;
         };
         unsafe {
-            let _ = SetWindowPos(
+            if let Err(error) = SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
                 point.x,
@@ -360,7 +357,9 @@ impl OverlayState {
                 0,
                 0,
                 SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOOWNERZORDER,
-            );
+            ) {
+                debug!("SetWindowPos(reposition) failed: {error}");
+            }
         }
     }
 
@@ -371,8 +370,10 @@ impl OverlayState {
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_ANIMATION);
             let _ = KillTimer(self.hwnd, TIMER_DEBOUNCE);
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-            let _ = SetWindowPos(
+            if !ShowWindow(self.hwnd, SW_HIDE).as_bool() {
+                debug!("ShowWindow(SW_HIDE) failed");
+            }
+            if let Err(error) = SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
                 0,
@@ -380,7 +381,9 @@ impl OverlayState {
                 0,
                 0,
                 SWP_HIDEWINDOW | SWP_NOACTIVATE | SWP_NOZORDER,
-            );
+            ) {
+                debug!("SetWindowPos(hide) failed: {error}");
+            }
         }
     }
 
@@ -398,10 +401,7 @@ impl OverlayState {
         let (_, shape) = self.frame();
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (logical_width, logical_height) = match content {
-            MediaEvent::TrackChanged(_) => (
-                self.config.overlay.max_width.max(180) as f32,
-                (self.config.appearance.art_size as f32 + 2.0 * self.config.appearance.padding + 12.0).max(48.0),
-            ),
+            MediaEvent::TrackChanged(_) => track_content_size(&self.config),
             MediaEvent::PlaybackStateChanged(_) => (240.0, 80.0),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
@@ -414,7 +414,7 @@ impl OverlayState {
     fn show_sample(&mut self) {
         self.content = Some(MediaEvent::PlaybackStateChanged(PlaybackState::Playing));
         let now = Instant::now();
-        self.dismiss_at = Some(now + Duration::from_millis(1500));
+        self.dismiss_at = Some(now + sample_duration(&self.config));
         self.phase = Phase::Light(now);
         unsafe {
             let _ = SetTimer(self.hwnd, TIMER_ANIMATION, 16, None);
@@ -422,6 +422,30 @@ impl OverlayState {
         }
         self.render();
     }
+}
+
+/// How long the "Show sample" preview stays visible: the configured duration,
+/// clamped to the same floor used for real notifications.
+fn sample_duration(config: &Config) -> Duration {
+    Duration::from_millis(config.overlay.duration_ms.max(500))
+}
+
+/// Minimum extra visible time granted to a metadata refresh: capped at the
+/// configured duration so a short setting is never silently extended.
+fn update_min_duration(config: &Config) -> Duration {
+    Duration::from_millis(config.overlay.duration_ms.min(1500))
+}
+
+/// Logical (96-DPI) size of a track-changed pill, sized for up to four text
+/// rows (title, subtitle, meta line, source app). Single source of truth used
+/// by both `render()` and `content_size()` so they cannot drift.
+fn track_content_size(config: &Config) -> (f32, f32) {
+    let appearance = &config.appearance;
+    let fs_artist = appearance.font_size_artist;
+    let text_h =
+        appearance.font_size_title * 1.35 + fs_artist * 1.35 + fs_artist * 0.85 * 1.35 + fs_artist * 0.75 * 1.35;
+    let height = (appearance.art_size as f32 + 2.0 * appearance.padding).max(text_h + 2.0 * appearance.padding + 8.0);
+    (config.overlay.max_width.max(180) as f32, height)
 }
 
 /// Forces the live overlay at `hwnd` to preview its current placement.
@@ -939,4 +963,42 @@ fn ease_out(value: f32) -> f32 {
 
 pub(crate) fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_duration_scales_with_config() {
+        let mut config = Config::default();
+        config.overlay.duration_ms = 10_000;
+        assert_eq!(sample_duration(&config), Duration::from_millis(10_000));
+
+        config.overlay.duration_ms = 200;
+        assert_eq!(sample_duration(&config), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn update_extension_is_capped_at_configured_duration() {
+        let mut config = Config::default();
+        config.overlay.duration_ms = 800;
+        assert_eq!(update_min_duration(&config), Duration::from_millis(800));
+
+        config.overlay.duration_ms = 5000;
+        assert_eq!(update_min_duration(&config), Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn track_content_size_fits_four_text_rows() {
+        let config = Config::default();
+        let (width, height) = track_content_size(&config);
+        assert_eq!(width, config.overlay.max_width as f32);
+        // Height must clear the sum of the four font-driven row heights plus
+        // padding, so no row gets clipped.
+        let fs = config.appearance.font_size_artist;
+        let text_h = config.appearance.font_size_title * 1.35 + fs * 1.35 + fs * 0.85 * 1.35 + fs * 0.75 * 1.35;
+        let needed = text_h + 2.0 * config.appearance.padding + 8.0;
+        assert!(height >= needed);
+    }
 }

@@ -1,6 +1,5 @@
-use crate::config::Config;
-use crate::overlay::{self, OverlayPos};
-use log::error;
+use crate::events::POSITION_MSG;
+use log::debug;
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -13,10 +12,10 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetCursorPos, GetWindowLongPtrW,
-    GetWindowRect, HWND_TOPMOST, IDC_ARROW, LoadCursorW, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASS_STYLES, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    GetWindowRect, HWND_TOPMOST, IDC_ARROW, LoadCursorW, PostMessageW, RegisterClassExW, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASS_STYLES,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
@@ -34,6 +33,7 @@ const DEFAULT_MARGIN: f32 = 8.0;
 static OPEN_POSITIONER: OnceLock<Mutex<(usize, usize)>> = OnceLock::new(); // (positioner, overlay)
 
 struct PositionerState {
+    owner: HWND,
     overlay: HWND,
     dragging: bool,
     drag_offset: POINT,
@@ -51,6 +51,7 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
         register_class(instance, &class_name);
 
         let state = Box::new(PositionerState {
+            owner,
             overlay,
             dragging: false,
             drag_offset: POINT::default(),
@@ -109,7 +110,7 @@ pub(crate) fn reset_position() {
         let margin = (DEFAULT_MARGIN * scale).round() as i32;
         let x = work.left + (work.right - work.left - w) / 2;
         let y = work.top + margin;
-        let _ = SetWindowPos(
+        if let Err(error) = SetWindowPos(
             hwnd,
             HWND_TOPMOST,
             x,
@@ -117,7 +118,9 @@ pub(crate) fn reset_position() {
             0,
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
+        ) {
+            debug!("positioner reset SetWindowPos failed: {error}");
+        }
     }
 }
 
@@ -159,9 +162,12 @@ fn snap(val: i32, edge: i32) -> i32 {
 
 /// Persists the positioner window's current screen position as absolute overlay
 /// coordinates and nudges the live overlay (without dismissing the window).
+/// The chosen position is posted to the main window, which owns the config and
+/// applies it — one writer, no disk round-trip that could clobber other settings.
 fn commit(hwnd: HWND, state: &mut PositionerState) {
     let mut rect = RECT::default();
-    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+    if let Err(error) = unsafe { GetWindowRect(hwnd, &mut rect) } {
+        debug!("positioner GetWindowRect failed: {error}");
         return;
     }
     let scale = unsafe { GetDpiForWindow(state.overlay).max(96) } as f32 / 96.0;
@@ -183,14 +189,15 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
     let log_x = (phys_x as f32 / scale).round() as i32;
     let log_y = (phys_y as f32 / scale).round() as i32;
 
-    if let Ok(mut config) = Config::load() {
-        config.overlay.position_x = Some(log_x);
-        config.overlay.position_y = Some(log_y);
-        if let Err(error) = config.save() {
-            error!("saving position config: {error:#}");
-        }
-        let pos = OverlayPos::from_config(&config);
-        overlay::set_position(state.overlay, pos);
+    if let Err(error) = unsafe {
+        PostMessageW(
+            state.owner,
+            POSITION_MSG,
+            WPARAM(log_x as usize),
+            LPARAM(log_y as isize),
+        )
+    } {
+        debug!("positioner PostMessageW failed: {error}");
     }
 }
 
@@ -239,7 +246,7 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
                 if GetCursorPos(&mut cursor).is_ok() {
                     let x = cursor.x + state.drag_offset.x;
                     let y = cursor.y + state.drag_offset.y;
-                    let _ = SetWindowPos(
+                    if let Err(error) = SetWindowPos(
                         hwnd,
                         HWND_TOPMOST,
                         x,
@@ -247,7 +254,9 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
                         0,
                         0,
                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                    );
+                    ) {
+                        debug!("positioner drag SetWindowPos failed: {error}");
+                    }
                 }
             }
             LRESULT(0)

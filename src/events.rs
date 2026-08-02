@@ -6,6 +6,11 @@ use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 pub const MEDIA_EVENT_MSG: u32 = WM_APP + 1;
 /// Posted by the main window's tray menu to toggle overlay notifications.
 pub const TOGGLE_MSG: u32 = WM_APP + 3;
+/// Posted by the positioner to the main window with the chosen custom position
+/// (X in wParam, Y in lParam, logical pixels). Routing through the main window
+/// keeps a single owner of the in-memory config, so a position commit can never
+/// clobber a concurrent settings change with a stale disk reload.
+pub const POSITION_MSG: u32 = WM_APP + 5;
 
 #[derive(Debug, Clone, Default)]
 pub struct TrackInfo {

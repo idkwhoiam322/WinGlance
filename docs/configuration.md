@@ -5,6 +5,11 @@ automatically with the defaults below on first run. `Config::normalize()`
 clamps every value to the safe ranges listed; out-of-range values are
 corrected silently but the file is not rewritten (see `docs/architecture.md`).
 
+> **Known limitation:** a hand-edited `config.toml` is only read at startup.
+> There is no live reload while the app is running — restart Notch after
+> editing the file by hand. Settings changed from the tray menu or the
+> Settings pane are applied immediately and persisted.
+
 ## [overlay]
 
 | Key            | Default | Range   | Effect                                            |

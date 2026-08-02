@@ -47,18 +47,9 @@ struct ListenerState {
     last_content_fingerprint: Option<TrackFingerprint>,
     last_playback: Option<(usize, PlaybackState)>,
     last_session_check: Instant,
-    /// Whether the current session is known to provide album titles. When true,
-    /// a track is not flushed until its album is present; sessions that never
-    /// provide album (e.g. browsers) flush as soon as artwork is ready.
-    session_has_album: bool,
     /// Whether the tracked session is currently Playing. Used to decide when a
     /// new source may take over the pill (only when nothing we track is active).
     current_playing: bool,
-    /// Whether the most recently flushed track had an album title. When the
-    /// previous track of this session carried album info, the next track is also
-    /// held until its album arrives — without adding latency for sources that
-    /// never provide album (browsers).
-    last_track_had_album: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,9 +121,7 @@ impl ListenerState {
             last_content_fingerprint: None,
             last_playback: None,
             last_session_check: Instant::now(),
-            session_has_album: false,
             current_playing: false,
-            last_track_had_album: false,
         }
     }
 
@@ -189,9 +178,6 @@ impl ListenerState {
                         .pending_track
                         .as_ref()
                         .is_some_and(|(k, p)| *k == key && p.title == track.title && p.artist == track.artist);
-                    if !track.album.trim().is_empty() {
-                        self.session_has_album = true;
-                    }
                     if is_merge {
                         if let Some((_, p)) = self.pending_track.as_mut() {
                             if !track.album.trim().is_empty() {
@@ -259,7 +245,6 @@ impl ListenerState {
         }
 
         self.current_key = new_key;
-        self.session_has_album = false;
         self.current_playing = false;
         if let Some(session) = resolved {
             self.ensure_subscribed(&session)?;
@@ -269,9 +254,6 @@ impl ListenerState {
                 if playback != Some(PlaybackState::Stopped)
                     && let Ok(track) = read_track_info(&session)
                 {
-                    if !track.album.trim().is_empty() {
-                        self.session_has_album = true;
-                    }
                     self.pending_track = Some((session_key(&session), track));
                 }
                 if let Some(state) = playback {
@@ -429,12 +411,14 @@ impl ListenerState {
     fn flush_pending(&mut self) {
         self.pending_deadline = None;
         // Wait until the track is complete before sending: artwork must be ready,
-        // and the album too when this session is known to provide one (or the
-        // previous flushed track had one). Re-schedule every 100ms up to 3s from
-        // the first read of this track.
+        // and a freshly-pending track also gets a short unconditional grace window
+        // for its album field (title/artist/artwork and album frequently arrive as
+        // separate MediaPropertiesChanged events, so gating on learned history
+        // raced on the very first track of a session). Re-schedule every 100ms;
+        // artwork waits up to 3s, album grace is fixed and short.
         let incomplete = self.pending_track.as_ref().is_some_and(|(_, track)| {
-            track.artwork.is_none()
-                || (track.album.trim().is_empty() && (self.session_has_album || self.last_track_had_album))
+            let elapsed = self.track_pending_since.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+            track.artwork.is_none() || (track.album.trim().is_empty() && elapsed < album_grace())
         });
         if incomplete {
             if self.track_pending_since.is_none() {
@@ -451,7 +435,6 @@ impl ListenerState {
             let fingerprint = track_fingerprint(&track);
             if self.last_content_fingerprint.as_ref() != Some(&fingerprint) {
                 self.last_content_fingerprint = Some(fingerprint);
-                self.last_track_had_album = !track.album.trim().is_empty();
                 info!(
                     "track changed | title={:?} | artist={:?} | album={:?} | source={:?}",
                     track.title, track.artist, track.album, track.source_app
@@ -616,6 +599,14 @@ fn debounce_duration(config: &Config) -> Duration {
     Duration::from_millis(config.behavior.debounce_ms.clamp(150, 250))
 }
 
+/// Grace window granted for the album field of a freshly-pending track. SMTC
+/// often delivers title/artist/artwork and album as separate events, so this
+/// fixed window lets the first track of a session pick up its album without
+/// relying on history. Sources that never provide album flush after this delay.
+fn album_grace() -> Duration {
+    Duration::from_millis(400)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,5 +625,12 @@ mod tests {
         assert_eq!(debounce_duration(&config), Duration::from_millis(150));
         config.behavior.debounce_ms = 1000;
         assert_eq!(debounce_duration(&config), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn album_grace_is_a_fixed_short_window() {
+        // Short enough to bound browser latency, long enough to catch the
+        // album event that typically follows artwork.
+        assert_eq!(album_grace(), Duration::from_millis(400));
     }
 }

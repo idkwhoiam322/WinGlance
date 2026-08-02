@@ -1,6 +1,6 @@
 use crate::autostart;
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
-use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo};
+use crate::events::{MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo};
 use crate::overlay::{
     EventQueue, OverlayPos, decode_artwork, draw_string, set_duration, set_position, show_sample, wide,
 };
@@ -1144,10 +1144,21 @@ impl MainWindowState {
                         SettingId::Duration => {
                             let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
                             let values = [2000u64, 3000, 5000, 10000];
+                            let duration_ms = self.config.overlay.duration_ms;
+                            let exact = values.contains(&duration_ms);
+                            // Nearest preset, for when the config holds a value
+                            // outside the four presets (e.g. hand-edited).
+                            let nearest = values
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, v)| v.abs_diff(duration_ms))
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
                             for (i, seg) in segments.iter().enumerate() {
-                                let active = self.config.overlay.duration_ms == values[i];
+                                let active = duration_ms == values[i];
+                                let near = !exact && i == nearest;
                                 let seg_hovered = self.settings_hover == Some((row_index, SettingSub::Seg(i)));
-                                let border = if active {
+                                let border = if active || near {
                                     colorref(accent[0], accent[1], accent[2])
                                 } else {
                                     colorref(SETTINGS_BORDER[0], SETTINGS_BORDER[1], SETTINGS_BORDER[2])
@@ -1167,6 +1178,10 @@ impl MainWindowState {
                                 };
                                 let fill = if active {
                                     accent_soft
+                                } else if near {
+                                    // Approximate preset: dimmer accent fill than the
+                                    // exact match, so "saved but not exact" is visible.
+                                    mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], 0.55)
                                 } else if seg_hovered {
                                     SETTINGS_HOVER
                                 } else {
@@ -1180,16 +1195,13 @@ impl MainWindowState {
                                     let _ = DeleteObject(HGDIOBJ(f.0));
                                 }
                                 let mut t = s_inner;
-                                let tc = if active { SETTINGS_TEXT } else { SETTINGS_MUTED };
-                                draw_string(
-                                    hdc,
-                                    &format!("{}s", values[i] / 1000),
-                                    &mut t,
-                                    (10.0 * scale) as i32,
-                                    tc,
-                                    active,
-                                    true,
-                                );
+                                let tc = if active || near { SETTINGS_TEXT } else { SETTINGS_MUTED };
+                                let label = if near {
+                                    format!("≈{}s", values[i] / 1000)
+                                } else {
+                                    format!("{}s", values[i] / 1000)
+                                };
+                                draw_string(hdc, &label, &mut t, (10.0 * scale) as i32, tc, active || near, true);
                             }
                         }
                         SettingId::Position => {
@@ -2054,6 +2066,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         MEDIA_EVENT_MSG => {
             if !state_ptr.is_null() {
                 (*state_ptr).receive_events();
+            }
+            LRESULT(0)
+        }
+        POSITION_MSG => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                // Custom position posted by the positioner (logical pixels).
+                state.config.overlay.position_x = Some(wparam.0 as i32);
+                state.config.overlay.position_y = Some(lparam.0 as i32);
+                let _ = state.config.save();
+                set_position(state.overlay_hwnd, OverlayPos::from_config(&state.config));
             }
             LRESULT(0)
         }
