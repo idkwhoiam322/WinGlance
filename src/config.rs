@@ -77,7 +77,7 @@ impl Default for OverlayConfig {
             vertical: VerticalPosition::Top,
             horizontal: HorizontalPosition::Center,
             margin: 8,
-            max_width: 240,
+            max_width: 340,
             position_x: None,
             position_y: None,
         }
@@ -104,11 +104,11 @@ impl Default for AppearanceConfig {
             background_color: [0x00, 0x00, 0x00, 0xFF],
             text_color: [0xFF, 0xFF, 0xFF, 0xFF],
             accent_color: [0x00, 0xD4, 0xAA, 0xFF],
-            corner_radius: 16.0,
-            padding: 8.0,
-            art_size: 32,
-            font_size_title: 12.0,
-            font_size_artist: 10.0,
+            corner_radius: 18.0,
+            padding: 12.0,
+            art_size: 48,
+            font_size_title: 16.0,
+            font_size_artist: 13.0,
         }
     }
 }

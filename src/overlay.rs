@@ -68,7 +68,7 @@ const MARQUEE_HOLD: Duration = Duration::from_millis(600);
 /// Horizontal gap between the end of the text and its repeated copy.
 const MARQUEE_GAP: f32 = 24.0;
 /// Scroll speed in logical px per second.
-const MARQUEE_SPEED: f32 = 30.0;
+const MARQUEE_SPEED: f32 = 40.0;
 /// Band height per text row as a multiple of the row's font size. Matches the
 /// font's natural line height (ascent + descent ≈ 1.33x for Segoe UI), so rows
 /// pack tightly without clipping.
@@ -549,7 +549,7 @@ fn state_content_size(config: &Config, last_track: Option<&TrackInfo>) -> (f32, 
         }
     }
     let height = text_h + 2.0 * appearance.padding + 8.0;
-    (240.0, height)
+    (config.overlay.max_width.max(180) as f32, height)
 }
 
 /// Forces the live overlay at `hwnd` to preview its current placement.
