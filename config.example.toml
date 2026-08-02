@@ -25,7 +25,8 @@ start_on_login = false
 close_to_tray = true
 
 [appearance]
-background_color = [0, 0, 0, 230]
+# Opaque pill background (alpha 255). Lower the alpha for translucency.
+background_color = [0, 0, 0, 255]
 text_color = [255, 255, 255, 255]
 accent_color = [0, 212, 170, 255]
 corner_radius = 16.0

@@ -96,7 +96,7 @@ impl Default for BehaviorConfig {
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
-            background_color: [0x00, 0x00, 0x00, 0xE6],
+            background_color: [0x00, 0x00, 0x00, 0xFF],
             text_color: [0xFF, 0xFF, 0xFF, 0xFF],
             accent_color: [0x00, 0xD4, 0xAA, 0xFF],
             corner_radius: 16.0,

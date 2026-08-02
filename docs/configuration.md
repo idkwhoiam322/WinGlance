@@ -33,7 +33,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 
 | Key                | Default       | Range    | Effect                                  |
 |--------------------|---------------|----------|-----------------------------------------|
-| `background_color` | `[0, 0, 0, 230]` | RGBA 0–255 | Pill background (near-black by default) |
+| `background_color` | `[0, 0, 0, 255]` | RGBA 0–255 | Pill background (opaque by default; lower alpha for translucency) |
 | `text_color`       | `[255, 255, 255, 255]` | RGBA 0–255 | Title and state-label color |
 | `accent_color`     | `[0, 212, 170, 255]` | RGBA 0–255 | Placeholder circle when no artwork |
 | `corner_radius`    | `16.0`     | 4–48    | Corner rounding in logical pixels       |
