@@ -292,13 +292,7 @@ impl MainWindowState {
     }
 
     fn add_state_change(&mut self, state: PlaybackState) {
-        let track = self.current.as_ref().map(|c| c.track.clone()).unwrap_or(TrackInfo {
-            title: "Unknown".into(),
-            artist: String::new(),
-            album: String::new(),
-            artwork: None,
-            source_app: "Media".into(),
-        });
+        let track = self.current.as_ref().map(|c| c.track.clone()).unwrap_or_default();
         let before = self.history.len();
         self.history.push(HistoryEntry {
             at: Local::now(),
@@ -602,12 +596,30 @@ impl MainWindowState {
                     false,
                 );
             }
-            if !current.track.source_app.trim().is_empty() {
-                let mut app_rect = RECT {
+            let extra = current.track.meta_line(false);
+            if !extra.is_empty() {
+                let mut extra_rect = RECT {
                     left: text_left,
                     top: art_y + (86.0 * scale) as i32,
                     right: text_right,
                     bottom: art_y + (100.0 * scale) as i32,
+                };
+                draw_string(
+                    hdc,
+                    &extra,
+                    &mut extra_rect,
+                    (11.0 * scale) as i32,
+                    [0x88, 0x88, 0x88, 0xFF],
+                    false,
+                    false,
+                );
+            }
+            if !current.track.source_app.trim().is_empty() {
+                let mut app_rect = RECT {
+                    left: text_left,
+                    top: art_y + (100.0 * scale) as i32,
+                    right: text_right,
+                    bottom: art_y + (114.0 * scale) as i32,
                 };
                 draw_string(
                     hdc,
@@ -1610,6 +1622,10 @@ mod tests {
             album: "The Album".into(),
             artwork: None,
             source_app: "Spotify".into(),
+            duration_secs: None,
+            track_number: None,
+            track_count: None,
+            genre: None,
         }
     }
 

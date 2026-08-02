@@ -124,10 +124,11 @@ impl ListenerState {
                 Ok(signal) => self.handle_signal(signal)?,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.flush_pending();
-                    // Periodically re-check sessions to catch missed changes
+                    // Periodically re-check sessions to catch missed changes. emit_initial=true
+                    // so a newly-detected current session reports its track+state immediately.
                     if self.last_session_check.elapsed() >= session_check_interval {
                         self.last_session_check = Instant::now();
-                        let _ = self.refresh_current_session(None, false);
+                        let _ = self.refresh_current_session(None, true);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -143,7 +144,10 @@ impl ListenerState {
                 self.refresh_current_session(None, true)?;
             }
             Signal::MediaProperties(session) => {
-                self.refresh_current_session(Some(&session), false)?;
+                // emit_initial=true: when this event changes the current session,
+                // immediately report the new session's track+state instead of
+                // showing stale info from the previous app.
+                self.refresh_current_session(Some(&session), true)?;
                 if self.current_key == Some(session_key(&session))
                     && read_playback_state(&session)? != Some(PlaybackState::Stopped)
                     && let Ok(track) = read_track_info(&session)
@@ -176,7 +180,7 @@ impl ListenerState {
                 }
             }
             Signal::PlaybackInfo(session) => {
-                self.refresh_current_session(Some(&session), false)?;
+                self.refresh_current_session(Some(&session), true)?;
                 if self.current_key == Some(session_key(&session))
                     && let Some(state) = read_playback_state(&session)?
                 {
@@ -388,13 +392,45 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession) -> Resul
         debug!("album-art read failed: {error:#}");
         None
     });
+    let track_number = {
+        let n = properties.TrackNumber()?;
+        if n > 0 { Some(n as u32) } else { None }
+    };
+    let track_count = {
+        let n = properties.AlbumTrackCount()?;
+        if n > 0 { Some(n as u32) } else { None }
+    };
+    let genre = {
+        let genres: Vec<String> = properties.Genres()?.into_iter().map(|g| g.to_string()).collect();
+        let joined = genres.join(", ");
+        if joined.trim().is_empty() { None } else { Some(joined) }
+    };
+    // Total duration is static per track (EndTime - StartTime); fine to read
+    // once at track-change time without any continuous timeline updates.
+    let duration_secs = read_duration(session);
     Ok(TrackInfo {
         title,
         artist,
         album,
         artwork,
         source_app,
+        duration_secs,
+        track_number,
+        track_count,
+        genre,
     })
+}
+
+fn read_duration(session: &GlobalSystemMediaTransportControlsSession) -> Option<u64> {
+    let timeline = session.GetTimelineProperties().ok()?;
+    let start = timeline.StartTime().ok()?.Duration;
+    let end = timeline.EndTime().ok()?.Duration;
+    let duration_100ns = end - start;
+    if duration_100ns <= 0 {
+        return None;
+    }
+    // TimeSpan.Duration is in 100-nanosecond units.
+    Some((duration_100ns / 10_000_000) as u64)
 }
 
 fn read_playback_state(session: &GlobalSystemMediaTransportControlsSession) -> Result<Option<PlaybackState>> {

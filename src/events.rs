@@ -7,13 +7,44 @@ pub const MEDIA_EVENT_MSG: u32 = WM_APP + 1;
 /// Posted by the main window's tray menu to toggle overlay notifications.
 pub const TOGGLE_MSG: u32 = WM_APP + 3;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TrackInfo {
     pub title: String,
     pub artist: String,
     pub album: String,
     pub artwork: Option<Vec<u8>>,
     pub source_app: String,
+    /// Total duration in seconds, when the app reports timeline info.
+    pub duration_secs: Option<u64>,
+    /// 1-based track number within the album, when provided.
+    pub track_number: Option<u32>,
+    /// Total track count within the album, when provided.
+    pub track_count: Option<u32>,
+    /// Genre, when provided.
+    pub genre: Option<String>,
+}
+
+impl TrackInfo {
+    /// Compact secondary info line: album · duration · track n/c · genre.
+    /// Only the parts the app actually provided are included.
+    pub fn meta_line(&self, include_album: bool) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if include_album && !self.album.trim().is_empty() {
+            parts.push(self.album.clone());
+        }
+        if let Some(d) = self.duration_secs {
+            parts.push(format!("{}:{:02}", d / 60, d % 60));
+        }
+        if let (Some(n), Some(c)) = (self.track_number, self.track_count) {
+            parts.push(format!("{n}/{c}"));
+        }
+        if let Some(g) = &self.genre
+            && !g.trim().is_empty()
+        {
+            parts.push(g.clone());
+        }
+        parts.join(" · ")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

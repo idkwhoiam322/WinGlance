@@ -243,7 +243,7 @@ impl OverlayState {
         let (logical_width, logical_height) = match content {
             MediaEvent::TrackChanged(_) => (
                 self.config.overlay.max_width.max(180) as f32,
-                (self.config.appearance.art_size as f32 + 2.0 * self.config.appearance.padding + 4.0).max(40.0),
+                (self.config.appearance.art_size as f32 + 2.0 * self.config.appearance.padding + 12.0).max(48.0),
             ),
             MediaEvent::PlaybackStateChanged(_) => (240.0, 80.0),
         };
@@ -384,7 +384,7 @@ impl OverlayState {
         let (logical_width, logical_height) = match content {
             MediaEvent::TrackChanged(_) => (
                 self.config.overlay.max_width.max(180) as f32,
-                (self.config.appearance.art_size as f32 + 2.0 * self.config.appearance.padding + 4.0).max(40.0),
+                (self.config.appearance.art_size as f32 + 2.0 * self.config.appearance.padding + 12.0).max(48.0),
             ),
             MediaEvent::PlaybackStateChanged(_) => (240.0, 80.0),
         };
@@ -610,15 +610,21 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
             let left = padding + art + (12.0 * scale) as i32;
             let mut title_rect = RECT {
                 left,
-                top: (height as f32 * 0.20) as i32,
+                top: (height as f32 * 0.16) as i32,
                 right: width - padding,
-                bottom: (height as f32 * 0.56) as i32,
+                bottom: (height as f32 * 0.38) as i32,
             };
             let mut artist_rect = RECT {
                 left,
-                top: (height as f32 * 0.56) as i32,
+                top: (height as f32 * 0.38) as i32,
                 right: width - padding,
-                bottom: height - (height as f32 * 0.12) as i32,
+                bottom: (height as f32 * 0.60) as i32,
+            };
+            let mut meta_rect = RECT {
+                left,
+                top: (height as f32 * 0.60) as i32,
+                right: width - padding,
+                bottom: (height as f32 * 0.82) as i32,
             };
             draw_string(
                 hdc,
@@ -643,13 +649,22 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
                 false,
                 false,
             );
+            let meta = track.meta_line(true);
+            if !meta.is_empty() {
+                draw_string(
+                    hdc,
+                    &meta,
+                    &mut meta_rect,
+                    ((state.config.appearance.font_size_artist * 0.85 * scale) as i32).max(1),
+                    [0x99, 0x99, 0x99, 0xFF],
+                    false,
+                    false,
+                );
+            }
             if !track.source_app.trim().is_empty() {
-                let source_top =
-                    (padding as f32 + art as f32 + (12.0 + state.config.appearance.font_size_artist * 2.0) * scale)
-                        as i32;
                 let mut app_rect = RECT {
                     left,
-                    top: source_top,
+                    top: (height as f32 * 0.82) as i32,
                     right: width - padding,
                     bottom: height - padding,
                 };
@@ -657,8 +672,8 @@ fn draw_text(state: &OverlayState, hdc: HDC, content: &MediaEvent, width: i32, h
                     hdc,
                     &track.source_app,
                     &mut app_rect,
-                    ((state.config.appearance.font_size_artist * 0.8) as i32).max(1),
-                    [0x88, 0x88, 0x88, 0xFF],
+                    ((state.config.appearance.font_size_artist * 0.75 * scale) as i32).max(1),
+                    [0x77, 0x77, 0x77, 0xFF],
                     false,
                     false,
                 );
