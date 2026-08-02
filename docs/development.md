@@ -21,7 +21,7 @@ WinGlance/
     ├── main.rs             Entry point; wires logging, threads, and the loop
     ├── config.rs           Config structs, defaults, load/save, normalize()
     ├── events.rs           Shared event types (TrackInfo, PlaybackState)
-    ├── logging.rs          Rotating log-N.log + log-Live.log file logger
+    ├── logging.rs          Single-file logger (log-Live.log, current run)
     ├── smtc.rs             Isolated SMTC listener on its own COM thread
     └── overlay.rs          Win32 layered window, GDI rendering, tray icon
 ```
@@ -43,8 +43,8 @@ WinGlance/
 - **overlay.rs** — all Win32 window creation, message handling, GDI drawing,
   DPI math, tray icon/menu, and the expand/light/collapse state machine.
 - **logging.rs** — a `log`-crate logger that appends to
-  `log-<n>.log` (one per run, retained per `keep_files`) and mirrors into
-  `log-Live.log` (truncated each run), inside `<data_dir>\logs`.
+  `log-Live.log` inside `<data_dir>\logs`, truncated at each startup so only
+  the current run is retained.
 - **config.rs** — serde structs with `#[serde(default)]` so missing fields
   never break loading; `normalize()` clamps every value before use. The
   config file lives at `%APPDATA%\notch\notch\data\config.toml`.
@@ -76,7 +76,7 @@ uses all CPU cores, `-NoRestart` leaves a running instance alone.
 | What          | Where                                            |
 |---------------|--------------------------------------------------|
 | Config        | `%APPDATA%\notch\notch\data\config.toml`         |
-| Logs          | `%APPDATA%\notch\notch\data\logs\log-*.log`      |
+| Logs          | `%APPDATA%\notch\notch\data\logs\log-Live.log`  |
 | Artwork cache | none (decoded in memory per event)               |
 
 ## Testing notes

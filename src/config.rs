@@ -7,7 +7,6 @@ pub struct Config {
     pub overlay: OverlayConfig,
     pub behavior: BehaviorConfig,
     pub appearance: AppearanceConfig,
-    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,12 +50,6 @@ pub struct AppearanceConfig {
     pub font_size_artist: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LoggingConfig {
-    pub keep_files: u32,
-}
-
 impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
@@ -91,12 +84,6 @@ impl Default for AppearanceConfig {
             font_size_title: 12.0,
             font_size_artist: 10.0,
         }
-    }
-}
-
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self { keep_files: 5 }
     }
 }
 
@@ -150,7 +137,6 @@ impl Config {
         self.appearance.art_size = self.appearance.art_size.clamp(24, 96);
         self.appearance.font_size_title = self.appearance.font_size_title.clamp(8.0, 32.0);
         self.appearance.font_size_artist = self.appearance.font_size_artist.clamp(8.0, 28.0);
-        self.logging.keep_files = self.logging.keep_files.clamp(1, 100);
     }
 }
 

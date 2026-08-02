@@ -39,11 +39,11 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 Colors are `[R, G, B, A]` with 0–255 components. The alpha channel is used
 for compositing; a value below 255 makes the pill slightly translucent.
 
-## [logging]
+## Logging
 
-| Key          | Default | Range | Effect                                  |
-|--------------|---------|-------|-----------------------------------------|
-| `keep_files` | `5`     | 1–100 | Number of numbered `log-<n>.log` files retained |
+Logging has no configuration. A single `log-Live.log` file in
+`<data_dir>\logs` captures the current run and is truncated at startup; no
+history is retained.
 
 ## Compact notch defaults
 

@@ -13,7 +13,7 @@ use std::thread;
 
 fn main() -> Result<()> {
     let config = config::Config::load()?;
-    logging::init_logging(&config.logs_dir(), config.logging.keep_files);
+    logging::init_logging(&config.logs_dir());
     info!("starting Notch");
 
     let (event_tx, event_rx) = mpsc::channel();

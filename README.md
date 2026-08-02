@@ -29,11 +29,10 @@ The first run creates:
 
 `%APPDATA%\notch\notch\data\config.toml`
 
-Copy the values from `config.example.toml` to edit them. Logs use the same
-rotation pattern as NewsAggregator:
+Copy the values from `config.example.toml` to edit them. Logging is a single
+per-run file, truncated at startup:
 
-- `data\logs\log-N.log` is the permanent run log.
-- `data\logs\log-Live.log` is truncated at startup and contains the current run.
+- `data\logs\log-Live.log` contains the current run.
 
 ## Build
 
