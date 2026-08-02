@@ -31,7 +31,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, HWND_TOPMOST,
-    IDC_ARROW, IDI_APPLICATION, KillTimer, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETTEXT, LB_INSERTSTRING,
+    IDC_ARROW, IDI_APPLICATION, KillTimer, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_INSERTSTRING,
     LB_ITEMFROMPOINT, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED,
     LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage,
     RegisterClassExW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW,
@@ -1504,36 +1504,73 @@ impl MainWindowState {
             let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
         }
 
-        let mut buf = vec![0u16; 512];
-        let len = unsafe {
-            SendMessageW(
-                item.hwndItem,
-                LB_GETTEXT,
-                WPARAM(index),
-                LPARAM(buf.as_mut_ptr() as isize),
-            )
-            .0 as usize
-        };
-        buf.truncate(len.min(buf.len()));
-        let text = String::from_utf16_lossy(&buf);
+        // Column layout: TIME | STATE | TITLE | ARTIST | ALBUM | SOURCE.
+        let pad = (8.0 * scale) as i32;
+        let gap = (4.0 * scale) as i32;
+        let time_w = (78.0 * scale) as i32;
+        let state_w = (30.0 * scale) as i32;
+        let left = item.rcItem.left + pad;
+        let rest = (item.rcItem.right - pad - left - time_w - state_w - gap).max(0);
+        let title_w = (rest as f32 * 0.34) as i32;
+        let artist_w = (rest as f32 * 0.24) as i32;
+        let album_w = (rest as f32 * 0.20) as i32;
+        let source_w = (rest - title_w - artist_w - album_w).max(0);
+        let col_x = [left, left + time_w + gap, left + time_w + gap + state_w + gap];
+        let title_x = col_x[2];
+        let artist_x = title_x + title_w + gap;
+        let album_x = artist_x + artist_w + gap;
+        let source_x = album_x + album_w + gap;
+        let header_font = (11.0 * scale) as i32;
+        let row_font = (13.0 * scale) as i32;
+        let header_color = [0x9A, 0x9A, 0x9A, 0xFF];
+        let row_color = [0xE6, 0xE6, 0xE6, 0xFF];
 
-        let mut text_rect = item.rcItem;
-        text_rect.left += (8.0 * scale) as i32;
-        text_rect.right -= (8.0 * scale) as i32;
-        let color = if index == 0 {
-            [0x9A, 0x9A, 0x9A, 0xFF]
-        } else {
-            [0xE6, 0xE6, 0xE6, 0xFF]
+        let cell = |x: i32, w: i32, text: &str, font: i32, color: [u8; 4], bold: bool| {
+            if w <= 0 {
+                return;
+            }
+            let mut rect = RECT {
+                left: x,
+                top: item.rcItem.top,
+                right: x + w,
+                bottom: item.rcItem.bottom,
+            };
+            draw_string(hdc, text, &mut rect, font, color, bold, false);
         };
-        draw_string(
-            hdc,
-            &text,
-            &mut text_rect,
-            ((if index == 0 { 11.0 } else { 13.0 }) * scale) as i32,
-            color,
-            index == 0,
-            false,
-        );
+
+        if index == 0 {
+            // Header row.
+            cell(col_x[0], time_w, "TIME", header_font, header_color, true);
+            cell(col_x[1], state_w, "", header_font, header_color, true);
+            cell(title_x, title_w, "TITLE", header_font, header_color, true);
+            cell(artist_x, artist_w, "ARTIST", header_font, header_color, true);
+            cell(album_x, album_w, "ALBUM", header_font, header_color, true);
+            cell(source_x, source_w, "SOURCE", header_font, header_color, true);
+        } else if let Some(entry) = self.history.entries.get(index - 1) {
+            let status = match entry.state {
+                PlaybackState::Playing => "▶",
+                PlaybackState::Paused => "‖",
+                PlaybackState::Stopped => "■",
+            };
+            let artist = if entry.track.artist.trim().is_empty() {
+                &entry.track.source_app
+            } else {
+                &entry.track.artist
+            };
+            cell(
+                col_x[0],
+                time_w,
+                &entry.at.format("%H:%M:%S").to_string(),
+                row_font,
+                row_color,
+                false,
+            );
+            cell(col_x[1], state_w, status, row_font, row_color, false);
+            cell(title_x, title_w, &entry.track.title, row_font, row_color, false);
+            cell(artist_x, artist_w, artist, row_font, row_color, false);
+            cell(album_x, album_w, &entry.track.album, row_font, row_color, false);
+            cell(source_x, source_w, &entry.track.source_app, row_font, row_color, false);
+        }
     }
 
     fn on_destroy(&mut self) {
@@ -2317,7 +2354,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             LRESULT(0)
         }
-        WM_TIMER if wparam.0 as usize == TIMER_LOGS_ID => {
+        WM_TIMER if wparam.0 == TIMER_LOGS_ID => {
             unsafe {
                 let _ = KillTimer(hwnd, TIMER_LOGS_ID);
             }
