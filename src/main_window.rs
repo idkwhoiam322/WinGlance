@@ -23,12 +23,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, IDC_ARROW, IDI_APPLICATION, LB_ADDSTRING,
     LB_DELETESTRING, LB_GETCOUNT, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT,
-    LBS_OWNERDRAWFIXED, LoadCursorW, LoadIconW, MF_CHECKED, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SW_HIDE, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD,
-    WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    LBS_OWNERDRAWFIXED, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WNDCLASS_STYLES,
+    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -48,7 +48,10 @@ const MENU_POSITION_BOTTOM_RIGHT: usize = 1012;
 const MENU_POSITION_CUSTOM: usize = 1013;
 const MENU_POSITION_SAMPLE: usize = 1014;
 const MENU_POSITION_RESET: usize = 1015;
-const MENU_DURATION: usize = 1016;
+const MENU_DURATION_2S: usize = 1017;
+const MENU_DURATION_3S: usize = 1018;
+const MENU_DURATION_5S: usize = 1019;
+const MENU_DURATION_10S: usize = 1020;
 const LISTBOX_ID: usize = 2;
 const HISTORY_CAP: usize = 500;
 
@@ -837,8 +840,62 @@ fn show_tray_menu(state: &mut MainWindowState) {
             PCWSTR(wide("Reset position").as_ptr()),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let duration_label = format!("Duration: {}s", state.config.overlay.duration_ms / 1000);
-        let _ = AppendMenuW(menu, MF_STRING, MENU_DURATION, PCWSTR(wide(&duration_label).as_ptr()));
+        // Duration submenu
+        let Ok(duration_menu) = CreatePopupMenu() else {
+            let _ = DestroyMenu(menu);
+            return;
+        };
+        let current_secs = state.config.overlay.duration_ms / 1000;
+        let dur_2s_flags = if current_secs == 2 {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let dur_3s_flags = if current_secs == 3 {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let dur_5s_flags = if current_secs == 5 {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let dur_10s_flags = if current_secs == 10 {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let _ = AppendMenuW(
+            duration_menu,
+            dur_2s_flags,
+            MENU_DURATION_2S,
+            PCWSTR(wide("2 seconds").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            duration_menu,
+            dur_3s_flags,
+            MENU_DURATION_3S,
+            PCWSTR(wide("3 seconds").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            duration_menu,
+            dur_5s_flags,
+            MENU_DURATION_5S,
+            PCWSTR(wide("5 seconds").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            duration_menu,
+            dur_10s_flags,
+            MENU_DURATION_10S,
+            PCWSTR(wide("10 seconds").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            duration_menu.0 as usize,
+            PCWSTR(wide("Duration").as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT_ID, PCWSTR(wide("Quit").as_ptr()));
 
@@ -894,13 +951,20 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     let _ = state.config.save();
                     set_position(state.overlay_hwnd, OverlayPos::from_config(&state.config));
                 }
-                MENU_DURATION => {
-                    state.config.overlay.duration_ms = match state.config.overlay.duration_ms {
-                        2000 => 3000,
-                        3000 => 5000,
-                        5000 => 10000,
-                        _ => 2000,
-                    };
+                MENU_DURATION_2S => {
+                    state.config.overlay.duration_ms = 2000;
+                    let _ = state.config.save();
+                }
+                MENU_DURATION_3S => {
+                    state.config.overlay.duration_ms = 3000;
+                    let _ = state.config.save();
+                }
+                MENU_DURATION_5S => {
+                    state.config.overlay.duration_ms = 5000;
+                    let _ = state.config.save();
+                }
+                MENU_DURATION_10S => {
+                    state.config.overlay.duration_ms = 10000;
                     let _ = state.config.save();
                 }
                 _ => {}
