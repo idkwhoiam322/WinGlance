@@ -45,6 +45,19 @@ verified headless.
   log file may be truncated at startup). The Settings pane has a "Copy logs"
   button that puts the log on the clipboard.
 
+## Never launch anything
+
+- Never start the app, helper processes, capture scripts, or any command
+  that can appear on the user's screen (no `Start-Process`, no `.exe`
+  launches, no GUI/screenshot tooling) — the user may be in a fullscreen
+  game. This is a hard rule.
+- Verify through log files only: `log-Live.log` (+ `crash.log`) under
+  `%APPDATA%\notch\notch\data\logs\`, and temporary files under
+  `C:\Users\admin\AppData\Local\Temp\opencode\`. All diagnostic output goes
+  to those files, never to the screen.
+- If a visual check is needed, tell the user what to look at and let them
+  restart the app themselves.
+
 ## Architecture guardrails
 
 - The pill (`src/overlay.rs`) is strictly passive: no click targets, no focus,

@@ -69,6 +69,10 @@ const MARQUEE_HOLD: Duration = Duration::from_millis(600);
 const MARQUEE_GAP: f32 = 24.0;
 /// Scroll speed in logical px per second.
 const MARQUEE_SPEED: f32 = 30.0;
+/// Band height per text row as a multiple of the row's font size. Matches the
+/// font's natural line height (ascent + descent ≈ 1.33x for Segoe UI), so rows
+/// pack tightly without clipping.
+const ROW_HEIGHT: f32 = 1.35;
 
 /// Regular and bold faces loaded once from the system font directory. Segoe UI
 /// is the preferred family, with Tahoma and Arial as fallbacks.
@@ -332,8 +336,8 @@ impl OverlayState {
         let (alpha, shape) = self.frame();
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (logical_width, logical_height) = match content {
-            MediaEvent::TrackChanged(_) => track_content_size(&self.config),
-            MediaEvent::PlaybackStateChanged(_) => (240.0, 80.0),
+            MediaEvent::TrackChanged(track) => track_content_size(&self.config, track),
+            MediaEvent::PlaybackStateChanged(_) => state_content_size(&self.config, self.last_track.as_ref()),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
@@ -476,8 +480,8 @@ impl OverlayState {
         let (_, shape) = self.frame();
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (logical_width, logical_height) = match content {
-            MediaEvent::TrackChanged(_) => track_content_size(&self.config),
-            MediaEvent::PlaybackStateChanged(_) => (240.0, 80.0),
+            MediaEvent::TrackChanged(track) => track_content_size(&self.config, track),
+            MediaEvent::PlaybackStateChanged(_) => state_content_size(&self.config, self.last_track.as_ref()),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
@@ -512,16 +516,40 @@ fn update_min_duration(config: &Config) -> Duration {
     Duration::from_millis(config.overlay.duration_ms.min(1500))
 }
 
-/// Logical (96-DPI) size of a track-changed pill, sized for up to four text
-/// rows (title, subtitle, meta line, source app). Single source of truth used
-/// by both `render()` and `content_size()` so they cannot drift.
-fn track_content_size(config: &Config) -> (f32, f32) {
+/// Logical (96-DPI) size of a track-changed pill. The height fits exactly the
+/// rows that will actually be drawn (title, subtitle, plus the meta and
+/// source-app rows when present), so the text fills the pill instead of
+/// floating in expanded bands. Single source of truth used by both `render()`
+/// and `content_size()` so they cannot drift.
+fn track_content_size(config: &Config, track: &TrackInfo) -> (f32, f32) {
     let appearance = &config.appearance;
     let fs_artist = appearance.font_size_artist;
-    let text_h =
-        appearance.font_size_title * 1.35 + fs_artist * 1.35 + fs_artist * 0.85 * 1.35 + fs_artist * 0.75 * 1.35;
+    let rows: [f32; 4] = [
+        appearance.font_size_title * ROW_HEIGHT,
+        fs_artist * ROW_HEIGHT,
+        fs_artist * 0.85 * ROW_HEIGHT,
+        fs_artist * 0.75 * ROW_HEIGHT,
+    ];
+    let meta = track.meta_line(true);
+    let active = [true, true, !meta.is_empty(), !track.source_app.trim().is_empty()];
+    let text_h: f32 = rows.iter().zip(active).filter(|(_, a)| *a).map(|(h, _)| *h).sum();
     let height = (appearance.art_size as f32 + 2.0 * appearance.padding).max(text_h + 2.0 * appearance.padding + 8.0);
     (config.overlay.max_width.max(180) as f32, height)
+}
+
+/// Logical size of a playback-state pill: the label plus the current track's
+/// title/artist rows when one is known, again fitted to the drawn rows.
+fn state_content_size(config: &Config, last_track: Option<&TrackInfo>) -> (f32, f32) {
+    let appearance = &config.appearance;
+    let mut text_h = appearance.font_size_title * ROW_HEIGHT;
+    if let Some(track) = last_track {
+        text_h += appearance.font_size_artist * ROW_HEIGHT;
+        if !track.artist.trim().is_empty() {
+            text_h += appearance.font_size_artist * 0.85 * ROW_HEIGHT;
+        }
+    }
+    let height = text_h + 2.0 * appearance.padding + 8.0;
+    (240.0, height)
 }
 
 /// Forces the live overlay at `hwnd` to preview its current placement.
@@ -582,7 +610,7 @@ fn render_layered(
     position: POINT,
 ) -> Result<()> {
     let mut pixels = draw_pixels(state, content, width as usize, height as usize, scale)?;
-    draw_text_pixels(state, &mut pixels, content, width, height, scale);
+    draw_text_pixels(state, &mut pixels, content, width, scale);
     let bitmap_info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -737,14 +765,7 @@ fn draw_pixels(state: &OverlayState, content: &MediaEvent, width: usize, height:
 /// shapes: glyph coverage from fontdue becomes alpha, so text alpha-composites
 /// exactly like every other element (GDI text cannot do this on a layered
 /// window — it never touches the alpha channel).
-fn draw_text_pixels(
-    state: &OverlayState,
-    pixels: &mut [u8],
-    content: &MediaEvent,
-    width: i32,
-    height: i32,
-    scale: f32,
-) {
+fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEvent, width: i32, scale: f32) {
     match content {
         MediaEvent::TrackChanged(track) => {
             let appearance = &state.config.appearance;
@@ -754,35 +775,27 @@ fn draw_text_pixels(
             let right = width - padding;
 
             // Font-driven row heights: bands are sized from the actual fonts, so
-            // rows can never overlap at any pill size (including mid-animation).
+            // rows can never overlap at any pill size (including mid-animation)
+            // and pack tightly — the pill is fitted to the drawn rows, so each
+            // band keeps its natural line height instead of expanding.
             let fs_title = appearance.font_size_title * scale;
             let fs_artist = appearance.font_size_artist * scale;
             let fs_meta = fs_artist * 0.85;
             let fs_app = fs_artist * 0.75;
             let rows: [(f32, f32); 4] = [
-                (fs_title * 1.35, fs_title),
-                (fs_artist * 1.35, fs_artist),
-                (fs_meta * 1.35, fs_meta),
-                (fs_app * 1.35, fs_app),
+                (fs_title * ROW_HEIGHT, fs_title),
+                (fs_artist * ROW_HEIGHT, fs_artist),
+                (fs_meta * ROW_HEIGHT, fs_meta),
+                (fs_app * ROW_HEIGHT, fs_app),
             ];
-            // Only rows that will actually be drawn participate in the band
-            // split, so title/artist expand to fill the pill when the meta or
-            // source-app line is absent.
+            // Only rows that will actually be drawn participate, so title/artist
+            // expand to fill the pill when the meta or source-app line is absent.
             let meta = track.meta_line(true);
             let active: [bool; 4] = [true, true, !meta.is_empty(), !track.source_app.trim().is_empty()];
-            let total: f32 = rows
-                .iter()
-                .zip(active)
-                .filter(|(_, active)| *active)
-                .map(|((h, _), _)| *h)
-                .sum();
-            let mut y = 0.0f32;
+            let text_top = appearance.padding * scale;
+            let mut y = text_top;
             let mut next_band = |i: usize| -> RECT {
-                let band_h = if active[i] {
-                    rows[i].0 / total * height as f32
-                } else {
-                    0.0
-                };
+                let band_h = if active[i] { rows[i].0 } else { 0.0 };
                 let r = RECT {
                     left,
                     top: y as i32,
@@ -859,54 +872,53 @@ fn draw_text_pixels(
                 PlaybackState::Paused => "Paused",
                 PlaybackState::Stopped => "Stopped",
             };
-            let state_rect = RECT {
-                left: 0,
-                top: 0,
-                right: width,
-                bottom: (height as f32 * 0.35) as i32,
+            let fs_title = state.config.appearance.font_size_title * scale;
+            let fs_artist = state.config.appearance.font_size_artist * scale;
+            let text_top = state.config.appearance.padding * scale;
+            let mut y = text_top;
+            let mut next_band = |h: f32| -> RECT {
+                let r = RECT {
+                    left: 0,
+                    top: y as i32,
+                    right: width,
+                    bottom: (y + h) as i32,
+                };
+                y += h;
+                r
             };
+            let label_rect = next_band(fs_title * ROW_HEIGHT);
             draw_text_line_pixels(
                 pixels,
                 width as usize,
                 label,
-                &state_rect,
-                (state.config.appearance.font_size_title * scale) as i32,
+                &label_rect,
+                fs_title as i32,
                 state.config.appearance.accent_color,
                 true,
                 true,
                 None,
             );
             if let Some(track) = &state.last_track {
-                let title_rect = RECT {
-                    left: 0,
-                    top: (height as f32 * 0.35) as i32,
-                    right: width,
-                    bottom: (height as f32 * 0.65) as i32,
-                };
+                let title_rect = next_band(fs_artist * ROW_HEIGHT);
                 draw_text_line_pixels(
                     pixels,
                     width as usize,
                     &track.title,
                     &title_rect,
-                    (state.config.appearance.font_size_artist * scale) as i32,
+                    fs_artist as i32,
                     state.config.appearance.text_color,
                     true,
                     true,
                     None,
                 );
                 if !track.artist.trim().is_empty() {
-                    let artist_rect = RECT {
-                        left: 0,
-                        top: (height as f32 * 0.65) as i32,
-                        right: width,
-                        bottom: height,
-                    };
+                    let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
                     draw_text_line_pixels(
                         pixels,
                         width as usize,
                         &track.artist,
                         &artist_rect,
-                        ((state.config.appearance.font_size_artist * 0.85) as i32).max(1),
+                        (fs_artist * 0.85) as i32,
                         [0xCC, 0xCC, 0xCC, 0xFF],
                         false,
                         true,
@@ -1289,16 +1301,35 @@ mod tests {
     }
 
     #[test]
-    fn track_content_size_fits_four_text_rows() {
+    fn track_content_size_fits_its_active_rows() {
         let config = Config::default();
-        let (width, height) = track_content_size(&config);
+        let track = TrackInfo {
+            title: "Title".into(),
+            artist: "Artist".into(),
+            source_app: "App".into(),
+            ..TrackInfo::default()
+        };
+        let (width, height) = track_content_size(&config, &track);
         assert_eq!(width, config.overlay.max_width as f32);
-        // Height must clear the sum of the four font-driven row heights plus
-        // padding, so no row gets clipped.
+        // Height must clear the sum of the active row heights plus padding,
+        // so no row gets clipped.
         let fs = config.appearance.font_size_artist;
-        let text_h = config.appearance.font_size_title * 1.35 + fs * 1.35 + fs * 0.85 * 1.35 + fs * 0.75 * 1.35;
+        let meta = track.meta_line(true);
+        let text_h = if meta.is_empty() {
+            config.appearance.font_size_title * ROW_HEIGHT + fs * ROW_HEIGHT
+        } else {
+            config.appearance.font_size_title * ROW_HEIGHT + fs * ROW_HEIGHT + fs * 0.85 * ROW_HEIGHT
+        } + fs * 0.75 * ROW_HEIGHT;
         let needed = text_h + 2.0 * config.appearance.padding + 8.0;
         assert!(height >= needed);
+        // Without meta/source rows the pill is shorter, not bloated.
+        let minimal = TrackInfo {
+            title: "Title".into(),
+            artist: "Artist".into(),
+            ..TrackInfo::default()
+        };
+        let (_, compact) = track_content_size(&config, &minimal);
+        assert!(compact < height, "fewer rows must yield a shorter pill");
     }
 
     #[test]
@@ -1381,7 +1412,7 @@ mod tests {
             artist: "John Muirhead".into(),
             ..TrackInfo::default()
         };
-        draw_text_pixels(&state, &mut pixels, &MediaEvent::TrackChanged(track), 240, 76, 1.0);
+        draw_text_pixels(&state, &mut pixels, &MediaEvent::TrackChanged(track), 240, 1.0);
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 500, "expected text + art pixels, got {lit}");
     }
