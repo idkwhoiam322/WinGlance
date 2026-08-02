@@ -1,0 +1,33 @@
+# cargo-deny policy for the notch build.
+#
+# The allowlist covers every license in the locked dependency tree. All are
+# OSI-approved and FSF Free/Libre:
+#   - 0BSD / MIT / Apache-2.0: adler2, serde, image, windows, ...
+#   - Apache-2.0 WITH LLVM-exception: wasi (pulled in via getrandom on WASM
+#     targets; unused at runtime on Windows but present in Cargo.lock)
+#   - Zlib: zune-core / zune-jpeg (image's JPEG decoder)
+#   - MPL-2.0: option-ext (via dirs-sys)
+#   - Unicode-3.0: unicode-ident (data tables)
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "0BSD",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-3.0",
+]
+
+# Duplicate crate versions in this tree are two disjoint families that never
+# exchange types, so the duplicates are benign:
+#   - chrono -> iana-time-zone pulls windows-core 0.62 alongside our pinned
+#     windows 0.58.
+#   - dirs -> dirs-sys pulls windows-sys 0.48, a separate line from the
+#     windows 0.58 targets.
+[bans]
+skip-tree = [
+    { name = "iana-time-zone" },
+    { name = "dirs-sys" },
+]

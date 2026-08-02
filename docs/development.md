@@ -6,6 +6,7 @@
 WinGlance/
 ├── Cargo.toml              Crate manifest; pinned windows 0.58, image, serde/toml
 ├── Cargo.lock              Locked dependency set (build with --locked)
+├── deny.toml               cargo-deny policy (license allowlist, duplicate skips)
 ├── .rustfmt.toml           Formatting options (imports = "granular")
 ├── .gitignore              Ignores target/, data/, logs/
 ├── config.example.toml     Documented defaults; copy of what the app generates

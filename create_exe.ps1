@@ -40,7 +40,13 @@ param(
     [switch]$FreshInstall
 )
 
-$ErrorActionPreference = "Stop"
+# Fail fast on cmdlet errors, but not on native-command stderr. Under
+# Windows PowerShell 5.1, $ErrorActionPreference = "Stop" turns any native
+# stderr line piped through 2>&1 into a terminating error, which kills the
+# script whenever a caller captures its output. Native commands are checked
+# explicitly via $LASTEXITCODE instead; cmdlets that must fail hard carry an
+# explicit -ErrorAction Stop.
+$ErrorActionPreference = "Continue"
 $AppName = "notch"
 
 function Write-Step($Message) {
@@ -80,7 +86,7 @@ $dataDir = "$env:APPDATA\$AppName\$AppName\data"
 if ($FreshInstall) {
     Write-Step "Wiping app data for explicit fresh-install simulation"
     if (Test-Path -LiteralPath $dataDir) {
-        Remove-Item -LiteralPath $dataDir -Recurse -Force
+        Remove-Item -LiteralPath $dataDir -Recurse -Force -ErrorAction Stop
         Write-Host "Removed: $dataDir" -ForegroundColor Yellow
     }
 }
@@ -153,7 +159,7 @@ try {
 
     if ($Start -or ($wasRunning -and -not $NoRestart)) {
         Write-Step "Launching $AppName.exe"
-        Start-Process -FilePath $exePath
+        Start-Process -FilePath $exePath -ErrorAction Stop
     }
 
     Write-Step "Done"
