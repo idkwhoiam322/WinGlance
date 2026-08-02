@@ -416,18 +416,6 @@ pub fn create_window(config: Config, queue: EventQueue, overlay_hwnd: HWND) -> R
         }
     };
 
-    // Color the window title bar with the pill's pink accent so the app
-    // reads as one theme.
-    unsafe {
-        let color = COLORREF(0x00E0_6C9F);
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_CAPTION_COLOR,
-            &color as *const COLORREF as *const c_void,
-            std::mem::size_of::<COLORREF>() as u32,
-        );
-    }
-
     unsafe {
         if config.behavior.start_in_tray {
             let _ = ShowWindow(hwnd, SW_HIDE);
@@ -2197,6 +2185,21 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_CREATE => {
             if !state_ptr.is_null() {
                 (*state_ptr).create_children();
+            }
+            // Color the window title bar with the pill's pink accent so the
+            // app reads as one theme. Applied here, after the frame is
+            // realized, rather than right after CreateWindowExW.
+            let color = COLORREF(0x00E0_6C9F);
+            let result = unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_CAPTION_COLOR,
+                    &color as *const COLORREF as *const c_void,
+                    std::mem::size_of::<COLORREF>() as u32,
+                )
+            };
+            if let Err(error) = result {
+                debug!("DwmSetWindowAttribute(CAPTION_COLOR) failed: {error}");
             }
             LRESULT(0)
         }

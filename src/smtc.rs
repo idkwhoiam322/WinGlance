@@ -336,12 +336,18 @@ impl ListenerState {
                 } else {
                     // A session other than the current one changed state. If it
                     // started playing, try to make it current (eligibility
-                    // filters placeholder sessions). If it is not adopted, the
-                    // change is still recorded for the history — the pill
-                    // follows the current session, but every state change is
-                    // visible.
+                    // filters placeholder sessions). A session from the same
+                    // source app as the current one (e.g. YouTube Music
+                    // re-creating its session per track) is treated as the
+                    // current session re-registering: re-resolve so the new
+                    // session object is adopted, then the state change flows
+                    // through the current-session path.
                     let state = read_playback_state(&session)?;
-                    if state == Some(PlaybackState::Playing) {
+                    let source = read_source_app(&session);
+                    let current_source = self
+                        .current_key
+                        .and_then(|k| self.subscriptions.get(&k).map(|s| read_source_app(&s.session)));
+                    if state == Some(PlaybackState::Playing) || Some(source.as_str()) == current_source.as_deref() {
                         self.refresh_current_session(Some(&session), true, false)?;
                     }
                     // Record only when the session did not become current; an
@@ -349,7 +355,7 @@ impl ListenerState {
                     if self.current_key != Some(key)
                         && let Some(state) = state
                     {
-                        self.queue_history_state(state, read_source_app(&session));
+                        self.queue_history_state(state, source);
                     }
                 }
             }
