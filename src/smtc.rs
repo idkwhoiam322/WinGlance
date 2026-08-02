@@ -148,7 +148,30 @@ impl ListenerState {
                     && read_playback_state(&session)? != Some(PlaybackState::Stopped)
                     && let Ok(track) = read_track_info(&session)
                 {
-                    self.pending_track = Some((session_key(&session), track));
+                    let key = session_key(&session);
+                    // SMTC fills metadata progressively (title -> artist -> album ->
+                    // artwork). If a read for the same song arrives, merge the richer
+                    // fields into the pending track instead of replacing it, so the
+                    // notification is shown once, complete.
+                    let is_merge = self
+                        .pending_track
+                        .as_ref()
+                        .is_some_and(|(k, p)| *k == key && p.title == track.title && p.artist == track.artist);
+                    if is_merge {
+                        if let Some((_, p)) = self.pending_track.as_mut() {
+                            if !track.album.trim().is_empty() {
+                                p.album = track.album;
+                            }
+                            if track.artwork.is_some() {
+                                p.artwork = track.artwork;
+                            }
+                            if !track.source_app.trim().is_empty() && p.source_app.trim().is_empty() {
+                                p.source_app = track.source_app;
+                            }
+                        }
+                    } else {
+                        self.pending_track = Some((key, track));
+                    }
                     self.schedule_flush();
                 }
             }
@@ -358,7 +381,9 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession) -> Resul
     let properties = session.TryGetMediaPropertiesAsync()?.get()?;
     let title = non_empty(properties.Title()?.to_string(), &source_app);
     let artist = non_empty(properties.Artist()?.to_string(), &source_app);
-    let album = non_empty(properties.AlbumTitle()?.to_string(), "Unknown album");
+    // Keep album empty when the app has not provided it yet; renderers hide the
+    // album line until real data arrives (prevents a bogus "Unknown album").
+    let album = non_empty(properties.AlbumTitle()?.to_string(), "");
     let artwork = read_artwork(&properties).unwrap_or_else(|error| {
         debug!("album-art read failed: {error:#}");
         None

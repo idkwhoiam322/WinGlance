@@ -22,13 +22,13 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, IDC_ARROW, IDI_APPLICATION, LB_ADDSTRING,
-    LB_DELETESTRING, LB_GETCOUNT, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT,
-    LBS_OWNERDRAWFIXED, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WNDCLASS_STYLES,
-    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    LB_DELETESTRING, LB_GETCOUNT, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS,
+    LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE,
+    WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -321,6 +321,46 @@ impl MainWindowState {
     }
 
     fn add_track(&mut self, track: TrackInfo) {
+        // Metadata refresh for the same song (album/artwork arriving late): update
+        // the current activity and the last history row in place instead of
+        // appending a duplicate entry.
+        let is_update = self
+            .current
+            .as_ref()
+            .is_some_and(|c| c.track.title == track.title && c.track.artist == track.artist);
+
+        if is_update {
+            if let Some(current) = &mut self.current {
+                current.track = track.clone();
+                current.art = None;
+            }
+            if let Some(last) = self.history.entries.back_mut() {
+                last.track = track.clone();
+            }
+            let row = history_row(
+                &track,
+                Local::now(),
+                self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing),
+            );
+            let row = wide(&row);
+            if !self.listbox.0.is_null() {
+                unsafe {
+                    let count = SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
+                    if count > 0 {
+                        let _ = SendMessageW(self.listbox, LB_DELETESTRING, WPARAM(count - 1), LPARAM(0));
+                        let _ = SendMessageW(
+                            self.listbox,
+                            LB_INSERTSTRING,
+                            WPARAM(count - 1),
+                            LPARAM(row.as_ptr() as isize),
+                        );
+                    }
+                }
+            }
+            self.invalidate();
+            return;
+        }
+
         let state = self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing);
         let before = self.history.len();
         self.history.push(HistoryEntry {

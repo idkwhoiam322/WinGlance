@@ -46,6 +46,11 @@ enum Phase {
 struct PendingEvents {
     track: Option<TrackInfo>,
     playback: Option<PlaybackState>,
+    /// True when the pending track matches the currently shown track (same
+    /// title+artist) and only metadata changed — e.g. album/artwork arriving a
+    /// moment after the initial notification. Such refreshes update the pill in
+    /// place instead of showing a brand-new notification.
+    track_update: bool,
 }
 
 struct OverlayState {
@@ -131,7 +136,12 @@ impl OverlayState {
                 }
                 match event {
                     MediaEvent::TrackChanged(track) if self.config.behavior.enable_track_change => {
-                        self.pending.track = Some(track)
+                        let is_update = self
+                            .last_track
+                            .as_ref()
+                            .is_some_and(|last| last.title == track.title && last.artist == track.artist);
+                        self.pending.track = Some(track);
+                        self.pending.track_update = is_update;
                     }
                     MediaEvent::PlaybackStateChanged(state) => self.pending.playback = Some(state),
                     MediaEvent::TrackChanged(_) => {}
@@ -157,13 +167,28 @@ impl OverlayState {
         }
         let pending = std::mem::take(&mut self.pending);
         if let Some(track) = pending.track {
+            let is_update = pending.track_update;
             self.last_track = Some(track.clone());
-            self.show(MediaEvent::TrackChanged(track), true);
+            if is_update && self.content.is_some() {
+                self.update_content(MediaEvent::TrackChanged(track));
+            } else {
+                self.show(MediaEvent::TrackChanged(track), true);
+            }
         } else if let Some(playback) = pending.playback
             && self.config.behavior.enable_playback_state_change
         {
             self.show(MediaEvent::PlaybackStateChanged(playback), false);
         }
+    }
+
+    /// Refreshes the shown content in place (metadata-only change): keeps the
+    /// current animation phase, extends the visible time, and re-renders.
+    fn update_content(&mut self, event: MediaEvent) {
+        self.content = Some(event);
+        if let Some(deadline) = self.dismiss_at {
+            self.dismiss_at = Some(deadline.max(Instant::now() + Duration::from_millis(1500)));
+        }
+        self.render();
     }
 
     fn show(&mut self, event: MediaEvent, full_animation: bool) {
