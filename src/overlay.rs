@@ -669,6 +669,9 @@ fn state_content_size(config: &Config, last_track: Option<&TrackInfo>) -> (f32, 
         if !track.meta_line(true).is_empty() {
             text_h += appearance.font_size_artist * 0.85 * ROW_HEIGHT;
         }
+        if !track.source_app.trim().is_empty() {
+            text_h += appearance.font_size_artist * 0.75 * ROW_HEIGHT;
+        }
     }
     let height = text_h + 2.0 * appearance.padding + 8.0;
     (config.overlay.max_width.max(180) as f32, height)
@@ -999,17 +1002,7 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
             let padding = (appearance.padding * scale) as i32;
             let art = (appearance.art_size as f32 * scale) as i32;
             let left = padding + art + (12.0 * scale) as i32;
-            // Right-edge zone: the track duration, right-aligned on the first
-            // row. The text rows reserve the zone so nothing overlaps it.
-            let dur_text = track.duration_secs.map(|d| format!("{}:{:02}", d / 60, d % 60));
-            let dur_w = match (&dur_text, font_set()) {
-                (Some(text), Ok(fonts)) => {
-                    text_advance(text, &fonts.regular, appearance.font_size_artist * scale * 0.85).ceil() as i32
-                }
-                _ => 0,
-            };
-            let zone_w = if dur_w > 0 { dur_w + (8.0 * scale) as i32 } else { 0 };
-            let right = width - padding - zone_w;
+            let right = width - padding;
 
             // Font-driven row heights: bands are sized from the actual fonts, so
             // rows can never overlap at any pill size (including mid-animation)
@@ -1102,26 +1095,6 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
                     Some(&state.scroll[3]),
                 );
             }
-
-            if let Some(text) = dur_text {
-                let dur_rect = RECT {
-                    left: right + (4.0 * scale) as i32,
-                    top: title_rect.top,
-                    right: width - padding,
-                    bottom: title_rect.bottom,
-                };
-                draw_text_line_pixels(
-                    pixels,
-                    width as usize,
-                    &text,
-                    &dur_rect,
-                    rows[2].1 as i32,
-                    [0x99, 0x99, 0x99, 0xFF],
-                    false,
-                    false,
-                    None,
-                );
-            }
         }
         MediaEvent::PlaybackStateChanged(playback) | MediaEvent::HistoryPlaybackState(playback, _) => {
             let label = match playback {
@@ -1129,41 +1102,22 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
                 PlaybackState::Paused => "Paused",
                 PlaybackState::Stopped => "Stopped",
             };
-            let fs_title = state.config.appearance.font_size_title * scale;
-            let fs_artist = state.config.appearance.font_size_artist * scale;
-            // Right-edge zone: track duration + a state glyph on the label row.
-            let glyph = match playback {
-                PlaybackState::Playing => "▶",
-                PlaybackState::Paused => "‖",
-                PlaybackState::Stopped => "■",
-            };
-            let meta_px = fs_artist * 0.85;
-            let (dur_w, glyph_w) = match font_set() {
-                Ok(fonts) => {
-                    let dur_w = state
-                        .last_track
-                        .as_ref()
-                        .and_then(|t| t.duration_secs)
-                        .map(|d| text_advance(&format!("{}:{:02}", d / 60, d % 60), &fonts.regular, meta_px))
-                        .unwrap_or(0.0);
-                    (
-                        dur_w.ceil() as i32,
-                        text_advance(glyph, &fonts.regular, meta_px).ceil() as i32,
-                    )
-                }
-                Err(_) => (0, 0),
-            };
-            let gap = (8.0 * scale) as i32;
-            let zone_w = if dur_w > 0 { dur_w + glyph_w + gap } else { 0 };
-            let base_right = width - (state.config.appearance.padding * scale) as i32;
-
-            let text_top = state.config.appearance.padding * scale;
+            let appearance = &state.config.appearance;
+            let padding = (appearance.padding * scale) as i32;
+            let art = (appearance.art_size as f32 * scale) as i32;
+            // Text starts after the artwork tile, like the track pill, so a
+            // centered long line can never overlap the cover.
+            let left = padding + art + (12.0 * scale) as i32;
+            let right = width - padding;
+            let fs_title = appearance.font_size_title * scale;
+            let fs_artist = appearance.font_size_artist * scale;
+            let text_top = appearance.padding * scale;
             let mut y = text_top;
             let mut next_band = |h: f32| -> RECT {
                 let r = RECT {
-                    left: 0,
+                    left,
                     top: y as i32,
-                    right: width,
+                    right,
                     bottom: (y + h) as i32,
                 };
                 y += h;
@@ -1176,54 +1130,11 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
                 label,
                 &label_rect,
                 fs_title as i32,
-                state.config.appearance.accent_color,
+                appearance.accent_color,
                 true,
                 true,
                 None,
             );
-            if zone_w > 0 {
-                let glyph_rect = RECT {
-                    left: base_right - glyph_w,
-                    top: label_rect.top,
-                    right: base_right,
-                    bottom: label_rect.bottom,
-                };
-                draw_text_line_pixels(
-                    pixels,
-                    width as usize,
-                    glyph,
-                    &glyph_rect,
-                    meta_px as i32,
-                    state.config.appearance.accent_color,
-                    true,
-                    false,
-                    None,
-                );
-                let dur = state
-                    .last_track
-                    .as_ref()
-                    .and_then(|t| t.duration_secs)
-                    .map(|d| format!("{}:{:02}", d / 60, d % 60));
-                if let Some(text) = dur {
-                    let dur_rect = RECT {
-                        left: base_right - glyph_w - dur_w - gap,
-                        top: label_rect.top,
-                        right: base_right - glyph_w - gap,
-                        bottom: label_rect.bottom,
-                    };
-                    draw_text_line_pixels(
-                        pixels,
-                        width as usize,
-                        &text,
-                        &dur_rect,
-                        meta_px as i32,
-                        [0x99, 0x99, 0x99, 0xFF],
-                        false,
-                        false,
-                        None,
-                    );
-                }
-            }
             if let Some(track) = &state.last_track {
                 let title_rect = next_band(fs_artist * ROW_HEIGHT);
                 draw_text_line_pixels(
@@ -1232,7 +1143,7 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
                     &track.title,
                     &title_rect,
                     fs_artist as i32,
-                    state.config.appearance.text_color,
+                    appearance.text_color,
                     true,
                     true,
                     None,
@@ -1266,15 +1177,23 @@ fn draw_text_pixels(state: &OverlayState, pixels: &mut [u8], content: &MediaEven
                         None,
                     );
                 }
+                if !track.source_app.trim().is_empty() {
+                    let source_rect = next_band(fs_artist * 0.75 * ROW_HEIGHT);
+                    draw_text_line_pixels(
+                        pixels,
+                        width as usize,
+                        &track.source_app,
+                        &source_rect,
+                        (fs_artist * 0.75) as i32,
+                        [0x77, 0x77, 0x77, 0xFF],
+                        false,
+                        true,
+                        None,
+                    );
+                }
             }
         }
     }
-}
-
-/// Total advance width of a text line in the given face and size, for
-/// right-edge layout.
-fn text_advance(value: &str, face: &Font, px: f32) -> f32 {
-    value.chars().map(|c| face.metrics(c, px).advance_width).sum()
 }
 
 /// Rasterizes one pill text line into the pixel buffer. Text that fits is

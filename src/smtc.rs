@@ -334,24 +334,18 @@ impl ListenerState {
                         self.queue_playback_state(key, state, source);
                     }
                 } else {
-                    // A session other than the current one changed state. If it
-                    // started playing, try to make it current (eligibility
-                    // filters placeholder sessions). A session from the same
-                    // source app as the current one (e.g. YouTube Music
-                    // re-creating its session per track) is treated as the
-                    // current session re-registering: re-resolve so the new
-                    // session object is adopted, then the state change flows
-                    // through the current-session path.
+                    // A session other than the current one changed state. Any
+                    // non-Stopped change re-resolves so the best session wins
+                    // (eligibility filters placeholder sessions, and the
+                    // re-resolve picks up same-source session churn); only a
+                    // session that is still not current afterwards is recorded
+                    // as a history event — the pill follows the current session,
+                    // but every state change is visible.
                     let state = read_playback_state(&session)?;
                     let source = read_source_app(&session);
-                    let current_source = self
-                        .current_key
-                        .and_then(|k| self.subscriptions.get(&k).map(|s| read_source_app(&s.session)));
-                    if state == Some(PlaybackState::Playing) || Some(source.as_str()) == current_source.as_deref() {
+                    if state != Some(PlaybackState::Stopped) {
                         self.refresh_current_session(Some(&session), true, false)?;
                     }
-                    // Record only when the session did not become current; an
-                    // adopted session's state is handled by the adoption path.
                     if self.current_key != Some(key)
                         && let Some(state) = state
                     {

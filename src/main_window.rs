@@ -641,6 +641,7 @@ impl MainWindowState {
                     // A state change from a non-current session: record it with
                     // the app that produced it (title/artist are unknown here).
                     let track = TrackInfo {
+                        title: source.clone(),
                         source_app: source,
                         ..TrackInfo::default()
                     };
@@ -2188,8 +2189,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             // Color the window title bar with the pill's pink accent so the
             // app reads as one theme. Applied here, after the frame is
-            // realized, rather than right after CreateWindowExW.
-            let color = COLORREF(0x00E0_6C9F);
+            // realized, rather than right after CreateWindowExW. COLORREF is
+            // 0x00BBGGRR, hence the swapped red/blue channels.
+            let color = COLORREF(0x009F_6CE0);
             let result = unsafe {
                 DwmSetWindowAttribute(
                     hwnd,
