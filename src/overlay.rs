@@ -393,7 +393,13 @@ impl OverlayState {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
-        debug!("pill shown | duration_ms={duration_ms}");
+        // Log the foreground window so we can tell what was in front when the
+        // pill fired (an exclusive-fullscreen game hides topmost windows).
+        let foreground = unsafe { GetForegroundWindow() };
+        debug!(
+            "pill shown | duration_ms={duration_ms} | fg=0x{:x}",
+            foreground.0 as usize
+        );
         self.render();
     }
 
