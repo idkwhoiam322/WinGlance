@@ -63,13 +63,25 @@ SystemMediaTransportControls            create_window x2 (pill + main)
 ## SMTC session selection
 
 SMTC surfaces one "current session" and a list of sessions. The worker
-resolves the session to watch with this priority (see `smtc.rs`):
+subscribes to **every** open session's `MediaPropertiesChanged` and
+`PlaybackInfoChanged` (tracked in a `HashMap`), so changes in background
+sessions are never missed — the native media widget does the same, we just
+display one session at a time. It also listens to both `SessionsChanged`
+(creation/removal) and `CurrentSessionChanged` (Windows' internal "current"
+pointer moving), re-syncing subscriptions and re-resolving on either event.
 
-1. The session from `GetCurrentSession()`.
-2. A hinted session whose playback state is `Playing`, when the current
-   session is not playing.
-3. The most recently observed session that was `Playing`.
+The session to *display* resolves with this priority (see `smtc.rs`):
+
+1. The session from `GetCurrentSession()` — the pointer Windows itself
+   maintains and the native widget follows; consulted fresh on every resolve.
+2. A hinted session that is not `Stopped` (the session that fired the event).
+3. The most recently observed session that was `Playing` (keeps the tracked
+   session stable while it is active).
 4. The first `Playing` session from `GetSessions()`.
+
+When the tracked session reports `Stopped`, the worker immediately re-resolves
+to hand off to whatever is still playing, instead of waiting for the 2-second
+safety-net poll (which remains as a backstop only).
 
 Documented limitation: SMTC exposes no portable "last active" timestamp, so
 fallback 3 is a best-effort heuristic.

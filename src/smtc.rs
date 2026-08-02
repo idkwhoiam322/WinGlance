@@ -2,19 +2,22 @@ use crate::config::Config;
 use crate::events::{MediaEvent, PlaybackState, TrackInfo};
 use anyhow::{Context, Result};
 use log::{debug, info};
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
 use windows::Media::Control::{
-    GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager,
-    GlobalSystemMediaTransportControlsSessionPlaybackStatus, MediaPropertiesChangedEventArgs,
-    PlaybackInfoChangedEventArgs, SessionsChangedEventArgs,
+    CurrentSessionChangedEventArgs, GlobalSystemMediaTransportControlsSession,
+    GlobalSystemMediaTransportControlsSessionManager, GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+    MediaPropertiesChangedEventArgs, PlaybackInfoChangedEventArgs, SessionsChangedEventArgs,
 };
 use windows::Storage::Streams::{Buffer, DataReader, InputStreamOptions};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::core::Interface;
 
 enum Signal {
+    /// Fired by SessionsChanged or CurrentSessionChanged: re-sync subscriptions
+    /// and re-resolve the current session against GetCurrentSession().
     Sessions,
     MediaProperties(GlobalSystemMediaTransportControlsSession),
     PlaybackInfo(GlobalSystemMediaTransportControlsSession),
@@ -31,7 +34,10 @@ struct ListenerState {
     config: Config,
     output: Sender<MediaEvent>,
     signal_tx: Sender<Signal>,
-    subscription: Option<SessionSubscription>,
+    /// Every open session's event subscriptions, keyed by session pointer.
+    /// Unlike Windows' native widget we only *display* one session, but we still
+    /// subscribe to all of them so background sessions' changes are never missed.
+    subscriptions: HashMap<usize, SessionSubscription>,
     current_key: Option<usize>,
     recent_playing: Option<GlobalSystemMediaTransportControlsSession>,
     pending_track: Option<(usize, TrackInfo)>,
@@ -88,13 +94,16 @@ impl SmtcListener {
             .context("requesting the SMTC session manager")?;
         let (signal_tx, signal_rx) = mpsc::channel();
         let sessions_token = register_sessions_handler(&manager, signal_tx.clone())?;
+        let current_token = register_current_session_handler(&manager, signal_tx.clone())?;
         let mut state = ListenerState::new(manager, self.config, self.output, signal_tx);
 
+        state.sync_subscriptions();
         state.refresh_current_session(None, true)?;
         state.event_loop(signal_rx)?;
 
         let _ = state.manager.RemoveSessionsChanged(sessions_token);
-        state.unsubscribe();
+        let _ = state.manager.RemoveCurrentSessionChanged(current_token);
+        state.remove_all_subscriptions();
         Ok(())
     }
 }
@@ -111,7 +120,7 @@ impl ListenerState {
             config,
             output,
             signal_tx,
-            subscription: None,
+            subscriptions: HashMap::new(),
             current_key: None,
             recent_playing: None,
             pending_track: None,
@@ -155,7 +164,11 @@ impl ListenerState {
     fn handle_signal(&mut self, signal: Signal) -> Result<()> {
         match signal {
             Signal::Sessions => {
-                debug!("SMTC SessionsChanged");
+                debug!("SMTC SessionsChanged/CurrentSessionChanged");
+                // Re-sync subscriptions with the current session list, then re-resolve
+                // the current session against GetCurrentSession() — the pointer
+                // Windows itself maintains.
+                self.sync_subscriptions();
                 self.refresh_current_session(None, true)?;
             }
             Signal::MediaProperties(session) => {
@@ -201,6 +214,19 @@ impl ListenerState {
                 let key = session_key(&session);
                 if self.current_key == Some(key) {
                     if let Some(state) = read_playback_state(&session)? {
+                        if state == PlaybackState::Stopped {
+                            // The tracked session stopped: hand off to whatever else
+                            // is playing right now instead of waiting for the poll.
+                            let before = self.current_key;
+                            self.refresh_current_session(None, true)?;
+                            if self.current_key == before {
+                                // Nothing else took over — report the stop.
+                                self.current_playing = false;
+                                self.pending_playback = Some((key, state));
+                                self.schedule_flush();
+                            }
+                            return Ok(());
+                        }
                         if state == PlaybackState::Playing {
                             self.recent_playing = Some(session.clone());
                         }
@@ -232,12 +258,11 @@ impl ListenerState {
             return Ok(());
         }
 
-        self.unsubscribe();
         self.current_key = new_key;
         self.session_has_album = false;
         self.current_playing = false;
         if let Some(session) = resolved {
-            self.subscribe(&session)?;
+            self.ensure_subscribed(&session)?;
             let playback = read_playback_state(&session)?;
             self.current_playing = matches!(playback, Some(PlaybackState::Playing));
             if emit_initial {
@@ -271,25 +296,29 @@ impl ListenerState {
         &mut self,
         hint: Option<&GlobalSystemMediaTransportControlsSession>,
     ) -> Option<GlobalSystemMediaTransportControlsSession> {
-        // 1. The session that caused the event wins when it is not stopped. This
-        //    makes the pill follow media changes from ANY source, matching the
-        //    native media widget, instead of being stuck on the first playing
-        //    session in the enumeration.
+        // 1. GetCurrentSession() is the pointer Windows itself maintains (the
+        //    native media widget follows it); consult it fresh on every resolve.
+        if let Ok(session) = self.manager.GetCurrentSession()
+            && !matches!(read_playback_state(&session), Ok(Some(PlaybackState::Stopped)))
+        {
+            return Some(session);
+        }
+
+        // 2. The session that caused the event, when it is not stopped.
         if let Some(session) = hint
             && !matches!(read_playback_state(session), Ok(Some(PlaybackState::Stopped)))
         {
             return Some(session.clone());
         }
 
-        // 2. Keep the tracked session while it is still playing; otherwise the
-        //    periodic re-check could flap between two concurrently playing sources.
+        // 3. The last observed playing session (keeps the current one stable).
         if let Some(session) = self.recent_playing.clone()
             && matches!(read_playback_state(&session), Ok(Some(PlaybackState::Playing)))
         {
             return Some(session);
         }
 
-        // 3. Any playing session.
+        // 4. Any playing session.
         if let Ok(sessions) = self.manager.GetSessions()
             && let Some(playing) = sessions
                 .into_iter()
@@ -298,17 +327,10 @@ impl ListenerState {
             return Some(playing);
         }
 
-        // 4. The current session if it is not stopped.
-        if let Ok(session) = self.manager.GetCurrentSession()
-            && !matches!(read_playback_state(&session), Ok(Some(PlaybackState::Stopped)))
-        {
-            return Some(session);
-        }
-
         None
     }
 
-    fn subscribe(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<()> {
+    fn subscribe(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<SessionSubscription> {
         let properties_session = session.clone();
         let playback_session = session.clone();
         let properties_tx = self.signal_tx.clone();
@@ -336,23 +358,64 @@ impl ListenerState {
                 return Err(error.into());
             }
         };
-        self.subscription = Some(SessionSubscription {
+        info!("subscribed to SMTC session {}", session_key(session));
+        Ok(SessionSubscription {
             session: session.clone(),
             properties_token,
             playback_token,
-        });
-        info!("subscribed to SMTC session {}", session_key(session));
+        })
+    }
+
+    /// Subscribes to a session unless it is already subscribed.
+    fn ensure_subscribed(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<()> {
+        let key = session_key(session);
+        if self.subscriptions.contains_key(&key) {
+            return Ok(());
+        }
+        let subscription = self.subscribe(session)?;
+        self.subscriptions.insert(key, subscription);
         Ok(())
     }
 
-    fn unsubscribe(&mut self) {
-        if let Some(subscription) = self.subscription.take() {
+    /// Re-syncs the subscription map with the current session list: subscribes
+    /// to every open session and drops subscriptions for removed sessions.
+    fn sync_subscriptions(&mut self) {
+        let Some(sessions) = self.manager.GetSessions().ok() else {
+            return;
+        };
+        let sessions: Vec<_> = sessions.into_iter().collect();
+        for session in &sessions {
+            if let Err(error) = self.ensure_subscribed(session) {
+                debug!("subscribe failed for a session: {error:#}");
+            }
+        }
+        let alive: HashSet<usize> = sessions.iter().map(session_key).collect();
+        let stale: Vec<usize> = self
+            .subscriptions
+            .keys()
+            .filter(|k| !alive.contains(k))
+            .copied()
+            .collect();
+        for key in stale {
+            self.remove_subscription(key);
+        }
+    }
+
+    fn remove_subscription(&mut self, key: usize) {
+        if let Some(subscription) = self.subscriptions.remove(&key) {
             let _ = subscription
                 .session
                 .RemoveMediaPropertiesChanged(subscription.properties_token);
             let _ = subscription
                 .session
                 .RemovePlaybackInfoChanged(subscription.playback_token);
+        }
+    }
+
+    fn remove_all_subscriptions(&mut self) {
+        let keys: Vec<usize> = self.subscriptions.keys().copied().collect();
+        for key in keys {
+            self.remove_subscription(key);
         }
     }
 
@@ -416,6 +479,21 @@ fn register_sessions_handler(
             Ok(())
         });
     Ok(manager.SessionsChanged(&handler)?)
+}
+
+/// Registers CurrentSessionChanged, the event Windows fires when its internal
+/// "current session" pointer moves (focus heuristics, a new app starting, etc.).
+/// Session-list events alone do not cover those cases.
+fn register_current_session_handler(
+    manager: &GlobalSystemMediaTransportControlsSessionManager,
+    signal_tx: Sender<Signal>,
+) -> Result<EventRegistrationToken> {
+    let handler: TypedEventHandler<GlobalSystemMediaTransportControlsSessionManager, CurrentSessionChangedEventArgs> =
+        TypedEventHandler::new(move |_, _| {
+            let _ = signal_tx.send(Signal::Sessions);
+            Ok(())
+        });
+    Ok(manager.CurrentSessionChanged(&handler)?)
 }
 
 fn session_key(session: &GlobalSystemMediaTransportControlsSession) -> usize {
