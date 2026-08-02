@@ -11,10 +11,11 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BITMAPINFO, BITMAPINFOHEADER, BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
-    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteObject, EndPaint, FF_DONTCARE, FillRect, GetStockObject,
-    HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, SetBkColor, SetTextColor,
-    StretchDIBits,
+    BITMAPINFO, BITMAPINFOHEADER, BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, ClientToScreen, CreateFontW,
+    CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_TOP,
+    DeleteObject, DrawTextW, EndPaint, FF_DONTCARE, FillRect, GetDC, GetMonitorInfoW, GetStockObject, HBRUSH, HDC,
+    HFONT, HGDIOBJ, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS,
+    PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetTextColor, StretchDIBits, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED, WM_MOUSELEAVE};
@@ -24,16 +25,17 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, IDC_ARROW, IDI_APPLICATION, LB_ADDSTRING,
-    LB_DELETESTRING, LB_GETCOUNT, LB_GETTEXT, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS,
-    LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER,
-    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY,
-    WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP,
-    WM_SETFONT, WM_SIZE, WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
-    WS_VSCROLL,
+    AppendMenuW, CREATESTRUCTW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DestroyWindow, GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, HWND_TOPMOST,
+    IDC_ARROW, IDI_APPLICATION, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETTEXT, LB_INSERTSTRING,
+    LB_ITEMFROMPOINT, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED,
+    LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP,
+    WM_SETFONT, WM_SIZE, WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -59,6 +61,7 @@ const MENU_DURATION_5S: usize = 1019;
 const MENU_DURATION_10S: usize = 1020;
 const LISTBOX_ID: usize = 2;
 const HISTORY_CAP: usize = 500;
+const TOOLTIP_CLASS: &str = "NotchTooltip";
 
 const fn colorref(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
@@ -345,6 +348,12 @@ struct MainWindowState {
     active_pane: Pane,
     /// Hovered settings row (row index, sub-control) for highlight.
     settings_hover: Option<(usize, SettingSub)>,
+    /// Previous listbox window proc (subclassing for hover tooltips).
+    listbox_prev_proc: isize,
+    /// Lazy-created hover tooltip window; null when never shown.
+    tooltip_hwnd: HWND,
+    /// Full details text of the currently shown tooltip.
+    tooltip_text: String,
 }
 
 /// Creates the main window: a maximized tracker with current activity,
@@ -354,6 +363,7 @@ pub fn create_window(config: Config, queue: EventQueue, overlay_hwnd: HWND) -> R
     let instance: HINSTANCE = module.into();
     let class_name = wide("NotchMainWindow");
     register_main_class(instance, &class_name)?;
+    register_tooltip_class(instance);
 
     let state = Box::new(MainWindowState::new(config.clone(), queue, overlay_hwnd, instance));
     let state_ptr = Box::into_raw(state);
@@ -414,6 +424,9 @@ impl MainWindowState {
             notifications_enabled: true,
             active_pane: Pane::Activity,
             settings_hover: None,
+            listbox_prev_proc: 0,
+            tooltip_hwnd: HWND::default(),
+            tooltip_text: String::new(),
         }
     }
 
@@ -477,6 +490,14 @@ impl MainWindowState {
                 let _ = SendMessageW(self.listbox, LB_ADDSTRING, WPARAM(0), LPARAM(header.as_ptr() as isize));
             }
             self.layout();
+            // Subclass the listbox to show a hover tooltip with the full details
+            // of each history entry.
+            unsafe {
+                let state_ptr = self as *const MainWindowState as *mut MainWindowState as isize;
+                SetWindowLongPtrW(self.listbox, GWLP_USERDATA, state_ptr);
+                self.listbox_prev_proc =
+                    SetWindowLongPtrW(self.listbox, GWLP_WNDPROC, listbox_subclass_proc as *const () as isize);
+            }
         }
     }
 
@@ -615,6 +636,9 @@ impl MainWindowState {
                     SW_HIDE
                 },
             );
+        }
+        if self.active_pane != Pane::Activity {
+            self.hide_tooltip();
         }
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (client_w, client_h) = client_size(self.hwnd);
@@ -1463,6 +1487,15 @@ impl MainWindowState {
     fn on_destroy(&mut self) {
         remove_tray_icon(self.hwnd);
         unsafe {
+            if !self.tooltip_hwnd.0.is_null() {
+                let _ = DestroyWindow(self.tooltip_hwnd);
+                self.tooltip_hwnd = HWND::default();
+            }
+            if !self.listbox.0.is_null() && self.listbox_prev_proc != 0 {
+                SetWindowLongPtrW(self.listbox, GWLP_WNDPROC, self.listbox_prev_proc);
+                SetWindowLongPtrW(self.listbox, GWLP_USERDATA, 0);
+                self.listbox_prev_proc = 0;
+            }
             if !self.listbox_font.0.is_null() {
                 let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.listbox_font.0));
             }
@@ -1485,6 +1518,104 @@ impl MainWindowState {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWMAXIMIZED);
             let _ = SetForegroundWindow(self.hwnd);
+        }
+    }
+
+    /// Creates the hover tooltip window on first use.
+    fn ensure_tooltip(&mut self) -> HWND {
+        if !self.tooltip_hwnd.0.is_null() {
+            return self.tooltip_hwnd;
+        }
+        let state_ptr = self as *const MainWindowState as *mut MainWindowState;
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                PCWSTR(wide(TOOLTIP_CLASS).as_ptr()),
+                PCWSTR::null(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                self.instance,
+                Some(state_ptr.cast()),
+            )
+        };
+        if let Ok(hwnd) = hwnd {
+            self.tooltip_hwnd = hwnd;
+        }
+        self.tooltip_hwnd
+    }
+
+    /// Shows the tooltip with `text` near the given screen point.
+    fn show_tooltip(&mut self, text: &str, at: POINT) {
+        let hwnd = self.ensure_tooltip();
+        if hwnd.0.is_null() {
+            return;
+        }
+        self.tooltip_text = text.to_string();
+        let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+        unsafe {
+            let hdc = GetDC(HWND::default());
+            let font_name = wide("Segoe UI");
+            let font = CreateFontW(
+                -((13.0 * scale).round() as i32).max(1),
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_DEFAULT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                CLEARTYPE_QUALITY.0 as u32,
+                DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+                PCWSTR(font_name.as_ptr()),
+            );
+            let old = SelectObject(hdc, font);
+            let mut text_w = wide(text);
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: 480,
+                bottom: 0,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut text_w,
+                &mut rect,
+                DT_CALCRECT | DT_LEFT | DT_TOP | DT_NOPREFIX,
+            );
+            SelectObject(hdc, old);
+            let _ = DeleteObject(font);
+            let _ = ReleaseDC(HWND::default(), hdc);
+            let w = rect.right + (16.0 * scale) as i32;
+            let h = rect.bottom + (12.0 * scale) as i32;
+            let work = tooltip_work_area(self.hwnd);
+            let x = at.x.clamp(work.left, (work.right - w).max(work.left));
+            let y = at.y.clamp(work.top, (work.bottom - h).max(work.top));
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                x,
+                y,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+            );
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    }
+
+    fn hide_tooltip(&mut self) {
+        if !self.tooltip_hwnd.0.is_null() {
+            unsafe {
+                let _ = ShowWindow(self.tooltip_hwnd, SW_HIDE);
+            }
         }
     }
 
@@ -1518,7 +1649,11 @@ fn history_row(track: &TrackInfo, at: DateTime<Local>, state: PlaybackState) -> 
         PlaybackState::Paused => "‖",
         PlaybackState::Stopped => "■",
     };
-    format!("{}  {}  {} — {}", at.format("%H:%M:%S"), status, track.title, artist)
+    let mut row = format!("{}  {}  {} — {}", at.format("%H:%M:%S"), status, track.title, artist);
+    if !track.album.trim().is_empty() {
+        row.push_str(&format!(" — {}", track.album));
+    }
+    row
 }
 
 fn draw_art(hdc: HDC, rgba: &[u8], px: i32, x: i32, y: i32) {
@@ -1572,6 +1707,200 @@ fn client_size(hwnd: HWND) -> (i32, i32) {
         let _ = GetClientRect(hwnd, &mut rect);
     }
     (rect.right, rect.bottom)
+}
+
+/// Full details of a history entry, shown in the hover tooltip.
+fn entry_detail(entry: &HistoryEntry) -> String {
+    let mut parts = vec![
+        format!(
+            "{}  {}",
+            entry.at.format("%H:%M:%S"),
+            match entry.state {
+                PlaybackState::Playing => "Playing",
+                PlaybackState::Paused => "Paused",
+                PlaybackState::Stopped => "Stopped",
+            }
+        ),
+        entry.track.title.clone(),
+    ];
+    if !entry.track.artist.trim().is_empty() {
+        parts.push(entry.track.artist.clone());
+    }
+    if !entry.track.album.trim().is_empty() {
+        parts.push(entry.track.album.clone());
+    }
+    let meta = entry.track.meta_line(false);
+    if !meta.is_empty() {
+        parts.push(meta);
+    }
+    if !entry.track.source_app.trim().is_empty() {
+        parts.push(entry.track.source_app.clone());
+    }
+    parts.join("\n")
+}
+
+fn tooltip_work_area(hwnd: HWND) -> RECT {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        let _ = GetMonitorInfoW(monitor, &mut info);
+        info.rcWork
+    }
+}
+
+fn register_tooltip_class(instance: HINSTANCE) {
+    unsafe {
+        let cursor = LoadCursorW(None, IDC_ARROW).unwrap();
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: WNDCLASS_STYLES(0),
+            lpfnWndProc: Some(tooltip_proc),
+            hInstance: instance,
+            hCursor: cursor,
+            lpszClassName: PCWSTR(wide(TOOLTIP_CLASS).as_ptr()),
+            hbrBackground: CreateSolidBrush(colorref(0x1B, 0x1B, 0x1B)),
+            ..Default::default()
+        };
+        let _ = RegisterClassExW(&class);
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe extern "system" fn tooltip_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match message {
+        WM_NCCREATE => {
+            let create = lparam.0 as *const CREATESTRUCTW;
+            if !create.is_null() {
+                let state = (*create).lpCreateParams as *mut MainWindowState;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut MainWindowState;
+            if !hdc.0.is_null() && !state_ptr.is_null() {
+                let state = &*state_ptr;
+                let (cw, ch) = client_size(hwnd);
+                let whole = RECT {
+                    left: 0,
+                    top: 0,
+                    right: cw,
+                    bottom: ch,
+                };
+                let border = CreateSolidBrush(colorref(0x2D, 0x2D, 0x2D));
+                let _ = FillRect(hdc, &whole, border);
+                let _ = DeleteObject(HGDIOBJ(border.0));
+                let inner = RECT {
+                    left: 1,
+                    top: 1,
+                    right: cw - 1,
+                    bottom: ch - 1,
+                };
+                let bg = CreateSolidBrush(colorref(0x1B, 0x1B, 0x1B));
+                let _ = FillRect(hdc, &inner, bg);
+                let _ = DeleteObject(HGDIOBJ(bg.0));
+
+                let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+                let font_name = wide("Segoe UI");
+                let font = CreateFontW(
+                    -((13.0 * scale).round() as i32).max(1),
+                    0,
+                    0,
+                    0,
+                    400,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET.0 as u32,
+                    OUT_DEFAULT_PRECIS.0 as u32,
+                    CLIP_DEFAULT_PRECIS.0 as u32,
+                    CLEARTYPE_QUALITY.0 as u32,
+                    DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+                    PCWSTR(font_name.as_ptr()),
+                );
+                let old = SelectObject(hdc, font);
+                let _ = SetBkMode(hdc, TRANSPARENT);
+                let _ = SetTextColor(hdc, colorref(0xE6, 0xE6, 0xE6));
+                let mut text_rect = RECT {
+                    left: inner.left + (8 * scale as i32),
+                    top: inner.top + (6 * scale as i32),
+                    right: inner.right - (8 * scale as i32),
+                    bottom: inner.bottom - (6 * scale as i32),
+                };
+                let mut text_w = wide(&state.tooltip_text);
+                let _ = DrawTextW(hdc, &mut text_w, &mut text_rect, DT_LEFT | DT_TOP | DT_NOPREFIX);
+                SelectObject(hdc, old);
+                let _ = DeleteObject(font);
+            }
+            let _ = EndPaint(hwnd, &paint);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+/// Subclassed listbox window proc: shows the full-details tooltip while the
+/// mouse hovers a history row, and hides it on leave/click/scroll.
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe extern "system" fn listbox_subclass_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut MainWindowState;
+
+    if matches!(message, WM_LBUTTONDOWN | WM_MOUSEWHEEL | WM_KEYDOWN) && !state_ptr.is_null() {
+        (*state_ptr).hide_tooltip();
+    }
+    if message == WM_MOUSEMOVE {
+        if !state_ptr.is_null() {
+            let state = &mut *state_ptr;
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            let packed = (((y & 0xFFFF) << 16) | (x & 0xFFFF)) as isize;
+            let result = SendMessageW(hwnd, LB_ITEMFROMPOINT, WPARAM(0), LPARAM(packed)).0 as u32;
+            let in_bounds = (result >> 16) == 0;
+            let index = (result & 0xFFFF) as usize;
+            if in_bounds
+                && index >= 1
+                && let Some(entry) = state.history.entries.get(index - 1)
+            {
+                let text = entry_detail(entry);
+                let mut pt = POINT { x, y };
+                let _ = ClientToScreen(hwnd, &mut pt);
+                pt.x += 12;
+                pt.y += 18;
+                state.show_tooltip(&text, pt);
+                return LRESULT(0);
+            }
+            state.hide_tooltip();
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut tme);
+        }
+        return LRESULT(0);
+    }
+    if message == WM_MOUSELEAVE {
+        if !state_ptr.is_null() {
+            (*state_ptr).hide_tooltip();
+        }
+        return LRESULT(0);
+    }
+
+    let prev: isize = if !state_ptr.is_null() {
+        (*state_ptr).listbox_prev_proc
+    } else {
+        0
+    };
+    if prev != 0 {
+        let prev_proc: WNDPROC = std::mem::transmute(prev);
+        CallWindowProcW(prev_proc, hwnd, message, wparam, lparam)
+    } else {
+        DefWindowProcW(hwnd, message, wparam, lparam)
+    }
 }
 
 fn register_main_class(instance: HINSTANCE, class_name: &[u16]) -> Result<()> {
