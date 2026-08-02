@@ -921,6 +921,11 @@ pub(crate) fn draw_string(
     bold: bool,
     centered: bool,
 ) {
+    // Drawing an empty string is a crash: for an empty Vec<u16> the buffer
+    // pointer is the dangling sentinel 0x2, which DrawTextW dereferences.
+    if value.is_empty() {
+        return;
+    }
     let mut text = value.encode_utf16().collect::<Vec<_>>();
     let font_name = wide("Segoe UI");
     let font = unsafe {
