@@ -478,6 +478,11 @@ impl OverlayState {
         self.content = Some(content);
         if let Err(error) = result {
             error!("rendering overlay: {error:#}");
+        } else {
+            debug!(
+                "pill rendered | {width}x{height} at ({}, {}) | alpha={alpha}",
+                position.x, position.y
+            );
         }
     }
 
