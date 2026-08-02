@@ -420,7 +420,7 @@ impl ListenerState {
             let playback = read_playback_state(&session)?;
             self.current_playing = matches!(playback, Some(PlaybackState::Playing));
             if emit_initial {
-                if playback != Some(PlaybackState::Stopped)
+                let track_queued = if playback != Some(PlaybackState::Stopped)
                     && let Ok(mut track) = read_track_info(&session)
                 {
                     self.apply_cache(&mut track);
@@ -439,7 +439,10 @@ impl ListenerState {
                         return Ok(());
                     }
                     self.pending_track = Some((session_key(&session), track));
-                }
+                    true
+                } else {
+                    false
+                };
                 if let Some(state) = playback {
                     if state == PlaybackState::Playing {
                         self.recent_playing = Some(session.clone());
@@ -448,7 +451,12 @@ impl ListenerState {
                         // Establish a baseline without showing an empty/stopped
                         // notification when the app starts with no active media.
                         self.last_state_by_source.insert(read_source_app(&session), state);
-                    } else {
+                    } else if !track_queued {
+                        // The track notification covers the state when a track was
+                        // read. Queueing it anyway would only suppress it as a
+                        // track-change blip and record it as emitted, which then
+                        // deduplicates the user's genuine state change (e.g. a
+                        // pause arriving right after a session handoff).
                         self.queue_playback_state(session_key(&session), state, read_source_app(&session));
                     }
                 }
