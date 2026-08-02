@@ -70,11 +70,14 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 cargo build --release --locked
 cargo deny check
-.\create_exe.ps1 -NoRestart
+.\create_exe.ps1 -Release -Start
 ```
 
-Useful `create_exe.ps1` flags: `-SkipAudit` skips advisory/dependency checks,
-`-NoThrottle` uses all CPU cores, `-NoRestart` leaves a running instance alone.
+The default build is `.\create_exe.ps1 -Release -Start`: it formats, checks,
+builds the optimized `notch.exe`, audits, and relaunches it into the tray
+(silent — the app runs in the background by default). Useful flags: `-NoRestart`
+leaves the previous instance stopped, `-SkipAudit` skips advisory/dependency
+checks, `-NoThrottle` uses all CPU cores.
 
 ## Self-contained distribution
 
