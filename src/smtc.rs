@@ -92,6 +92,17 @@ struct ListenerState {
     /// A SessionsChanged burst is pending its debounce window; the next flush
     /// performs the re-sync + re-resolve once per burst instead of per event.
     sessions_pending: bool,
+    /// Playback-state changes from sessions that are not current, awaiting the
+    /// next flush. Emitted as HistoryPlaybackState (history only, never the
+    /// pill).
+    pending_noncurrent_states: Vec<(PlaybackState, String)>,
+    /// Last history-recorded state per source app, for dedup of non-current
+    /// session changes. Separate from `last_state_by_source` so background
+    /// state never pollutes the current session's pill dedup.
+    last_noncurrent_state: HashMap<String, PlaybackState>,
+    /// Last observed timeline position per tracked session, for restart
+    /// detection (a position collapse to ~0 on unchanged content).
+    last_position: Option<(usize, Duration)>,
 }
 
 /// How long a playback state change is held before emission, so a song-change
@@ -118,7 +129,7 @@ const CHURN_COOLDOWN_MS: u64 = 30_000;
 const RESUBSCRIBE_WINDOW_MS: u64 = 10_000;
 /// Upper bound for the album/artwork caches; beyond it they are cleared (the
 /// caches are a convenience, not critical state).
-const CACHE_CAP: usize = 32;
+const CACHE_CAP: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrackFingerprint {
@@ -202,6 +213,9 @@ impl ListenerState {
             churn: HashMap::new(),
             churn_cooldown: HashMap::new(),
             sessions_pending: false,
+            pending_noncurrent_states: Vec::new(),
+            last_noncurrent_state: HashMap::new(),
+            last_position: None,
         }
     }
 
@@ -219,8 +233,12 @@ impl ListenerState {
                     self.flush_pending();
                     // Periodically re-check sessions to catch missed changes. emit_initial=true
                     // so a newly-detected current session reports its track+state immediately.
+                    // Always re-sync subscriptions first so sessions created outside a
+                    // SessionsChanged burst (e.g. a browser tab that just started a video)
+                    // are discovered and subscribed before the resolve.
                     if self.last_session_check.elapsed() >= session_check_interval {
                         self.last_session_check = Instant::now();
+                        self.sync_subscriptions();
                         let _ = self.refresh_current_session(None, true, false);
                     }
                 }
@@ -312,19 +330,75 @@ impl ListenerState {
                             self.recent_playing = Some(session.clone());
                         }
                         self.current_playing = state == PlaybackState::Playing;
+                        self.detect_restart(&session, key);
                         self.queue_playback_state(key, state, source);
                     }
-                } else if !self.current_playing
-                    && matches!(read_playback_state(&session)?, Some(PlaybackState::Playing))
-                {
-                    // A new source started playing while nothing we track is active.
-                    // Adopt it; the pill only follows actively playing media, so a
-                    // paused/stale session never steals the current one.
-                    self.refresh_current_session(Some(&session), true, false)?;
+                } else {
+                    // A session other than the current one changed state. If it
+                    // started playing, try to make it current (eligibility
+                    // filters placeholder sessions). Whether adopted or not, the
+                    // change is recorded for the history — the pill follows the
+                    // current session, but every state change is visible.
+                    let state = read_playback_state(&session)?;
+                    let became_current = if state == Some(PlaybackState::Playing) {
+                        let before = self.current_key;
+                        self.refresh_current_session(Some(&session), true, false)?;
+                        self.current_key != before
+                    } else {
+                        false
+                    };
+                    if !became_current && let Some(state) = state {
+                        self.queue_history_state(state, read_source_app(&session));
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Detects a restart of the current track (Prev button, or a looping
+    /// track): the timeline position collapses to ~0 while the content is
+    /// unchanged. Re-shows the pill briefly via TrackRestarted instead of
+    /// deduplicating the restart away.
+    fn detect_restart(&mut self, session: &GlobalSystemMediaTransportControlsSession, key: usize) {
+        let position = read_position(session);
+        let restarted = self.last_position.as_ref().is_some_and(|(last_key, last_pos)| {
+            *last_key == key
+                && *last_pos > Duration::from_secs(3)
+                && position.is_some_and(|p| p < Duration::from_secs(1))
+        });
+        self.last_position = position.map(|p| (key, p));
+        if !restarted {
+            return;
+        }
+        // A new track also starts at position ~0; only treat this as a restart
+        // when we are still showing this exact content.
+        if let Ok(mut track) = read_track_info(session) {
+            let same_content = self
+                .last_content_fingerprint
+                .as_ref()
+                .is_some_and(|last| track.title == last.title && track.artist == last.artist);
+            if same_content {
+                self.apply_cache(&mut track);
+                debug!(
+                    "track restart detected | title={:?} | artist={:?}",
+                    track.title, track.artist
+                );
+                let _ = self.output.send(MediaEvent::TrackRestarted(track));
+            }
+        }
+    }
+
+    /// Queues a playback-state change from a session that is not current. It is
+    /// recorded for the history only (never shown in the pill), deduplicated
+    /// per source app.
+    fn queue_history_state(&mut self, state: PlaybackState, source: String) {
+        if self.last_noncurrent_state.get(&source) == Some(&state) {
+            debug!("history state suppressed | state={state:?} | source={source}");
+            return;
+        }
+        self.last_noncurrent_state.insert(source.clone(), state);
+        self.pending_noncurrent_states.push((state, source));
     }
 
     /// Updates the album/artwork caches from a fresh read (replacing any older
@@ -718,6 +792,13 @@ impl ListenerState {
     fn flush_pending(&mut self) {
         self.pending_deadline = None;
 
+        // History-only state changes from sessions that are not current: logged,
+        // never shown in the pill (dedup already happened at queue time).
+        for (state, source) in self.pending_noncurrent_states.drain(..) {
+            info!("history: playback state changed | state={state:?} | source={source}");
+            let _ = self.output.send(MediaEvent::HistoryPlaybackState(state, source));
+        }
+
         // Debounced session-list changes: one re-sync + re-resolve per burst
         // instead of one per SessionsChanged/CurrentSessionChanged event.
         if self.sessions_pending {
@@ -921,6 +1002,17 @@ fn read_duration(session: &GlobalSystemMediaTransportControlsSession) -> Option<
     }
     // TimeSpan.Duration is in 100-nanosecond units.
     Some((duration_100ns / 10_000_000) as u64)
+}
+
+/// Current timeline position of a session, for restart detection. TimeSpan
+/// durations are in 100-nanosecond units.
+fn read_position(session: &GlobalSystemMediaTransportControlsSession) -> Option<Duration> {
+    let position_100ns = session.GetTimelineProperties().ok()?.Position().ok()?.Duration;
+    if position_100ns <= 0 {
+        Some(Duration::ZERO)
+    } else {
+        Some(Duration::from_nanos((position_100ns * 100) as u64))
+    }
 }
 
 fn read_playback_state(session: &GlobalSystemMediaTransportControlsSession) -> Result<Option<PlaybackState>> {
