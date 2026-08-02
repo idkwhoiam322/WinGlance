@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::BOOLEAN;
-use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HANDLE, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
     CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_NOPREFIX,
@@ -284,8 +286,11 @@ impl OverlayState {
 
     fn delete_anim_timer(&mut self) {
         if !self.anim_timer.0.is_null() {
+            // Wait for any in-flight callback (it blocks in SendMessageW to the
+            // UI thread) before freeing the timer, so the next pill can start
+            // a fresh timer without racing a stale callback.
             unsafe {
-                let _ = DeleteTimerQueueTimer(None, self.anim_timer, None);
+                let _ = DeleteTimerQueueTimer(None, self.anim_timer, INVALID_HANDLE_VALUE);
             }
             self.anim_timer = HANDLE::default();
         }
@@ -421,9 +426,11 @@ impl OverlayState {
         match self.phase {
             Phase::Expanding(start) if start.elapsed() >= animation_duration(&self.config) => {
                 self.phase = Phase::Shown;
+                debug!("pill phase -> shown");
             }
             Phase::Light(start) if start.elapsed() >= LIGHT_DURATION => {
                 self.phase = Phase::Shown;
+                debug!("pill phase -> shown");
             }
             Phase::Collapsing(start) if start.elapsed() >= animation_duration(&self.config) => {
                 self.hide();
@@ -476,15 +483,18 @@ impl OverlayState {
     }
 
     fn frame(&self) -> (u8, f32) {
+        // Animation frames start visibly (never alpha 0): the pill must be
+        // seen from the first render even if a tick is delayed, and the fade
+        // from ~25% reads just as smoothly.
         match self.phase {
             Phase::Hidden => (0, 0.55),
             Phase::Expanding(start) => {
                 let progress = ease_out(start.elapsed().as_secs_f32() / animation_duration(&self.config).as_secs_f32());
-                ((progress * 255.0) as u8, 0.55 + progress * 0.45)
+                ((64.0 + progress * 191.0) as u8, 0.55 + progress * 0.45)
             }
             Phase::Light(start) => {
                 let progress = ease_out(start.elapsed().as_secs_f32() / LIGHT_DURATION.as_secs_f32());
-                ((progress * 255.0) as u8, 1.0)
+                ((64.0 + progress * 191.0) as u8, 1.0)
             }
             Phase::Shown => (255, 1.0),
             Phase::Collapsing(start) => {
