@@ -792,10 +792,13 @@ fn track_content_size(config: &Config, track: &TrackInfo) -> (f32, f32) {
 /// title/artist rows when one is known, again fitted to the drawn rows.
 fn state_content_size(config: &Config, last_track: Option<&TrackInfo>) -> (f32, f32) {
     let appearance = &config.appearance;
+    // The title row is always present (its right side holds the ▶/‖/■ symbol);
+    // artist, meta and source rows are conditional, matching the TrackChanged
+    // pill's row structure.
     let mut text_h = appearance.font_size_title * ROW_HEIGHT;
     if let Some(track) = last_track {
         if !track.artist.trim().is_empty() {
-            text_h += appearance.font_size_artist * ROW_HEIGHT;
+            text_h += appearance.font_size_artist * 0.85 * ROW_HEIGHT;
         }
         if !track.meta_line(true).is_empty() {
             text_h += appearance.font_size_artist * 0.85 * ROW_HEIGHT;
@@ -1243,15 +1246,13 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
         }
         MediaEvent::PlaybackStateChanged(playback, source_app) => {
             let label = match playback {
-                PlaybackState::Playing => "Playing",
-                PlaybackState::Paused => "Paused",
-                PlaybackState::Stopped => "Stopped",
+                PlaybackState::Playing => "▶",
+                PlaybackState::Paused => "‖",
+                PlaybackState::Stopped => "■",
             };
             let appearance = &state.config.appearance;
             let padding = (appearance.padding * scale) as i32;
             let art = (appearance.art_size as f32 * scale) as i32;
-            // Text starts after the artwork tile, like the track pill, so a
-            // centered long line can never overlap the cover.
             let left = padding + art + (12.0 * scale) as i32;
             let right = width - padding;
             let fs_title = appearance.font_size_title * scale;
@@ -1268,24 +1269,13 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 y += h;
                 r
             };
-            let label_rect = next_band(fs_title * ROW_HEIGHT);
-            draw_text_line_pixels(
-                &mut state.text_scratch,
-                pixels,
-                width as usize,
-                label,
-                &label_rect,
-                fs_title as i32,
-                appearance.accent_color,
-                true,
-                true,
-                None,
-            );
 
-            // Look up the cached track for this source app so a pause/play pill
-            // shows the correct track info per source. Falls back to the source
-            // name + "Unknown" when no track has been cached for it (e.g. the
-            // sample preview, or a state change before any TrackChanged).
+            // Width reserved on the right of the title row for the playback
+            // state symbol (▶/‖/■), so it reads like a badge rather than a
+            // separate centered row — matching the TrackChanged pill layout.
+            let label_w = (80.0 * scale) as i32;
+
+            // Cached track: title row carries the symbol on the right.
             let cached = if source_app.is_empty() {
                 None
             } else {
@@ -1293,17 +1283,41 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
             };
 
             if let Some(track) = cached {
-                let title_rect = next_band(fs_artist * ROW_HEIGHT);
+                let title_rect = next_band(fs_title * ROW_HEIGHT);
+                let title_narrow = RECT {
+                    left: title_rect.left,
+                    top: title_rect.top,
+                    right: title_rect.right - label_w,
+                    bottom: title_rect.bottom,
+                };
+                let label_rect = RECT {
+                    left: title_rect.right - label_w,
+                    top: title_rect.top,
+                    right: title_rect.right,
+                    bottom: title_rect.bottom,
+                };
                 draw_text_line_pixels(
                     &mut state.text_scratch,
                     pixels,
                     width as usize,
                     &track.title,
-                    &title_rect,
-                    fs_artist as i32,
+                    &title_narrow,
+                    fs_title as i32,
                     appearance.text_color,
                     true,
                     false,
+                    None,
+                );
+                draw_text_line_pixels(
+                    &mut state.text_scratch,
+                    pixels,
+                    width as usize,
+                    label,
+                    &label_rect,
+                    fs_title as i32,
+                    appearance.accent_color,
+                    true,
+                    true,
                     None,
                 );
                 if !track.artist.trim().is_empty() {
@@ -1359,17 +1373,41 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                     state.current_source.as_deref()
                 };
                 if let Some(name) = fallback_name {
-                    let title_rect = next_band(fs_artist * ROW_HEIGHT);
+                    let title_rect = next_band(fs_title * ROW_HEIGHT);
+                    let title_narrow = RECT {
+                        left: title_rect.left,
+                        top: title_rect.top,
+                        right: title_rect.right - label_w,
+                        bottom: title_rect.bottom,
+                    };
+                    let label_rect = RECT {
+                        left: title_rect.right - label_w,
+                        top: title_rect.top,
+                        right: title_rect.right,
+                        bottom: title_rect.bottom,
+                    };
                     draw_text_line_pixels(
                         &mut state.text_scratch,
                         pixels,
                         width as usize,
                         name,
-                        &title_rect,
-                        fs_artist as i32,
+                        &title_narrow,
+                        fs_title as i32,
                         appearance.text_color,
                         true,
                         false,
+                        None,
+                    );
+                    draw_text_line_pixels(
+                        &mut state.text_scratch,
+                        pixels,
+                        width as usize,
+                        label,
+                        &label_rect,
+                        fs_title as i32,
+                        appearance.accent_color,
+                        true,
+                        true,
                         None,
                     );
                     let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
