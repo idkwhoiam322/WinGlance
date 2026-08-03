@@ -369,11 +369,7 @@ impl ListenerState {
                     // known, just not re-readable on this fresh session yet.
                     if read_artwork
                         && merged.artwork.is_none()
-                        && let Some(cached) = self.cached_artwork_for(
-                            &merged.source_app,
-                            &merged.title,
-                            &merged.artist,
-                        )
+                        && let Some(cached) = self.cached_artwork_for(&merged.source_app, &merged.title, &merged.artist)
                     {
                         merged.artwork = Some(cached);
                     }
@@ -393,14 +389,21 @@ impl ListenerState {
                     // LogicalState, content_differ always sees a change. Compare
                     // against the last track actually emitted per source
                     // (title + artist + artwork-presence); a genuine artwork
-                    // gain still surfaces because is_some() changes.
+                    // gain still surfaces because is_some() changes. When the
+                    // read did not read artwork (the 2s poll: read_artwork=false),
+                    // the artwork clause is skipped — the poll always produces
+                    // artwork=None, which would otherwise mismatch the last emit's
+                    // Some and escape dedup as a duplicate pill (see the Bleed It
+                    // Out case: same session key, duration drift, poll read art=None
+                    // vs last emit art=Some). Cached artwork injection (above) makes
+                    // event reads for recreated sessions also see Some==Some.
                     let session_recreation =
                         self.last_track_per_source
                             .get(&merged.source_app)
                             .is_some_and(|prev_track| {
                                 prev_track.title == merged.title
                                     && prev_track.artist == merged.artist
-                                    && prev_track.artwork.is_some() == merged.artwork.is_some()
+                                    && (!read_artwork || prev_track.artwork.is_some() == merged.artwork.is_some())
                             });
                     if emit && !session_recreation {
                         let label = track_label(&merged);
@@ -1330,24 +1333,27 @@ mod tests {
         );
 
         // No cached entry → None.
-        assert_eq!(
-            cached_artwork_for(&HashMap::new(), "unknown", "Song", "Artist"),
-            None
-        );
+        assert_eq!(cached_artwork_for(&HashMap::new(), "unknown", "Song", "Artist"), None);
     }
 
     /// The session-recreation predicate used in `refresh_session` to decide
     /// whether a TrackChanged for the same source should be suppressed.
     /// Mirrors the inline comparison so the logic is tested in isolation.
-    fn is_session_recreation(prev: &TrackInfo, merged: &TrackInfo) -> bool {
-        prev.title == merged.title && prev.artist == merged.artist && prev.artwork.is_some() == merged.artwork.is_some()
+    /// When `read_artwork` is false (the 2s poll, which never reads art), the
+    /// artwork-presence clause is skipped — a poll always produces None, which
+    /// would otherwise mismatch a last emit's Some and escape dedup.
+    fn is_session_recreation(prev: &TrackInfo, merged: &TrackInfo, read_artwork: bool) -> bool {
+        prev.title == merged.title
+            && prev.artist == merged.artist
+            && (!read_artwork || prev.artwork.is_some() == merged.artwork.is_some())
     }
 
     #[test]
     fn session_recreation_dedup_logic() {
         // Same track, same artwork presence → suppressed (session recreation noise).
         let prev = track("Song", "Artist");
-        assert!(is_session_recreation(&prev, &track("Song", "Artist")));
+        let merged = track("Song", "Artist");
+        assert!(is_session_recreation(&prev, &merged, true));
 
         // Same track, artwork gained → NOT suppressed (legitimate in-place refresh).
         let with_art = TrackInfo {
@@ -1356,19 +1362,50 @@ mod tests {
             artwork: Some(vec![1]),
             ..TrackInfo::default()
         };
-        assert!(!is_session_recreation(&prev, &with_art));
+        assert!(!is_session_recreation(&prev, &with_art, true));
 
         // Same track, artwork lost → NOT suppressed.
-        assert!(!is_session_recreation(&with_art, &prev));
+        assert!(!is_session_recreation(&with_art, &prev, true));
 
         // Different track → NOT suppressed.
-        assert!(!is_session_recreation(&prev, &track("Other", "Artist")));
+        assert!(!is_session_recreation(&prev, &track("Other", "Artist"), true));
 
         // Different artist → NOT suppressed.
         assert!(!is_session_recreation(
             &track("Song", "Artist"),
-            &track("Song", "Other")
+            &track("Song", "Other"),
+            true,
         ));
+    }
+
+    #[test]
+    fn session_recreation_dedup_skips_artwork_clause_for_poll_reads() {
+        // The Bleed It Out case: last emit had art (Some), but the poll read
+        // always produces artwork=None (read_artwork=false). Without the fix,
+        // is_some()==is_some() → Some==None → false → emitted as a duplicate.
+        let last_emit = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            artwork: Some(vec![1]),
+            ..TrackInfo::default()
+        };
+        let poll_read = track("Song", "Artist");
+
+        // OLD (buggy) behavior: suppressed == false (escapes dedup → duplicate).
+        assert!(!old_is_session_recreation(&last_emit, &poll_read));
+
+        // NEW behavior: poll read skips artwork clause → suppressed.
+        assert!(is_session_recreation(&last_emit, &poll_read, false));
+
+        // Event read with art still gained → NOT suppressed (in-place refresh).
+        assert!(!is_session_recreation(&last_emit, &poll_read, true));
+    }
+
+    /// OLD (buggy) predicate, for diff regression testing: compares artwork
+    /// presence unconditionally, which misfires when a poll read (always None)
+    /// follows an emit that had art.
+    fn old_is_session_recreation(prev: &TrackInfo, merged: &TrackInfo) -> bool {
+        prev.title == merged.title && prev.artist == merged.artist && prev.artwork.is_some() == merged.artwork.is_some()
     }
 
     #[test]
