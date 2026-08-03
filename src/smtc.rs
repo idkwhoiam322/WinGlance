@@ -120,6 +120,14 @@ struct ListenerState {
     /// Heartbeat touched each loop iteration so the supervisor can detect a
     /// stall and restart the listener.
     heartbeat: Arc<Mutex<Instant>>,
+    /// Last emitted track per source app (keyed by `source_app`). Persisting
+    /// this across session-key changes lets us suppress the duplicate
+    /// TrackChanged events a source emits when it recreates its session
+    /// (YouTube Music is observed doing this every ~60s and on every song
+    /// change): the new session has a default LogicalState, so content_differ
+    /// always sees a change. We compare title + artist + artwork-presence so
+    /// that a genuine artwork gain still surfaces as an in-place refresh.
+    last_track_per_source: HashMap<String, TrackInfo>,
 }
 
 pub struct SmtcListener {
@@ -193,6 +201,7 @@ impl ListenerState {
             churn: HashMap::new(),
             churn_cooldown: HashMap::new(),
             rejected_seen: HashSet::new(),
+            last_track_per_source: HashMap::new(),
             heartbeat,
         }
     }
@@ -349,11 +358,32 @@ impl ListenerState {
                         let label = track_label(&merged);
                         debug!("track emit forced | reason=artwork-timeout | {label}");
                     }
-                    if emit {
+                    // Per-source session-recreation dedup: a source that
+                    // recreates its session (e.g. YouTube Music ~60s and on
+                    // every song change) re-reports the same track on a new
+                    // session key. Since the new session starts with a default
+                    // LogicalState, content_differ always sees a change. Compare
+                    // against the last track actually emitted per source
+                    // (title + artist + artwork-presence); a genuine artwork
+                    // gain still surfaces because is_some() changes.
+                    let session_recreation =
+                        self.last_track_per_source
+                            .get(&merged.source_app)
+                            .is_some_and(|prev_track| {
+                                prev_track.title == merged.title
+                                    && prev_track.artist == merged.artist
+                                    && prev_track.artwork.is_some() == merged.artwork.is_some()
+                            });
+                    if emit && !session_recreation {
                         let label = track_label(&merged);
                         info!("track changed | {label}");
                         events.push(MediaEvent::TrackChanged(merged.clone()));
+                        self.last_track_per_source
+                            .insert(merged.source_app.clone(), merged.clone());
                         next.deferred_at = None;
+                    } else if session_recreation {
+                        let label = track_label(&merged);
+                        debug!("track emit suppressed | reason=session-recreation | {label}");
                     } else if artwork_lost {
                         // Absence is already shown as a placeholder: store the
                         // loss (a later reappearance re-emits) without
@@ -1156,5 +1186,40 @@ mod tests {
         assert!(is_session_gone(&rpc));
         assert!(is_session_gone(&device));
         assert!(!is_session_gone(&other));
+    }
+
+    /// The session-recreation predicate used in `refresh_session` to decide
+    /// whether a TrackChanged for the same source should be suppressed.
+    /// Mirrors the inline comparison so the logic is tested in isolation.
+    fn is_session_recreation(prev: &TrackInfo, merged: &TrackInfo) -> bool {
+        prev.title == merged.title && prev.artist == merged.artist && prev.artwork.is_some() == merged.artwork.is_some()
+    }
+
+    #[test]
+    fn session_recreation_dedup_logic() {
+        // Same track, same artwork presence → suppressed (session recreation noise).
+        let prev = track("Song", "Artist");
+        assert!(is_session_recreation(&prev, &track("Song", "Artist")));
+
+        // Same track, artwork gained → NOT suppressed (legitimate in-place refresh).
+        let with_art = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            artwork: Some(vec![1]),
+            ..TrackInfo::default()
+        };
+        assert!(!is_session_recreation(&prev, &with_art));
+
+        // Same track, artwork lost → NOT suppressed.
+        assert!(!is_session_recreation(&with_art, &prev));
+
+        // Different track → NOT suppressed.
+        assert!(!is_session_recreation(&prev, &track("Other", "Artist")));
+
+        // Different artist → NOT suppressed.
+        assert!(!is_session_recreation(
+            &track("Song", "Artist"),
+            &track("Song", "Other")
+        ));
     }
 }
