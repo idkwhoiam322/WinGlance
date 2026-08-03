@@ -1132,6 +1132,251 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
+/// Draws a playback-state symbol (play ▶ / pause ‖ / stop ■) as custom
+/// anti-aliased vector shapes directly into the pixel buffer, replacing the
+/// old GDI text glyphs. The symbol box is `size`×`size` pixels (size = font
+/// height); bars are 0.20×S wide × 0.62×S tall with a 0.22×S gap. Play is a
+/// triangle of the same height whose corners are rounded at the pause bars'
+/// radius; pause and stop use rounded corners with radius 0.2×S
+/// (clamped to half the bar width — capsule ends for the bars, matching the
+/// artwork tile's `size * 0.2` rounding convention and the pill's soft look).
+/// The symbol is positioned with its right edge at `right` and vertically
+/// centered in its row band.
+#[allow(clippy::too_many_arguments)]
+fn draw_symbol_pixels(
+    pixels: &mut [u8],
+    width: usize,
+    right: i32,
+    y: i32,
+    size: f32,
+    playback: PlaybackState,
+    color: [u8; 4],
+) {
+    let bar_w = 0.20 * size;
+    let bar_h = 0.62 * size;
+    let gap = 0.22 * size;
+    let radius = (0.20 * size).min(bar_w / 2.0).max(0.0);
+    let box_left = (right as f32 - size).round() as i32;
+    let v_center = y as f32 + (bar_h / 2.0);
+    match playback {
+        PlaybackState::Playing => {
+            // Triangle, height ≈ bar_h, point on the left. The width matches
+            // the pause symbol's total width (bars + gap ≈ 0.62×S) so the
+            // play glyph carries the same visual weight as the pause bars;
+            // its corners use the pause bars' rounding radius.
+            let tri_w = 0.50 * size;
+            let tri_h = bar_h;
+            let left = box_left as f32 + (size - tri_w) * 0.5;
+            let top = v_center - tri_h / 2.0;
+            draw_triangle_filled(
+                pixels,
+                width,
+                (left as i32, top as i32),
+                (left as i32 + tri_w as i32, (top + tri_h / 2.0) as i32),
+                (left as i32, (top + tri_h) as i32),
+                radius,
+                color,
+            );
+        }
+        PlaybackState::Paused => {
+            // Two rounded bars, centered horizontally in the box.
+            let total = bar_w * 2.0 + gap;
+            let origin = box_left as f32 + (size - total) * 0.5;
+            for offset in [0.0, bar_w + gap] {
+                draw_rounded_rect_filled(
+                    pixels,
+                    width,
+                    (origin + offset) as i32,
+                    (v_center - bar_h / 2.0) as i32,
+                    bar_w as i32,
+                    bar_h as i32,
+                    radius,
+                    color,
+                );
+            }
+        }
+        PlaybackState::Stopped => {
+            // Rounded square, same height as the bars.
+            let sq = bar_h;
+            let left = box_left as f32 + (size - sq) * 0.5;
+            draw_rounded_rect_filled(
+                pixels,
+                width,
+                left as i32,
+                (v_center - sq / 2.0) as i32,
+                sq as i32,
+                sq as i32,
+                radius,
+                color,
+            );
+        }
+    }
+}
+
+/// Fills a rounded rectangle into the pixel buffer using `round_rect_coverage`.
+#[allow(clippy::too_many_arguments)]
+fn draw_rounded_rect_filled(
+    pixels: &mut [u8],
+    width: usize,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    radius: f32,
+    color: [u8; 4],
+) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let r = radius.min(w as f32 / 2.0).min(h as f32 / 2.0);
+    for dy in 0..h {
+        for dx in 0..w {
+            let cov = round_rect_coverage(dx as f32, dy as f32, w as f32, h as f32, r);
+            if cov > 0.0 {
+                let alpha = (color[3] as f32 * cov) as u32;
+                composite(
+                    pixels,
+                    width,
+                    (x + dx) as usize,
+                    (y + dy) as usize,
+                    [color[0], color[1], color[2]],
+                    alpha,
+                );
+            }
+        }
+    }
+}
+
+/// Fills a triangle (given three pixel corners) with corners rounded to the
+/// given radius into the pixel buffer, anti-aliased via signed-distance
+/// coverage. Used only for the play symbol; the radius matches the pause
+/// bars' capsule-end radius so all three symbols share the same rounding.
+fn draw_triangle_filled(
+    pixels: &mut [u8],
+    width: usize,
+    (ax, ay): (i32, i32),
+    (bx, by): (i32, i32),
+    (cx, cy): (i32, i32),
+    radius: f32,
+    color: [u8; 4],
+) {
+    let min_x = ax.min(bx).min(cx);
+    let max_x = ax.max(bx).max(cx);
+    let min_y = ay.min(by).min(cy);
+    let max_y = ay.max(by).max(cy);
+    for py in min_y..=max_y {
+        for px in min_x..=max_x {
+            let cov = rounded_triangle_coverage(
+                px as f32, py as f32, ax as f32, ay as f32, bx as f32, by as f32, cx as f32, cy as f32, radius,
+            );
+            if cov > 0.0 {
+                let alpha = (color[3] as f32 * cov) as u32;
+                composite(
+                    pixels,
+                    width,
+                    px as usize,
+                    py as usize,
+                    [color[0], color[1], color[2]],
+                    alpha,
+                );
+            }
+        }
+    }
+}
+
+/// Signed distance from a point to the line through (a, b): positive on the
+/// left side, which is the interior side for a counter-clockwise triangle.
+fn edge_signed_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let ex = bx - ax;
+    let ey = by - ay;
+    let len = ex.hypot(ey);
+    if len <= 0.0 {
+        return f32::INFINITY;
+    }
+    (ex * (py - ay) - ey * (px - ax)) / len
+}
+
+/// Distance from a point to the closest point of a line segment.
+fn point_segment_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let ex = bx - ax;
+    let ey = by - ay;
+    let len2 = ex * ex + ey * ey;
+    let t = if len2 <= 0.0 {
+        0.0
+    } else {
+        (((px - ax) * ex + (py - ay) * ey) / len2).clamp(0.0, 1.0)
+    };
+    let qx = ax + t * ex;
+    let qy = ay + t * ey;
+    (px - qx).hypot(py - qy)
+}
+
+/// The vertex of the triangle eroded by `radius` at corner (ax, ay): the
+/// intersection of the two lines parallel to the adjacent edges, each inset
+/// by the perpendicular `radius` toward the interior.
+fn inset_vertex(ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32, radius: f32) -> (f32, f32) {
+    // Inward unit normals (left of the counter-clockwise edge direction).
+    let (e1x, e1y) = (bx - ax, by - ay);
+    let l1 = e1x.hypot(e1y);
+    let (e2x, e2y) = (ax - cx, ay - cy);
+    let l2 = e2x.hypot(e2y);
+    if l1 <= 0.0 || l2 <= 0.0 {
+        return (ax, ay);
+    }
+    let (n1x, n1y) = (-e1y / l1, e1x / l1);
+    let (n2x, n2y) = (-e2y / l2, e2x / l2);
+    let det = n1x * n2y - n1y * n2x;
+    if det.abs() <= 1e-6 {
+        return (ax, ay);
+    }
+    let vx = radius * (n2y - n1y) / det;
+    let vy = radius * (n1x - n2x) / det;
+    (ax + vx, ay + vy)
+}
+
+/// Anti-aliased coverage of a triangle with corners rounded to `radius`
+/// (radius 0 = sharp triangle). The rounded triangle is the original eroded
+/// by `radius` (each edge inset perpendicularly) dilated back by the same
+/// radius: a pixel is covered when it is within `radius` of the eroded core,
+/// which cuts the corners into arcs while keeping the flat edges on the
+/// original edge lines.
+#[allow(clippy::too_many_arguments)]
+fn rounded_triangle_coverage(
+    px: f32,
+    py: f32,
+    ax: f32,
+    ay: f32,
+    bx: f32,
+    by: f32,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+) -> f32 {
+    let signed_dist = if radius <= 0.0 {
+        // Sharp triangle: minimum signed distance to the three edges.
+        edge_signed_dist(px, py, ax, ay, bx, by)
+            .min(edge_signed_dist(px, py, bx, by, cx, cy))
+            .min(edge_signed_dist(px, py, cx, cy, ax, ay))
+    } else {
+        let (ax2, ay2) = inset_vertex(ax, ay, bx, by, cx, cy, radius);
+        let (bx2, by2) = inset_vertex(bx, by, cx, cy, ax, ay, radius);
+        let (cx2, cy2) = inset_vertex(cx, cy, ax, ay, bx, by, radius);
+        let inside_core = edge_signed_dist(px, py, ax2, ay2, bx2, by2) >= 0.0
+            && edge_signed_dist(px, py, bx2, by2, cx2, cy2) >= 0.0
+            && edge_signed_dist(px, py, cx2, cy2, ax2, ay2) >= 0.0;
+        let dist = if inside_core {
+            0.0
+        } else {
+            point_segment_dist(px, py, ax2, ay2, bx2, by2)
+                .min(point_segment_dist(px, py, bx2, by2, cx2, cy2))
+                .min(point_segment_dist(px, py, cx2, cy2, ax2, ay2))
+        };
+        radius - dist
+    };
+    let t = (signed_dist / 1.5 + 0.5).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Draws the pill's text rows into the same premultiplied pixel buffer as the
 /// shapes: glyph coverage from fontdue becomes alpha, so text alpha-composites
 /// exactly like every other element (GDI text cannot do this on a layered
@@ -1245,11 +1490,6 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
             }
         }
         MediaEvent::PlaybackStateChanged(playback, source_app) => {
-            let label = match playback {
-                PlaybackState::Playing => "▶",
-                PlaybackState::Paused => "‖",
-                PlaybackState::Stopped => "■",
-            };
             let appearance = &state.config.appearance;
             let padding = (appearance.padding * scale) as i32;
             let art = (appearance.art_size as f32 * scale) as i32;
@@ -1290,12 +1530,6 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                     right: title_rect.right - label_w,
                     bottom: title_rect.bottom,
                 };
-                let label_rect = RECT {
-                    left: title_rect.right - label_w,
-                    top: title_rect.top,
-                    right: title_rect.right,
-                    bottom: title_rect.bottom,
-                };
                 draw_text_line_pixels(
                     &mut state.text_scratch,
                     pixels,
@@ -1308,17 +1542,14 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                     false,
                     None,
                 );
-                draw_text_line_pixels(
-                    &mut state.text_scratch,
+                draw_symbol_pixels(
                     pixels,
                     width as usize,
-                    label,
-                    &label_rect,
-                    fs_title as i32,
+                    title_rect.right,
+                    title_rect.top,
+                    fs_title,
+                    *playback,
                     appearance.accent_color,
-                    true,
-                    true,
-                    None,
                 );
                 if !track.artist.trim().is_empty() {
                     let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
@@ -1380,12 +1611,6 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         right: title_rect.right - label_w,
                         bottom: title_rect.bottom,
                     };
-                    let label_rect = RECT {
-                        left: title_rect.right - label_w,
-                        top: title_rect.top,
-                        right: title_rect.right,
-                        bottom: title_rect.bottom,
-                    };
                     draw_text_line_pixels(
                         &mut state.text_scratch,
                         pixels,
@@ -1398,17 +1623,14 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         false,
                         None,
                     );
-                    draw_text_line_pixels(
-                        &mut state.text_scratch,
+                    draw_symbol_pixels(
                         pixels,
                         width as usize,
-                        label,
-                        &label_rect,
-                        fs_title as i32,
+                        title_rect.right,
+                        title_rect.top,
+                        fs_title,
+                        *playback,
                         appearance.accent_color,
-                        true,
-                        true,
-                        None,
                     );
                     let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
                     draw_text_line_pixels(
@@ -2184,5 +2406,136 @@ mod tests {
             "current_source must clear when the pill collapses"
         );
         assert!(matches!(state.phase, Phase::Hidden));
+    }
+
+    #[test]
+    fn pause_symbol_draws_two_separate_bars() {
+        let mut pixels = vec![0u8; 100 * 100 * 4];
+        let size = 40.0;
+        // Right-aligned at x=100, y=30 — a 40px box, bars centered in it.
+        draw_symbol_pixels(
+            &mut pixels,
+            100,
+            100,
+            30,
+            size,
+            PlaybackState::Paused,
+            [255, 255, 255, 255],
+        );
+        let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
+        assert!(lit > 0, "pause symbol must draw pixels");
+        // Two bars: scan the vertical midline of the box for two separate
+        // lit clusters (the gap between bars must be dark).
+        let mid_y = 50; // vertically centered in the 30..70 band
+        let mut clusters = 0;
+        let mut in_bar = false;
+        for x in 0..100 {
+            let alpha = pixels[(mid_y * 100 + x) * 4 + 3];
+            if alpha > 0 && !in_bar {
+                clusters += 1;
+                in_bar = true;
+            } else if alpha == 0 {
+                in_bar = false;
+            }
+        }
+        assert_eq!(
+            clusters, 2,
+            "expected two bars with a gap, got {clusters} lit cluster(s)"
+        );
+    }
+
+    #[test]
+    fn play_symbol_draws_a_triangle() {
+        let mut pixels = vec![0u8; 100 * 100 * 4];
+        draw_symbol_pixels(
+            &mut pixels,
+            100,
+            100,
+            30,
+            40.0,
+            PlaybackState::Playing,
+            [255, 255, 255, 255],
+        );
+        let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
+        assert!(lit > 0, "play symbol must draw pixels");
+    }
+
+    #[test]
+    fn stop_symbol_draws_a_square() {
+        let mut pixels = vec![0u8; 100 * 100 * 4];
+        draw_symbol_pixels(
+            &mut pixels,
+            100,
+            100,
+            30,
+            40.0,
+            PlaybackState::Stopped,
+            [255, 255, 255, 255],
+        );
+        let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
+        assert!(lit > 0, "stop symbol must draw pixels");
+    }
+
+    #[test]
+    fn symbol_is_right_aligned_within_its_box() {
+        let mut pixels = vec![0u8; 200 * 80 * 4];
+        // Symbol box right edge at x=200, size 32 → box spans 168..200.
+        let size = 32.0_f32;
+        draw_symbol_pixels(
+            &mut pixels,
+            200,
+            200,
+            24,
+            size,
+            PlaybackState::Paused,
+            [255, 255, 255, 255],
+        );
+        // Find the rightmost lit pixel in the vertical center band.
+        let mut rightmost_lit = -1_i32;
+        for x in 0..200 {
+            for y in 30..70 {
+                if pixels[(y * 200 + x) * 4 + 3] > 0 {
+                    rightmost_lit = rightmost_lit.max(x as i32);
+                }
+            }
+        }
+        assert!(rightmost_lit >= 0, "symbol must have lit pixels");
+        // Rightmost lit pixel should be inside the right half of the box
+        // (i.e. within 100px..200px), confirming the symbol sits in the
+        // right-aligned box, not on the left.
+        assert!(
+            rightmost_lit >= 168,
+            "rightmost lit pixel at {rightmost_lit} should be inside the right-aligned box (>=168)"
+        );
+    }
+
+    #[test]
+    fn rounded_triangle_coverage_matches_sharp_triangle_without_radius() {
+        // Triangle (0,0), (10,0), (0,10) at radius 0: solid inside, empty outside.
+        let cov = |x: f32, y: f32, r: f32| rounded_triangle_coverage(x, y, 0.0, 0.0, 10.0, 0.0, 0.0, 10.0, r);
+        assert_eq!(cov(3.0, 3.0, 0.0), 1.0);
+        assert_eq!(cov(1.0, 7.0, 0.0), 1.0);
+        assert_eq!(cov(8.0, 8.0, 0.0), 0.0);
+        assert_eq!(cov(-1.0, 5.0, 0.0), 0.0);
+        // On an edge: half coverage.
+        let edge = cov(0.0, 5.0, 0.0);
+        assert!((edge - 0.5).abs() < 0.2, "expected ~0.5 on the edge, got {edge}");
+    }
+
+    #[test]
+    fn rounded_triangle_coverage_cuts_the_corners() {
+        let cov = |x: f32, y: f32, r: f32| rounded_triangle_coverage(x, y, 0.0, 0.0, 10.0, 0.0, 0.0, 10.0, r);
+        // The sharp corner (0,0) is cut away by the radius-2 arc.
+        assert_eq!(cov(0.0, 0.0, 2.0), 0.0);
+        // The core vertex (the arc's center) is fully covered.
+        assert_eq!(cov(2.0, 2.0, 2.0), 1.0);
+        // Deep interior stays solid.
+        assert_eq!(cov(4.0, 4.0, 2.0), 1.0);
+        // The arc passes through (2-√2, 2-√2) ≈ (0.586, 0.586): half coverage.
+        let arc = cov(0.586, 0.586, 2.0);
+        assert!((arc - 0.5).abs() < 0.2, "expected ~0.5 on the arc, got {arc}");
+        // The flat edge stays on the original edge: (5,5) lies on x+y=10.
+        let flat = cov(5.0, 5.0, 2.0);
+        assert!((flat - 0.5).abs() < 0.2, "expected ~0.5 on the flat edge, got {flat}");
     }
 }
