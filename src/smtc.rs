@@ -359,7 +359,24 @@ impl ListenerState {
         if status != GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped {
             match read_track_info(session, read_artwork) {
                 Ok(read) => {
-                    let merged = merge_track(&prev, &read, read_artwork);
+                    let mut merged = merge_track(&prev, &read, read_artwork);
+                    // Session-recreation recovery: when a source recreates its
+                    // session (new key, default prev state) its first event-driven
+                    // read often grabs an empty thumbnail stream (SMTC populates art
+                    // ~500ms after title). Inject the cached artwork for the same
+                    // title+artist identity so the dedup predicate sees present==
+                    // present and suppresses the duplicate — the cover is already
+                    // known, just not re-readable on this fresh session yet.
+                    if read_artwork
+                        && merged.artwork.is_none()
+                        && let Some(cached) = self.cached_artwork_for(
+                            &merged.source_app,
+                            &merged.title,
+                            &merged.artist,
+                        )
+                    {
+                        merged.artwork = Some(cached);
+                    }
                     let (mut emit, artwork_lost) = emit_track(&prev, &merged, read_artwork);
                     // Safety net: a first pill deferred for artwork shows
                     // anyway after ARTWORK_TIMEOUT, so a source that never
@@ -527,6 +544,14 @@ impl ListenerState {
         set_active_session_sources(active_sources);
     }
 
+    /// Returns the last emitted artwork bytes for `source_app` if the cached
+    /// track matches the given title+artist identity. This only returns art for
+    /// the *same track* — never cross-track — so a recreated session reports the
+    /// cover without re-reading the (often transiently-empty) thumbnail stream.
+    fn cached_artwork_for(&self, source_app: &str, title: &str, artist: &str) -> Option<Vec<u8>> {
+        cached_artwork_for(&self.last_track_per_source, source_app, title, artist)
+    }
+
     /// Re-reads a session's artwork on the poll path (read_artwork=true), then
     /// re-runs the full refresh so a newly-arrived thumbnail surfaces a
     /// TrackChanged / artwork-gain event in place. The retry counter is bumped
@@ -569,7 +594,7 @@ impl ListenerState {
             // Clone the COM interface out so the map borrow ends before the
             // refresh (which can mutate subscriptions via eviction).
             let session = self.subscriptions.get(&key).map(|s| s.session.clone());
-                if let Some(session) = session {
+            if let Some(session) = session {
                 let _ = self.refresh_session(&session, false);
                 if should_poll_artwork(self.states.get(&key))
                     && let Err(error) = self.retry_artwork(&session)
@@ -732,8 +757,31 @@ fn track_label(track: &TrackInfo) -> String {
     )
 }
 
+/// Returns the last emitted artwork bytes for `source_app` if the cached
+/// track matches the given title+artist identity. This only returns art for
+/// the same track identity (title + artist) — never cross-track, so a
+/// recreated session reports the cover without re-reading the
+/// (often transiently-empty) thumbnail stream.
+fn cached_artwork_for(
+    last_track_per_source: &HashMap<String, TrackInfo>,
+    source_app: &str,
+    title: &str,
+    artist: &str,
+) -> Option<Vec<u8>> {
+    last_track_per_source.get(source_app).and_then(|cached| {
+        if cached.title == title && cached.artist == artist {
+            cached.artwork.clone()
+        } else {
+            None
+        }
+    })
+}
+
 /// True if a session still needs a poll-driven artwork read: it has no artwork
 /// yet and has not exhausted its retry budget. Used by the 2-second safety-net
+/// poll to chase a thumbnail that an earlier event-driven read missed (SMTC
+/// populates the thumbnail a moment after the title), without re-reading art
+/// on every poll pass for sessions that already have it.
 /// poll to chase a thumbnail that an earlier event-driven read missed (SMTC
 /// populates the thumbnail a moment after the title), without re-reading art
 /// on every poll pass for sessions that already have it.
@@ -1246,6 +1294,46 @@ mod tests {
         assert!(is_session_gone(&rpc));
         assert!(is_session_gone(&device));
         assert!(!is_session_gone(&other));
+    }
+
+    #[test]
+    fn cached_artwork_reused_only_for_same_track_identity() {
+        // Build a last_track_per_source map directly — no ListenerState needed.
+        let mut last_track_per_source = HashMap::new();
+        let art = vec![0x89, 0x50, 0x4E, 0x47];
+        last_track_per_source.insert(
+            "youtube-music".to_string(),
+            TrackInfo {
+                title: "Song".into(),
+                artist: "Artist".into(),
+                artwork: Some(art.clone()),
+                ..TrackInfo::default()
+            },
+        );
+
+        // Same source + title + artist → cached artwork returned.
+        assert_eq!(
+            cached_artwork_for(&last_track_per_source, "youtube-music", "Song", "Artist"),
+            Some(art.clone())
+        );
+
+        // Cross-track (same source, different title) → None (no bleed).
+        assert_eq!(
+            cached_artwork_for(&last_track_per_source, "youtube-music", "Other", "Artist"),
+            None
+        );
+
+        // Cross-source → None.
+        assert_eq!(
+            cached_artwork_for(&last_track_per_source, "spotify", "Song", "Artist"),
+            None
+        );
+
+        // No cached entry → None.
+        assert_eq!(
+            cached_artwork_for(&HashMap::new(), "unknown", "Song", "Artist"),
+            None
+        );
     }
 
     /// The session-recreation predicate used in `refresh_session` to decide
