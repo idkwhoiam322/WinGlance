@@ -138,10 +138,6 @@ struct OverlayState {
     /// Timestamp of the previous animation tick, for time-based marquee
     /// scrolling.
     last_tick: Instant,
-    /// Source app of the currently shown state pill, when it came from a
-    /// session that is not current. The pill draws this name instead of the
-    /// (wrong) last_track content.
-    state_source: Option<String>,
     /// Source app of the last TrackChanged shown, used as the label fallback
     /// in state pills for current-session playback states so the pill always
     /// names the app that owns the media — never another app's last track.
@@ -235,7 +231,6 @@ impl OverlayState {
             decoded_art_key: None,
             dib: None,
             last_tick: Instant::now(),
-            state_source: None,
             current_source: None,
             track_cache: HashMap::new(),
             text_scratch: None,
@@ -664,7 +659,6 @@ impl OverlayState {
         self.content = None;
         self.dismiss_at = None;
         self.phase = Phase::Hidden;
-        self.state_source = None;
         self.delete_anim_timer();
         unsafe {
             // Do NOT kill the debounce timer here: an event that arrived while
@@ -1336,7 +1330,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 let fallback_name = if !source_app.is_empty() {
                     Some(source_app.as_str())
                 } else {
-                    state.state_source.as_deref().or(state.current_source.as_deref())
+                    state.current_source.as_deref()
                 };
                 if let Some(name) = fallback_name {
                     let title_rect = next_band(fs_artist * ROW_HEIGHT);
