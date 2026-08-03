@@ -696,6 +696,16 @@ impl MainWindowState {
 
     fn add_state_change(&mut self, state: PlaybackState) {
         let track = self.current.as_ref().map(|c| c.track.clone()).unwrap_or_default();
+        // Skip a state row that duplicates the newest one (same track, same
+        // state). Session recreation re-reports "Playing" for the same song,
+        // which would otherwise flood the history with identical rows while
+        // the user never changed anything.
+        let is_duplicate = self.history.entries.front().is_some_and(|last| {
+            last.state == state && last.track.title == track.title && last.track.artist == track.artist
+        });
+        if is_duplicate {
+            return;
+        }
         self.push_history(track, state, true);
     }
 
