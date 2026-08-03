@@ -676,7 +676,18 @@ impl ListenerState {
             && let Some(session) = hint
             && self.session_is_eligible(session)
         {
-            return Some(session.clone());
+            // Don't let a non-Playing session steal the current slot from
+            // one that is actively playing.  A paused background session with
+            // known content (e.g. YouTube Music sitting minimized while Brave
+            // plays in the foreground) must not displace the foreground app.
+            let hint_is_current = self.current_key == Some(session_key(session));
+            let hint_is_playing = read_playback_state(session)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s == PlaybackState::Playing);
+            if hint_is_current || !self.current_playing || hint_is_playing {
+                return Some(session.clone());
+            }
         }
 
         // 1. GetCurrentSession() is the pointer Windows itself maintains (the
