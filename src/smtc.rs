@@ -394,6 +394,7 @@ impl ListenerState {
     /// session churn for the cool-down.
     fn sync_subscriptions(&mut self) {
         let Ok(sessions) = self.manager.GetSessions() else {
+            debug!("SMTC GetSessions failed; keeping the current subscription map");
             return;
         };
         let sessions: Vec<_> = sessions.into_iter().collect();
