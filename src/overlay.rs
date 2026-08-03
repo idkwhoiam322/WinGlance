@@ -324,19 +324,25 @@ impl OverlayState {
                 MediaEvent::PlaybackStateChanged(state, source_app)
                     if self.config.behavior.enable_playback_state_change =>
                 {
-                    // A track pill already queued for the same source will
-                    // surface the new content on its own; showing a state pill
-                    // (usually "Playing") on top of it would flash the same
-                    // track twice. The smtc worker suppresses this case when
-                    // both events land in one batch; this is the safety net
-                    // for when the PlaybackStateChanged arrives separately.
-                    let track_pending = self
-                        .pending
-                        .iter()
-                        .any(|e| matches!(e, MediaEvent::TrackChanged(track) if track.source_app == source_app));
-                    if track_pending {
+                    // Suppress a PlaybackStateChanged pill when:
+                    //  - It is Playing AND the same source's TrackChanged was
+                    //    recently shown (prevents the "replaying" pill after
+                    //    session recreation, or when a browser video triggers
+                    //    YTM to re-report "Playing").
+                    //  - A TrackChanged for the same source is queued (a
+                    //    TrackChanged pill is about to show; a redundant
+                    //    PlaybackStateChanged would flash the same info).
+                    // Paused/Stopped pass through when they are a new state
+                    // from a source that is NOT currently shown.
+                    let is_redundant = (matches!(state, PlaybackState::Playing)
+                        && self.current_source.as_deref() == Some(source_app.as_str()))
+                        || self
+                            .pending
+                            .iter()
+                            .any(|e| matches!(e, MediaEvent::TrackChanged(t) if t.source_app == source_app));
+                    if is_redundant {
                         debug!(
-                            "playback state pill suppressed | reason=track pending for same source | source={source_app}"
+                            "playback state pill suppressed | reason=track shown for same source | source={source_app}"
                         );
                         continue;
                     }
