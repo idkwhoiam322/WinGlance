@@ -363,22 +363,29 @@ impl OverlayState {
 
     /// Adds a notification to the pending queue. At the cap, the oldest unshown
     /// queued event is dropped in favor of the incoming one; the pill currently
-    /// on screen is never pulled. A metadata refresh for the same track as the
-    /// queue's last entry replaces it instead of showing the song twice.
+    /// on screen is never pulled. A metadata refresh for a track already
+    /// waiting in the queue replaces it instead of showing the song twice.
     fn enqueue(&mut self, event: MediaEvent) {
-        if let Some(MediaEvent::TrackChanged(queued)) = self.pending.back_mut()
-            && let MediaEvent::TrackChanged(incoming) = &event
-            && queued.title == incoming.title
-            && queued.artist == incoming.artist
-            && queued.source_app == incoming.source_app
-        {
-            if !incoming.album.trim().is_empty() {
-                queued.album = incoming.album.clone();
+        // A metadata refresh for a track already waiting in the queue (artwork
+        // or album arriving late) merges into that entry instead of queueing a
+        // duplicate. Checking only the back of the queue is not enough: other
+        // sources' events can interleave between the track and its refresh.
+        if let MediaEvent::TrackChanged(incoming) = &event {
+            for queued in self.pending.iter_mut() {
+                if let MediaEvent::TrackChanged(queued) = queued
+                    && queued.title == incoming.title
+                    && queued.artist == incoming.artist
+                    && queued.source_app == incoming.source_app
+                {
+                    if !incoming.album.trim().is_empty() {
+                        queued.album = incoming.album.clone();
+                    }
+                    if incoming.artwork.is_some() {
+                        queued.artwork = incoming.artwork.clone();
+                    }
+                    return;
+                }
             }
-            if incoming.artwork.is_some() {
-                queued.artwork = incoming.artwork.clone();
-            }
-            return;
         }
         if self.pending.len() >= PENDING_CAP {
             self.pending.pop_front();
