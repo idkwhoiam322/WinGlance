@@ -342,7 +342,7 @@ impl ListenerState {
                         debug!("track emit skipped | reason=artwork-removed | {label}");
                     } else {
                         let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
-                        if is_first_read && merged.artwork.is_none() {
+                        if is_first_read && read_artwork && merged.artwork.is_none() {
                             next.deferred_at = Some(Instant::now());
                             let label = track_label(&merged);
                             debug!("track emit deferred | reason=awaiting-artwork | {label}");
@@ -685,19 +685,19 @@ fn content_differ(prev: &LogicalState, read: &TrackInfo) -> bool {
 /// pill refreshes the cover in place), a loss is stored silently — absence is
 /// already shown as a placeholder, so re-emitting would flash the same track.
 ///
-/// On the first read for a session (the stored state is still empty), if
-/// artwork has not arrived yet, the emit is deferred until the `has_artwork`
-/// gained diff fires on a later read (or until `ARTWORK_TIMEOUT` expires).
-/// This eliminates the artwork=no→artwork=yes double-pill: the app reports
-/// title/artist first, then fires a second event with the thumbnail.
+/// On the first event-driven read for a session (the stored state is still
+/// empty), if artwork has not arrived yet, the emit is deferred until the
+/// `has_artwork` gained diff fires on a later read (or until `ARTWORK_TIMEOUT`
+/// expires). This eliminates the artwork=no→artwork=yes double-pill: the app
+/// reports title/artist first, then fires a second event with the thumbnail.
+/// Poll reads (`read_artwork=false`) never defer: they cannot fetch artwork,
+/// so the startup pill must show immediately rather than wait for a timeout.
 fn emit_track(prev: &LogicalState, merged: &TrackInfo, read_artwork: bool) -> (bool, bool) {
     let content_changed = content_differ(prev, merged);
     let artwork_gained = read_artwork && merged.artwork.is_some() && !prev.has_artwork;
     let artwork_lost = read_artwork && merged.artwork.is_none() && prev.has_artwork;
     let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
-    // Defer regardless of `read_artwork`: a poll first-read carries no
-    // artwork either (merge strips it), so it must wait too.
-    let defer_first = is_first_read && merged.artwork.is_none();
+    let defer_first = is_first_read && read_artwork && merged.artwork.is_none();
     (content_changed && !defer_first || artwork_gained, artwork_lost)
 }
 
@@ -1056,11 +1056,12 @@ mod tests {
         // A poll that did not read artwork never touches presence.
         assert_eq!(emit_track(&had_art, &track("Song", "Artist"), false), (false, false));
         assert_eq!(emit_track(&prev, &with_art, false), (false, false));
-        // First read without artwork: deferred (no emit, awaits thumbnail),
-        // whether the read carried artwork or not (a poll read strips it).
+        // First read without artwork: deferred on event-driven reads (awaits
+        // the thumbnail), but a poll first-read emits immediately — the
+        // startup read must not wait for artwork a poll cannot fetch.
         let first = LogicalState::default();
         assert_eq!(emit_track(&first, &track("Song", "Artist"), true), (false, false));
-        assert_eq!(emit_track(&first, &track("Song", "Artist"), false), (false, false));
+        assert_eq!(emit_track(&first, &track("Song", "Artist"), false), (true, false));
         // First read WITH artwork: emits immediately (no double-pill).
         assert_eq!(emit_track(&first, &with_art, true), (true, false));
         // After a deferred first read the state holds the track info; a
