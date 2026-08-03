@@ -52,6 +52,10 @@ struct LogicalState {
     /// When the first read was deferred waiting for artwork: the pill shows
     /// anyway once this timestamp is older than `ARTWORK_TIMEOUT`.
     deferred_at: Option<Instant>,
+    /// Number of poll-driven artwork retries attempted for this session. Bounded
+    /// by `ARTWORK_RETRY_BUDGET` so a session that never provides a thumbnail is
+    /// not re-read indefinitely (the 2s poll interval keeps this cheap).
+    artwork_attempts: u8,
 }
 
 /// Rolling window, threshold and cool-down for the per-source session-churn
@@ -66,6 +70,13 @@ const CHURN_COOLDOWN_MS: u64 = 30_000;
 /// SMTC populates the thumbnail a moment after the title (observed ~500ms),
 /// so a source that never provides one still gets its pill after this.
 const ARTWORK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum number of poll-driven artwork retries per session. A poll that
+/// never reads artwork (read_artwork=false) cannot surface a thumbnail, so
+/// when a session is still missing art we re-read it on the poll path up to
+/// this many times (~6s at the 2s poll interval) before giving up. Once a
+/// thumbnail is present, `has_artwork` is true and no further retries run.
+const ARTWORK_RETRY_BUDGET: u8 = 3;
 
 /// Source labels of every currently open SMTC session, refreshed at each
 /// subscription re-sync. The process picker reads this so media apps that run
@@ -516,19 +527,55 @@ impl ListenerState {
         set_active_session_sources(active_sources);
     }
 
+    /// Re-reads a session's artwork on the poll path (read_artwork=true), then
+    /// re-runs the full refresh so a newly-arrived thumbnail surfaces a
+    /// TrackChanged / artwork-gain event in place. The retry counter is bumped
+    /// so a session that never provides art stops being polled after the budget
+    /// is exhausted.
+    fn retry_artwork(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<()> {
+        let key = session_key(session);
+        if !should_poll_artwork(self.states.get(&key)) {
+            return Ok(());
+        }
+        let read = read_track_info(session, true)?;
+        let prev = self.states.get(&key).cloned().unwrap_or_default();
+        let merged = merge_track(&prev, &read, true);
+        let (emit, _lost) = emit_track(&prev, &merged, true);
+        if let Some(state) = self.states.get_mut(&key) {
+            state.has_artwork = merged.artwork.is_some();
+            state.artwork_attempts += 1;
+        }
+        if emit {
+            let label = track_label(&merged);
+            info!("track changed | {label}");
+            self.last_track_per_source
+                .insert(merged.source_app.clone(), merged.clone());
+            let _ = self.output.send(MediaEvent::TrackChanged(merged.clone()));
+            if let Some(state) = self.states.get_mut(&key) {
+                state.deferred_at = None;
+            }
+        }
+        Ok(())
+    }
+
     /// Re-reads every subscribed session (metadata only, no artwork) and diffs
     /// it against the stored state. The 2-second safety net; also used for the
-    /// startup read so the pill reports what is already playing.
+    /// startup read so the pill reports what is already playing. For sessions
+    /// still missing artwork, the poll also re-reads the thumbnail (up to the
+    /// retry budget) so a slow-to-populate stream still surfaces a cover.
     fn poll_sessions(&mut self) {
         let keys: Vec<usize> = self.subscriptions.keys().copied().collect();
         for key in keys {
             // Clone the COM interface out so the map borrow ends before the
             // refresh (which can mutate subscriptions via eviction).
             let session = self.subscriptions.get(&key).map(|s| s.session.clone());
-            if let Some(session) = session
-                && let Err(error) = self.refresh_session(&session, false)
-            {
-                debug!("poll refresh failed for session {key}: {error:#}");
+                if let Some(session) = session {
+                let _ = self.refresh_session(&session, false);
+                if should_poll_artwork(self.states.get(&key))
+                    && let Err(error) = self.retry_artwork(&session)
+                {
+                    debug!("artwork retry failed for session {key}: {error:#}");
+                }
             }
         }
     }
@@ -683,6 +730,19 @@ fn track_label(track: &TrackInfo) -> String {
         track.genre,
         track.source_app,
     )
+}
+
+/// True if a session still needs a poll-driven artwork read: it has no artwork
+/// yet and has not exhausted its retry budget. Used by the 2-second safety-net
+/// poll to chase a thumbnail that an earlier event-driven read missed (SMTC
+/// populates the thumbnail a moment after the title), without re-reading art
+/// on every poll pass for sessions that already have it.
+fn should_poll_artwork(state: Option<&LogicalState>) -> bool {
+    let prev = match state {
+        Some(p) => p,
+        None => return false,
+    };
+    !prev.has_artwork && prev.artwork_attempts < ARTWORK_RETRY_BUDGET
 }
 
 /// Merges a fresh read into the stored state. Within the same title/artist
@@ -1221,5 +1281,21 @@ mod tests {
             &track("Song", "Artist"),
             &track("Song", "Other")
         ));
+    }
+
+    #[test]
+    fn artwork_retry_budget_bounds_poll_attempts() {
+        // No state yet: no retry.
+        assert!(!should_poll_artwork(None));
+        // No art + attempts < budget → retry.
+        let mut s = LogicalState::default();
+        assert!(should_poll_artwork(Some(&s)));
+        // Budget exhausted → stop retrying.
+        s.artwork_attempts = ARTWORK_RETRY_BUDGET;
+        assert!(!should_poll_artwork(Some(&s)));
+        // Artwork present → no retry.
+        s.artwork_attempts = 0;
+        s.has_artwork = true;
+        assert!(!should_poll_artwork(Some(&s)));
     }
 }
