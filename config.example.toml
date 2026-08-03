@@ -25,9 +25,9 @@ start_in_tray = true
 start_on_login = false
 # Instead of closing the app, hide the window to the tray when its X is pressed.
 close_to_tray = true
-# Source apps to ignore entirely (case-insensitive substrings against the
-# AUMID and its label). For apps that spam SMTC session changes.
-# ignored_sources = ["riotgames"]
+# Source apps to allow (case-insensitive substrings against the
+# AUMID and its label). When empty, all apps generate notifications.
+# allowed_sources = ["spotify"]
 
 [appearance]
 # Opaque pill background (alpha 255). Lower the alpha for translucency.

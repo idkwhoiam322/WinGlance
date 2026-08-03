@@ -604,9 +604,9 @@ impl ListenerState {
     /// paused but with real content this run has seen. A placeholder session
     /// that is perpetually Paused with no metadata (a client churning empty
     /// sessions) is never eligible, regardless of what GetCurrentSession()
-    /// reports. Ignored and cool-down sources are excluded outright.
+    /// reports. Disallowed and cool-down sources are excluded outright.
     fn session_is_eligible(&self, session: &GlobalSystemMediaTransportControlsSession) -> bool {
-        if self.session_source_ignored(session) {
+        if !self.session_source_allowed(session) {
             return false;
         }
         match read_playback_state(session) {
@@ -617,18 +617,24 @@ impl ListenerState {
     }
 
     /// Whether a session's source app is excluded: on the churn cool-down, or
-    /// listed in the user's `ignored_sources` config (case-insensitive
-    /// substring against both the raw AUMID and its derived label).
-    fn session_source_ignored(&self, session: &GlobalSystemMediaTransportControlsSession) -> bool {
+    /// not matching the user's `allowed_sources` config. When `allowed_sources`
+    /// is empty, all sources are allowed. When non-empty, only sources matching
+    /// an entry (case-insensitive substring against the AUMID and its derived
+    /// label) are allowed; everything else is excluded.
+    fn session_source_allowed(&self, session: &GlobalSystemMediaTransportControlsSession) -> bool {
         let aumid = session
             .SourceAppUserModelId()
             .map(|value| value.to_string())
             .unwrap_or_default();
         let label = source_app_label(&aumid);
         if self.source_on_cooldown(&label) {
+            return false;
+        }
+        let allowed = &self.config.behavior.allowed_sources;
+        if allowed.is_empty() {
             return true;
         }
-        self.config.behavior.ignored_sources.iter().any(|pattern| {
+        allowed.iter().any(|pattern| {
             let pattern = pattern.to_lowercase();
             aumid.to_lowercase().contains(&pattern) || label.to_lowercase().contains(&pattern)
         })
@@ -800,7 +806,7 @@ impl ListenerState {
         let sessions: Vec<_> = sessions.into_iter().collect();
         let before: HashSet<usize> = self.subscriptions.keys().copied().collect();
         for session in &sessions {
-            if self.session_source_ignored(session) {
+            if !self.session_source_allowed(session) {
                 continue;
             }
             if !before.contains(&session_key(session)) {

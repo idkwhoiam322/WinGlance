@@ -118,7 +118,7 @@ enum SettingId {
     Duration,
     StartOnLogin,
     CloseToTray,
-    IgnoredApps,
+    AllowedApps,
     Position,
     ShowSample,
     CopyLogs,
@@ -1109,7 +1109,7 @@ impl MainWindowState {
             SettingId::Duration,
             SettingId::StartOnLogin,
             SettingId::CloseToTray,
-            SettingId::IgnoredApps,
+            SettingId::AllowedApps,
         ] {
             items.push(SettingsItem::Row {
                 id,
@@ -1285,12 +1285,12 @@ impl MainWindowState {
                             SETTINGS_MUTED,
                         ),
                         SettingId::Position => ("Position", self.position_label(), SETTINGS_MUTED),
-                        SettingId::IgnoredApps => (
-                            "Ignored apps",
-                            if self.config.behavior.ignored_sources.is_empty() {
-                                "None".to_string()
+                        SettingId::AllowedApps => (
+                            "Allowed apps",
+                            if self.config.behavior.allowed_sources.is_empty() {
+                                "All".to_string()
                             } else {
-                                self.config.behavior.ignored_sources.join(", ")
+                                self.config.behavior.allowed_sources.join(", ")
                             },
                             SETTINGS_MUTED,
                         ),
@@ -1312,7 +1312,7 @@ impl MainWindowState {
                         SettingId::Notifications
                         | SettingId::StartOnLogin
                         | SettingId::CloseToTray
-                        | SettingId::IgnoredApps => {
+                        | SettingId::AllowedApps => {
                             let mut val_rect = control_rect;
                             draw_string(
                                 hdc,
@@ -2382,7 +2382,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                 SettingId::CopyLogs => {
                                     state.copy_logs();
                                 }
-                                SettingId::IgnoredApps => {}
+                                SettingId::AllowedApps => {}
                             }
                             return LRESULT(0);
                         }
