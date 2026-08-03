@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
 use windows::Media::Control::{
@@ -66,6 +66,26 @@ const CHURN_COOLDOWN_MS: u64 = 30_000;
 /// SMTC populates the thumbnail a moment after the title (observed ~500ms),
 /// so a source that never provides one still gets its pill after this.
 const ARTWORK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Source labels of every currently open SMTC session, refreshed at each
+/// subscription re-sync. The process picker reads this so media apps that run
+/// without a visible window (tray-only Electron apps, background browser
+/// tabs) still appear as selectable entries.
+static ACTIVE_SESSION_SOURCES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+pub(crate) fn active_session_sources() -> Vec<String> {
+    let Some(list) = ACTIVE_SESSION_SOURCES.get() else {
+        return Vec::new();
+    };
+    list.lock().map(|guard| guard.clone()).unwrap_or_default()
+}
+
+fn set_active_session_sources(sources: Vec<String>) {
+    let list = ACTIVE_SESSION_SOURCES.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut guard) = list.lock() {
+        *guard = sources;
+    }
+}
 
 struct ListenerState {
     manager: GlobalSystemMediaTransportControlsSessionManager,
@@ -459,6 +479,11 @@ impl ListenerState {
         // reported again.
         self.rejected_seen.retain(|key| alive.contains(key));
         self.churn_cooldown.retain(|_, until| *until > Instant::now());
+        // Keep the picker's candidate list in sync with what is actually
+        // open, including apps whose sessions were rejected: checking them
+        // is how the user adds them to the allow-list.
+        let active_sources: Vec<String> = sessions.iter().map(read_source_app).collect();
+        set_active_session_sources(active_sources);
     }
 
     /// Re-reads every subscribed session (metadata only, no artwork) and diffs
@@ -936,7 +961,7 @@ fn source_app_label(value: &str) -> String {
 /// Strips common word-boundary characters (`-`, `_`, `.`, ` `) and lowercases,
 /// so that `"youtube music"` matches `"youtube-music"` in an AUMID like
 /// `com.github.th-ch.youtube-music`.
-fn normalize_for_match(s: &str) -> String {
+pub(crate) fn normalize_for_match(s: &str) -> String {
     s.to_lowercase().replace(['-', '_', '.', ' '], "")
 }
 
