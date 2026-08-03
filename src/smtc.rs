@@ -49,6 +49,9 @@ struct LogicalState {
     track_count: Option<u32>,
     genre: Option<String>,
     playback: Option<PlaybackState>,
+    /// When the first read was deferred waiting for artwork: the pill shows
+    /// anyway once this timestamp is older than `ARTWORK_TIMEOUT`.
+    deferred_at: Option<Instant>,
 }
 
 /// Rolling window, threshold and cool-down for the per-source session-churn
@@ -58,6 +61,11 @@ struct LogicalState {
 const CHURN_WINDOW_MS: u64 = 2000;
 const CHURN_THRESHOLD: usize = 5;
 const CHURN_COOLDOWN_MS: u64 = 30_000;
+
+/// Maximum time a first-read pill waits for artwork before showing anyway.
+/// SMTC populates the thumbnail a moment after the title (observed ~500ms),
+/// so a source that never provides one still gets its pill after this.
+const ARTWORK_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct ListenerState {
     manager: GlobalSystemMediaTransportControlsSessionManager,
@@ -312,11 +320,20 @@ impl ListenerState {
             match read_track_info(session, read_artwork) {
                 Ok(read) => {
                     let merged = merge_track(&prev, &read, read_artwork);
-                    let (emit, artwork_lost) = emit_track(&prev, &merged, read_artwork);
+                    let (mut emit, artwork_lost) = emit_track(&prev, &merged, read_artwork);
+                    // Safety net: a first pill deferred for artwork shows
+                    // anyway after ARTWORK_TIMEOUT, so a source that never
+                    // provides a thumbnail still gets its pill.
+                    if !emit && defer_expired(prev.deferred_at) {
+                        emit = true;
+                        let label = track_label(&merged);
+                        debug!("track emit forced | reason=artwork-timeout | {label}");
+                    }
                     if emit {
                         let label = track_label(&merged);
                         info!("track changed | {label}");
                         events.push(MediaEvent::TrackChanged(merged.clone()));
+                        next.deferred_at = None;
                     } else if artwork_lost {
                         // Absence is already shown as a placeholder: store the
                         // loss (a later reappearance re-emits) without
@@ -325,7 +342,8 @@ impl ListenerState {
                         debug!("track emit skipped | reason=artwork-removed | {label}");
                     } else {
                         let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
-                        if is_first_read && read_artwork && merged.artwork.is_none() {
+                        if is_first_read && merged.artwork.is_none() {
+                            next.deferred_at = Some(Instant::now());
                             let label = track_label(&merged);
                             debug!("track emit deferred | reason=awaiting-artwork | {label}");
                         } else if read_artwork {
@@ -669,16 +687,24 @@ fn content_differ(prev: &LogicalState, read: &TrackInfo) -> bool {
 ///
 /// On the first read for a session (the stored state is still empty), if
 /// artwork has not arrived yet, the emit is deferred until the `has_artwork`
-/// gained diff fires on the subsequent MediaPropertiesChanged. This eliminates
-/// the artwork=no→artwork=yes double-pill: the app reports title/artist first,
-/// then fires a second event with the thumbnail.
+/// gained diff fires on a later read (or until `ARTWORK_TIMEOUT` expires).
+/// This eliminates the artwork=no→artwork=yes double-pill: the app reports
+/// title/artist first, then fires a second event with the thumbnail.
 fn emit_track(prev: &LogicalState, merged: &TrackInfo, read_artwork: bool) -> (bool, bool) {
     let content_changed = content_differ(prev, merged);
     let artwork_gained = read_artwork && merged.artwork.is_some() && !prev.has_artwork;
     let artwork_lost = read_artwork && merged.artwork.is_none() && prev.has_artwork;
     let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
-    let defer_first = is_first_read && read_artwork && merged.artwork.is_none();
+    // Defer regardless of `read_artwork`: a poll first-read carries no
+    // artwork either (merge strips it), so it must wait too.
+    let defer_first = is_first_read && merged.artwork.is_none();
     (content_changed && !defer_first || artwork_gained, artwork_lost)
+}
+
+/// Whether a deferred first pill has waited past the artwork timeout and
+/// should be emitted anyway, artwork or not.
+fn defer_expired(deferred_at: Option<Instant>) -> bool {
+    deferred_at.is_some_and(|t| t.elapsed() >= ARTWORK_TIMEOUT)
 }
 
 fn register_sessions_handler(
@@ -1030,9 +1056,11 @@ mod tests {
         // A poll that did not read artwork never touches presence.
         assert_eq!(emit_track(&had_art, &track("Song", "Artist"), false), (false, false));
         assert_eq!(emit_track(&prev, &with_art, false), (false, false));
-        // First read without artwork: deferred (no emit, awaits thumbnail).
+        // First read without artwork: deferred (no emit, awaits thumbnail),
+        // whether the read carried artwork or not (a poll read strips it).
         let first = LogicalState::default();
         assert_eq!(emit_track(&first, &track("Song", "Artist"), true), (false, false));
+        assert_eq!(emit_track(&first, &track("Song", "Artist"), false), (false, false));
         // First read WITH artwork: emits immediately (no double-pill).
         assert_eq!(emit_track(&first, &with_art, true), (true, false));
         // After a deferred first read the state holds the track info; a
@@ -1047,5 +1075,23 @@ mod tests {
             emit_track(&after_defer, &track("Song", "Artist"), false),
             (false, false)
         );
+    }
+
+    #[test]
+    fn defer_timeout_expires_only_after_the_artwork_window() {
+        let now = Instant::now();
+        // No deferral: never expired.
+        assert!(!defer_expired(None));
+        // Just deferred: not expired.
+        assert!(!defer_expired(Some(now)));
+        // Deferred recently (artwork normally arrives ~500ms later): not expired.
+        let recent = now.checked_sub(Duration::from_millis(1500)).unwrap();
+        assert!(!defer_expired(Some(recent)));
+        // Deferred past the timeout: expired, the pill must fire anyway.
+        let old = now.checked_sub(Duration::from_secs(3)).unwrap();
+        assert!(defer_expired(Some(old)));
+        // Exactly at the boundary: expired.
+        let boundary = now.checked_sub(ARTWORK_TIMEOUT).unwrap();
+        assert!(defer_expired(Some(boundary)));
     }
 }
