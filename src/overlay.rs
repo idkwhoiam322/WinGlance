@@ -84,6 +84,10 @@ const PENDING_CAP: usize = 4;
 struct LineScroll {
     offset: f32,
     started_at: Option<Instant>,
+    /// Whether the last rendered frame overflowed this line (text wider than
+    /// its band). The animation tick only repaints a fully-shown pill while at
+    /// least one line is scrolling; static text needs no per-frame redraw.
+    scrolling: bool,
 }
 
 /// Hold time before an overflowing line starts scrolling.
@@ -138,6 +142,10 @@ struct OverlayState {
     /// Timestamp of the previous animation tick, for time-based marquee
     /// scrolling.
     last_tick: Instant,
+    /// Last time the topmost z-order was re-asserted. While the pill is fully
+    /// shown (static), the re-assert is throttled to 1 Hz instead of running
+    /// on every 4 ms tick.
+    last_reassert: Option<Instant>,
     /// Source app of the last TrackChanged shown, used as the label fallback
     /// in state pills for current-session playback states so the pill always
     /// names the app that owns the media — never another app's last track.
@@ -231,6 +239,7 @@ impl OverlayState {
             decoded_art_key: None,
             dib: None,
             last_tick: Instant::now(),
+            last_reassert: None,
             current_source: None,
             track_cache: HashMap::new(),
             text_scratch: None,
@@ -242,6 +251,8 @@ impl OverlayState {
         for line in &mut self.scroll {
             line.offset = 0.0;
             line.started_at = Some(now);
+            // The overflow flag is recomputed on the next render.
+            line.scrolling = false;
         }
     }
 
@@ -492,8 +503,13 @@ impl OverlayState {
         self.last_tick = now;
         // A layered popup can be hidden by fullscreen transitions or external
         // ShowWindow calls; re-assert visibility and topmost z-order while a
-        // pill should be up.
-        if !matches!(self.phase, Phase::Hidden) {
+        // pill should be up. While the pill is fully shown this is throttled
+        // to 1 Hz — the window state cannot meaningfully change every 4 ms.
+        let animating = !matches!(self.phase, Phase::Shown);
+        if !matches!(self.phase, Phase::Hidden)
+            && (animating || self.last_reassert.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)))
+        {
+            self.last_reassert = Some(now);
             unsafe {
                 if !IsWindowVisible(self.hwnd).as_bool() {
                     let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
@@ -545,7 +561,13 @@ impl OverlayState {
                 line.offset += per_tick;
             }
         }
-        self.render();
+        // A fully-shown pill is static unless a marquee line is actually
+        // overflowing: skip the render (and its UpdateLayeredWindow) entirely
+        // when nothing changed. The animation phases still repaint every tick.
+        let marquee_active = self.scroll.iter().any(|line| line.scrolling);
+        if animating || marquee_active {
+            self.render();
+        }
     }
 
     fn render(&mut self) {
@@ -870,8 +892,9 @@ fn render_layered(
     alpha: u8,
     position: POINT,
 ) -> Result<()> {
-    let mut pixels = draw_pixels(state, content, width as usize, height as usize, scale, art_base)?;
-    draw_text_pixels(state, &mut pixels, content, width, scale);
+    // Draw straight into the cached DIB: no per-frame pixel Vec allocation and
+    // no copy. The DIB is zeroed first so the transparent corners of the
+    // rounded pill do not accumulate stale pixels from the previous frame.
     let bitmap_info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -885,9 +908,13 @@ fn render_layered(
         ..Default::default()
     };
     let (hdc, _bitmap, bits) = dib_for(state, &bitmap_info, width, height)?;
+    let pixel_count = width as usize * height as usize * 4;
     unsafe {
-        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast(), pixels.len());
+        std::ptr::write_bytes(bits.cast::<u8>(), 0, pixel_count);
     }
+    let pixels = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), pixel_count) };
+    draw_pixels(state, pixels, content, width as usize, height as usize, scale, art_base)?;
+    draw_text_pixels(state, pixels, content, width, scale);
 
     let size = SIZE { cx: width, cy: height };
     let source = POINT { x: 0, y: 0 };
@@ -971,13 +998,13 @@ fn dib_for(
 
 fn draw_pixels(
     state: &mut OverlayState,
+    pixels: &mut [u8],
     content: &MediaEvent,
     width: usize,
     height: usize,
     scale: f32,
     art_base: usize,
-) -> Result<Vec<u8>> {
-    let mut pixels = vec![0u8; width * height * 4];
+) -> Result<()> {
     let radius = state.config.appearance.corner_radius * scale;
     let background = state.config.appearance.background_color;
     for y in 0..height {
@@ -986,7 +1013,7 @@ fn draw_pixels(
             if coverage > 0.0 {
                 let alpha = (background[3] as f32 * coverage) as u32;
                 composite(
-                    &mut pixels,
+                    pixels,
                     width,
                     x,
                     y,
@@ -1006,7 +1033,7 @@ fn draw_pixels(
             state.ensure_art(track, art_base);
             if let Some(art) = state.decoded_art.as_deref() {
                 draw_art_scaled(
-                    &mut pixels,
+                    pixels,
                     width,
                     art,
                     art_base,
@@ -1017,7 +1044,7 @@ fn draw_pixels(
                 );
             } else {
                 draw_placeholder(
-                    &mut pixels,
+                    pixels,
                     width,
                     art_x,
                     art_y,
@@ -1043,7 +1070,7 @@ fn draw_pixels(
             let art_y = height.saturating_sub(art_size) / 2;
             if let Some(art) = state.decoded_art.as_deref() {
                 draw_art_scaled(
-                    &mut pixels,
+                    pixels,
                     width,
                     art,
                     art_base,
@@ -1054,7 +1081,7 @@ fn draw_pixels(
                 );
             } else {
                 draw_placeholder(
-                    &mut pixels,
+                    pixels,
                     width,
                     art_x,
                     art_y,
@@ -1066,7 +1093,7 @@ fn draw_pixels(
         // Never rendered: SessionRejected is filtered out before enqueue.
         MediaEvent::SessionRejected { .. } => {}
     }
-    Ok(pixels)
+    Ok(())
 }
 
 /// Draws the cached artwork bitmap into the tile region, bilinear-scaled from
@@ -1439,7 +1466,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 appearance.text_color,
                 true,
                 false,
-                Some(&state.scroll[0]),
+                Some(&mut state.scroll[0]),
             );
 
             let artist_rect = next_band(1);
@@ -1454,7 +1481,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                     [0xCC, 0xCC, 0xCC, 0xFF],
                     false,
                     false,
-                    Some(&state.scroll[1]),
+                    Some(&mut state.scroll[1]),
                 );
             }
 
@@ -1470,7 +1497,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                     [0x99, 0x99, 0x99, 0xFF],
                     false,
                     false,
-                    Some(&state.scroll[2]),
+                    Some(&mut state.scroll[2]),
                 );
             }
             if active[3] {
@@ -1485,7 +1512,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                     [0x77, 0x77, 0x77, 0xFF],
                     false,
                     false,
-                    Some(&state.scroll[3]),
+                    Some(&mut state.scroll[3]),
                 );
             }
         }
@@ -1669,7 +1696,7 @@ fn draw_text_line_pixels(
     color: [u8; 4],
     bold: bool,
     centered: bool,
-    marquee: Option<&LineScroll>,
+    marquee: Option<&mut LineScroll>,
 ) {
     if value.is_empty() || rect.right <= rect.left || rect.bottom <= rect.top {
         return;
@@ -1720,6 +1747,9 @@ fn draw_text_line_pixels(
                 DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT,
             );
             let text_w = measured.right - measured.left;
+            // Whether this line overflows its band: while a fully-shown pill
+            // has no overflowing line, the animation tick skips repainting.
+            scroll.scrolling = text_w > rw;
             let hold_elapsed = scroll.started_at.map(|t| t.elapsed()).unwrap_or_default();
             if text_w <= rw {
                 // Text fits: render once statically (no scrolling needed).
@@ -2316,7 +2346,7 @@ mod tests {
             [255, 255, 255, 255],
             false,
             false,
-            Some(&LineScroll::default()),
+            Some(&mut LineScroll::default()),
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 100, "expected glyph pixels with marquee state, got {lit}");
