@@ -380,11 +380,12 @@ impl ListenerState {
         }
 
         // A TrackChanged already surfaces the new content in the pill. A
-        // simultaneous PlaybackStateChanged (typically "Playing" reported by
-        // a freshly-adopted session) is redundant — suppressing it avoids a
-        // "Playing" flicker immediately after every fresh track pill.
+        // simultaneous PlaybackStateChanged(Playing) reported by a freshly
+        // adopted session is redundant — suppressing it avoids a "Playing"
+        // flicker immediately after every fresh track pill. Paused and Stopped
+        // are never suppressed: they carry real state the pill must show.
         if events.iter().any(|e| matches!(e, MediaEvent::TrackChanged(_))) {
-            events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
+            events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(PlaybackState::Playing, _)));
         }
 
         self.states.insert(key, next);
