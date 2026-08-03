@@ -1,6 +1,7 @@
 use crate::overlay::wide;
 use log::warn;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BDR_SUNKENOUTER, BF_RECT, BeginPaint, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
@@ -18,12 +19,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWLP_USERDATA,
     GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IDC_ARROW,
-    IsIconic, IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETCURSEL, LB_GETITEMDATA, LB_GETITEMRECT, LB_SETITEMDATA,
-    LB_SETITEMHEIGHT, LBN_DBLCLK, LBN_SELCHANGE, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW,
-    PostMessageW, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DRAWITEM,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETFONT, WNDCLASS_STYLES, WNDCLASSEXW,
-    WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    IsIconic, IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT, LB_SETITEMDATA,
+    LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, PostMessageW,
+    RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETFONT, WNDCLASS_STYLES, WNDCLASSEXW, WS_BORDER, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -50,6 +51,8 @@ struct PickerState {
     list: Vec<ProcessEntry>,
     listbox: HWND,
     close_hover: bool,
+    last_click_item: Option<usize>,
+    last_click_time: Option<Instant>,
 }
 
 static OPEN_PICKER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
@@ -224,6 +227,8 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
             list,
             listbox: HWND::default(),
             close_hover: false,
+            last_click_item: None,
+            last_click_time: None,
         });
         let state_ptr = Box::into_raw(state);
 
@@ -509,7 +514,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 if draw.itemData == BST_CHECKED {
                     SetTextColor(draw.hDC, COLORREF(0x00F0F0F0));
                     SetBkMode(draw.hDC, TRANSPARENT);
-                    let tick = wide("\u{2713}");
+                    let tick = wide("X");
                     DrawTextW(
                         draw.hDC,
                         &mut tick.clone(),
@@ -582,52 +587,74 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 let _ = unsafe { DestroyWindow(hwnd) };
                 return LRESULT(0);
             }
-            DefWindowProcW(hwnd, message, wparam, lparam)
-        }
-        WM_COMMAND => {
-            let notif = (wparam.0 >> 16) as u32;
+
+            // Handle listbox click-to-toggle and double-click-to-confirm. The
+            // listbox is owner-drawn, so Windows does not manage selection on
+            // its own; toggling must happen here.
             let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
-            match notif {
-                LBN_DBLCLK => {
-                    post_result(hwnd, false);
-                    let _ = unsafe { DestroyWindow(hwnd) };
-                    return LRESULT(0);
-                }
-                LBN_SELCHANGE => {
-                    // Toggle the checkbox of the clicked item.
-                    let Some(state) = (unsafe { state_ptr.as_ref() }) else {
-                        return DefWindowProcW(hwnd, message, wparam, lparam);
-                    };
-                    let lb = state.listbox;
-                    let idx = unsafe { SendMessageW(lb, LB_GETCURSEL, WPARAM(0), LPARAM(0)) };
-                    if idx.0 >= 0 {
-                        let i = idx.0 as usize;
-                        let data = unsafe { SendMessageW(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
-                        let toggled = if data.0 as usize == BST_CHECKED {
-                            BST_UNCHECKED
-                        } else {
-                            BST_CHECKED
-                        };
-                        let _ = unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
-                        // Repaint just this item so the tick flips immediately.
-                        let mut item_rect = RECT::default();
-                        let _ = unsafe {
-                            SendMessageW(
-                                lb,
-                                LB_GETITEMRECT,
-                                WPARAM(i),
-                                LPARAM(&mut item_rect as *mut RECT as isize),
-                            )
-                        };
-                        unsafe {
-                            let _ = InvalidateRect(lb, Some(&item_rect), false);
-                        }
-                    }
-                }
-                _ => {}
+            let Some(state) = (unsafe { state_ptr.as_ref() }) else {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            };
+            let lb = state.listbox;
+            if lb.0.is_null() {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
             }
-            DefWindowProcW(hwnd, message, wparam, lparam)
+
+            // Listbox bounds (after the header row).
+            let lb_y = HEADER_H;
+            let lb_h = ROW_HEIGHT * state.list.len().min(MAX_VISIBLE) as i32;
+            if y < lb_y || y >= lb_y + lb_h || !(0..WIDTH).contains(&x) {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
+
+            let item_idx = (y - lb_y) / ROW_HEIGHT;
+            let count = unsafe { SendMessageW(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as i32;
+            if item_idx < 0 || item_idx >= count {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
+            let i = item_idx as usize;
+
+            // Double-click detection: same item within 400ms = confirm.
+            let now = Instant::now();
+            let is_double = state.last_click_item == Some(i)
+                && state
+                    .last_click_time
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(400));
+
+            let state = unsafe { &mut *state_ptr };
+            state.last_click_item = Some(i);
+            state.last_click_time = Some(now);
+
+            if is_double {
+                post_result(hwnd, false);
+                let _ = unsafe { DestroyWindow(hwnd) };
+                return LRESULT(0);
+            }
+
+            // Single click: toggle the checkbox.
+            let data = unsafe { SendMessageW(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
+            let toggled = if data.0 as usize == BST_CHECKED {
+                BST_UNCHECKED
+            } else {
+                BST_CHECKED
+            };
+            let _ = unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
+            // Repaint just this item so the mark flips immediately.
+            let mut item_rect = RECT::default();
+            let _ = unsafe {
+                SendMessageW(
+                    lb,
+                    LB_GETITEMRECT,
+                    WPARAM(i),
+                    LPARAM(&mut item_rect as *mut RECT as isize),
+                )
+            };
+            unsafe {
+                let _ = InvalidateRect(lb, Some(&item_rect), false);
+            }
+            LRESULT(0)
         }
+        WM_COMMAND => DefWindowProcW(hwnd, message, wparam, lparam),
         WM_KEYDOWN => {
             if wparam.0 as u16 == VK_ESCAPE.0 {
                 post_result(hwnd, true);
