@@ -11,6 +11,7 @@ use chrono::{DateTime, Local};
 use log::{debug, error};
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DwmSetWindowAttribute};
@@ -364,7 +365,7 @@ struct CurrentActivity {
 struct MainWindowState {
     hwnd: HWND,
     instance: HINSTANCE,
-    config: Config,
+    config: Arc<RwLock<Config>>,
     queue: EventQueue,
     overlay_hwnd: HWND,
     listbox: HWND,
@@ -387,7 +388,7 @@ struct MainWindowState {
 
 /// Creates the main window: a maximized tracker with current activity,
 /// per-session history, and a tray icon. The caller runs the message loop.
-pub fn create_window(config: Config, queue: EventQueue, overlay_hwnd: HWND) -> Result<HWND> {
+pub fn create_window(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwnd: HWND) -> Result<HWND> {
     let module = unsafe { GetModuleHandleW(None) }.context("getting the process module")?;
     let instance: HINSTANCE = module.into();
     let class_name = wide("NotchMainWindow");
@@ -420,7 +421,7 @@ pub fn create_window(config: Config, queue: EventQueue, overlay_hwnd: HWND) -> R
     };
 
     unsafe {
-        if config.behavior.start_in_tray {
+        if config.read().unwrap().behavior.start_in_tray {
             let _ = ShowWindow(hwnd, SW_HIDE);
         } else {
             let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
@@ -436,7 +437,11 @@ pub fn create_window(config: Config, queue: EventQueue, overlay_hwnd: HWND) -> R
 }
 
 impl MainWindowState {
-    fn new(config: Config, queue: EventQueue, overlay_hwnd: HWND, instance: HINSTANCE) -> Self {
+    fn cfg(&self) -> std::sync::RwLockReadGuard<'_, Config> {
+        self.config.read().unwrap()
+    }
+
+    fn new(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwnd: HWND, instance: HINSTANCE) -> Self {
         Self {
             hwnd: HWND::default(),
             instance,
@@ -480,7 +485,7 @@ impl MainWindowState {
             )
         };
         self.gray_brush = unsafe { CreateSolidBrush(colorref(0x1E, 0x1E, 0x1E)) };
-        let accent = self.config.appearance.accent_color;
+        let accent = self.cfg().appearance.accent_color;
         self.accent_brush = unsafe { CreateSolidBrush(colorref(accent[0], accent[1], accent[2])) };
 
         self.listbox = unsafe {
@@ -639,16 +644,6 @@ impl MainWindowState {
                         self.add_state_change(state);
                         self.invalidate();
                     }
-                }
-                MediaEvent::HistoryPlaybackState(state, source) => {
-                    // A state change from a non-current session: record it with
-                    // the app that produced it (title/artist are unknown here).
-                    let track = TrackInfo {
-                        title: "Unknown".into(),
-                        source_app: source,
-                        ..TrackInfo::default()
-                    };
-                    self.push_history(track, state);
                 }
             }
         }
@@ -823,7 +818,7 @@ impl MainWindowState {
                 &mut text_rect,
                 (10.0 * scale) as i32,
                 if *pane == self.active_pane {
-                    self.config.appearance.accent_color
+                    self.cfg().appearance.accent_color
                 } else {
                     [0x88, 0x88, 0x88, 0xFF]
                 },
@@ -855,7 +850,7 @@ impl MainWindowState {
             "NOW PLAYING",
             &mut header_rect,
             (11.0 * scale) as i32,
-            self.config.appearance.accent_color,
+            self.cfg().appearance.accent_color,
             true,
             false,
         );
@@ -865,6 +860,9 @@ impl MainWindowState {
         let art_y = (ART_Y * scale) as i32;
         let text_left = art_x + art + (12.0 * scale) as i32;
         let text_right = client_w - pad;
+
+        let accent_color = self.cfg().appearance.accent_color;
+        let text_color = self.cfg().appearance.text_color;
 
         if let Some(current) = &mut self.current {
             if current.art.is_none() {
@@ -893,7 +891,7 @@ impl MainWindowState {
                 PlaybackState::Stopped => "Stopped",
             };
             let state_color = if current.state == PlaybackState::Playing {
-                self.config.appearance.accent_color
+                accent_color
             } else {
                 [0xBB, 0xBB, 0xBB, 0xFF]
             };
@@ -924,7 +922,7 @@ impl MainWindowState {
                 &current.track.title,
                 &mut title_rect,
                 (19.0 * scale) as i32,
-                self.config.appearance.text_color,
+                text_color,
                 true,
                 false,
             );
@@ -1048,20 +1046,20 @@ impl MainWindowState {
         );
 
         let pos_y = history_rect.bottom + (4.0 * scale) as i32;
-        let pos_label = if self.config.overlay.position_x.is_some() {
+        let pos_label = if self.cfg().overlay.position_x.is_some() {
             format!(
                 "Position: custom ({}, {})",
-                self.config.overlay.position_x.unwrap_or(0),
-                self.config.overlay.position_y.unwrap_or(0)
+                self.cfg().overlay.position_x.unwrap_or(0),
+                self.cfg().overlay.position_y.unwrap_or(0)
             )
         } else {
             format!(
                 "Position: {}-{}",
-                match self.config.overlay.vertical {
+                match self.cfg().overlay.vertical {
                     VerticalPosition::Top => "top",
                     VerticalPosition::Bottom => "bottom",
                 },
-                match self.config.overlay.horizontal {
+                match self.cfg().overlay.horizontal {
                     HorizontalPosition::Left => "left",
                     HorizontalPosition::Center => "center",
                     HorizontalPosition::Right => "right",
@@ -1180,7 +1178,7 @@ impl MainWindowState {
     }
 
     fn paint_settings(&self, hdc: HDC, content_left: i32, client_w: i32, _client_h: i32, scale: f32, pad: i32) {
-        let accent = self.config.appearance.accent_color;
+        let accent = self.cfg().appearance.accent_color;
         let accent_soft = mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], 0.28);
 
         let mut hdr = RECT {
@@ -1257,12 +1255,12 @@ impl MainWindowState {
                         ),
                         SettingId::StartOnLogin => (
                             "Start on login",
-                            if self.config.behavior.start_on_login {
+                            if self.cfg().behavior.start_on_login {
                                 "ON".to_string()
                             } else {
                                 "OFF".to_string()
                             },
-                            if self.config.behavior.start_on_login {
+                            if self.cfg().behavior.start_on_login {
                                 accent
                             } else {
                                 SETTINGS_FAINT
@@ -1270,12 +1268,12 @@ impl MainWindowState {
                         ),
                         SettingId::CloseToTray => (
                             "Close to tray",
-                            if self.config.behavior.close_to_tray {
+                            if self.cfg().behavior.close_to_tray {
                                 "ON".to_string()
                             } else {
                                 "OFF".to_string()
                             },
-                            if self.config.behavior.close_to_tray {
+                            if self.cfg().behavior.close_to_tray {
                                 accent
                             } else {
                                 SETTINGS_FAINT
@@ -1283,16 +1281,16 @@ impl MainWindowState {
                         ),
                         SettingId::Duration => (
                             "Duration",
-                            format!("{}s", self.config.overlay.duration_ms / 1000),
+                            format!("{}s", self.cfg().overlay.duration_ms / 1000),
                             SETTINGS_MUTED,
                         ),
                         SettingId::Position => ("Position", self.position_label(), SETTINGS_MUTED),
                         SettingId::AllowedApps => (
                             "Allowed apps",
-                            if self.config.behavior.allowed_sources.is_empty() {
+                            if self.cfg().behavior.allowed_sources.is_empty() {
                                 "All".to_string()
                             } else {
-                                self.config.behavior.allowed_sources.join(", ")
+                                self.cfg().behavior.allowed_sources.join(", ")
                             },
                             SETTINGS_MUTED,
                         ),
@@ -1329,7 +1327,7 @@ impl MainWindowState {
                         SettingId::Duration => {
                             let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
                             let values = [2000u64, 3000, 5000, 10000];
-                            let duration_ms = self.config.overlay.duration_ms;
+                            let duration_ms = self.cfg().overlay.duration_ms;
                             let exact = values.contains(&duration_ms);
                             // Nearest preset, for when the config holds a value
                             // outside the four presets (e.g. hand-edited).
@@ -1391,11 +1389,11 @@ impl MainWindowState {
                         }
                         SettingId::Position => {
                             let parts = position_parts(rect, scale);
-                            let custom = self.config.overlay.position_x.is_some();
+                            let custom = self.cfg().overlay.position_x.is_some();
                             let active_anchor = if custom {
                                 None
                             } else {
-                                Some(match (self.config.overlay.vertical, self.config.overlay.horizontal) {
+                                Some(match (self.cfg().overlay.vertical, self.cfg().overlay.horizontal) {
                                     (VerticalPosition::Top, HorizontalPosition::Left) => 0,
                                     (VerticalPosition::Top, HorizontalPosition::Center) => 1,
                                     (VerticalPosition::Top, HorizontalPosition::Right) => 2,
@@ -1489,20 +1487,20 @@ impl MainWindowState {
     }
 
     fn position_label(&self) -> String {
-        if self.config.overlay.position_x.is_some() {
+        if self.cfg().overlay.position_x.is_some() {
             format!(
                 "Custom ({}, {})",
-                self.config.overlay.position_x.unwrap_or(0),
-                self.config.overlay.position_y.unwrap_or(0)
+                self.cfg().overlay.position_x.unwrap_or(0),
+                self.cfg().overlay.position_y.unwrap_or(0)
             )
         } else {
             format!(
                 "{}-{}",
-                match self.config.overlay.vertical {
+                match self.cfg().overlay.vertical {
                     VerticalPosition::Top => "top",
                     VerticalPosition::Bottom => "bottom",
                 },
-                match self.config.overlay.horizontal {
+                match self.cfg().overlay.horizontal {
                     HorizontalPosition::Left => "left",
                     HorizontalPosition::Center => "center",
                     HorizontalPosition::Right => "right",
@@ -1600,7 +1598,7 @@ impl MainWindowState {
 
     fn on_close(&self) {
         unsafe {
-            if self.config.behavior.close_to_tray {
+            if self.cfg().behavior.close_to_tray {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             } else {
                 let _ = DestroyWindow(self.hwnd);
@@ -1652,7 +1650,7 @@ impl MainWindowState {
         let header_font = (11.0 * scale) as i32;
         let row_font = (13.0 * scale) as i32;
         let header_color = [0x9A, 0x9A, 0x9A, 0xFF];
-        let row_color = [0xE6, 0xE6, 0xE6, 0xFF];
+        let accent_color = self.cfg().appearance.accent_color;
 
         let cell = |x: i32, w: i32, text: &str, font: i32, color: [u8; 4], bold: bool| {
             if w <= 0 {
@@ -1682,23 +1680,27 @@ impl MainWindowState {
                 PlaybackState::Stopped => "■",
             };
             let artist = if entry.track.artist.trim().is_empty() {
-                "Unknown"
+                ""
             } else {
                 &entry.track.artist
             };
+            // All history entries are from accepted sessions; highlight them
+            // in pink (the accent color) with bold text.
+            let row_color = accent_color;
+            let bold = true;
             cell(
                 col_x[0],
                 time_w,
                 &entry.at.format("%H:%M:%S").to_string(),
                 row_font,
                 row_color,
-                false,
+                bold,
             );
-            cell(col_x[1], state_w, status, row_font, row_color, false);
-            cell(title_x, title_w, &entry.track.title, row_font, row_color, false);
-            cell(artist_x, artist_w, artist, row_font, row_color, false);
-            cell(album_x, album_w, &entry.track.album, row_font, row_color, false);
-            cell(source_x, source_w, &entry.track.source_app, row_font, row_color, false);
+            cell(col_x[1], state_w, status, row_font, row_color, bold);
+            cell(title_x, title_w, &entry.track.title, row_font, row_color, bold);
+            cell(artist_x, artist_w, artist, row_font, row_color, bold);
+            cell(album_x, album_w, &entry.track.album, row_font, row_color, bold);
+            cell(source_x, source_w, &entry.track.source_app, row_font, row_color, bold);
         }
     }
 
@@ -1738,7 +1740,7 @@ impl MainWindowState {
     /// Copies the current run's log file to the clipboard (UTF-16 with per-line
     /// newlines preserved) and shows a transient "Copied" state.
     fn copy_logs(&mut self) {
-        let path = self.config.logs_dir().join("log-Live.log");
+        let path = self.cfg().logs_dir().join("log-Live.log");
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
@@ -1787,12 +1789,15 @@ impl MainWindowState {
     /// Pins the overlay to a vertical/horizontal anchor: clears any absolute
     /// override, persists the choice, and nudges the live overlay into place.
     fn apply_anchor(&mut self, vertical: VerticalPosition, horizontal: HorizontalPosition) {
-        self.config.overlay.vertical = vertical;
-        self.config.overlay.horizontal = horizontal;
-        self.config.overlay.position_x = None;
-        self.config.overlay.position_y = None;
-        let _ = self.config.save();
-        set_position(self.overlay_hwnd, OverlayPos::from_config(&self.config));
+        {
+            let mut cfg = self.config.write().unwrap();
+            cfg.overlay.vertical = vertical;
+            cfg.overlay.horizontal = horizontal;
+            cfg.overlay.position_x = None;
+            cfg.overlay.position_y = None;
+            let _ = cfg.save();
+        }
+        set_position(self.overlay_hwnd, OverlayPos::from_config(&self.cfg()));
     }
 
     /// Clears any custom X/Y override and returns to the default top-center anchor.
@@ -1805,7 +1810,7 @@ impl MainWindowState {
 
 fn history_row(track: &TrackInfo, at: DateTime<Local>, state: PlaybackState) -> String {
     let artist = if track.artist.trim().is_empty() {
-        "Unknown"
+        ""
     } else {
         &track.artist
     };
@@ -1969,11 +1974,11 @@ fn show_tray_menu(state: &mut MainWindowState) {
         notify_flags |= MF_CHECKED;
     }
     let mut autostart_flags = MF_STRING;
-    if state.config.behavior.start_on_login {
+    if state.cfg().behavior.start_on_login {
         autostart_flags |= MF_CHECKED;
     }
     let mut close_tray_flags = MF_STRING;
-    if state.config.behavior.close_to_tray {
+    if state.cfg().behavior.close_to_tray {
         close_tray_flags |= MF_CHECKED;
     }
     unsafe {
@@ -2058,7 +2063,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
             let _ = DestroyMenu(menu);
             return;
         };
-        let current_secs = state.config.overlay.duration_ms / 1000;
+        let current_secs = state.cfg().overlay.duration_ms / 1000;
         let dur_2s_flags = if current_secs == 2 {
             MF_STRING | MF_CHECKED
         } else {
@@ -2131,15 +2136,15 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     let _ = PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0));
                 }
                 MENU_AUTOSTART_ID => {
-                    state.config.behavior.start_on_login = !state.config.behavior.start_on_login;
-                    let _ = state.config.save();
-                    if let Err(error) = autostart::apply(state.config.behavior.start_on_login) {
+                    state.config.write().unwrap().behavior.start_on_login = !state.cfg().behavior.start_on_login;
+                    let _ = state.config.write().unwrap().save();
+                    if let Err(error) = autostart::apply(state.cfg().behavior.start_on_login) {
                         error!("start-on-login update failed: {error:#}");
                     }
                 }
                 MENU_CLOSE_TRAY_ID => {
-                    state.config.behavior.close_to_tray = !state.config.behavior.close_to_tray;
-                    let _ = state.config.save();
+                    state.config.write().unwrap().behavior.close_to_tray = !state.cfg().behavior.close_to_tray;
+                    let _ = state.config.write().unwrap().save();
                 }
                 MENU_QUIT_ID => {
                     let _ = DestroyWindow(state.hwnd);
@@ -2160,23 +2165,23 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     state.reset_position();
                 }
                 MENU_DURATION_2S => {
-                    state.config.overlay.duration_ms = 2000;
-                    let _ = state.config.save();
+                    state.config.write().unwrap().overlay.duration_ms = 2000;
+                    let _ = state.config.write().unwrap().save();
                     set_duration(state.overlay_hwnd, 2000);
                 }
                 MENU_DURATION_3S => {
-                    state.config.overlay.duration_ms = 3000;
-                    let _ = state.config.save();
+                    state.config.write().unwrap().overlay.duration_ms = 3000;
+                    let _ = state.config.write().unwrap().save();
                     set_duration(state.overlay_hwnd, 3000);
                 }
                 MENU_DURATION_5S => {
-                    state.config.overlay.duration_ms = 5000;
-                    let _ = state.config.save();
+                    state.config.write().unwrap().overlay.duration_ms = 5000;
+                    let _ = state.config.write().unwrap().save();
                     set_duration(state.overlay_hwnd, 5000);
                 }
                 MENU_DURATION_10S => {
-                    state.config.overlay.duration_ms = 10000;
-                    let _ = state.config.save();
+                    state.config.write().unwrap().overlay.duration_ms = 10000;
+                    let _ = state.config.write().unwrap().save();
                     set_duration(state.overlay_hwnd, 10000);
                 }
                 _ => {}
@@ -2323,16 +2328,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     state.invalidate();
                                 }
                                 SettingId::StartOnLogin => {
-                                    state.config.behavior.start_on_login = !state.config.behavior.start_on_login;
-                                    let _ = state.config.save();
-                                    if let Err(error) = autostart::apply(state.config.behavior.start_on_login) {
+                                    state.config.write().unwrap().behavior.start_on_login =
+                                        !state.cfg().behavior.start_on_login;
+                                    let _ = state.config.write().unwrap().save();
+                                    if let Err(error) = autostart::apply(state.cfg().behavior.start_on_login) {
                                         error!("start-on-login update failed: {error:#}");
                                     }
                                     state.invalidate();
                                 }
                                 SettingId::CloseToTray => {
-                                    state.config.behavior.close_to_tray = !state.config.behavior.close_to_tray;
-                                    let _ = state.config.save();
+                                    state.config.write().unwrap().behavior.close_to_tray =
+                                        !state.cfg().behavior.close_to_tray;
+                                    let _ = state.config.write().unwrap().save();
                                     state.invalidate();
                                 }
                                 SettingId::Duration => {
@@ -2341,8 +2348,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     if let Some((i, _)) =
                                         segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right)
                                     {
-                                        state.config.overlay.duration_ms = values[i];
-                                        let _ = state.config.save();
+                                        state.config.write().unwrap().overlay.duration_ms = values[i];
+                                        let _ = state.config.write().unwrap().save();
                                         set_duration(state.overlay_hwnd, values[i]);
                                         state.invalidate();
                                     }
@@ -2385,11 +2392,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     state.copy_logs();
                                 }
                                 SettingId::AllowedApps => {
-                                    if !process_picker::open(
-                                        hwnd,
-                                        &control_rect,
-                                        &state.config.behavior.allowed_sources,
-                                    ) {
+                                    if !process_picker::open(hwnd, &control_rect, &state.cfg().behavior.allowed_sources)
+                                    {
                                         debug!("process picker failed to open");
                                     }
                                 }
@@ -2469,10 +2473,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 // Custom position posted by the positioner (logical pixels).
-                state.config.overlay.position_x = Some(wparam.0 as i32);
-                state.config.overlay.position_y = Some(lparam.0 as i32);
-                let _ = state.config.save();
-                set_position(state.overlay_hwnd, OverlayPos::from_config(&state.config));
+                state.config.write().unwrap().overlay.position_x = Some(wparam.0 as i32);
+                state.config.write().unwrap().overlay.position_y = Some(lparam.0 as i32);
+                let _ = state.config.write().unwrap().save();
+                set_position(state.overlay_hwnd, OverlayPos::from_config(&state.cfg()));
             }
             LRESULT(0)
         }
@@ -2482,8 +2486,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 if wparam.0 == 0 {
                     // Confirmed: read the selected patterns.
                     let patterns = unsafe { Box::from_raw(lparam.0 as *mut Vec<String>) };
-                    state.config.behavior.allowed_sources = *patterns;
-                    let _ = state.config.save();
+                    state.config.write().unwrap().behavior.allowed_sources = *patterns;
+                    let _ = state.config.write().unwrap().save();
                     state.invalidate();
                 } else {
                     // Cancelled: free the pointer.
@@ -2561,12 +2565,12 @@ mod tests {
     }
 
     #[test]
-    fn row_falls_back_to_unknown_when_artist_is_blank() {
+    fn row_omits_artist_when_blank() {
         let mut blank = track("Song");
         blank.artist = "   ".into();
         let row = history_row(&blank, Local::now(), PlaybackState::Playing);
         assert!(row.contains("Song"));
-        assert!(row.contains("Unknown"));
+        assert!(!row.contains("Unknown"));
 
         let titled = track("Song");
         let row = history_row(&titled, Local::now(), PlaybackState::Paused);

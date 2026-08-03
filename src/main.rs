@@ -10,6 +10,7 @@ mod positioner;
 mod process_picker;
 mod smtc;
 
+use crate::config::Config;
 use anyhow::Result;
 use log::{error, info, warn};
 use std::collections::VecDeque;
@@ -154,7 +155,9 @@ fn main() -> Result<()> {
     }
 
     let (event_tx, event_rx) = mpsc::channel();
-    let listener_config = config.clone();
+    let shared_config: std::sync::Arc<std::sync::RwLock<Config>> =
+        std::sync::Arc::new(std::sync::RwLock::new(config.clone()));
+    let listener_config = shared_config.clone();
     let heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
     let supervisor_heartbeat = heartbeat.clone();
     // Supervisor: runs the SMTC worker and restarts it when it stalls (a WinRT
@@ -207,7 +210,7 @@ fn main() -> Result<()> {
     let main_queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
     let overlay_queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
     let overlay_hwnd = overlay::create_window(config.clone(), overlay_queue.clone())?;
-    let main_hwnd = main_window::create_window(config, main_queue.clone(), overlay_hwnd)?;
+    let main_hwnd = main_window::create_window(shared_config.clone(), main_queue.clone(), overlay_hwnd)?;
 
     spawn_event_forwarder(main_hwnd, overlay_hwnd, main_queue, overlay_queue, event_rx);
 

@@ -66,9 +66,6 @@ pub enum MediaEvent {
     /// The same track restarted (Prev button, or a looping track): re-show the
     /// track pill briefly instead of deduplicating it away.
     TrackRestarted(TrackInfo),
-    /// A playback-state change from a session that is not current. Recorded in
-    /// the history (with the source app label); never shown in the pill.
-    HistoryPlaybackState(PlaybackState, String),
 }
 
 #[cfg(test)]

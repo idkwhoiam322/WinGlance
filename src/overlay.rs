@@ -313,14 +313,6 @@ impl OverlayState {
                     self.pending.track_update = is_update;
                 }
                 MediaEvent::PlaybackStateChanged(state) => self.pending.playback = Some(state),
-                // A state change from a session that is not current: still show
-                // the pill so no pause/play from any app is missed (the main
-                // window records the source in its history). The source is
-                // carried so the pill shows this app, never another app's track.
-                MediaEvent::HistoryPlaybackState(state, source) => {
-                    self.pending.playback = Some(state);
-                    self.pending.source = Some(source);
-                }
                 MediaEvent::TrackRestarted(track) if self.config.behavior.enable_track_change => {
                     // A restart (Prev/repeat) re-shows the pill briefly.
                     self.show_restart(track);
@@ -488,9 +480,7 @@ impl OverlayState {
             MediaEvent::TrackChanged(track) | MediaEvent::TrackRestarted(track) => {
                 track_content_size(&self.config, track)
             }
-            MediaEvent::PlaybackStateChanged(_) | MediaEvent::HistoryPlaybackState(_, _) => {
-                state_content_size(&self.config, self.last_track.as_ref())
-            }
+            MediaEvent::PlaybackStateChanged(_) => state_content_size(&self.config, self.last_track.as_ref()),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
@@ -652,9 +642,7 @@ impl OverlayState {
             MediaEvent::TrackChanged(track) | MediaEvent::TrackRestarted(track) => {
                 track_content_size(&self.config, track)
             }
-            MediaEvent::PlaybackStateChanged(_) | MediaEvent::HistoryPlaybackState(_, _) => {
-                state_content_size(&self.config, self.last_track.as_ref())
-            }
+            MediaEvent::PlaybackStateChanged(_) => state_content_size(&self.config, self.last_track.as_ref()),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
@@ -704,7 +692,12 @@ fn track_content_size(config: &Config, track: &TrackInfo) -> (f32, f32) {
         fs_artist * 0.85 * ROW_HEIGHT,
     ];
     let meta = track.meta_line(true);
-    let active = [true, true, !meta.is_empty(), !track.source_app.trim().is_empty()];
+    let active = [
+        true,
+        !track.artist.trim().is_empty(),
+        !meta.is_empty(),
+        !track.source_app.trim().is_empty(),
+    ];
     let text_h: f32 = rows.iter().zip(active).filter(|(_, a)| *a).map(|(h, _)| *h).sum();
     let height = (appearance.art_size as f32 + 2.0 * appearance.padding).max(text_h + 2.0 * appearance.padding + 8.0);
     (config.overlay.max_width.max(180) as f32, height)
@@ -716,9 +709,8 @@ fn state_content_size(config: &Config, last_track: Option<&TrackInfo>) -> (f32, 
     let appearance = &config.appearance;
     let mut text_h = appearance.font_size_title * ROW_HEIGHT;
     if let Some(track) = last_track {
-        text_h += appearance.font_size_artist * ROW_HEIGHT;
         if !track.artist.trim().is_empty() {
-            text_h += appearance.font_size_artist * 0.85 * ROW_HEIGHT;
+            text_h += appearance.font_size_artist * ROW_HEIGHT;
         }
         if !track.meta_line(true).is_empty() {
             text_h += appearance.font_size_artist * 0.85 * ROW_HEIGHT;
@@ -946,7 +938,7 @@ fn draw_pixels(
                 );
             }
         }
-        MediaEvent::PlaybackStateChanged(_) | MediaEvent::HistoryPlaybackState(_, _) => {
+        MediaEvent::PlaybackStateChanged(_) => {
             // The state pill reuses the current track's artwork and details so
             // a pause/play notification still shows what is playing (the cache
             // was populated when the track was shown; falls back to the accent
@@ -1072,10 +1064,16 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 (fs_meta * ROW_HEIGHT, fs_meta),
                 (fs_app * ROW_HEIGHT, fs_app),
             ];
-            // Only rows that will actually be drawn participate, so title/artist
-            // expand to fill the pill when the meta or source-app line is absent.
+            // Only rows that will actually be drawn participate, so title expands
+            // to fill the pill when the artist, meta, or source-app line is absent.
             let meta = track.meta_line(true);
-            let active: [bool; 4] = [true, true, !meta.is_empty(), !track.source_app.trim().is_empty()];
+            let artist_active = !track.artist.trim().is_empty();
+            let active: [bool; 4] = [
+                true,
+                artist_active,
+                !meta.is_empty(),
+                !track.source_app.trim().is_empty(),
+            ];
             let text_top = appearance.padding * scale;
             let mut y = text_top;
             let mut next_band = |i: usize| -> RECT {
@@ -1104,24 +1102,21 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 Some(&state.scroll[0]),
             );
 
-            let subtitle = if track.artist.trim().is_empty() {
-                "Unknown"
-            } else {
-                &track.artist
-            };
             let artist_rect = next_band(1);
-            draw_text_line_pixels(
-                &mut state.text_scratch,
-                pixels,
-                width as usize,
-                subtitle,
-                &artist_rect,
-                rows[1].1 as i32,
-                [0xCC, 0xCC, 0xCC, 0xFF],
-                false,
-                false,
-                Some(&state.scroll[1]),
-            );
+            if artist_active {
+                draw_text_line_pixels(
+                    &mut state.text_scratch,
+                    pixels,
+                    width as usize,
+                    &track.artist,
+                    &artist_rect,
+                    rows[1].1 as i32,
+                    [0xCC, 0xCC, 0xCC, 0xFF],
+                    false,
+                    false,
+                    Some(&state.scroll[1]),
+                );
+            }
 
             if active[2] {
                 let meta_rect = next_band(2);
@@ -1154,7 +1149,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 );
             }
         }
-        MediaEvent::PlaybackStateChanged(playback) | MediaEvent::HistoryPlaybackState(playback, _) => {
+        MediaEvent::PlaybackStateChanged(playback) => {
             let label = match playback {
                 PlaybackState::Playing => "Playing",
                 PlaybackState::Paused => "Paused",
