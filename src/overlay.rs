@@ -1303,7 +1303,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                     fs_artist as i32,
                     appearance.text_color,
                     true,
-                    true,
+                    false,
                     None,
                 );
                 if !track.artist.trim().is_empty() {
@@ -1317,7 +1317,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         (fs_artist * 0.85) as i32,
                         [0xCC, 0xCC, 0xCC, 0xFF],
                         false,
-                        true,
+                        false,
                         None,
                     );
                 }
@@ -1333,7 +1333,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         (fs_artist * 0.85) as i32,
                         [0x99, 0x99, 0x99, 0xFF],
                         false,
-                        true,
+                        false,
                         None,
                     );
                 }
@@ -1348,7 +1348,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         (fs_artist * 0.85) as i32,
                         [0x77, 0x77, 0x77, 0xFF],
                         false,
-                        true,
+                        false,
                         None,
                     );
                 }
@@ -1369,7 +1369,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         fs_artist as i32,
                         appearance.text_color,
                         true,
-                        true,
+                        false,
                         None,
                     );
                     let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
@@ -1382,7 +1382,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         (fs_artist * 0.85) as i32,
                         [0xCC, 0xCC, 0xCC, 0xFF],
                         false,
-                        true,
+                        false,
                         None,
                     );
                 }
