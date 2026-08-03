@@ -1356,7 +1356,7 @@ fn draw_text_line_pixels(
             );
             let text_w = measured.right - measured.left;
             let hold_elapsed = scroll.started_at.map(|t| t.elapsed()).unwrap_or_default();
-            if text_w <= rw && hold_elapsed < MARQUEE_HOLD {
+            if text_w <= rw {
                 // Text fits: render once statically (no scrolling needed).
                 let _ = DrawTextW(hdc, &mut text, &mut local, flags);
             } else if hold_elapsed < MARQUEE_HOLD {

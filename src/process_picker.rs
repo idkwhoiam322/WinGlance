@@ -3,8 +3,9 @@ use log::warn;
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    DeleteObject, DrawTextW, EndPaint, FillRect, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor,
+    TRANSPARENT,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -16,12 +17,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWLP_USERDATA,
     GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IDC_ARROW,
-    IsIconic, IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETSEL, LB_SETITEMHEIGHT, LB_SETSEL, LBS_EXTENDEDSEL,
+    IsIconic, IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETITEMDATA, LB_SETITEMDATA, LB_SETITEMHEIGHT,
     LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LoadCursorW, PostMessageW, RegisterClassExW, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_NCCREATE, WM_PAINT, WM_SETFONT, WNDCLASS_STYLES,
-    WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
-    WS_VSCROLL,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_STYLE,
+    WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
+    WM_SETFONT, WNDCLASS_STYLES, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -31,6 +32,9 @@ const HEADER_H: i32 = 30;
 const ROW_HEIGHT: i32 = 22;
 const MAX_VISIBLE: usize = 12;
 const WS_EX_TOOLWINDOW_STYLE: i32 = 0x80;
+const CLOSE_BTN_SIZE: i32 = 20;
+const BST_CHECKED: usize = 1;
+const BST_UNCHECKED: usize = 0;
 
 pub(crate) const PICKER_RESULT_MSG: u32 = WM_APP + 7;
 
@@ -42,12 +46,22 @@ pub(crate) struct ProcessEntry {
 struct PickerState {
     list: Vec<ProcessEntry>,
     listbox: HWND,
+    close_hover: bool,
 }
 
 static OPEN_PICKER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
 
 fn get_open_picker() -> &'static Mutex<Option<isize>> {
     OPEN_PICKER.get_or_init(|| Mutex::new(None))
+}
+
+fn close_btn_rect(client: &RECT) -> RECT {
+    RECT {
+        left: client.right - CLOSE_BTN_SIZE - 4,
+        top: 4,
+        right: client.right - 4,
+        bottom: 4 + CLOSE_BTN_SIZE,
+    }
 }
 
 fn register_class(instance: HINSTANCE) {
@@ -206,6 +220,7 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
         let state = Box::new(PickerState {
             list,
             listbox: HWND::default(),
+            close_hover: false,
         });
         let state_ptr = Box::into_raw(state);
 
@@ -257,7 +272,7 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
                 | WS_VSCROLL
                 | WS_CLIPCHILDREN
                 | WS_BORDER
-                | WINDOW_STYLE((LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL) as u32),
+                | WINDOW_STYLE((LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | 0x0080) as u32),
             0,
             HEADER_H,
             phys_w,
@@ -293,10 +308,9 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
 
             for (i, entry) in state_ref.list.iter().enumerate() {
                 let text = wide(&entry.display_name);
-                let _ = SendMessageW(lb, LB_ADDSTRING, WPARAM(0), LPARAM(text.as_ptr() as isize));
-                if checked[i] {
-                    let _ = SendMessageW(lb, LB_SETSEL, WPARAM(1), LPARAM(i as isize));
-                }
+                let idx = SendMessageW(lb, LB_ADDSTRING, WPARAM(0), LPARAM(text.as_ptr() as isize));
+                let state_val = if checked[i] { BST_CHECKED } else { BST_UNCHECKED };
+                let _ = SendMessageW(lb, LB_SETITEMDATA, WPARAM(idx.0 as usize), LPARAM(state_val as isize));
             }
         }
 
@@ -305,7 +319,7 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
     }
 }
 
-fn read_selection(hwnd: HWND, lb: HWND) -> Vec<String> {
+fn read_checked(hwnd: HWND, lb: HWND) -> Vec<String> {
     let count = unsafe { SendMessageW(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) };
     if count.0 <= 0 {
         return Vec::new();
@@ -317,8 +331,8 @@ fn read_selection(hwnd: HWND, lb: HWND) -> Vec<String> {
     let state = unsafe { &*state_ptr };
     let mut result = Vec::new();
     for i in 0..(count.0 as usize) {
-        let sel = unsafe { SendMessageW(lb, LB_GETSEL, WPARAM(i), LPARAM(0)) };
-        if sel.0 != 0
+        let data = unsafe { SendMessageW(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
+        if data.0 as usize == BST_CHECKED
             && let Some(entry) = state.list.get(i)
         {
             result.push(entry.pattern.clone());
@@ -338,7 +352,7 @@ fn post_result(hwnd: HWND, cancelled: bool) {
     let lparam = if cancelled {
         0
     } else {
-        let selected = read_selection(hwnd, state.listbox);
+        let selected = read_checked(hwnd, state.listbox);
         Box::into_raw(Box::new(selected)) as isize
     };
 
@@ -350,6 +364,13 @@ fn post_result(hwnd: HWND, cancelled: bool) {
             LPARAM(lparam),
         );
     }
+}
+
+fn hit_test_close(hwnd: HWND, x: i32, y: i32) -> bool {
+    let mut client = RECT::default();
+    let _ = unsafe { GetClientRect(hwnd, &mut client) };
+    let r = close_btn_rect(&client);
+    x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -407,7 +428,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             let old_font = unsafe { SelectObject(hdc, font) };
             let _ = unsafe { SetBkMode(hdc, TRANSPARENT) };
             let _ = unsafe { SetTextColor(hdc, COLORREF(0x00F0F0F0)) };
-            let title = wide("Select apps (Enter=apply, Esc=cancel, double-click=apply)");
+            let title = wide("Select apps (Enter=apply, Esc=cancel)");
             let _ = unsafe {
                 DrawTextW(
                     hdc,
@@ -415,21 +436,78 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     &mut RECT {
                         left: client.left + 12,
                         top: client.top + 6,
-                        right: client.right - 12,
+                        right: client.right - 12 - CLOSE_BTN_SIZE,
                         bottom: client.top + HEADER_H - 6,
                     },
                     DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
                 )
             };
+
+            // Draw close button (X)
+            let btn = close_btn_rect(&client);
+            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+            let hover = !state_ptr.is_null() && unsafe { (*state_ptr).close_hover };
+            let btn_brush = unsafe { CreateSolidBrush(COLORREF(if hover { 0x00404040 } else { 0x00333333 })) };
+            let _ = unsafe { FillRect(hdc, &btn, btn_brush) };
+            let _ = unsafe { DeleteObject(btn_brush) };
+
+            let _ = unsafe { SetTextColor(hdc, COLORREF(0x00F0F0F0)) };
+            let x_text = wide("\u{00D7}");
+            let _ = unsafe {
+                DrawTextW(
+                    hdc,
+                    &mut x_text.clone(),
+                    &mut RECT {
+                        left: btn.left,
+                        top: btn.top,
+                        right: btn.right,
+                        bottom: btn.bottom,
+                    },
+                    DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
+                )
+            };
+
             let _ = unsafe { SelectObject(hdc, old_font) };
             let _ = unsafe { DeleteObject(font) };
 
             let _ = unsafe { EndPaint(hwnd, &ps) };
             LRESULT(0)
         }
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xFFFF) as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+            if state_ptr.is_null() {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
+            let hovering = hit_test_close(hwnd, x, y);
+            let was_hover = unsafe { (*state_ptr).close_hover };
+            if hovering != was_hover {
+                unsafe { (*state_ptr).close_hover = hovering };
+                unsafe {
+                    let mut client = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut client);
+                    let btn = close_btn_rect(&client);
+                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, Some(&btn), false);
+                };
+                // Change cursor
+                let cursor = unsafe { LoadCursorW(None, windows::Win32::UI::WindowsAndMessaging::IDC_HAND).unwrap() };
+                unsafe {
+                    SetCursor(cursor);
+                }
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
         WM_LBUTTONDOWN => {
             let x = (lparam.0 & 0xFFFF) as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+
+            if hit_test_close(hwnd, x, y) {
+                post_result(hwnd, true);
+                let _ = unsafe { DestroyWindow(hwnd) };
+                return LRESULT(0);
+            }
+
             let mut client = RECT::default();
             let _ = unsafe { GetClientRect(hwnd, &mut client) };
             if x < client.left || x >= client.right || y < client.top || y >= client.bottom {
