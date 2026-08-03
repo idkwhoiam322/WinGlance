@@ -37,12 +37,12 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, IDC_ARROW, IDI_APPLICATION, KillTimer,
-    LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMRECT, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX,
-    LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED,
-    SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE,
+    LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT,
+    LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, LoadIconW, MF_CHECKED,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW,
+    SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP,
+    WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE,
     WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASS_STYLES,
     WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
@@ -388,6 +388,12 @@ struct MainWindowState {
     tooltip_ctrl: HWND,
     /// Number of tools currently registered in the native tooltip (for resync).
     tooltip_count: usize,
+    /// Last synced (item count, top index) of the history listbox; the 1 Hz
+    /// tooltip timer skips the full rebuild while both are unchanged.
+    tooltip_sync: Option<(usize, usize)>,
+    /// Set when an event batch changed the list; the tooltips are rebuilt once
+    /// per batch instead of once per event.
+    tooltips_dirty: bool,
     /// Timestamp of the last "Copy logs" press, for the "Copied" feedback.
     logs_copied_at: Option<Instant>,
 }
@@ -465,6 +471,8 @@ impl MainWindowState {
             settings_hover: None,
             tooltip_ctrl: HWND::default(),
             tooltip_count: 0,
+            tooltip_sync: None,
+            tooltips_dirty: false,
             logs_copied_at: None,
         }
     }
@@ -566,11 +574,19 @@ impl MainWindowState {
 
     /// Rebuilds the per-item tool definitions so rects and row count match
     /// the listbox (rows are fixed-height, so scroll changes the mapping).
+    /// The 1 Hz timer calls this constantly, so a full rebuild (3N+1
+    /// SendMessageW) is skipped when the item count and scroll position are
+    /// unchanged since the last sync.
     fn sync_tooltips(&mut self) {
         if self.tooltip_ctrl.0.is_null() || self.listbox.0.is_null() {
             return;
         }
         unsafe {
+            let count = SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
+            let top = SendMessageW(self.listbox, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)).0 as usize;
+            if self.tooltip_sync == Some((count, top)) {
+                return;
+            }
             for index in 0..self.tooltip_count {
                 let mut tool = ToolInfo {
                     cb_size: std::mem::size_of::<ToolInfo>() as u32,
@@ -590,7 +606,6 @@ impl MainWindowState {
                     LPARAM(&mut tool as *mut _ as isize),
                 );
             }
-            let count = SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
             for index in 0..count {
                 let mut rect = RECT::default();
                 let ok = SendMessageW(
@@ -621,6 +636,7 @@ impl MainWindowState {
                 );
             }
             self.tooltip_count = count;
+            self.tooltip_sync = Some((count, top));
         }
     }
 
@@ -659,6 +675,12 @@ impl MainWindowState {
                 } => self.add_session(source_app, title, artist, state, accepted),
             }
         }
+        // One tooltip rebuild per batch: a session-churn burst otherwise
+        // rebuilds the full tool set once per event.
+        if self.tooltips_dirty {
+            self.tooltips_dirty = false;
+            self.sync_tooltips();
+        }
     }
 
     /// Appends a history row and syncs the listbox + tooltips. Artwork is
@@ -691,7 +713,9 @@ impl MainWindowState {
                 let _ = SendMessageW(self.listbox, LB_SETTOPINDEX, WPARAM(0), LPARAM(0));
             }
         }
-        self.sync_tooltips();
+        // Tooltip rebuilds are coalesced per event batch (receive_events) or
+        // picked up by the 1 Hz timer.
+        self.tooltips_dirty = true;
     }
 
     fn add_state_change(&mut self, state: PlaybackState) {
@@ -767,7 +791,7 @@ impl MainWindowState {
                     }
                 }
             }
-            self.sync_tooltips();
+            self.tooltips_dirty = true;
             self.invalidate();
             return;
         }
