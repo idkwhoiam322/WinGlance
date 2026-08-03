@@ -17,6 +17,11 @@ pub struct TrackInfo {
     pub title: String,
     pub artist: String,
     pub album: String,
+    /// Album artist, when provided by the source. Used as a fallback when the
+    /// album title is empty (some apps populate one but not the other).
+    pub album_artist: String,
+    /// Subtitle (e.g. a podcast episode name or video title), when provided.
+    pub subtitle: String,
     pub artwork: Option<Vec<u8>>,
     pub source_app: String,
     /// Total duration in seconds, when the app reports timeline info.
@@ -30,12 +35,25 @@ pub struct TrackInfo {
 }
 
 impl TrackInfo {
-    /// Compact secondary info line: album · duration · track n/c · genre.
-    /// Only the parts the app actually provided are included.
+    /// Compact secondary info line: album (or subtitle/album-artist fallback) ·
+    /// duration · track n/c · genre. Only the parts the app actually provided
+    /// are included. When the album title is empty, the subtitle or album
+    /// artist is shown instead so the line still carries useful context.
     pub fn meta_line(&self, include_album: bool) -> String {
         let mut parts: Vec<String> = Vec::new();
-        if include_album && !self.album.trim().is_empty() {
-            parts.push(self.album.clone());
+        if include_album {
+            let album_line = if !self.album.trim().is_empty() {
+                Some(self.album.clone())
+            } else if !self.subtitle.trim().is_empty() {
+                Some(self.subtitle.clone())
+            } else if !self.album_artist.trim().is_empty() {
+                Some(self.album_artist.clone())
+            } else {
+                None
+            };
+            if let Some(line) = album_line {
+                parts.push(line);
+            }
         }
         if let Some(d) = self.duration_secs {
             parts.push(format!("{}:{:02}", d / 60, d % 60));
@@ -62,7 +80,7 @@ pub enum PlaybackState {
 #[derive(Debug, Clone)]
 pub enum MediaEvent {
     TrackChanged(TrackInfo),
-    PlaybackStateChanged(PlaybackState),
+    PlaybackStateChanged(PlaybackState, String),
 }
 
 #[cfg(test)]
@@ -73,5 +91,14 @@ mod tests {
     fn playback_states_are_compared_by_value() {
         assert_eq!(PlaybackState::Playing, PlaybackState::Playing);
         assert_ne!(PlaybackState::Playing, PlaybackState::Paused);
+    }
+
+    #[test]
+    fn playback_state_event_carries_source() {
+        let event = MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "spotify".into());
+        match event {
+            MediaEvent::PlaybackStateChanged(_, source) => assert_eq!(source, "spotify"),
+            _ => panic!("expected PlaybackStateChanged"),
+        }
     }
 }

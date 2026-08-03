@@ -40,6 +40,8 @@ struct LogicalState {
     title: String,
     artist: String,
     album: String,
+    album_artist: String,
+    subtitle: String,
     has_artwork: bool,
     source_app: String,
     duration_secs: Option<u64>,
@@ -296,7 +298,7 @@ impl ListenerState {
                 "playback state changed | state={state:?} | source={}",
                 read_source_app(session)
             );
-            events.push(MediaEvent::PlaybackStateChanged(state));
+            events.push(MediaEvent::PlaybackStateChanged(state, read_source_app(session)));
         }
 
         // Content is only diffed while the session is not stopped; a stopped
@@ -316,15 +318,23 @@ impl ListenerState {
                         // flashing the same track again.
                         let label = track_label(&merged);
                         debug!("track emit skipped | reason=artwork-removed | {label}");
-                    } else if read_artwork {
-                        // Event-driven reads only: the 2-second poll re-reads
-                        // every session and must not log a duplicate per pass.
-                        let label = track_label(&merged);
-                        debug!("track emit skipped | reason=duplicate | {label}");
+                    } else {
+                        let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
+                        if is_first_read && read_artwork && merged.artwork.is_none() {
+                            let label = track_label(&merged);
+                            debug!("track emit deferred | reason=awaiting-artwork | {label}");
+                        } else if read_artwork {
+                            // Event-driven reads only: the 2-second poll re-reads
+                            // every session and must not log a duplicate per pass.
+                            let label = track_label(&merged);
+                            debug!("track emit skipped | reason=duplicate | {label}");
+                        }
                     }
                     next.title = merged.title;
                     next.artist = merged.artist;
                     next.album = merged.album;
+                    next.album_artist = merged.album_artist;
+                    next.subtitle = merged.subtitle;
                     next.has_artwork = if read_artwork {
                         merged.artwork.is_some()
                     } else {
@@ -345,7 +355,7 @@ impl ListenerState {
         // a freshly-adopted session) is redundant — suppressing it avoids a
         // "Playing" flicker immediately after every fresh track pill.
         if events.iter().any(|e| matches!(e, MediaEvent::TrackChanged(_))) {
-            events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_)));
+            events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
         }
 
         self.states.insert(key, next);
@@ -554,10 +564,12 @@ fn track_label(track: &TrackInfo) -> String {
         .map(|n| format!("{n}/{}", track.track_count.unwrap_or(0)))
         .unwrap_or_else(|| "-".into());
     format!(
-        "title={:?} | artist={:?} | album={:?} | artwork={} | duration={:?}s | track={track_no} | genre={:?} | source={:?}",
+        "title={:?} | artist={:?} | album={:?} | album_artist={:?} | subtitle={:?} | artwork={} | duration={:?}s | track={track_no} | genre={:?} | source={:?}",
         track.title,
         track.artist,
         track.album,
+        track.album_artist,
+        track.subtitle,
         if track.artwork.is_some() { "yes" } else { "no" },
         track.duration_secs,
         track.genre,
@@ -583,6 +595,8 @@ fn merge_track(prev: &LogicalState, read: &TrackInfo, read_artwork: bool) -> Tra
         title: read.title.clone(),
         artist: inherit(&read.artist, &prev.artist),
         album: inherit(&read.album, &prev.album),
+        album_artist: inherit(&read.album_artist, &prev.album_artist),
+        subtitle: inherit(&read.subtitle, &prev.subtitle),
         artwork: if read_artwork { read.artwork.clone() } else { None },
         source_app: read.source_app.clone(),
         duration_secs: if same_identity {
@@ -613,6 +627,8 @@ fn content_differ(prev: &LogicalState, read: &TrackInfo) -> bool {
     read.title != prev.title
         || read.artist != prev.artist
         || read.album != prev.album
+        || read.album_artist != prev.album_artist
+        || read.subtitle != prev.subtitle
         || read.source_app != prev.source_app
         || read.duration_secs != prev.duration_secs
         || read.track_number != prev.track_number
@@ -625,11 +641,19 @@ fn content_differ(prev: &LogicalState, read: &TrackInfo) -> bool {
 /// follows the read only when artwork was actually read; a gain re-emits (the
 /// pill refreshes the cover in place), a loss is stored silently — absence is
 /// already shown as a placeholder, so re-emitting would flash the same track.
+///
+/// On the first read for a session (the stored state is still empty), if
+/// artwork has not arrived yet, the emit is deferred until the `has_artwork`
+/// gained diff fires on the subsequent MediaPropertiesChanged. This eliminates
+/// the artwork=no→artwork=yes double-pill: the app reports title/artist first,
+/// then fires a second event with the thumbnail.
 fn emit_track(prev: &LogicalState, merged: &TrackInfo, read_artwork: bool) -> (bool, bool) {
     let content_changed = content_differ(prev, merged);
     let artwork_gained = read_artwork && merged.artwork.is_some() && !prev.has_artwork;
     let artwork_lost = read_artwork && merged.artwork.is_none() && prev.has_artwork;
-    (content_changed || artwork_gained, artwork_lost)
+    let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
+    let defer_first = is_first_read && read_artwork && merged.artwork.is_none();
+    (content_changed && !defer_first || artwork_gained, artwork_lost)
 }
 
 fn register_sessions_handler(
@@ -682,6 +706,12 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_art
     // Keep album empty when the app has not provided it yet; renderers hide the
     // album line until real data arrives (prevents a bogus "Unknown album").
     let album = non_empty(properties.AlbumTitle()?.to_string(), "");
+    // Album artist and subtitle are read as additional data sources. Some apps
+    // (e.g. YouTube Music) populate only Title/Artist and leave these empty,
+    // but others may fill one but not the album title — the pill falls back to
+    // whichever is available.
+    let album_artist = non_empty(properties.AlbumArtist()?.to_string(), "");
+    let subtitle = non_empty(properties.Subtitle()?.to_string(), "");
     let artwork = if read_artwork {
         // Artwork reads fail transiently under heavy session churn (overlapping
         // async WinRT calls on one thread); retry once before giving up, and
@@ -722,6 +752,8 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_art
         title,
         artist,
         album,
+        album_artist,
+        subtitle,
         artwork,
         source_app,
         duration_secs,
@@ -757,7 +789,7 @@ fn read_thumbnail(
     let size = stream
         .Size()
         .map_err(|e| anyhow!("Size failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
-    if size == 0 || size > 8 * 1024 * 1024 || size > u32::MAX as u64 {
+    if size == 0 || !(1024..=8 * 1024 * 1024).contains(&size) || size > u32::MAX as u64 {
         return Ok(None);
     }
     let size = size as u32;
@@ -946,5 +978,22 @@ mod tests {
         // A poll that did not read artwork never touches presence.
         assert_eq!(emit_track(&had_art, &track("Song", "Artist"), false), (false, false));
         assert_eq!(emit_track(&prev, &with_art, false), (false, false));
+        // First read without artwork: deferred (no emit, awaits thumbnail).
+        let first = LogicalState::default();
+        assert_eq!(emit_track(&first, &track("Song", "Artist"), true), (false, false));
+        // First read WITH artwork: emits immediately (no double-pill).
+        assert_eq!(emit_track(&first, &with_art, true), (true, false));
+        // After a deferred first read the state holds the track info; a
+        // subsequent poll (no artwork read) sees no content change and
+        // correctly emits nothing.
+        let after_defer = LogicalState {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            ..LogicalState::default()
+        };
+        assert_eq!(
+            emit_track(&after_defer, &track("Song", "Artist"), false),
+            (false, false)
+        );
     }
 }

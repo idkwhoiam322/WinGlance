@@ -481,7 +481,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if draw_ptr.is_null() {
                 return DefWindowProcW(hwnd, message, wparam, lparam);
             }
-            let draw = unsafe { *draw_ptr };
+            let draw = unsafe { &*draw_ptr };
             let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
             if state_ptr.is_null() || draw.itemID as usize >= unsafe { (*state_ptr).list.len() } {
                 return DefWindowProcW(hwnd, message, wparam, lparam);

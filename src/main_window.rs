@@ -637,7 +637,7 @@ impl MainWindowState {
         for event in batch {
             match event {
                 MediaEvent::TrackChanged(track) => self.add_track(track),
-                MediaEvent::PlaybackStateChanged(state) => {
+                MediaEvent::PlaybackStateChanged(state, _source_app) => {
                     if let Some(current) = &mut self.current {
                         current.state = state;
                         self.add_state_change(state);
@@ -1898,7 +1898,17 @@ fn entry_detail(entry: &HistoryEntry) -> String {
     if !entry.track.album.trim().is_empty() {
         parts.push(entry.track.album.clone());
     }
-    let meta = entry.track.meta_line(false);
+    // Subtitle and album artist carry useful context when the album title is
+    // empty (some apps populate one but not the other).
+    if entry.track.album.trim().is_empty() {
+        if !entry.track.subtitle.trim().is_empty() {
+            parts.push(entry.track.subtitle.clone());
+        }
+        if !entry.track.album_artist.trim().is_empty() {
+            parts.push(entry.track.album_artist.clone());
+        }
+    }
+    let meta = entry.track.meta_line(entry.track.album.trim().is_empty());
     if !meta.is_empty() {
         parts.push(meta);
     }
@@ -2539,6 +2549,8 @@ mod tests {
             title: title.into(),
             artist: "The Artist".into(),
             album: "The Album".into(),
+            album_artist: String::new(),
+            subtitle: String::new(),
             artwork: None,
             source_app: "Spotify".into(),
             duration_secs: None,

@@ -3,7 +3,7 @@ use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, Trac
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
 use log::{debug, error};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::{Arc, Mutex};
@@ -146,6 +146,10 @@ struct OverlayState {
     /// in state pills for current-session playback states so the pill always
     /// names the app that owns the media — never another app's last track.
     current_source: Option<String>,
+    /// Per-source track cache: the last TrackChanged shown for each source app,
+    /// so that a later PlaybackStateChanged for that source can render the
+    /// correct track info instead of the most-recently-shown app's track.
+    track_cache: HashMap<String, TrackInfo>,
     /// Scratch DC + DIB for GDI text rendering (cached across frames).
     text_scratch: Option<TextScratch>,
 }
@@ -233,6 +237,7 @@ impl OverlayState {
             last_tick: Instant::now(),
             state_source: None,
             current_source: None,
+            track_cache: HashMap::new(),
             text_scratch: None,
         }
     }
@@ -315,15 +320,21 @@ impl OverlayState {
                     if is_update {
                         self.current_source = Some(track.source_app.clone());
                         self.last_track = Some(track.clone());
+                        self.track_cache.insert(track.source_app.clone(), track.clone());
                         self.update_content(MediaEvent::TrackChanged(track));
                     } else {
                         self.enqueue(MediaEvent::TrackChanged(track));
                     }
                 }
-                MediaEvent::PlaybackStateChanged(state) if self.config.behavior.enable_playback_state_change => {
-                    self.enqueue(MediaEvent::PlaybackStateChanged(state));
+                MediaEvent::PlaybackStateChanged(state, source_app)
+                    if self.config.behavior.enable_playback_state_change =>
+                {
+                    // Cache the source app so show_next / draw_text_pixels can
+                    // look up the right track for this state pills.
+                    let event = MediaEvent::PlaybackStateChanged(state, source_app);
+                    self.enqueue(event);
                 }
-                MediaEvent::TrackChanged(_) | MediaEvent::PlaybackStateChanged(_) => {}
+                MediaEvent::TrackChanged(_) | MediaEvent::PlaybackStateChanged(_, _) => {}
             }
         }
         if !self.pending.is_empty() {
@@ -375,10 +386,11 @@ impl OverlayState {
             MediaEvent::TrackChanged(track) => {
                 self.current_source = Some(track.source_app.clone());
                 self.last_track = Some(track.clone());
+                self.track_cache.insert(track.source_app.clone(), track.clone());
                 self.show(MediaEvent::TrackChanged(track), true);
             }
-            MediaEvent::PlaybackStateChanged(state) => {
-                self.show(MediaEvent::PlaybackStateChanged(state), false);
+            MediaEvent::PlaybackStateChanged(state, source_app) => {
+                self.show(MediaEvent::PlaybackStateChanged(state, source_app), false);
             }
         }
     }
@@ -507,7 +519,7 @@ impl OverlayState {
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (logical_width, logical_height) = match &content {
             MediaEvent::TrackChanged(track) => track_content_size(&self.config, track),
-            MediaEvent::PlaybackStateChanged(_) => state_content_size(&self.config, self.last_track.as_ref()),
+            MediaEvent::PlaybackStateChanged(_, _) => state_content_size(&self.config, self.last_track.as_ref()),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
@@ -670,7 +682,7 @@ impl OverlayState {
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (logical_width, logical_height) = match content {
             MediaEvent::TrackChanged(track) => track_content_size(&self.config, track),
-            MediaEvent::PlaybackStateChanged(_) => state_content_size(&self.config, self.last_track.as_ref()),
+            MediaEvent::PlaybackStateChanged(_, _) => state_content_size(&self.config, self.last_track.as_ref()),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
@@ -680,7 +692,7 @@ impl OverlayState {
     /// Shows a short-lived preview of the overlay at its current position, used by
     /// the tray "Show sample" command to preview placement without real media.
     fn show_sample(&mut self) {
-        self.content = Some(MediaEvent::PlaybackStateChanged(PlaybackState::Playing));
+        self.content = Some(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, String::new()));
         self.reset_scroll();
         let now = Instant::now();
         self.dismiss_at = Some(now + sample_duration(&self.config));
@@ -966,11 +978,16 @@ fn draw_pixels(
                 );
             }
         }
-        MediaEvent::PlaybackStateChanged(_) => {
-            // The state pill reuses the current track's artwork and details so
-            // a pause/play notification still shows what is playing (the cache
-            // was populated when the track was shown; falls back to the accent
-            // placeholder when nothing has been shown yet).
+        MediaEvent::PlaybackStateChanged(_, source_app) => {
+            // State pills reuse the cached track's artwork for the source that
+            // produced the state change, so a pause/play pill still shows the
+            // right cover. Falls back to the accent placeholder when nothing
+            // has been cached for this source yet.
+            if !source_app.is_empty()
+                && let Some(track) = state.track_cache.get(source_app).cloned()
+            {
+                state.ensure_art(&track, art_base);
+            }
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
             let art_size = art_size.min(height.saturating_sub(2 * padding));
@@ -1177,7 +1194,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 );
             }
         }
-        MediaEvent::PlaybackStateChanged(playback) => {
+        MediaEvent::PlaybackStateChanged(playback, source_app) => {
             let label = match playback {
                 PlaybackState::Playing => "Playing",
                 PlaybackState::Paused => "Paused",
@@ -1217,36 +1234,18 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 true,
                 None,
             );
-            if let Some(source_name) = state.state_source.as_deref().or(state.current_source.as_deref()) {
-                // A state change from a session that is not current: show the
-                // app that produced it, never another app's track.
-                let title_rect = next_band(fs_artist * ROW_HEIGHT);
-                draw_text_line_pixels(
-                    &mut state.text_scratch,
-                    pixels,
-                    width as usize,
-                    source_name,
-                    &title_rect,
-                    fs_artist as i32,
-                    appearance.text_color,
-                    true,
-                    true,
-                    None,
-                );
-                let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
-                draw_text_line_pixels(
-                    &mut state.text_scratch,
-                    pixels,
-                    width as usize,
-                    "Unknown",
-                    &artist_rect,
-                    (fs_artist * 0.85) as i32,
-                    [0xCC, 0xCC, 0xCC, 0xFF],
-                    false,
-                    true,
-                    None,
-                );
-            } else if let Some(track) = &state.last_track {
+
+            // Look up the cached track for this source app so a pause/play pill
+            // shows the correct track info per source. Falls back to the source
+            // name + "Unknown" when no track has been cached for it (e.g. the
+            // sample preview, or a state change before any TrackChanged).
+            let cached = if source_app.is_empty() {
+                None
+            } else {
+                state.track_cache.get(source_app).cloned()
+            };
+
+            if let Some(track) = cached {
                 let title_rect = next_band(fs_artist * ROW_HEIGHT);
                 draw_text_line_pixels(
                     &mut state.text_scratch,
@@ -1301,6 +1300,40 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         &source_rect,
                         (fs_artist * 0.85) as i32,
                         [0x77, 0x77, 0x77, 0xFF],
+                        false,
+                        true,
+                        None,
+                    );
+                }
+            } else {
+                let fallback_name = if !source_app.is_empty() {
+                    Some(source_app.as_str())
+                } else {
+                    state.state_source.as_deref().or(state.current_source.as_deref())
+                };
+                if let Some(name) = fallback_name {
+                    let title_rect = next_band(fs_artist * ROW_HEIGHT);
+                    draw_text_line_pixels(
+                        &mut state.text_scratch,
+                        pixels,
+                        width as usize,
+                        name,
+                        &title_rect,
+                        fs_artist as i32,
+                        appearance.text_color,
+                        true,
+                        true,
+                        None,
+                    );
+                    let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
+                    draw_text_line_pixels(
+                        &mut state.text_scratch,
+                        pixels,
+                        width as usize,
+                        "Unknown",
+                        &artist_rect,
+                        (fs_artist * 0.85) as i32,
+                        [0xCC, 0xCC, 0xCC, 0xFF],
                         false,
                         true,
                         None,
