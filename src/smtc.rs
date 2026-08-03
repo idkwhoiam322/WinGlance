@@ -369,7 +369,13 @@ impl ListenerState {
                     next.track_count = merged.track_count;
                     next.genre = merged.genre;
                 }
-                Err(error) => debug!("track read failed | key={key} | {error:#}"),
+                Err(error) => {
+                    if is_session_gone(&error) {
+                        debug!("session torn down during read | key={key} | {error:#}");
+                    } else {
+                        debug!("track read failed | key={key} | {error:#}");
+                    }
+                }
             }
         }
 
@@ -794,16 +800,22 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_art
     let artwork = if read_artwork {
         // Artwork reads fail transiently under heavy session churn (overlapping
         // async WinRT calls on one thread); retry once before giving up, and
-        // log which call failed with its raw HRESULT.
+        // log which call failed with its raw HRESULT. When the session itself
+        // is gone (RPC-unavailable / device-not-ready), retrying cannot
+        // succeed — return None immediately.
         match read_thumbnail(&properties) {
             Ok(artwork) => artwork,
             Err(first) => {
                 debug!("album-art read failed (attempt 1): {first:#}");
-                match read_thumbnail(&properties) {
-                    Ok(artwork) => artwork,
-                    Err(second) => {
-                        debug!("album-art read failed (attempt 2): {second:#}");
-                        None
+                if is_session_gone(&first) {
+                    None
+                } else {
+                    match read_thumbnail(&properties) {
+                        Ok(artwork) => artwork,
+                        Err(second) => {
+                            debug!("album-art read failed (attempt 2): {second:#}");
+                            None
+                        }
                     }
                 }
             }
@@ -852,6 +864,16 @@ fn read_duration(session: &GlobalSystemMediaTransportControlsSession) -> Option<
     }
     // TimeSpan.Duration is in 100-nanosecond units.
     Some((duration_100ns / 10_000_000) as u64)
+}
+
+/// Whether an error is one of the HRESULTs WinRT raises while a session is
+/// torn down mid-read (RPC server unavailable / device not ready). Expected
+/// under session churn: the event fired, then the session died before the
+/// read completed. A retry cannot succeed, so fail fast instead of logging
+/// an anomaly. Mirrors WindowsMediaController's message-based suppression.
+fn is_session_gone(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains("0x800706BA") || text.contains("0x80070015")
 }
 
 fn read_thumbnail(
@@ -1095,5 +1117,16 @@ mod tests {
         // Exactly at the boundary: expired.
         let boundary = now.checked_sub(ARTWORK_TIMEOUT).unwrap();
         assert!(defer_expired(Some(boundary)));
+    }
+
+    #[test]
+    fn session_gone_detects_teardown_hresults() {
+        use windows::core::HRESULT;
+        let rpc = anyhow::Error::new(windows::core::Error::from(HRESULT(0x8007_06BAu32 as i32)));
+        let device = anyhow::Error::new(windows::core::Error::from(HRESULT(0x8007_0015u32 as i32)));
+        let other = anyhow!("disk read failed (hr=0x80004005)");
+        assert!(is_session_gone(&rpc));
+        assert!(is_session_gone(&device));
+        assert!(!is_session_gone(&other));
     }
 }
