@@ -71,20 +71,12 @@ enum Phase {
     Collapsing(Instant),
 }
 
-#[derive(Default)]
-struct PendingEvents {
-    track: Option<TrackInfo>,
-    playback: Option<PlaybackState>,
-    /// Source app of a playback-state change from a session that is not
-    /// current. The state pill then shows the source instead of whatever track
-    /// is in `last_track`, so it never displays another app's media data.
-    source: Option<String>,
-    /// True when the pending track matches the currently shown track (same
-    /// title+artist) and only metadata changed — e.g. album/artwork arriving a
-    /// moment after the initial notification. Such refreshes update the pill in
-    /// place instead of showing a brand-new notification.
-    track_update: bool,
-}
+/// Upper bound on the pending notification queue. At the cap the oldest
+/// unshown queued event is dropped in favor of the incoming one; the pill
+/// currently on screen is never pulled. Four distinct real notifications
+/// colliding within milliseconds is already an edge case, so the cap is not
+/// worth tuning.
+const PENDING_CAP: usize = 4;
 
 /// Per-line marquee state for the pill's text rows. The offset advances on the
 /// 16ms animation tick; a short hold before the first movement reads better.
@@ -123,7 +115,10 @@ struct OverlayState {
     hwnd: HWND,
     config: Config,
     queue: EventQueue,
-    pending: PendingEvents,
+    /// Notifications waiting to be shown, in arrival order. Distinct events
+    /// from different sources show one after another instead of clobbering
+    /// each other; the pill on screen is never replaced early.
+    pending: VecDeque<MediaEvent>,
     enabled: bool,
     content: Option<MediaEvent>,
     last_track: Option<TrackInfo>,
@@ -223,7 +218,7 @@ impl OverlayState {
             hwnd: HWND::default(),
             config,
             queue,
-            pending: PendingEvents::default(),
+            pending: VecDeque::new(),
             enabled: true,
             content: None,
             last_track: None,
@@ -305,23 +300,33 @@ impl OverlayState {
             }
             match event {
                 MediaEvent::TrackChanged(track) if self.config.behavior.enable_track_change => {
-                    let is_update = self
-                        .last_track
-                        .as_ref()
-                        .is_some_and(|last| last.title == track.title && last.artist == track.artist);
-                    self.pending.track = Some(track);
-                    self.pending.track_update = is_update;
+                    // A metadata refresh for the track currently on screen
+                    // (SMTC fills artwork/album progressively, a moment after
+                    // the title) updates the pill in place instead of queueing
+                    // a second notification for the same song. Cross-source
+                    // matches do not refresh in place: both sources notify
+                    // independently.
+                    let is_update = self.content.as_ref().is_some_and(|content| {
+                        matches!(content, MediaEvent::TrackChanged(shown)
+                            if shown.title == track.title
+                                && shown.artist == track.artist
+                                && shown.source_app == track.source_app)
+                    });
+                    if is_update {
+                        self.current_source = Some(track.source_app.clone());
+                        self.last_track = Some(track.clone());
+                        self.update_content(MediaEvent::TrackChanged(track));
+                    } else {
+                        self.enqueue(MediaEvent::TrackChanged(track));
+                    }
                 }
-                MediaEvent::PlaybackStateChanged(state) => self.pending.playback = Some(state),
-                MediaEvent::TrackRestarted(track) if self.config.behavior.enable_track_change => {
-                    // A restart (Prev/repeat) re-shows the pill briefly.
-                    self.show_restart(track);
+                MediaEvent::PlaybackStateChanged(state) if self.config.behavior.enable_playback_state_change => {
+                    self.enqueue(MediaEvent::PlaybackStateChanged(state));
                 }
-                MediaEvent::TrackRestarted(_) => {}
-                MediaEvent::TrackChanged(_) => {}
+                MediaEvent::TrackChanged(_) | MediaEvent::PlaybackStateChanged(_) => {}
             }
         }
-        if self.pending.track.is_some() || self.pending.playback.is_some() {
+        if !self.pending.is_empty() {
             unsafe {
                 let _ = KillTimer(self.hwnd, TIMER_DEBOUNCE);
                 SetTimer(
@@ -334,28 +339,60 @@ impl OverlayState {
         }
     }
 
+    /// Adds a notification to the pending queue. At the cap, the oldest unshown
+    /// queued event is dropped in favor of the incoming one; the pill currently
+    /// on screen is never pulled. A metadata refresh for the same track as the
+    /// queue's last entry replaces it instead of showing the song twice.
+    fn enqueue(&mut self, event: MediaEvent) {
+        if let Some(MediaEvent::TrackChanged(queued)) = self.pending.back_mut()
+            && let MediaEvent::TrackChanged(incoming) = &event
+            && queued.title == incoming.title
+            && queued.artist == incoming.artist
+            && queued.source_app == incoming.source_app
+        {
+            if !incoming.album.trim().is_empty() {
+                queued.album = incoming.album.clone();
+            }
+            if incoming.artwork.is_some() {
+                queued.artwork = incoming.artwork.clone();
+            }
+            return;
+        }
+        if self.pending.len() >= PENDING_CAP {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(event);
+    }
+
+    /// Shows the front of the pending queue as a fresh notification. Called by
+    /// the debounce flush while the pill is hidden, and when the current pill
+    /// finishes collapsing, so queued notifications show one after another.
+    fn show_next(&mut self) {
+        let Some(event) = self.pending.pop_front() else {
+            return;
+        };
+        match event {
+            MediaEvent::TrackChanged(track) => {
+                self.current_source = Some(track.source_app.clone());
+                self.last_track = Some(track.clone());
+                self.show(MediaEvent::TrackChanged(track), true);
+            }
+            MediaEvent::PlaybackStateChanged(state) => {
+                self.show(MediaEvent::PlaybackStateChanged(state), false);
+            }
+        }
+    }
+
     fn flush_pending(&mut self) {
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_DEBOUNCE);
         }
-        let mut pending = std::mem::take(&mut self.pending);
-        if let Some(track) = pending.track {
-            let is_update = pending.track_update;
-            self.current_source = Some(track.source_app.clone());
-            self.last_track = Some(track.clone());
-            if is_update && self.content.is_some() {
-                self.update_content(MediaEvent::TrackChanged(track));
-            } else {
-                self.show(MediaEvent::TrackChanged(track), true);
-            }
-        } else if let Some(playback) = pending.playback
-            && self.config.behavior.enable_playback_state_change
-        {
-            // A non-current session's state pill shows its source name, not
-            // whatever track was last emitted by another app.
-            self.state_source = pending.source.take();
-            self.show(MediaEvent::PlaybackStateChanged(playback), false);
+        // While a pill is on screen the queue waits: the next event shows when
+        // the current one collapses, so notifications never clobber each other.
+        if !matches!(self.phase, Phase::Hidden) {
+            return;
         }
+        self.show_next();
     }
 
     /// Refreshes the shown content in place (metadata-only change): keeps the
@@ -398,14 +435,6 @@ impl OverlayState {
             foreground.0 as usize
         );
         self.render();
-    }
-
-    /// Re-shows the pill for a track restart (Prev button, or a looping track)
-    /// with the shorter restart duration.
-    fn show_restart(&mut self, track: TrackInfo) {
-        self.last_track = Some(track.clone());
-        let duration = self.config.overlay.restart_duration_ms.clamp(500, 2000);
-        self.show_with_duration(MediaEvent::TrackChanged(track), true, duration);
     }
 
     fn tick(&mut self) {
@@ -477,9 +506,7 @@ impl OverlayState {
         let (alpha, shape) = self.frame();
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (logical_width, logical_height) = match &content {
-            MediaEvent::TrackChanged(track) | MediaEvent::TrackRestarted(track) => {
-                track_content_size(&self.config, track)
-            }
+            MediaEvent::TrackChanged(track) => track_content_size(&self.config, track),
             MediaEvent::PlaybackStateChanged(_) => state_content_size(&self.config, self.last_track.as_ref()),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
@@ -623,12 +650,15 @@ impl OverlayState {
                 debug!("SetWindowPos(hide) failed: {error}");
             }
         }
+        // Advance the queue: the next pending notification shows as a fresh
+        // pill. show() checks `enabled`, so a toggle-off collapse stays hidden.
+        self.show_next();
     }
 
     fn toggle_enabled(&mut self) {
         self.enabled = !self.enabled;
         if !self.enabled {
-            self.pending = PendingEvents::default();
+            self.pending.clear();
             self.hide();
         }
     }
@@ -639,9 +669,7 @@ impl OverlayState {
         let (_, shape) = self.frame();
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (logical_width, logical_height) = match content {
-            MediaEvent::TrackChanged(track) | MediaEvent::TrackRestarted(track) => {
-                track_content_size(&self.config, track)
-            }
+            MediaEvent::TrackChanged(track) => track_content_size(&self.config, track),
             MediaEvent::PlaybackStateChanged(_) => state_content_size(&self.config, self.last_track.as_ref()),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
@@ -910,7 +938,7 @@ fn draw_pixels(
     }
 
     match content {
-        MediaEvent::TrackChanged(track) | MediaEvent::TrackRestarted(track) => {
+        MediaEvent::TrackChanged(track) => {
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
             let art_x = padding;
@@ -1043,7 +1071,7 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
 /// window — it never touches the alpha channel).
 fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &MediaEvent, width: i32, scale: f32) {
     match content {
-        MediaEvent::TrackChanged(track) | MediaEvent::TrackRestarted(track) => {
+        MediaEvent::TrackChanged(track) => {
             let appearance = &state.config.appearance;
             let padding = (appearance.padding * scale) as i32;
             let art = (appearance.art_size as f32 * scale) as i32;

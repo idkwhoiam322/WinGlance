@@ -78,8 +78,10 @@ verified headless.
   `SessionsChanged/CurrentSessionChanged (debounced)` line per burst with
   `(coalesced)` lines in between (not one resolve per event), that the
   churning source gets one `WARN ... churning sessions ... excluding it` line
-  when it trips the cool-down, and that `current_key` never leaves the
-  actually-playing session (no adoption of the churning source).
+  when it trips the cool-down, and that no `track changed` /
+  `playback state changed` line names the churning source while it is on
+  cool-down (its sessions never emit a `track changed` /
+  `playback state changed` line).
 
 ## Git
 

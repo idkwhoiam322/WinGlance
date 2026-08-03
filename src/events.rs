@@ -63,9 +63,6 @@ pub enum PlaybackState {
 pub enum MediaEvent {
     TrackChanged(TrackInfo),
     PlaybackStateChanged(PlaybackState),
-    /// The same track restarted (Prev button, or a looping track): re-show the
-    /// track pill briefly instead of deduplicating it away.
-    TrackRestarted(TrackInfo),
 }
 
 #[cfg(test)]

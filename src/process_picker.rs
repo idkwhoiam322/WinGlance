@@ -3,26 +3,27 @@ use log::warn;
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    BDR_SUNKENOUTER, BF_RECT, BeginPaint, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect, InvalidateRect,
+    PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWLP_USERDATA,
     GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IDC_ARROW,
-    IsIconic, IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETITEMDATA, LB_SETITEMDATA, LB_SETITEMHEIGHT,
-    LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LoadCursorW, PostMessageW, RegisterClassExW, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_STYLE,
-    WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT,
-    WM_SETFONT, WNDCLASS_STYLES, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    IsIconic, IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETCURSEL, LB_GETITEMDATA, LB_GETITEMRECT, LB_SETITEMDATA,
+    LB_SETITEMHEIGHT, LBN_DBLCLK, LBN_SELCHANGE, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LoadCursorW, PostMessageW,
+    RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETFONT, WNDCLASS_STYLES, WNDCLASSEXW, WS_BORDER, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -35,6 +36,8 @@ const WS_EX_TOOLWINDOW_STYLE: i32 = 0x80;
 const CLOSE_BTN_SIZE: i32 = 20;
 const BST_CHECKED: usize = 1;
 const BST_UNCHECKED: usize = 0;
+/// Checkbox square size in pixels.
+const CB_SIZE: i32 = 13;
 
 pub(crate) const PICKER_RESULT_MSG: u32 = WM_APP + 7;
 
@@ -473,6 +476,70 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             let _ = unsafe { EndPaint(hwnd, &ps) };
             LRESULT(0)
         }
+        WM_DRAWITEM => {
+            let draw_ptr = lparam.0 as *const DRAWITEMSTRUCT;
+            if draw_ptr.is_null() {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
+            let draw = unsafe { *draw_ptr };
+            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+            if state_ptr.is_null() || draw.itemID as usize >= unsafe { (*state_ptr).list.len() } {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
+            let state = unsafe { &*state_ptr };
+            let entry = &state.list[draw.itemID as usize];
+            unsafe {
+                // Background: highlight selected items.
+                let bg = COLORREF(if draw.itemState.0 & ODS_SELECTED.0 != 0 {
+                    0x003D3D3D
+                } else {
+                    0x001E1E1E
+                });
+                FillRect(draw.hDC, &draw.rcItem, CreateSolidBrush(bg));
+
+                // Checkbox square on the left.
+                let mid = (draw.rcItem.top + draw.rcItem.bottom) / 2;
+                let mut cb = RECT {
+                    left: draw.rcItem.left + 6,
+                    top: mid - CB_SIZE / 2,
+                    right: draw.rcItem.left + 6 + CB_SIZE,
+                    bottom: mid - CB_SIZE / 2 + CB_SIZE,
+                };
+                let _ = DrawEdge(draw.hDC, &mut cb, BDR_SUNKENOUTER, BF_RECT);
+                if draw.itemData == BST_CHECKED {
+                    SetTextColor(draw.hDC, COLORREF(0x00F0F0F0));
+                    SetBkMode(draw.hDC, TRANSPARENT);
+                    let tick = wide("\u{2713}");
+                    DrawTextW(
+                        draw.hDC,
+                        &mut tick.clone(),
+                        &mut RECT {
+                            left: cb.left,
+                            top: cb.top,
+                            right: cb.right,
+                            bottom: cb.bottom,
+                        },
+                        DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX,
+                    );
+                }
+
+                // Entry text.
+                SetTextColor(draw.hDC, COLORREF(0x00F0F0F0));
+                SetBkMode(draw.hDC, TRANSPARENT);
+                DrawTextW(
+                    draw.hDC,
+                    &mut wide(&entry.display_name).clone(),
+                    &mut RECT {
+                        left: draw.rcItem.left + 24,
+                        right: draw.rcItem.right - 4,
+                        top: draw.rcItem.top,
+                        bottom: draw.rcItem.bottom,
+                    },
+                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+            }
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
             let x = (lparam.0 & 0xFFFF) as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
@@ -518,12 +585,46 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_COMMAND => {
-            let notif = (wparam.0 as u32) >> 16;
-            if notif == 0xFFFF {
-                // LBN_DBLCLK
-                post_result(hwnd, false);
-                let _ = unsafe { DestroyWindow(hwnd) };
-                return LRESULT(0);
+            let notif = (wparam.0 >> 16) as u32;
+            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+            match notif {
+                LBN_DBLCLK => {
+                    post_result(hwnd, false);
+                    let _ = unsafe { DestroyWindow(hwnd) };
+                    return LRESULT(0);
+                }
+                LBN_SELCHANGE => {
+                    // Toggle the checkbox of the clicked item.
+                    let Some(state) = (unsafe { state_ptr.as_ref() }) else {
+                        return DefWindowProcW(hwnd, message, wparam, lparam);
+                    };
+                    let lb = state.listbox;
+                    let idx = unsafe { SendMessageW(lb, LB_GETCURSEL, WPARAM(0), LPARAM(0)) };
+                    if idx.0 >= 0 {
+                        let i = idx.0 as usize;
+                        let data = unsafe { SendMessageW(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
+                        let toggled = if data.0 as usize == BST_CHECKED {
+                            BST_UNCHECKED
+                        } else {
+                            BST_CHECKED
+                        };
+                        let _ = unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
+                        // Repaint just this item so the tick flips immediately.
+                        let mut item_rect = RECT::default();
+                        let _ = unsafe {
+                            SendMessageW(
+                                lb,
+                                LB_GETITEMRECT,
+                                WPARAM(i),
+                                LPARAM(&mut item_rect as *mut RECT as isize),
+                            )
+                        };
+                        unsafe {
+                            let _ = InvalidateRect(lb, Some(&item_rect), false);
+                        }
+                    }
+                }
+                _ => {}
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }

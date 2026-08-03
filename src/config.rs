@@ -13,9 +13,6 @@ pub struct Config {
 #[serde(default)]
 pub struct OverlayConfig {
     pub duration_ms: u64,
-    /// How long the pill stays for a track restart (repeat/Prev). Bounded at
-    /// 2s so a restart is a brief nudge, not a full notification.
-    pub restart_duration_ms: u64,
     pub animation_ms: u64,
     pub vertical: VerticalPosition,
     pub horizontal: HorizontalPosition,
@@ -77,7 +74,6 @@ impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             duration_ms: 3000,
-            restart_duration_ms: 2000,
             animation_ms: 200,
             vertical: VerticalPosition::Top,
             horizontal: HorizontalPosition::Center,
@@ -163,7 +159,6 @@ impl Config {
 
     fn normalize(&mut self) {
         self.overlay.duration_ms = self.overlay.duration_ms.clamp(500, 60_000);
-        self.overlay.restart_duration_ms = self.overlay.restart_duration_ms.clamp(500, 2000);
         self.overlay.animation_ms = self.overlay.animation_ms.clamp(100, 500);
         self.overlay.max_width = self.overlay.max_width.clamp(180, 800);
         self.overlay.margin = self.overlay.margin.clamp(0, 500);

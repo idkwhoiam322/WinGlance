@@ -65,42 +65,53 @@ SystemMediaTransportControls            create_window x2 (pill + main)
 SMTC surfaces one "current session" and a list of sessions. The worker
 subscribes to **every** open session's `MediaPropertiesChanged` and
 `PlaybackInfoChanged` (tracked in a `HashMap`), so changes in background
-sessions are never missed — the native media widget does the same, we just
-display one session at a time. It also listens to both `SessionsChanged`
-(creation/removal) and `CurrentSessionChanged` (Windows' internal "current"
-pointer moving), re-syncing subscriptions and re-resolving on either event.
+sessions are never missed — the native media widget does the same. There is no
+"current session" concept on the worker side: each `(source_app, session_key)`
+is tracked independently with its own `LogicalState` (title, artist, album,
+artwork presence, source, duration, track numbers, genre, playback state).
 
-The session to *display* resolves with this priority (see `smtc.rs`):
+A fresh read is merged into the stored `LogicalState` and diffed against it:
 
-1. The session from `GetCurrentSession()` — the pointer Windows itself
-   maintains and the native widget follows; consulted fresh on every resolve.
-2. A hinted session that is not `Stopped` (the session that fired the event).
-3. The most recently observed session that was `Playing` (keeps the tracked
-   session stable while it is active).
-4. The first `Playing` session from `GetSessions()`.
+- Fields that actually changed are emitted (`TrackChanged` when a displayed
+  content field differs, `PlaybackStateChanged` when playback differs).
+- `Stopped` is a normal diffable `playback` value — it produces a pill like any
+  other real transition. `Closed` does not go through the diff path at all: it
+  triggers immediate eviction of the `(source_app, session_key)` entry, and a
+  session that disappears from the session list is evicted at the next re-sync.
+- Empty fields inherit from the stored state while the title/artist identity is
+  unchanged (SMTC fills metadata progressively); a new identity starts fresh.
+- Artwork presence is diffed separately: a late-arriving cover re-emits the
+  track (the pill refreshes in place), a disappearing one is stored silently —
+  absence is already shown as a placeholder.
+- Events for one session arriving within the debounce window are coalesced:
+  the key is marked dirty and read exactly once per window.
 
-When the tracked session reports `Stopped`, the worker immediately re-resolves
-to hand off to whatever is still playing, instead of waiting for the 2-second
-safety-net poll (which remains as a backstop only).
-
-Documented limitation: SMTC exposes no portable "last active" timestamp, so
-fallback 3 is a best-effort heuristic.
+Two sources with identical content both notify independently; no cross-source
+matching or suppression happens.
 
 ## Event pipeline and debounce
 
-`MediaPropertiesChanged` fires frequently, sometimes multiple times per
-second for a single visual change. The worker:
+`MediaPropertiesChanged` / `PlaybackInfoChanged` fire frequently, sometimes
+multiple times per second for a single visual change. The worker:
 
-1. Reads track title, artist, album, source app, and artwork thumbnail.
-2. Computes a fingerprint (title + artist + album) to drop duplicate events.
-3. Stages the event with a debounce timer (150–250 ms, clamped) so a burst of
-   changes coalesces into one overlay show.
-4. Track events are remembered on the overlay side; a later playback-state
-   event shows the last track with a light animation instead of a full
-   expand.
+1. Marks the session key dirty and schedules a flush 150–250 ms later (clamped
+   by config), so a burst of events for one session collapses into one read.
+2. At the flush, reads each dirty key once, merges the read into the stored
+   state, and emits one event per changed field.
+3. A `SessionsChanged`/`CurrentSessionChanged` burst is debounced the same
+   way: one subscription re-sync per burst.
+4. A 2-second periodic safety net re-syncs subscriptions and re-reads every
+   subscribed session (metadata only, no artwork) so a missed event still
+   surfaces; the same read reports what is already playing at startup.
 
-A Stopped baseline on startup is recorded silently; the overlay only shows a
-track when playback is not Stopped.
+The overlay holds a small pending queue (cap 4): while a pill is on screen the
+next notification waits for the current one to collapse, so simultaneous
+events from different sources show one after another instead of clobbering
+each other. At the cap, the oldest *unshown* queued event is dropped in favor
+of the incoming one; the pill on screen is never pulled.
+
+A Stopped session keeps its stored content, so a state pill after a stop still
+shows the last track.
 
 ## Rendering pipeline
 

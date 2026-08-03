@@ -637,7 +637,6 @@ impl MainWindowState {
         for event in batch {
             match event {
                 MediaEvent::TrackChanged(track) => self.add_track(track),
-                MediaEvent::TrackRestarted(track) => self.add_track(track),
                 MediaEvent::PlaybackStateChanged(state) => {
                     if let Some(current) = &mut self.current {
                         current.state = state;

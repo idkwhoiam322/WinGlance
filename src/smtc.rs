@@ -17,8 +17,8 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 use windows::core::Interface;
 
 enum Signal {
-    /// Fired by SessionsChanged or CurrentSessionChanged: re-sync subscriptions
-    /// and re-resolve the current session against GetCurrentSession().
+    /// Fired by SessionsChanged or CurrentSessionChanged: re-sync the
+    /// subscription map at the next flush (one re-sync per burst).
     Sessions,
     MediaProperties(GlobalSystemMediaTransportControlsSession),
     PlaybackInfo(GlobalSystemMediaTransportControlsSession),
@@ -30,6 +30,33 @@ struct SessionSubscription {
     playback_token: EventRegistrationToken,
 }
 
+/// The last known displayed state of one (source, session). Every field is a
+/// field the pill can show; a fresh read is merged into this, diffed against
+/// it, and only the fields that actually changed are emitted. There is no
+/// "current session": every subscribed session is tracked independently, so
+/// simultaneous sources never displace each other.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct LogicalState {
+    title: String,
+    artist: String,
+    album: String,
+    has_artwork: bool,
+    source_app: String,
+    duration_secs: Option<u64>,
+    track_number: Option<u32>,
+    track_count: Option<u32>,
+    genre: Option<String>,
+    playback: Option<PlaybackState>,
+}
+
+/// Rolling window, threshold and cool-down for the per-source session-churn
+/// guard. A source creating more than `CHURN_THRESHOLD` new sessions within
+/// `CHURN_WINDOW_MS` (a real client was observed doing ~20 in 8.5s) is
+/// excluded from tracking for the cool-down period.
+const CHURN_WINDOW_MS: u64 = 2000;
+const CHURN_THRESHOLD: usize = 5;
+const CHURN_COOLDOWN_MS: u64 = 30_000;
+
 struct ListenerState {
     manager: GlobalSystemMediaTransportControlsSessionManager,
     config: Arc<RwLock<Config>>,
@@ -37,83 +64,28 @@ struct ListenerState {
     signal_tx: Sender<Signal>,
     /// Every open session's event subscriptions, keyed by session pointer.
     subscriptions: HashMap<usize, SessionSubscription>,
-    current_key: Option<usize>,
-    recent_playing: Option<GlobalSystemMediaTransportControlsSession>,
-    pending_track: Option<(usize, TrackInfo)>,
+    /// Last known displayed state per session key.
+    states: HashMap<usize, LogicalState>,
+    /// Keys with unprocessed property events in the current tick. The flush
+    /// reads each key once, so a burst of events for one session coalesces
+    /// into one read + one diff + one emit per debounce window.
+    dirty: HashSet<usize>,
+    /// A SessionsChanged burst is pending its debounce window; the next flush
+    /// performs the re-sync once per burst instead of once per event.
+    sessions_pending: bool,
+    /// Debounce deadline for pending dirty keys and session bursts.
     pending_deadline: Option<Instant>,
-    track_pending_since: Option<Instant>,
-    last_content_fingerprint: Option<TrackFingerprint>,
-    /// When the tracked session last reported Stopped. A handoff to a new
-    /// session with identical content shortly after is the same song under a
-    /// new session object (browsers re-create their session per track/tab),
-    /// not a change.
-    last_stop_at: Option<Instant>,
+    /// Last time the periodic safety-net poll ran.
     last_session_check: Instant,
-    /// Whether the tracked session is currently Playing. Used to decide when a
-    /// new source may take over the pill (only when nothing we track is active).
-    current_playing: bool,
-    /// Album title by (title, artist), so a track read that omits the album can
-    /// still carry it. Insert replaces — a newer album always wins over a stale
-    /// cached one.
-    album_cache: HashMap<(String, String), String>,
-    /// Artwork bytes by (title, artist), so a read that omits the thumbnail can
-    /// still carry it. Insert replaces — a new cover for the same item replaces
-    /// the old cached one.
-    artwork_cache: HashMap<(String, String), Vec<u8>>,
-    /// Session keys that have ever produced readable track metadata (non-empty
-    /// title). A Paused session is only current-eligible when it has real
-    /// content; placeholder sessions (e.g. a client churning empty sessions)
-    /// must never displace an actively playing one.
-    known_content: HashSet<usize>,
-    /// Session keys recently removed from the subscription map (churned out),
-    /// with the removal time, so a re-added key is recognized and re-read.
-    recently_removed: HashMap<usize, Instant>,
     /// Session-creation counts per source app within a rolling window, for the
     /// churn cool-down.
     churn: HashMap<String, VecDeque<Instant>>,
-    /// Source apps currently on cool-down (their sessions are not
-    /// current-eligible) until the stored time.
+    /// Source apps currently on cool-down (their sessions are not tracked)
+    /// until the stored time.
     churn_cooldown: HashMap<String, Instant>,
-    /// A SessionsChanged burst is pending its debounce window; the next flush
-    /// performs the re-sync + re-resolve once per burst instead of per event.
-    sessions_pending: bool,
-    /// Last observed timeline position per tracked session, for restart
-    /// detection (a position collapse to ~0 on unchanged content).
-    last_position: Option<(usize, Duration)>,
     /// Heartbeat touched each loop iteration so the supervisor can detect a
     /// stall and restart the listener.
     heartbeat: Arc<Mutex<Instant>>,
-}
-
-/// Window after the tracked session stops in which a handoff to a new session
-/// with identical title/artist is treated as the same content continuing under
-/// a new session object instead of a change. Browsers re-create their session
-/// within this window in practice; a real replay of the same song later is not
-/// suppressed.
-const HANDOFF_SUPPRESS_MS: u64 = 2000;
-/// Rolling window, threshold and cool-down for the per-source session-churn
-/// guard. A source creating more than `CHURN_THRESHOLD` new sessions within
-/// `CHURN_WINDOW_MS` (a real client was observed doing ~20 in 8.5s) is
-/// excluded from current-session resolution for the cool-down period.
-const CHURN_WINDOW_MS: u64 = 2000;
-const CHURN_THRESHOLD: usize = 5;
-const CHURN_COOLDOWN_MS: u64 = 30_000;
-/// How long a removed session key stays "recently removed", so re-adding it
-/// triggers a proactive metadata re-read.
-const RESUBSCRIBE_WINDOW_MS: u64 = 10_000;
-/// Upper bound for the album/artwork caches; beyond it they are cleared (the
-/// caches are a convenience, not critical state).
-const CACHE_CAP: usize = 16;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TrackFingerprint {
-    title: String,
-    artist: String,
-    album: String,
-    /// Whether artwork was present. Artwork often arrives in a later event than
-    /// title/artist; including its presence means that late artwork re-emits the
-    /// track (the UI updates it in place) instead of being deduplicated away.
-    has_artwork: bool,
 }
 
 pub struct SmtcListener {
@@ -153,7 +125,9 @@ impl SmtcListener {
         let mut state = ListenerState::new(manager, self.config, self.output, signal_tx, self.heartbeat);
 
         state.sync_subscriptions();
-        state.refresh_current_session(None, true, false)?;
+        // Initial read: report what is already playing so the pill does not
+        // wait for the first event.
+        state.poll_sessions();
         state.event_loop(signal_rx)?;
 
         let _ = state.manager.RemoveSessionsChanged(sessions_token);
@@ -177,23 +151,13 @@ impl ListenerState {
             output,
             signal_tx,
             subscriptions: HashMap::new(),
-            current_key: None,
-            recent_playing: None,
-            pending_track: None,
+            states: HashMap::new(),
+            dirty: HashSet::new(),
+            sessions_pending: false,
             pending_deadline: None,
-            track_pending_since: None,
-            last_content_fingerprint: None,
-            last_stop_at: None,
             last_session_check: Instant::now(),
-            current_playing: false,
-            album_cache: HashMap::new(),
-            artwork_cache: HashMap::new(),
-            known_content: HashSet::new(),
-            recently_removed: HashMap::new(),
             churn: HashMap::new(),
             churn_cooldown: HashMap::new(),
-            sessions_pending: false,
-            last_position: None,
             heartbeat,
         }
     }
@@ -205,7 +169,7 @@ impl ListenerState {
             let timeout = self
                 .pending_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or(Duration::from_secs(24 * 60 * 60))
+                .unwrap_or(Duration::from_secs(5))
                 // Wake at least every 5s so the heartbeat stays fresh even
                 // when nothing is pending.
                 .min(Duration::from_secs(5));
@@ -213,16 +177,15 @@ impl ListenerState {
             match signal_rx.recv_timeout(timeout) {
                 Ok(signal) => self.handle_signal(signal)?,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    self.flush_pending();
-                    // Periodically re-check sessions to catch missed changes. emit_initial=true
-                    // so a newly-detected current session reports its track+state immediately.
-                    // Always re-sync subscriptions first so sessions created outside a
-                    // SessionsChanged burst (e.g. a browser tab that just started a video)
-                    // are discovered and subscribed before the resolve.
+                    self.flush();
+                    // Periodic safety net: re-sync (a session can appear
+                    // without a SessionsChanged event) and re-read every
+                    // subscribed session (metadata only, no artwork) so a
+                    // missed event still surfaces.
                     if self.last_session_check.elapsed() >= session_check_interval {
                         self.last_session_check = Instant::now();
                         self.sync_subscriptions();
-                        let _ = self.refresh_current_session(None, true, false);
+                        self.poll_sessions();
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -236,265 +199,219 @@ impl ListenerState {
             Signal::Sessions => {
                 // A session storm (one app recreating its SMTC session many
                 // times a second) fires these in bursts. Debounce: collapse a
-                // burst into one re-sync + re-resolve at the next flush.
+                // burst into one re-sync at the next flush.
                 if self.sessions_pending {
                     debug!("SMTC SessionsChanged/CurrentSessionChanged (coalesced)");
                 } else {
                     self.sessions_pending = true;
                     debug!("SMTC SessionsChanged/CurrentSessionChanged (debounced)");
                 }
-                let deadline = Instant::now() + debounce_duration(&self.config.read().unwrap());
-                self.pending_deadline = Some(self.pending_deadline.map_or(deadline, |d| d.min(deadline)));
+                self.schedule_flush();
             }
-            Signal::MediaProperties(session) => {
-                // emit_initial=true: when this event changes the current session,
-                // immediately report the new session's track+state instead of
-                // showing stale info from the previous app.
-                self.refresh_current_session(Some(&session), true, true)?;
-                if self.current_key == Some(session_key(&session))
-                    && read_playback_state(&session)? != Some(PlaybackState::Stopped)
-                    && let Ok(mut track) = read_track_info(&session)
-                {
-                    self.apply_cache(&mut track);
-                    let key = session_key(&session);
-                    self.remember_content(key, &track);
-                    // SMTC fills metadata progressively (title -> artist -> album ->
-                    // artwork). If a read for the same song arrives, merge the richer
-                    // fields into the pending track instead of replacing it, so the
-                    // notification is shown once, complete.
-                    let is_merge = self
-                        .pending_track
-                        .as_ref()
-                        .is_some_and(|(k, p)| *k == key && p.title == track.title && p.artist == track.artist);
-                    if is_merge {
-                        if let Some((_, p)) = self.pending_track.as_mut() {
-                            if !track.album.trim().is_empty() {
-                                p.album = track.album;
-                            }
-                            if track.artwork.is_some() {
-                                p.artwork = track.artwork;
-                            }
-                            if !track.source_app.trim().is_empty() && p.source_app.trim().is_empty() {
-                                p.source_app = track.source_app;
-                            }
-                        }
-                    } else {
-                        self.pending_track = Some((key, track));
-                    }
-                    // A track change is imminent: the new track notification
-                    // will carry the new state. Flush pending track.
-                    self.schedule_flush();
-                }
-            }
-            Signal::PlaybackInfo(session) => {
+            Signal::MediaProperties(session) | Signal::PlaybackInfo(session) => {
                 let key = session_key(&session);
-                if self.current_key == Some(key) {
-                    let source = read_source_app(&session);
-                    if let Some(state) = read_playback_state(&session)? {
-                        if state == PlaybackState::Stopped {
-                            // The tracked session stopped: hand off to whatever else
-                            // is playing right now instead of waiting for the poll.
-                            self.last_stop_at = Some(Instant::now());
-                            let before = self.current_key;
-                            self.refresh_current_session(None, true, false)?;
-                            if self.current_key == before {
-                                // Nothing else took over — report the stop.
-                                self.current_playing = false;
-                                self.emit_playback_state(state, source.clone());
-                            }
-                            return Ok(());
-                        }
-                        if state == PlaybackState::Playing {
-                            self.recent_playing = Some(session.clone());
-                        }
-                        self.current_playing = state == PlaybackState::Playing;
-                        self.detect_restart(&session, key);
-                        self.emit_playback_state(state, source);
+                if !self.subscriptions.contains_key(&key) {
+                    // An event for a session we are not tracking (it appeared
+                    // between syncs): subscribe now so its state is tracked.
+                    if let Err(error) = self.ensure_subscribed(&session) {
+                        debug!("subscribe failed for session {key}: {error:#}");
+                        return Ok(());
                     }
                 }
-                // Non-current session: ignore entirely. We track only the
-                // current session.
+                // Coalesce per key: a burst of MediaProperties/PlaybackInfo
+                // events for the same session is resolved once at the flush.
+                self.dirty.insert(key);
+                self.schedule_flush();
             }
         }
         Ok(())
     }
 
-    /// Detects a restart of the current track (Prev button, or a looping
-    /// track): the timeline position collapses to ~0 while the content is
-    /// unchanged. Re-shows the pill briefly via TrackRestarted instead of
-    /// deduplicating the restart away.
-    fn detect_restart(&mut self, session: &GlobalSystemMediaTransportControlsSession, key: usize) {
-        let position = read_position(session);
-        let restarted = self.last_position.as_ref().is_some_and(|(last_key, last_pos)| {
-            *last_key == key
-                && *last_pos > Duration::from_secs(3)
-                && position.is_some_and(|p| p < Duration::from_secs(1))
-        });
-        self.last_position = position.map(|p| (key, p));
-        if !restarted {
-            return;
+    /// Resolves everything pending at the deadline: a debounced session burst
+    /// (one re-sync) and each dirty key (one read + one diff + one emit).
+    fn flush(&mut self) {
+        self.pending_deadline = None;
+        if self.sessions_pending {
+            self.sessions_pending = false;
+            self.sync_subscriptions();
         }
-        // A new track also starts at position ~0; only treat this as a restart
-        // when we are still showing this exact content.
-        if let Ok(mut track) = read_track_info(session) {
-            let same_content = self
-                .last_content_fingerprint
-                .as_ref()
-                .is_some_and(|last| track.title == last.title && track.artist == last.artist);
-            if same_content {
-                self.apply_cache(&mut track);
-                debug!(
-                    "track restart detected | title={:?} | artist={:?}",
-                    track.title, track.artist
-                );
-                let _ = self.output.send(MediaEvent::TrackRestarted(track));
+        if !self.dirty.is_empty() {
+            let keys: Vec<usize> = self.dirty.drain().collect();
+            for key in keys {
+                // Clone the COM interface out so the map borrow ends before the
+                // refresh (which can mutate subscriptions via eviction).
+                let session = self.subscriptions.get(&key).map(|s| s.session.clone());
+                if let Some(session) = session
+                    && let Err(error) = self.refresh_session(&session, true)
+                {
+                    debug!("refresh failed for session {key}: {error:#}");
+                }
             }
         }
     }
 
-    /// Emits a playback state change immediately, with no hold or deduplication
-    /// — every state change is delivered so the history never misses one.
-    fn emit_playback_state(&mut self, state: PlaybackState, source: String) {
-        info!("playback state changed | state={state:?} | source={source}");
-        let _ = self.output.send(MediaEvent::PlaybackStateChanged(state));
-    }
-
-    /// Updates the album/artwork caches from a fresh read (replacing any older
-    /// entries for the same item) and back-fills any missing fields from cache,
-    /// so a notification can carry album/cover even when the event itself omits
-    /// them.
-    fn apply_cache(&mut self, track: &mut TrackInfo) {
-        let key = (track.title.clone(), track.artist.clone());
-        if !track.album.trim().is_empty() {
-            self.album_cache.insert(key.clone(), track.album.clone());
-        } else if let Some(album) = self.album_cache.get(&key) {
-            track.album = album.clone();
-        }
-        if track.artwork.is_some() {
-            if let Some(bytes) = &track.artwork {
-                self.artwork_cache.insert(key.clone(), bytes.clone());
-            }
-        } else if let Some(bytes) = self.artwork_cache.get(&key) {
-            track.artwork = Some(bytes.clone());
-        }
-        if self.album_cache.len() > CACHE_CAP {
-            self.album_cache.clear();
-        }
-        if self.artwork_cache.len() > CACHE_CAP {
-            self.artwork_cache.clear();
-        }
-    }
-
-    /// Marks a session as having produced real content, making it eligible as
-    /// current even while paused.
-    fn remember_content(&mut self, key: usize, track: &TrackInfo) {
-        if !track.title.trim().is_empty() {
-            self.known_content.insert(key);
-        }
-    }
-
-    /// True when a session that was just resolved carries the content we are
-    /// already showing, right after the previous session stopped. Browsers
-    /// re-create their SMTC session per track/tab, so this is the same song
-    /// continuing under a new session object — not a change to report.
-    fn handoff_is_same_content(&self, track: &TrackInfo) -> bool {
-        let Some(last) = &self.last_content_fingerprint else {
-            return false;
-        };
-        let Some(stopped_at) = self.last_stop_at else {
-            return false;
-        };
-        if stopped_at.elapsed() > Duration::from_millis(HANDOFF_SUPPRESS_MS) {
-            return false;
-        }
-        is_same_content(track, last)
-    }
-
-    fn refresh_current_session(
+    /// Reads a session's current state, merges it into the stored logical
+    /// state, and emits an event for every field that actually changed.
+    /// `read_artwork` is false for the periodic safety-net poll, which must
+    /// not re-read (or clear) artwork: it only catches missed content and
+    /// playback changes.
+    fn refresh_session(
         &mut self,
-        hint: Option<&GlobalSystemMediaTransportControlsSession>,
-        emit_initial: bool,
-        prefer_hint: bool,
+        session: &GlobalSystemMediaTransportControlsSession,
+        read_artwork: bool,
     ) -> Result<()> {
-        let resolved = self.resolve_current_session(hint, prefer_hint);
-        let new_key = resolved.as_ref().map(session_key);
-        if new_key == self.current_key {
+        let key = session_key(session);
+        if !self.session_source_allowed(session) {
             return Ok(());
         }
+        let status = session.GetPlaybackInfo()?.PlaybackStatus()?;
+        if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed {
+            // Closed does not go through the diff/emit path: it usually fires
+            // as the app quits, right after a Stopped/Paused already told the
+            // user what happened, so the entry is evicted immediately and
+            // nothing is emitted.
+            debug!("SMTC session closed | key={key} | source={}", read_source_app(session));
+            self.evict(key);
+            return Ok(());
+        }
+        let playback = match status {
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing => Some(PlaybackState::Playing),
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused => Some(PlaybackState::Paused),
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped => Some(PlaybackState::Stopped),
+            // Opened/Changing and unknown statuses are transitional: ignored.
+            _ => None,
+        };
+        let prev = self.states.get(&key).cloned().unwrap_or_default();
+        let mut next = prev.clone();
+        let mut events: Vec<MediaEvent> = Vec::new();
 
-        self.current_key = new_key;
-        self.current_playing = false;
-        if let Some(session) = resolved {
-            self.ensure_subscribed(&session)?;
-            let playback = read_playback_state(&session)?;
-            self.current_playing = matches!(playback, Some(PlaybackState::Playing));
-            if emit_initial {
-                if playback != Some(PlaybackState::Stopped) {
-                    match read_track_info(&session) {
-                        Ok(mut track) => {
-                            self.apply_cache(&mut track);
-                            self.remember_content(session_key(&session), &track);
-                            // Same-content handoff: adopt the re-created session
-                            // silently (the pill keeps tracking it) and let its
-                            // property events emit only when the content differs.
-                            if self.handoff_is_same_content(&track) {
-                                if playback == Some(PlaybackState::Playing) {
-                                    self.recent_playing = Some(session.clone());
-                                }
-                                debug!(
-                                    "session handoff, content unchanged | source={}",
-                                    read_source_app(&session)
-                                );
-                                return Ok(());
-                            }
-                            self.pending_track = Some((session_key(&session), track));
-                            self.schedule_flush();
-                        }
-                        Err(_) => {
-                            // The new session's metadata is not readable yet
-                            // (transitional state). Announce the source app so
-                            // the pill never shows the previous session's track
-                            // for this adoption; the real metadata replaces it
-                            // when MediaProperties arrives.
-                            let key = session_key(&session);
-                            let source = read_source_app(&session);
-                            self.pending_track = Some((
-                                key,
-                                TrackInfo {
-                                    title: source.clone(),
-                                    source_app: source,
-                                    ..TrackInfo::default()
-                                },
-                            ));
-                            self.schedule_flush();
-                        }
+        // Playback is a normal diffable field: Stopped goes through the same
+        // path as Playing/Paused and can produce a pill like any other real
+        // transition. Transitional statuses leave the stored state untouched.
+        if playback != prev.playback
+            && let Some(state) = playback
+        {
+            next.playback = Some(state);
+            info!(
+                "playback state changed | state={state:?} | source={}",
+                read_source_app(session)
+            );
+            events.push(MediaEvent::PlaybackStateChanged(state));
+        }
+
+        // Content is only diffed while the session is not stopped; a stopped
+        // session keeps its stored content (the pill shows the last track).
+        if status != GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped {
+            match read_track_info(session, read_artwork) {
+                Ok(read) => {
+                    let merged = merge_track(&prev, &read, read_artwork);
+                    let (emit, artwork_lost) = emit_track(&prev, &merged, read_artwork);
+                    if emit {
+                        let label = track_label(&merged);
+                        info!("track changed | {label}");
+                        events.push(MediaEvent::TrackChanged(merged.clone()));
+                    } else if artwork_lost {
+                        // Absence is already shown as a placeholder: store the
+                        // loss (a later reappearance re-emits) without
+                        // flashing the same track again.
+                        let label = track_label(&merged);
+                        debug!("track emit skipped | reason=artwork-removed | {label}");
+                    } else if read_artwork {
+                        // Event-driven reads only: the 2-second poll re-reads
+                        // every session and must not log a duplicate per pass.
+                        let label = track_label(&merged);
+                        debug!("track emit skipped | reason=duplicate | {label}");
                     }
+                    next.title = merged.title;
+                    next.artist = merged.artist;
+                    next.album = merged.album;
+                    next.has_artwork = if read_artwork {
+                        merged.artwork.is_some()
+                    } else {
+                        prev.has_artwork
+                    };
+                    next.source_app = merged.source_app;
+                    next.duration_secs = merged.duration_secs;
+                    next.track_number = merged.track_number;
+                    next.track_count = merged.track_count;
+                    next.genre = merged.genre;
                 }
-                if let Some(state) = playback {
-                    if state == PlaybackState::Playing {
-                        self.recent_playing = Some(session.clone());
-                    }
-                    self.current_playing = state == PlaybackState::Playing;
-                    self.emit_playback_state(state, read_source_app(&session));
-                }
+                Err(error) => debug!("track read failed | key={key} | {error:#}"),
             }
+        }
+
+        // A TrackChanged already surfaces the new content in the pill. A
+        // simultaneous PlaybackStateChanged (typically "Playing" reported by
+        // a freshly-adopted session) is redundant — suppressing it avoids a
+        // "Playing" flicker immediately after every fresh track pill.
+        if events.iter().any(|e| matches!(e, MediaEvent::TrackChanged(_))) {
+            events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_)));
+        }
+
+        self.states.insert(key, next);
+        for event in events {
+            let _ = self.output.send(event);
         }
         Ok(())
     }
 
-    /// Whether a session may become (or keep) current: actively playing, or
-    /// paused but with real content this run has seen. A placeholder session
-    /// that is perpetually Paused with no metadata (a client churning empty
-    /// sessions) is never eligible, regardless of what GetCurrentSession()
-    /// reports. Disallowed and cool-down sources are excluded outright.
-    fn session_is_eligible(&self, session: &GlobalSystemMediaTransportControlsSession) -> bool {
-        if !self.session_source_allowed(session) {
-            return false;
+    /// Re-syncs the subscription map with the current session list: subscribes
+    /// to every open session from an allowed source, drops subscriptions and
+    /// stored state for sessions that disappeared, and accounts per-source
+    /// session churn for the cool-down.
+    fn sync_subscriptions(&mut self) {
+        let Ok(sessions) = self.manager.GetSessions() else {
+            return;
+        };
+        let sessions: Vec<_> = sessions.into_iter().collect();
+        let before: HashSet<usize> = self.subscriptions.keys().copied().collect();
+        for session in &sessions {
+            let key = session_key(session);
+            let allowed = self.session_source_allowed(session);
+            debug!(
+                "SMTC session {} | key={key} | source={} | allowed_sources={:?}",
+                if allowed { "accepted" } else { "rejected" },
+                read_source_app(session),
+                self.config.read().unwrap().behavior.allowed_sources
+            );
+            if !allowed {
+                continue;
+            }
+            if !before.contains(&key) {
+                self.record_churn(&read_source_app(session));
+            }
+            if let Err(error) = self.ensure_subscribed(session) {
+                debug!("subscribe failed for a session: {error:#}");
+            }
         }
-        match read_playback_state(session) {
-            Ok(Some(PlaybackState::Playing)) => true,
-            Ok(Some(PlaybackState::Paused)) => self.known_content.contains(&session_key(session)),
-            _ => false,
+        let alive: HashSet<usize> = sessions.iter().map(session_key).collect();
+        let stale: Vec<usize> = self
+            .subscriptions
+            .keys()
+            .filter(|k| !alive.contains(k))
+            .copied()
+            .collect();
+        for key in stale {
+            debug!("SMTC session disappeared | key={key}");
+            self.evict(key);
+        }
+        self.churn_cooldown.retain(|_, until| *until > Instant::now());
+    }
+
+    /// Re-reads every subscribed session (metadata only, no artwork) and diffs
+    /// it against the stored state. The 2-second safety net; also used for the
+    /// startup read so the pill reports what is already playing.
+    fn poll_sessions(&mut self) {
+        let keys: Vec<usize> = self.subscriptions.keys().copied().collect();
+        for key in keys {
+            // Clone the COM interface out so the map borrow ends before the
+            // refresh (which can mutate subscriptions via eviction).
+            let session = self.subscriptions.get(&key).map(|s| s.session.clone());
+            if let Some(session) = session
+                && let Err(error) = self.refresh_session(&session, false)
+            {
+                debug!("poll refresh failed for session {key}: {error:#}");
+            }
         }
     }
 
@@ -511,7 +428,6 @@ impl ListenerState {
             .unwrap_or_default();
         let label = source_app_label(&aumid);
         if self.source_on_cooldown(&label) {
-            debug!("SMTC session rejected (cooldown) | aumid={} | label={}", aumid, label);
             return false;
         }
         let allowed = self.config.read().unwrap().behavior.allowed_sources.clone();
@@ -520,18 +436,10 @@ impl ListenerState {
         }
         let naumid = normalize_for_match(&aumid);
         let nlabel = normalize_for_match(&label);
-        let result = allowed.iter().any(|pattern| {
+        allowed.iter().any(|pattern| {
             let np = normalize_for_match(pattern);
             naumid.contains(&np) || nlabel.contains(&np)
-        });
-        debug!(
-            "SMTC session {} | aumid={} | label={} | allowed_sources={:?}",
-            if result { "accepted" } else { "rejected" },
-            aumid,
-            label,
-            allowed
-        );
-        result
+        })
     }
 
     /// True while a source app is on the churn cool-down.
@@ -558,70 +466,9 @@ impl ListenerState {
             self.churn_cooldown
                 .insert(source.to_string(), now + Duration::from_millis(CHURN_COOLDOWN_MS));
             warn!(
-                "source {source} is churning sessions ({CHURN_THRESHOLD}+ new sessions in {CHURN_WINDOW_MS}ms); excluding it from current-session resolution for {CHURN_COOLDOWN_MS}ms"
+                "source {source} is churning sessions ({CHURN_THRESHOLD}+ new sessions in {CHURN_WINDOW_MS}ms); excluding it from tracking for {CHURN_COOLDOWN_MS}ms"
             );
         }
-    }
-
-    fn resolve_current_session(
-        &mut self,
-        hint: Option<&GlobalSystemMediaTransportControlsSession>,
-        prefer_hint: bool,
-    ) -> Option<GlobalSystemMediaTransportControlsSession> {
-        // Media-property events (a track/media change) follow the event source
-        // itself: the pill should reflect the app + media that CHANGED, like the
-        // native widget's per-session entries. State/periodic paths use the
-        // native GetCurrentSession() pointer instead.
-        if prefer_hint
-            && let Some(session) = hint
-            && self.session_is_eligible(session)
-        {
-            // Don't let a non-Playing session steal the current slot from
-            // one that is actively playing.  A paused background session with
-            // known content (e.g. YouTube Music sitting minimized while Brave
-            // plays in the foreground) must not displace the foreground app.
-            let hint_is_current = self.current_key == Some(session_key(session));
-            let hint_is_playing = read_playback_state(session)
-                .ok()
-                .flatten()
-                .is_some_and(|s| s == PlaybackState::Playing);
-            if hint_is_current || !self.current_playing || hint_is_playing {
-                return Some(session.clone());
-            }
-        }
-
-        // 1. GetCurrentSession() is the pointer Windows itself maintains (the
-        //    native media widget follows it); consult it fresh on every resolve.
-        //    It must be eligible, not merely "not Stopped": a Paused, empty
-        //    placeholder session must never displace one that is playing.
-        if let Ok(session) = self.manager.GetCurrentSession()
-            && self.session_is_eligible(&session)
-        {
-            return Some(session);
-        }
-
-        // 2. The session that caused the event, when it is eligible.
-        if let Some(session) = hint
-            && self.session_is_eligible(session)
-        {
-            return Some(session.clone());
-        }
-
-        // 3. The last observed playing session (keeps the current one stable).
-        if let Some(session) = self.recent_playing.clone()
-            && self.session_is_eligible(&session)
-        {
-            return Some(session);
-        }
-
-        // 4. Any eligible session.
-        if let Ok(sessions) = self.manager.GetSessions()
-            && let Some(playing) = sessions.into_iter().find(|s| self.session_is_eligible(s))
-        {
-            return Some(playing);
-        }
-
-        None
     }
 
     fn subscribe(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<SessionSubscription> {
@@ -652,7 +499,6 @@ impl ListenerState {
                 return Err(error.into());
             }
         };
-        debug!("subscribed to SMTC session {}", session_key(session));
         Ok(SessionSubscription {
             session: session.clone(),
             properties_token,
@@ -660,75 +506,22 @@ impl ListenerState {
         })
     }
 
-    /// Subscribes to a session unless it is already subscribed. A key that
-    /// churned out and back (recently removed) is re-read proactively: it may
-    /// have changed its metadata while briefly unsubscribed, and re-subscribing
-    /// alone would wait for the next event that may never come.
     fn ensure_subscribed(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<()> {
         let key = session_key(session);
         if self.subscriptions.contains_key(&key) {
             return Ok(());
         }
-        let was_removed_recently = self.recently_removed.remove(&key).is_some();
         let subscription = self.subscribe(session)?;
+        debug!("subscribed to SMTC session {key} | source={}", read_source_app(session));
         self.subscriptions.insert(key, subscription);
-        if was_removed_recently && self.current_key == Some(key) {
-            debug!("resubscribed session {key}; re-reading its state");
-            if let Ok(Some(state)) = read_playback_state(session)
-                && state != PlaybackState::Stopped
-            {
-                if let Ok(mut track) = read_track_info(session) {
-                    self.apply_cache(&mut track);
-                    self.remember_content(key, &track);
-                    self.pending_track = Some((key, track));
-                    self.schedule_flush();
-                } else {
-                    self.emit_playback_state(state, read_source_app(session));
-                }
-            }
-        }
         Ok(())
     }
 
-    /// Re-syncs the subscription map with the current session list: subscribes
-    /// to every open (non-ignored) session, drops subscriptions for removed
-    /// sessions, and accounts per-source session churn for the cool-down.
-    fn sync_subscriptions(&mut self) {
-        let Some(sessions) = self.manager.GetSessions().ok() else {
-            return;
-        };
-        let sessions: Vec<_> = sessions.into_iter().collect();
-        let before: HashSet<usize> = self.subscriptions.keys().copied().collect();
-        for session in &sessions {
-            if !self.session_source_allowed(session) {
-                continue;
-            }
-            if !before.contains(&session_key(session)) {
-                self.record_churn(&read_source_app(session));
-            }
-            if let Err(error) = self.ensure_subscribed(session) {
-                debug!("subscribe failed for a session: {error:#}");
-            }
-        }
-        let alive: HashSet<usize> = sessions.iter().map(session_key).collect();
-        let stale: Vec<usize> = self
-            .subscriptions
-            .keys()
-            .filter(|k| !alive.contains(k))
-            .copied()
-            .collect();
-        for key in stale {
-            self.remove_subscription(key);
-        }
-        self.churn_cooldown.retain(|_, until| *until > Instant::now());
-        self.recently_removed
-            .retain(|_, at| at.elapsed() < Duration::from_millis(RESUBSCRIBE_WINDOW_MS));
-        self.known_content.retain(|key| self.subscriptions.contains_key(key));
-    }
-
-    fn remove_subscription(&mut self, key: usize) {
+    /// Removes a session's subscription and stored state. Called when a
+    /// session reports Closed and when it disappears from the session list.
+    fn evict(&mut self, key: usize) {
+        self.dirty.remove(&key);
         if let Some(subscription) = self.subscriptions.remove(&key) {
-            self.recently_removed.insert(key, Instant::now());
             let _ = subscription
                 .session
                 .RemoveMediaPropertiesChanged(subscription.properties_token);
@@ -736,81 +529,21 @@ impl ListenerState {
                 .session
                 .RemovePlaybackInfoChanged(subscription.playback_token);
         }
+        if self.states.remove(&key).is_some() {
+            debug!("evicted SMTC state | key={key}");
+        }
     }
 
     fn remove_all_subscriptions(&mut self) {
         let keys: Vec<usize> = self.subscriptions.keys().copied().collect();
         for key in keys {
-            self.remove_subscription(key);
+            self.evict(key);
         }
     }
 
     fn schedule_flush(&mut self) {
-        if self.track_pending_since.is_none() {
-            self.track_pending_since = Some(Instant::now());
-        }
-        self.pending_deadline = Some(Instant::now() + debounce_duration(&self.config.read().unwrap()));
-    }
-
-    fn flush_pending(&mut self) {
-        self.pending_deadline = None;
-
-        // Debounced session-list changes: one re-sync + re-resolve per burst
-        // instead of one per SessionsChanged/CurrentSessionChanged event.
-        if self.sessions_pending {
-            self.sessions_pending = false;
-            self.sync_subscriptions();
-            if let Err(error) = self.refresh_current_session(None, true, false) {
-                debug!("session re-sync after burst failed: {error:#}");
-            }
-        }
-
-        // Track: wait until complete before sending. Artwork must be ready, and a
-        // freshly-pending track also gets a short unconditional grace window for
-        // its album field (title/artist/artwork and album frequently arrive as
-        // separate MediaPropertiesChanged events). Re-schedule every 100ms;
-        // artwork waits up to 3s, album grace is fixed and short.
-        let incomplete = self.pending_track.as_ref().is_some_and(|(_, track)| {
-            let elapsed = self.track_pending_since.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
-            track.artwork.is_none() || (track.album.trim().is_empty() && elapsed < album_grace())
-        });
-        if incomplete {
-            if self.track_pending_since.is_none() {
-                self.track_pending_since = Some(Instant::now());
-            }
-            let elapsed = self.track_pending_since.unwrap().elapsed();
-            if elapsed < Duration::from_millis(3000) {
-                self.pending_deadline = Some(Instant::now() + Duration::from_millis(100));
-                return;
-            }
-        }
-        self.track_pending_since = None;
-        if let Some((_, track)) = self.pending_track.take() {
-            let fingerprint = track_fingerprint(&track);
-            let differs = self.last_content_fingerprint.as_ref() != Some(&fingerprint);
-            // Do not re-emit when only the artwork disappeared (thumbnail reads
-            // toggle): absence is already shown as a placeholder, and re-emitting
-            // it would produce the repeated notifications seen in the logs.
-            let artwork_only_removed = self.last_content_fingerprint.as_ref().is_some_and(|last| {
-                last.has_artwork
-                    && !fingerprint.has_artwork
-                    && last.title == fingerprint.title
-                    && last.artist == fingerprint.artist
-                    && last.album == fingerprint.album
-            });
-            if differs && !artwork_only_removed {
-                self.last_content_fingerprint = Some(fingerprint);
-                let track_label = track_label(&track);
-                info!("track changed | {track_label}");
-                let _ = self.output.send(MediaEvent::TrackChanged(track));
-            } else if artwork_only_removed {
-                let label = track_label(&track);
-                info!("track emit skipped | reason=artwork-removed | {label}");
-            } else {
-                let label = track_label(&track);
-                debug!("track emit skipped | reason=duplicate-fingerprint | {label}");
-            }
-        }
+        let deadline = Instant::now() + debounce_duration(&self.config.read().unwrap());
+        self.pending_deadline = Some(self.pending_deadline.map_or(deadline, |d| d.min(deadline)));
     }
 }
 
@@ -832,6 +565,73 @@ fn track_label(track: &TrackInfo) -> String {
     )
 }
 
+/// Merges a fresh read into the stored state. Within the same title/artist
+/// identity, empty fields inherit from the stored state (SMTC fills metadata
+/// progressively: title -> artist -> album -> artwork); a new identity starts
+/// fresh. Artwork presence follows `read_artwork` — a poll that did not read
+/// artwork must not touch it.
+fn merge_track(prev: &LogicalState, read: &TrackInfo, read_artwork: bool) -> TrackInfo {
+    let same_identity = read.title == prev.title && read.artist == prev.artist;
+    let inherit = |value: &str, fallback: &str| {
+        if same_identity && value.trim().is_empty() {
+            fallback.to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    TrackInfo {
+        title: read.title.clone(),
+        artist: inherit(&read.artist, &prev.artist),
+        album: inherit(&read.album, &prev.album),
+        artwork: if read_artwork { read.artwork.clone() } else { None },
+        source_app: read.source_app.clone(),
+        duration_secs: if same_identity {
+            read.duration_secs.or(prev.duration_secs)
+        } else {
+            read.duration_secs
+        },
+        track_number: if same_identity {
+            read.track_number.or(prev.track_number)
+        } else {
+            read.track_number
+        },
+        track_count: if same_identity {
+            read.track_count.or(prev.track_count)
+        } else {
+            read.track_count
+        },
+        genre: if same_identity {
+            read.genre.clone().or_else(|| prev.genre.clone())
+        } else {
+            read.genre.clone()
+        },
+    }
+}
+
+/// Whether any displayed content field differs from the stored state.
+fn content_differ(prev: &LogicalState, read: &TrackInfo) -> bool {
+    read.title != prev.title
+        || read.artist != prev.artist
+        || read.album != prev.album
+        || read.source_app != prev.source_app
+        || read.duration_secs != prev.duration_secs
+        || read.track_number != prev.track_number
+        || read.track_count != prev.track_count
+        || read.genre != prev.genre
+}
+
+/// Decides whether a merged read should emit a TrackChanged, and whether the
+/// stored artwork presence should be updated to absent. Artwork presence
+/// follows the read only when artwork was actually read; a gain re-emits (the
+/// pill refreshes the cover in place), a loss is stored silently — absence is
+/// already shown as a placeholder, so re-emitting would flash the same track.
+fn emit_track(prev: &LogicalState, merged: &TrackInfo, read_artwork: bool) -> (bool, bool) {
+    let content_changed = content_differ(prev, merged);
+    let artwork_gained = read_artwork && merged.artwork.is_some() && !prev.has_artwork;
+    let artwork_lost = read_artwork && merged.artwork.is_none() && prev.has_artwork;
+    (content_changed || artwork_gained, artwork_lost)
+}
+
 fn register_sessions_handler(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
     signal_tx: Sender<Signal>,
@@ -846,7 +646,8 @@ fn register_sessions_handler(
 
 /// Registers CurrentSessionChanged, the event Windows fires when its internal
 /// "current session" pointer moves (focus heuristics, a new app starting, etc.).
-/// Session-list events alone do not cover those cases.
+/// Session-list events alone do not cover those cases; both collapse into the
+/// same debounced re-sync.
 fn register_current_session_handler(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
     signal_tx: Sender<Signal>,
@@ -870,7 +671,7 @@ fn read_source_app(session: &GlobalSystemMediaTransportControlsSession) -> Strin
         .unwrap_or_else(|_| "Media".to_string())
 }
 
-fn read_track_info(session: &GlobalSystemMediaTransportControlsSession) -> Result<TrackInfo> {
+fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_artwork: bool) -> Result<TrackInfo> {
     let source_app = read_source_app(session);
     let properties = session.TryGetMediaPropertiesAsync()?.get()?;
     let title = non_empty(properties.Title()?.to_string(), &source_app);
@@ -881,21 +682,25 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession) -> Resul
     // Keep album empty when the app has not provided it yet; renderers hide the
     // album line until real data arrives (prevents a bogus "Unknown album").
     let album = non_empty(properties.AlbumTitle()?.to_string(), "");
-    // Artwork reads fail transiently under heavy session churn (overlapping
-    // async WinRT calls on one thread); retry once before giving up, and log
-    // which call failed with its raw HRESULT.
-    let artwork = match read_artwork(&properties) {
-        Ok(artwork) => artwork,
-        Err(first) => {
-            debug!("album-art read failed (attempt 1): {first:#}");
-            match read_artwork(&properties) {
-                Ok(artwork) => artwork,
-                Err(second) => {
-                    debug!("album-art read failed (attempt 2): {second:#}");
-                    None
+    let artwork = if read_artwork {
+        // Artwork reads fail transiently under heavy session churn (overlapping
+        // async WinRT calls on one thread); retry once before giving up, and
+        // log which call failed with its raw HRESULT.
+        match read_thumbnail(&properties) {
+            Ok(artwork) => artwork,
+            Err(first) => {
+                debug!("album-art read failed (attempt 1): {first:#}");
+                match read_thumbnail(&properties) {
+                    Ok(artwork) => artwork,
+                    Err(second) => {
+                        debug!("album-art read failed (attempt 2): {second:#}");
+                        None
+                    }
                 }
             }
         }
+    } else {
+        None
     };
     let track_number = {
         let n = properties.TrackNumber()?;
@@ -938,31 +743,7 @@ fn read_duration(session: &GlobalSystemMediaTransportControlsSession) -> Option<
     Some((duration_100ns / 10_000_000) as u64)
 }
 
-/// Current timeline position of a session, for restart detection. TimeSpan
-/// durations are in 100-nanosecond units.
-fn read_position(session: &GlobalSystemMediaTransportControlsSession) -> Option<Duration> {
-    let position_100ns = session.GetTimelineProperties().ok()?.Position().ok()?.Duration;
-    if position_100ns <= 0 {
-        Some(Duration::ZERO)
-    } else {
-        Some(Duration::from_nanos((position_100ns * 100) as u64))
-    }
-}
-
-fn read_playback_state(session: &GlobalSystemMediaTransportControlsSession) -> Result<Option<PlaybackState>> {
-    let status = session.GetPlaybackInfo()?.PlaybackStatus()?;
-    Ok(match status {
-        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing => Some(PlaybackState::Playing),
-        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused => Some(PlaybackState::Paused),
-        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped
-        | GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed => Some(PlaybackState::Stopped),
-        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Opened
-        | GlobalSystemMediaTransportControlsSessionPlaybackStatus::Changing => None,
-        _ => None,
-    })
-}
-
-fn read_artwork(
+fn read_thumbnail(
     properties: &windows::Media::Control::GlobalSystemMediaTransportControlsSessionMediaProperties,
 ) -> Result<Option<Vec<u8>>> {
     let reference = properties
@@ -1023,35 +804,8 @@ fn normalize_for_match(s: &str) -> String {
     s.to_lowercase().replace(['-', '_', '.', ' '], "")
 }
 
-fn track_fingerprint(track: &TrackInfo) -> TrackFingerprint {
-    // Content fingerprint: title+artist+album plus artwork presence. Artwork
-    // presence is part of the fingerprint so a thumbnail arriving on a later
-    // event re-emits the track (the UI refreshes it in place) instead of being
-    // deduplicated away forever.
-    TrackFingerprint {
-        title: track.title.clone(),
-        artist: track.artist.clone(),
-        album: track.album.clone(),
-        has_artwork: track.artwork.is_some(),
-    }
-}
-
-/// Whether a freshly-read track is the content we are already showing. Used to
-/// recognize a session handoff as no change. Title+artist equality, exact.
-fn is_same_content(track: &TrackInfo, last: &TrackFingerprint) -> bool {
-    track.title == last.title && track.artist == last.artist
-}
-
 fn debounce_duration(config: &Config) -> Duration {
     Duration::from_millis(config.behavior.debounce_ms.clamp(150, 250))
-}
-
-/// Grace window granted for the album field of a freshly-pending track. SMTC
-/// often delivers title/artist/artwork and album as separate events, so this
-/// fixed window lets the first track of a session pick up its album without
-/// relying on history. Sources that never provide album flush after this delay.
-fn album_grace() -> Duration {
-    Duration::from_millis(400)
 }
 
 #[cfg(test)]
@@ -1088,42 +842,109 @@ mod tests {
         assert_eq!(debounce_duration(&config), Duration::from_millis(250));
     }
 
-    #[test]
-    fn album_grace_is_a_fixed_short_window() {
-        // Short enough to bound browser latency, long enough to catch the
-        // album event that typically follows artwork.
-        assert_eq!(album_grace(), Duration::from_millis(400));
+    fn track(title: &str, artist: &str) -> TrackInfo {
+        TrackInfo {
+            title: title.into(),
+            artist: artist.into(),
+            ..TrackInfo::default()
+        }
+    }
+
+    fn state(title: &str, artist: &str) -> LogicalState {
+        LogicalState {
+            title: title.into(),
+            artist: artist.into(),
+            ..LogicalState::default()
+        }
     }
 
     #[test]
-    fn same_content_matches_title_and_artist_only() {
-        let track = TrackInfo {
-            title: "Song".into(),
-            artist: "Artist".into(),
+    fn merge_inherits_missing_fields_within_the_same_identity() {
+        let prev = LogicalState {
             album: "Album".into(),
-            ..TrackInfo::default()
-        };
-        let last = TrackFingerprint {
-            title: "Song".into(),
-            artist: "Artist".into(),
-            album: "Album".into(),
+            genre: Some("Rock".into()),
+            track_number: Some(3),
+            track_count: Some(10),
+            duration_secs: Some(200),
             has_artwork: true,
+            ..state("Song", "Artist")
         };
-        assert!(is_same_content(&track, &last));
-        // A different artist is a real change.
-        let other = TrackInfo {
+        let read = track("Song", "Artist");
+        let merged = merge_track(&prev, &read, true);
+        assert_eq!(merged.album, "Album");
+        assert_eq!(merged.genre.as_deref(), Some("Rock"));
+        assert_eq!(merged.track_number, Some(3));
+        assert_eq!(merged.track_count, Some(10));
+        assert_eq!(merged.duration_secs, Some(200));
+        // A read without artwork must not inherit stored artwork bytes.
+        assert!(merged.artwork.is_none());
+    }
+
+    #[test]
+    fn merge_starts_fresh_when_the_identity_changes() {
+        let prev = LogicalState {
+            album: "Album".into(),
+            genre: Some("Rock".into()),
+            track_number: Some(3),
+            ..state("Song", "Artist")
+        };
+        let merged = merge_track(&prev, &track("Next", "Artist"), true);
+        assert_eq!(merged.album, "");
+        assert_eq!(merged.genre, None);
+        assert_eq!(merged.track_number, None);
+        // An empty artist on a new title stays empty (the pill hides the row).
+        let merged = merge_track(&prev, &track("Next", ""), true);
+        assert_eq!(merged.artist, "");
+    }
+
+    #[test]
+    fn merge_poll_read_never_carries_artwork() {
+        let prev = LogicalState {
+            has_artwork: true,
+            ..state("Song", "Artist")
+        };
+        let merged = merge_track(&prev, &track("Song", "Artist"), false);
+        assert!(merged.artwork.is_none());
+    }
+
+    #[test]
+    fn content_differ_sees_every_displayed_field() {
+        let prev = state("Song", "Artist");
+        assert!(!content_differ(&prev, &track("Song", "Artist")));
+        assert!(content_differ(&prev, &track("Other", "Artist")));
+        assert!(content_differ(&prev, &track("Song", "Other")));
+        let album_only = TrackInfo {
             title: "Song".into(),
-            artist: "Other".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
             ..TrackInfo::default()
         };
-        assert!(!is_same_content(&other, &last));
-        // A momentarily blank artist must not match (fall back to the normal
-        // path; the fingerprint dedup is the backstop).
-        let blank = TrackInfo {
+        assert!(content_differ(&prev, &album_only));
+    }
+
+    #[test]
+    fn emit_track_decides_emits_and_artwork_losses() {
+        let prev = state("Song", "Artist");
+        // Unchanged: no emit.
+        assert_eq!(emit_track(&prev, &track("Song", "Artist"), true), (false, false));
+        // Content change: emit.
+        assert_eq!(emit_track(&prev, &track("Other", "Artist"), true), (true, false));
+        // Artwork gained: emit (the cover refreshes the pill in place).
+        let with_art = TrackInfo {
             title: "Song".into(),
-            artist: String::new(),
+            artist: "Artist".into(),
+            artwork: Some(vec![1]),
             ..TrackInfo::default()
         };
-        assert!(!is_same_content(&blank, &last));
+        assert_eq!(emit_track(&prev, &with_art, true), (true, false));
+        // Artwork lost: store the loss, no emit.
+        let had_art = LogicalState {
+            has_artwork: true,
+            ..state("Song", "Artist")
+        };
+        assert_eq!(emit_track(&had_art, &track("Song", "Artist"), true), (false, true));
+        // A poll that did not read artwork never touches presence.
+        assert_eq!(emit_track(&had_art, &track("Song", "Artist"), false), (false, false));
+        assert_eq!(emit_track(&prev, &with_art, false), (false, false));
     }
 }

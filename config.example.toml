@@ -1,7 +1,5 @@
 [overlay]
 duration_ms = 3000
-# How long the pill stays for a track restart (repeat/Prev), capped at 2000.
-restart_duration_ms = 2000
 animation_ms = 200
 # Vertical edge: "top" | "bottom".
 vertical = "top"
