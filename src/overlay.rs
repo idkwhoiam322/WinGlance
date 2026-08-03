@@ -431,6 +431,14 @@ impl OverlayState {
         if let Some(deadline) = self.dismiss_at {
             self.dismiss_at = Some(deadline.max(Instant::now() + update_min_duration(&self.config)));
         }
+        // A refresh that lands during the collapse (e.g. artwork arriving as
+        // the pill fades) would otherwise be cut short: the collapse keeps its
+        // original start time and hides the pill when its animation finishes,
+        // ignoring the extended deadline. Bring it back to full visibility for
+        // the extended time instead.
+        if matches!(self.phase, Phase::Collapsing(_)) {
+            self.phase = Phase::Shown;
+        }
         self.render();
     }
 
