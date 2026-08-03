@@ -69,7 +69,7 @@ const MENU_DURATION_3S: usize = 1018;
 const MENU_DURATION_5S: usize = 1019;
 const MENU_DURATION_10S: usize = 1020;
 const LISTBOX_ID: usize = 2;
-const HISTORY_CAP: usize = 500;
+const HISTORY_CAP: usize = 1000;
 /// Timer used to clear the "Copied" feedback on the Copy logs button.
 const TIMER_LOGS_ID: usize = 101;
 /// Timer used to keep the native history tooltip's item rects in sync (scroll).
@@ -324,6 +324,10 @@ struct HistoryEntry {
     at: DateTime<Local>,
     track: TrackInfo,
     state: PlaybackState,
+    /// Whether the source session passed the `allowed_sources` filter.
+    /// Accepted entries are highlighted; rejected ones render muted so every
+    /// media source is visible in the history.
+    accepted: bool,
 }
 
 struct History {
@@ -339,10 +343,12 @@ impl History {
         }
     }
 
+    /// Pushes a new entry at the front: the history is a reverse list, newest
+    /// first, matching the listbox rendering order.
     fn push(&mut self, entry: HistoryEntry) {
-        self.entries.push_back(entry);
+        self.entries.push_front(entry);
         while self.entries.len() > self.cap {
-            self.entries.pop_front();
+            self.entries.pop_back();
         }
     }
 
@@ -644,6 +650,13 @@ impl MainWindowState {
                         self.invalidate();
                     }
                 }
+                MediaEvent::SessionRejected {
+                    source_app,
+                    title,
+                    artist,
+                    state,
+                    accepted,
+                } => self.add_session(source_app, title, artist, state, accepted),
             }
         }
     }
@@ -651,26 +664,31 @@ impl MainWindowState {
     /// Appends a history row and syncs the listbox + tooltips. Artwork is
     /// stripped before storing — the history is text-only, and the raw image
     /// bytes would be pure waste across hundreds of rows.
-    fn push_history(&mut self, mut track: TrackInfo, state: PlaybackState) {
+    fn push_history(&mut self, mut track: TrackInfo, state: PlaybackState, accepted: bool) {
         track.artwork = None;
         let before = self.history.len();
         self.history.push(HistoryEntry {
             at: Local::now(),
             track: track.clone(),
             state,
+            accepted,
         });
         if self.history.len() <= before && before > 0 {
-            let _ = unsafe { SendMessageW(self.listbox, LB_DELETESTRING, WPARAM(0), LPARAM(0)) };
+            // The cap dropped the oldest entry, which sits at the bottom of
+            // the listbox (newest-first rendering, header at index 0).
+            let count = unsafe { SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as usize;
+            if count > 0 {
+                let _ = unsafe { SendMessageW(self.listbox, LB_DELETESTRING, WPARAM(count - 1), LPARAM(0)) };
+            }
         }
         let row = history_row(&track, Local::now(), state);
         let row = wide(&row);
         if !self.listbox.0.is_null() {
             unsafe {
-                let _ = SendMessageW(self.listbox, LB_ADDSTRING, WPARAM(0), LPARAM(row.as_ptr() as isize));
-                let count = SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
-                if count > 0 {
-                    let _ = SendMessageW(self.listbox, LB_SETTOPINDEX, WPARAM(count - 1), LPARAM(0));
-                }
+                // Insert after the header row (index 0), so the newest entry
+                // is the first data row.
+                let _ = SendMessageW(self.listbox, LB_INSERTSTRING, WPARAM(1), LPARAM(row.as_ptr() as isize));
+                let _ = SendMessageW(self.listbox, LB_SETTOPINDEX, WPARAM(0), LPARAM(0));
             }
         }
         self.sync_tooltips();
@@ -678,7 +696,20 @@ impl MainWindowState {
 
     fn add_state_change(&mut self, state: PlaybackState) {
         let track = self.current.as_ref().map(|c| c.track.clone()).unwrap_or_default();
-        self.push_history(track, state);
+        self.push_history(track, state, true);
+    }
+
+    /// Records a session that was seen but not tracked (filtered by
+    /// `allowed_sources` or on the churn cool-down). The row renders muted;
+    /// it never becomes the "Now Playing" activity.
+    fn add_session(&mut self, source_app: String, title: String, artist: String, state: PlaybackState, accepted: bool) {
+        let track = TrackInfo {
+            title,
+            artist,
+            source_app,
+            ..TrackInfo::default()
+        };
+        self.push_history(track, state, accepted);
     }
 
     fn add_track(&mut self, track: TrackInfo) {
@@ -695,25 +726,32 @@ impl MainWindowState {
                 current.track = track.clone();
                 current.art = None;
             }
-            if let Some(last) = self.history.entries.back_mut() {
-                last.track = track.clone();
-                last.track.artwork = None;
-            }
-            let row = history_row(
-                &track,
-                Local::now(),
-                self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing),
-            );
-            let row = wide(&row);
-            if !self.listbox.0.is_null() {
-                unsafe {
-                    let count = SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
-                    if count > 0 {
-                        let _ = SendMessageW(self.listbox, LB_DELETESTRING, WPARAM(count - 1), LPARAM(0));
+            // Rejected-session rows can be pushed on top of the current
+            // track's row, so find the entry by identity instead of assuming
+            // it is the newest.
+            let entry_index = self.history.entries.iter().position(|e| {
+                e.track.title == track.title && e.track.artist == track.artist && e.track.source_app == track.source_app
+            });
+            if let Some(index) = entry_index {
+                let entry = &mut self.history.entries[index];
+                entry.track = track.clone();
+                entry.track.artwork = None;
+                let row = history_row(
+                    &track,
+                    Local::now(),
+                    self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing),
+                );
+                let row = wide(&row);
+                if !self.listbox.0.is_null() {
+                    unsafe {
+                        // The header occupies row 0; data rows mirror the
+                        // entries order (newest first).
+                        let lb_row = index + 1;
+                        let _ = SendMessageW(self.listbox, LB_DELETESTRING, WPARAM(lb_row), LPARAM(0));
                         let _ = SendMessageW(
                             self.listbox,
                             LB_INSERTSTRING,
-                            WPARAM(count - 1),
+                            WPARAM(lb_row),
                             LPARAM(row.as_ptr() as isize),
                         );
                     }
@@ -725,7 +763,7 @@ impl MainWindowState {
         }
 
         let state = self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing);
-        self.push_history(track.clone(), state);
+        self.push_history(track.clone(), state, true);
         self.current = Some(CurrentActivity {
             track,
             state: self
@@ -1683,10 +1721,14 @@ impl MainWindowState {
             } else {
                 &entry.track.artist
             };
-            // All history entries are from accepted sessions; highlight them
-            // in pink (the accent color) with bold text.
-            let row_color = accent_color;
-            let bold = true;
+            // Accepted sessions are highlighted in pink (the accent color)
+            // with bold text; rejected sessions render muted so every media
+            // source is visible without stealing attention from tracked ones.
+            let (row_color, bold) = if entry.accepted {
+                (accent_color, true)
+            } else {
+                ([0x66, 0x66, 0x66, 0xFF], false)
+            };
             cell(
                 col_x[0],
                 time_w,
@@ -1892,6 +1934,9 @@ fn entry_detail(entry: &HistoryEntry) -> String {
         ),
         entry.track.title.clone(),
     ];
+    if !entry.accepted {
+        parts.push("(filtered by allowed apps)".to_string());
+    }
     if !entry.track.artist.trim().is_empty() {
         parts.push(entry.track.artist.clone());
     }
@@ -2568,11 +2613,36 @@ mod tests {
                 at: Local::now(),
                 track: track(&format!("Track {index}")),
                 state: PlaybackState::Playing,
+                accepted: true,
             });
         }
         assert_eq!(history.len(), 3);
+        // Newest first: the last pushed entry is at the front.
         let titles: Vec<_> = history.iter().map(|entry| entry.track.title.as_str()).collect();
-        assert_eq!(titles, ["Track 2", "Track 3", "Track 4"]);
+        assert_eq!(titles, ["Track 4", "Track 3", "Track 2"]);
+    }
+
+    #[test]
+    fn history_keeps_accepted_flag_with_newest_first() {
+        let mut history = History::new(3);
+        history.push(HistoryEntry {
+            at: Local::now(),
+            track: track("Track A"),
+            state: PlaybackState::Playing,
+            accepted: true,
+        });
+        history.push(HistoryEntry {
+            at: Local::now(),
+            track: track("Track B"),
+            state: PlaybackState::Paused,
+            accepted: false,
+        });
+        let entries: Vec<_> = history.iter().collect();
+        // Newest first, and the accepted flag travels with its entry.
+        assert_eq!(entries[0].track.title, "Track B");
+        assert!(!entries[0].accepted);
+        assert_eq!(entries[1].track.title, "Track A");
+        assert!(entries[1].accepted);
     }
 
     #[test]

@@ -85,6 +85,10 @@ struct ListenerState {
     /// Source apps currently on cool-down (their sessions are not tracked)
     /// until the stored time.
     churn_cooldown: HashMap<String, Instant>,
+    /// Keys of rejected sessions already reported to the history, so a
+    /// rejected session is logged once per appearance instead of on every
+    /// re-sync (the 2-second poll re-lists all sessions).
+    rejected_seen: HashSet<usize>,
     /// Heartbeat touched each loop iteration so the supervisor can detect a
     /// stall and restart the listener.
     heartbeat: Arc<Mutex<Instant>>,
@@ -160,6 +164,7 @@ impl ListenerState {
             last_session_check: Instant::now(),
             churn: HashMap::new(),
             churn_cooldown: HashMap::new(),
+            rejected_seen: HashSet::new(),
             heartbeat,
         }
     }
@@ -385,8 +390,25 @@ impl ListenerState {
                 self.config.read().unwrap().behavior.allowed_sources
             );
             if !allowed {
+                // Log rejected sessions once per appearance so the history
+                // shows every media source, not just the tracked ones.
+                if self.rejected_seen.insert(key) {
+                    let source_app = read_source_app(session);
+                    let (title, artist) = read_session_text(session, &source_app);
+                    let state = read_session_state(session);
+                    let _ = self.output.send(MediaEvent::SessionRejected {
+                        source_app,
+                        title,
+                        artist,
+                        state,
+                        accepted: false,
+                    });
+                }
                 continue;
             }
+            // A previously-rejected session that became allowed (config edit)
+            // should re-report as accepted on its next rejection, if any.
+            self.rejected_seen.remove(&key);
             if !before.contains(&key) {
                 self.record_churn(&read_source_app(session));
             }
@@ -405,6 +427,9 @@ impl ListenerState {
             debug!("SMTC session disappeared | key={key}");
             self.evict(key);
         }
+        // Forget rejected sessions that vanished so a later reappearance is
+        // reported again.
+        self.rejected_seen.retain(|key| alive.contains(key));
         self.churn_cooldown.retain(|_, until| *until > Instant::now());
     }
 
@@ -693,6 +718,33 @@ fn read_source_app(session: &GlobalSystemMediaTransportControlsSession) -> Strin
         .SourceAppUserModelId()
         .map(|value| source_app_label(&value.to_string()))
         .unwrap_or_else(|_| "Media".to_string())
+}
+
+/// Best-effort title/artist for a session's history row. Reads can fail or
+/// return empty for freshly-created sessions; the title falls back to the
+/// source label so the row always names the app.
+fn read_session_text(session: &GlobalSystemMediaTransportControlsSession, source_app: &str) -> (String, String) {
+    let Ok(properties) = session.TryGetMediaPropertiesAsync().and_then(|op| op.get()) else {
+        return (source_app.to_string(), String::new());
+    };
+    let title = non_empty(
+        properties.Title().map(|v| v.to_string()).unwrap_or_default(),
+        source_app,
+    );
+    let artist = non_empty(properties.Artist().map(|v| v.to_string()).unwrap_or_default(), "");
+    (title, artist)
+}
+
+/// Best-effort playback status for a session's history row. Unknown statuses
+/// (Opened/Changing) are reported as Playing — a live session is assumed to
+/// be playing unless it explicitly says otherwise.
+fn read_session_state(session: &GlobalSystemMediaTransportControlsSession) -> PlaybackState {
+    match session.GetPlaybackInfo().and_then(|info| info.PlaybackStatus()) {
+        Ok(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing) => PlaybackState::Playing,
+        Ok(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused) => PlaybackState::Paused,
+        Ok(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped) => PlaybackState::Stopped,
+        _ => PlaybackState::Playing,
+    }
 }
 
 fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_artwork: bool) -> Result<TrackInfo> {

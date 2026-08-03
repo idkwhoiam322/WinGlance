@@ -329,12 +329,28 @@ impl OverlayState {
                 MediaEvent::PlaybackStateChanged(state, source_app)
                     if self.config.behavior.enable_playback_state_change =>
                 {
-                    // Cache the source app so show_next / draw_text_pixels can
-                    // look up the right track for this state pills.
+                    // A track pill already queued for the same source will
+                    // surface the new content on its own; showing a state pill
+                    // (usually "Playing") on top of it would flash the same
+                    // track twice. The smtc worker suppresses this case when
+                    // both events land in one batch; this is the safety net
+                    // for when the PlaybackStateChanged arrives separately.
+                    let track_pending = self
+                        .pending
+                        .iter()
+                        .any(|e| matches!(e, MediaEvent::TrackChanged(track) if track.source_app == source_app));
+                    if track_pending {
+                        debug!(
+                            "playback state pill suppressed | reason=track pending for same source | source={source_app}"
+                        );
+                        continue;
+                    }
                     let event = MediaEvent::PlaybackStateChanged(state, source_app);
                     self.enqueue(event);
                 }
                 MediaEvent::TrackChanged(_) | MediaEvent::PlaybackStateChanged(_, _) => {}
+                // Rejected sessions are history-only: never shown as a pill.
+                MediaEvent::SessionRejected { .. } => {}
             }
         }
         if !self.pending.is_empty() {
@@ -391,6 +407,11 @@ impl OverlayState {
             }
             MediaEvent::PlaybackStateChanged(state, source_app) => {
                 self.show(MediaEvent::PlaybackStateChanged(state, source_app), false);
+            }
+            // Never queued (receive_events skips it); defensive for
+            // exhaustiveness.
+            MediaEvent::SessionRejected { .. } => {
+                debug!("session rejected event reached the pill queue; ignoring");
             }
         }
     }
@@ -520,6 +541,9 @@ impl OverlayState {
         let (logical_width, logical_height) = match &content {
             MediaEvent::TrackChanged(track) => track_content_size(&self.config, track),
             MediaEvent::PlaybackStateChanged(_, _) => state_content_size(&self.config, self.last_track.as_ref()),
+            // Never shown (receive_events skips it); the .max(1.0) guards
+            // below keep the size sane if this dead arm is ever reached.
+            MediaEvent::SessionRejected { .. } => (0.0, 0.0),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
@@ -683,6 +707,7 @@ impl OverlayState {
         let (logical_width, logical_height) = match content {
             MediaEvent::TrackChanged(track) => track_content_size(&self.config, track),
             MediaEvent::PlaybackStateChanged(_, _) => state_content_size(&self.config, self.last_track.as_ref()),
+            MediaEvent::SessionRejected { .. } => (0.0, 0.0),
         };
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
@@ -1015,6 +1040,8 @@ fn draw_pixels(
                 );
             }
         }
+        // Never rendered: SessionRejected is filtered out before enqueue.
+        MediaEvent::SessionRejected { .. } => {}
     }
     Ok(pixels)
 }
@@ -1341,6 +1368,8 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 }
             }
         }
+        // Never rendered: SessionRejected is filtered out before enqueue.
+        MediaEvent::SessionRejected { .. } => {}
     }
 }
 

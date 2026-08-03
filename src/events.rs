@@ -81,6 +81,17 @@ pub enum PlaybackState {
 pub enum MediaEvent {
     TrackChanged(TrackInfo),
     PlaybackStateChanged(PlaybackState, String),
+    /// A session was seen but is not tracked (rejected by `allowed_sources`
+    /// or on the churn cool-down). Carries whatever display info SMTC exposed
+    /// at discovery time. The history records it as a muted row so all media
+    /// sources are visible; `accepted` marks entries from tracked sessions.
+    SessionRejected {
+        source_app: String,
+        title: String,
+        artist: String,
+        state: PlaybackState,
+        accepted: bool,
+    },
 }
 
 #[cfg(test)]
