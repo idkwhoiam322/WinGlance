@@ -405,6 +405,16 @@ impl ListenerState {
                                     && prev_track.artist == merged.artist
                                     && (!read_artwork || prev_track.artwork.is_some() == merged.artwork.is_some())
                             });
+                    // A recreated session starts from a default LogicalState, so
+                    // its first read reports the new session's default playback
+                    // state (e.g. Paused while the user never touched anything)
+                    // as if it were a real transition. When the track identifies
+                    // the whole read as a session recreation, the paired
+                    // playback event is spurious too: drop it so a source that
+                    // re-creates its session while paused does not fire pills.
+                    if session_recreation && prev.source_app.is_empty() && prev.title.is_empty() {
+                        events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
+                    }
                     if emit && !session_recreation {
                         let label = track_label(&merged);
                         info!("track changed | {label}");
@@ -565,10 +575,26 @@ impl ListenerState {
         if !should_poll_artwork(self.states.get(&key)) {
             return Ok(());
         }
-        let read = read_track_info(session, true)?;
+        let read = match read_track_info(session, true) {
+            Ok(read) => read,
+            Err(error) => {
+                // Count a failed read against the budget too: a session whose
+                // reads keep failing must not be retried forever.
+                if let Some(state) = self.states.get_mut(&key) {
+                    state.artwork_attempts += 1;
+                }
+                return Err(error);
+            }
+        };
         let prev = self.states.get(&key).cloned().unwrap_or_default();
         let merged = merge_track(&prev, &read, true);
-        let (emit, _lost) = emit_track(&prev, &merged, true);
+        // The retry only surfaces artwork the normal path missed: no artwork
+        // found, or a recreated session re-reporting a track whose cover is
+        // already shown, must not emit a duplicate pill.
+        let track_changed = emit_track(&prev, &merged, true).0;
+        let recreation_suppressed =
+            merged.artwork.is_some() && !retry_should_emit(&merged, self.last_track_per_source.get(&merged.source_app));
+        let emit = track_changed && !recreation_suppressed;
         if let Some(state) = self.states.get_mut(&key) {
             state.has_artwork = merged.artwork.is_some();
             state.artwork_attempts += 1;
@@ -582,6 +608,9 @@ impl ListenerState {
             if let Some(state) = self.states.get_mut(&key) {
                 state.deferred_at = None;
             }
+        } else if recreation_suppressed {
+            let label = track_label(&merged);
+            debug!("track emit suppressed | reason=session-recreation | {label}");
         }
         Ok(())
     }
@@ -785,15 +814,24 @@ fn cached_artwork_for(
 /// poll to chase a thumbnail that an earlier event-driven read missed (SMTC
 /// populates the thumbnail a moment after the title), without re-reading art
 /// on every poll pass for sessions that already have it.
-/// poll to chase a thumbnail that an earlier event-driven read missed (SMTC
-/// populates the thumbnail a moment after the title), without re-reading art
-/// on every poll pass for sessions that already have it.
 fn should_poll_artwork(state: Option<&LogicalState>) -> bool {
     let prev = match state {
         Some(p) => p,
         None => return false,
     };
     !prev.has_artwork && prev.artwork_attempts < ARTWORK_RETRY_BUDGET
+}
+
+/// Whether a retry-driven artwork read should emit a TrackChanged. The retry
+/// exists to surface artwork the event path missed, so it only emits when the
+/// read found artwork AND that artwork is not already known for this track
+/// (same title + artist as the last emitted track). A recreated session
+/// re-reporting a track whose cover is already shown must not re-emit.
+fn retry_should_emit(merged: &TrackInfo, last_track: Option<&TrackInfo>) -> bool {
+    merged.artwork.is_some()
+        && !last_track.is_some_and(|cached| {
+            cached.title == merged.title && cached.artist == merged.artist && cached.artwork.is_some()
+        })
 }
 
 /// Merges a fresh read into the stored state. Within the same title/artist
@@ -1422,5 +1460,39 @@ mod tests {
         s.artwork_attempts = 0;
         s.has_artwork = true;
         assert!(!should_poll_artwork(Some(&s)));
+    }
+
+    #[test]
+    fn retry_artwork_only_surfaces_new_artwork() {
+        // Artwork found, no cached track → emit (genuine new track).
+        let with_art = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            artwork: Some(vec![1]),
+            ..TrackInfo::default()
+        };
+        assert!(retry_should_emit(&with_art, None));
+
+        // Artwork found, same track already shown WITH art → suppressed
+        // (the recreation case that produced the paused-pill spam).
+        assert!(!retry_should_emit(&with_art, Some(&with_art)));
+
+        // Artwork found, same track shown WITHOUT art → emit (artwork gain).
+        let no_art = track("Song", "Artist");
+        assert!(retry_should_emit(&with_art, Some(&no_art)));
+
+        // No artwork found → never emit (nothing to surface).
+        assert!(!retry_should_emit(&no_art, None));
+        assert!(!retry_should_emit(&no_art, Some(&no_art)));
+        assert!(!retry_should_emit(&no_art, Some(&with_art)));
+
+        // Different track with art → emit.
+        let other = TrackInfo {
+            title: "Other".into(),
+            artist: "Artist".into(),
+            artwork: Some(vec![2]),
+            ..TrackInfo::default()
+        };
+        assert!(retry_should_emit(&other, Some(&with_art)));
     }
 }
