@@ -361,22 +361,8 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
             }
 
             let _ = SendMessageW(lb, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(ROW_HEIGHT as isize));
-            let font = CreateFontW(
-                -((13.0 * scale).round() as i32).max(1),
-                0,
-                0,
-                0,
-                400,
-                0,
-                0,
-                0,
-                0x01,
-                0,
-                0,
-                0x02,
-                0x00,
-                PCWSTR(wide("Segoe UI").as_ptr()),
-            );
+            // Cached font: reused across opens and never leaked.
+            let font = crate::overlay::cached_font((13.0 * scale).round() as i32, false, 0x02);
             let _ = SendMessageW(lb, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
 
             for (i, entry) in state_ref.list.iter().enumerate() {

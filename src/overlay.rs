@@ -6,7 +6,7 @@ use log::{debug, error};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::BOOLEAN;
 use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -1797,7 +1797,6 @@ fn draw_text_line_pixels(
             let _ = DrawTextW(hdc, &mut text, &mut local, flags);
         }
         SelectObject(hdc, old_font);
-        let _ = DeleteObject(font);
     }
 
     // Composite the glyph pixels. Coverage = max(R,G,B); the scratch RGB is
@@ -1885,27 +1884,58 @@ fn text_scratch_for(
     Ok((hdc, bits, width, height))
 }
 
-/// Creates the pill's Segoe UI font with ClearType subpixel rendering.
-fn create_pill_font(height: i32, bold: bool) -> HFONT {
-    let font_name = wide("Segoe UI");
-    unsafe {
-        CreateFontW(
-            -height.max(1),
-            0,
-            0,
-            0,
-            if bold { 600 } else { 400 },
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_DEFAULT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
-            DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
-            PCWSTR(font_name.as_ptr()),
-        )
+/// Cache key: (font height, bold, GDI quality constant).
+type FontKey = (i32, bool, u32);
+
+/// Process-wide cache of created HFONTs, keyed by (height, bold, quality).
+/// Fonts are pure GDI objects with a tiny key set (a few sizes × 2 weights × 2
+/// qualities), so caching them for the process lifetime replaces thousands of
+/// CreateFontW/DeleteObject pairs per second with hash lookups. Handles are
+/// stored as `usize`: HFONT is a raw pointer and not Send, but GDI font
+/// handles are process-global and every use here is on the UI thread.
+static FONT_CACHE: OnceLock<Mutex<HashMap<FontKey, usize>>> = OnceLock::new();
+
+/// Returns the cached Segoe UI font for (height, bold, quality), creating it
+/// on first use. The returned handle must never be deleted (it stays valid
+/// until process exit).
+pub(crate) fn cached_font(height: i32, bold: bool, quality: u32) -> HFONT {
+    let cache = FONT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cache.lock() {
+        if let Some(font) = guard.get(&(height, bold, quality)) {
+            return HFONT(*font as *mut std::ffi::c_void);
+        }
+        let font_name = wide("Segoe UI");
+        let font = unsafe {
+            CreateFontW(
+                -height.max(1),
+                0,
+                0,
+                0,
+                if bold { 600 } else { 400 },
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_DEFAULT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                quality,
+                DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+                PCWSTR(font_name.as_ptr()),
+            )
+        };
+        if !font.0.is_null() {
+            guard.insert((height, bold, quality), font.0 as usize);
+        }
+        font
+    } else {
+        HFONT::default()
     }
+}
+
+/// Creates the pill's Segoe UI font with ClearType subpixel rendering,
+/// cached across frames.
+fn create_pill_font(height: i32, bold: bool) -> HFONT {
+    cached_font(height, bold, CLEARTYPE_QUALITY.0 as u32)
 }
 
 /// Source-over composite of a premultiplied source (rgb already multiplied by
@@ -1938,27 +1968,12 @@ pub(crate) fn draw_string(
         return;
     }
     let mut text = value.encode_utf16().collect::<Vec<_>>();
-    let font_name = wide("Segoe UI");
-    let font = unsafe {
-        CreateFontW(
-            -height.max(1),
-            0,
-            0,
-            0,
-            if bold { 600 } else { 400 },
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_DEFAULT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            // ClearType subpixel rendering is incorrect on layered windows;
-            // grayscale antialiasing keeps the pill text crisp.
-            ANTIALIASED_QUALITY.0 as u32,
-            DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
-            PCWSTR(font_name.as_ptr()),
-        )
-    };
+    // ClearType subpixel rendering is incorrect on layered windows; grayscale
+    // antialiasing keeps the pill text crisp.
+    let font = cached_font(height, bold, ANTIALIASED_QUALITY.0 as u32);
+    if font.0.is_null() {
+        return;
+    }
     let old_font = unsafe { SelectObject(hdc, font) };
     let color = COLORREF(color[0] as u32 | (color[1] as u32) << 8 | (color[2] as u32) << 16);
     unsafe {
@@ -1970,7 +1985,6 @@ pub(crate) fn draw_string(
         }
         let _ = DrawTextW(hdc, &mut text, rect, flags);
         SelectObject(hdc, old_font);
-        let _ = DeleteObject(font);
     }
 }
 
