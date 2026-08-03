@@ -7,6 +7,7 @@ mod logging;
 mod main_window;
 mod overlay;
 mod positioner;
+mod process_picker;
 mod smtc;
 
 use anyhow::Result;

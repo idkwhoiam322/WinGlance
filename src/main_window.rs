@@ -4,6 +4,8 @@ use crate::events::{MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TO
 use crate::overlay::{
     EventQueue, OverlayPos, decode_artwork, draw_string, set_duration, set_position, show_sample, wide,
 };
+use crate::process_picker;
+use crate::process_picker::PICKER_RESULT_MSG;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use log::{debug, error};
@@ -2382,7 +2384,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                 SettingId::CopyLogs => {
                                     state.copy_logs();
                                 }
-                                SettingId::AllowedApps => {}
+                                SettingId::AllowedApps => {
+                                    if !process_picker::open(
+                                        hwnd,
+                                        &control_rect,
+                                        &state.config.behavior.allowed_sources,
+                                    ) {
+                                        debug!("process picker failed to open");
+                                    }
+                                }
                             }
                             return LRESULT(0);
                         }
@@ -2463,6 +2473,24 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 state.config.overlay.position_y = Some(lparam.0 as i32);
                 let _ = state.config.save();
                 set_position(state.overlay_hwnd, OverlayPos::from_config(&state.config));
+            }
+            LRESULT(0)
+        }
+        PICKER_RESULT_MSG => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                if wparam.0 == 0 {
+                    // Confirmed: read the selected patterns.
+                    let patterns = unsafe { Box::from_raw(lparam.0 as *mut Vec<String>) };
+                    state.config.behavior.allowed_sources = *patterns;
+                    let _ = state.config.save();
+                    state.invalidate();
+                } else {
+                    // Cancelled: free the pointer.
+                    if lparam.0 != 0 {
+                        let _ = unsafe { Box::from_raw(lparam.0 as *mut Vec<String>) };
+                    }
+                }
             }
             LRESULT(0)
         }
