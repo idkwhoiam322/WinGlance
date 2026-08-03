@@ -17,14 +17,15 @@ use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWLP_USERDATA,
-    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IDC_ARROW,
-    IsIconic, IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT, LB_SETITEMDATA,
-    LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, PostMessageW,
-    RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETFONT, WNDCLASS_STYLES, WNDCLASSEXW, WS_BORDER, WS_CHILD,
-    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    CREATESTRUCTW, CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE,
+    GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId,
+    HWND_TOPMOST, IDC_ARROW, IsIconic, IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT,
+    LB_SETCURSEL, LB_SETITEMDATA, LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED,
+    LoadCursorW, PostMessageW, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW,
+    SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETFONT, WNDCLASS_STYLES,
+    WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -104,6 +105,51 @@ pub(crate) fn enumerate_app_processes() -> Vec<ProcessEntry> {
     }
     entries.sort_by_key(|a| a.display_name.to_lowercase());
     entries
+}
+
+/// Appends every currently open SMTC session source that the window scan did
+/// not already find (tray-only apps and background browser tabs have no
+/// visible window, so the session list is the only way to surface them).
+fn merge_smtc_sources(mut entries: Vec<ProcessEntry>) -> Vec<ProcessEntry> {
+    let sources = crate::smtc::active_session_sources();
+    if sources.is_empty() {
+        return entries;
+    }
+    let mut seen: std::collections::HashSet<String> = entries.iter().map(|e| normalize_pattern(&e.pattern)).collect();
+    for source in sources {
+        if normalize_pattern(&source).is_empty() || !seen.insert(normalize_pattern(&source)) {
+            continue;
+        }
+        entries.push(ProcessEntry {
+            display_name: pretty_source_label(&source),
+            pattern: source,
+        });
+    }
+    entries.sort_by_key(|a| a.display_name.to_lowercase());
+    entries
+}
+
+/// Same normalization the SMTC worker uses when matching allow-list patterns
+/// against AUMIDs, so picker pre-checking agrees with session filtering.
+fn normalize_pattern(value: &str) -> String {
+    crate::smtc::normalize_for_match(value)
+}
+
+/// Turns a session source label like `"youtube-music"` into a readable entry
+/// title like `"Youtube Music"` for the picker list.
+fn pretty_source_label(value: &str) -> String {
+    value
+        .split(['-', '_', '.'])
+        .filter(|w| !w.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -201,9 +247,9 @@ pub(crate) fn close_existing() {
 }
 
 pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool {
-    let list = enumerate_app_processes();
+    let list = merge_smtc_sources(enumerate_app_processes());
     if list.is_empty() {
-        warn!("no visible app processes found for picker");
+        warn!("no app processes or SMTC sessions found for picker");
         return false;
     }
 
@@ -218,9 +264,20 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
         let item_count = list.len().min(MAX_VISIBLE);
         let height = HEADER_H + item_count as i32 * ROW_HEIGHT + 10;
 
+        // Pre-check with the same normalization the SMTC worker applies to
+        // allow-list patterns, so a stored "youtube music" matches the
+        // session-derived "youtube-music" entry.
+        let norm_current: Vec<String> = current
+            .iter()
+            .map(|p| normalize_pattern(p))
+            .filter(|n| !n.is_empty())
+            .collect();
         let checked: Vec<bool> = list
             .iter()
-            .map(|e| current.iter().any(|p| e.pattern.contains(p) || p.contains(&e.pattern)))
+            .map(|e| {
+                let ne = normalize_pattern(&e.pattern);
+                norm_current.iter().any(|n| ne.contains(n.as_str()) || n.contains(&ne))
+            })
             .collect();
 
         let state = Box::new(PickerState {
@@ -294,6 +351,14 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
         if let Ok(lb) = lb {
             let state_ref = &mut *state_ptr;
             state_ref.listbox = lb;
+
+            // Mouse and keyboard messages go to the listbox child, not to the
+            // picker window, so route them through our own proc. The original
+            // proc is kept in the listbox's user data for forwarding.
+            let old_proc = SetWindowLongPtrW(lb, GWLP_WNDPROC, listbox_proc as *const () as isize);
+            if old_proc != 0 {
+                let _ = SetWindowLongPtrW(lb, GWLP_USERDATA, old_proc);
+            }
 
             let _ = SendMessageW(lb, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(ROW_HEIGHT as isize));
             let font = CreateFontW(
@@ -379,6 +444,107 @@ fn hit_test_close(hwnd: HWND, x: i32, y: i32) -> bool {
     let _ = unsafe { GetClientRect(hwnd, &mut client) };
     let r = close_btn_rect(&client);
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+/// Subclassed window proc for the picker's listbox. Mouse messages go to the
+/// child control under the cursor, never to the picker window, so
+/// click-to-toggle and double-click-to-confirm are handled here. The original
+/// listbox proc is stored in the listbox's GWLP_USERDATA and receives every
+/// message we do not consume.
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe extern "system" fn listbox_proc(lb: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match message {
+        WM_LBUTTONDOWN => {
+            let parent = unsafe { GetParent(lb).unwrap_or_default() };
+            let state_ptr = if parent.0.is_null() {
+                std::ptr::null_mut()
+            } else {
+                unsafe { GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut PickerState }
+            };
+            if !state_ptr.is_null() {
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                let item_idx = y / ROW_HEIGHT;
+                let count = unsafe { SendMessageW(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as i32;
+                if item_idx >= 0 && item_idx < count {
+                    let i = item_idx as usize;
+                    let state = unsafe { &mut *state_ptr };
+
+                    // Double-click on the same item within 400ms confirms and
+                    // closes, applying the state left by the first click.
+                    let now = Instant::now();
+                    let is_double = state.last_click_item == Some(i)
+                        && state
+                            .last_click_time
+                            .is_some_and(|t| t.elapsed() < Duration::from_millis(400));
+                    state.last_click_item = Some(i);
+                    state.last_click_time = Some(now);
+
+                    if is_double {
+                        post_result(parent, false);
+                        let _ = unsafe { DestroyWindow(parent) };
+                        return LRESULT(0);
+                    }
+
+                    // Single click: toggle the checkbox and repaint the row.
+                    let data = unsafe { SendMessageW(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
+                    let toggled = if data.0 as usize == BST_CHECKED {
+                        BST_UNCHECKED
+                    } else {
+                        BST_CHECKED
+                    };
+                    let _ = unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
+                    let _ = unsafe { SendMessageW(lb, LB_SETCURSEL, WPARAM(i), LPARAM(0)) };
+                    let mut item_rect = RECT::default();
+                    let _ = unsafe {
+                        SendMessageW(
+                            lb,
+                            LB_GETITEMRECT,
+                            WPARAM(i),
+                            LPARAM(&mut item_rect as *mut RECT as isize),
+                        )
+                    };
+                    unsafe {
+                        let _ = InvalidateRect(lb, Some(&item_rect), false);
+                    }
+                    return LRESULT(0);
+                }
+            }
+            forward_original(lb, message, wparam, lparam)
+        }
+        WM_KEYDOWN => {
+            // The listbox takes keyboard focus when clicked, so Enter/Esc must
+            // work here as well as on the picker window itself.
+            let parent = unsafe { GetParent(lb).unwrap_or_default() };
+            let key = wparam.0 as u16;
+            if key == VK_ESCAPE.0 {
+                if !parent.0.is_null() {
+                    post_result(parent, true);
+                    let _ = unsafe { DestroyWindow(parent) };
+                }
+                return LRESULT(0);
+            }
+            if key == 0x0D {
+                if !parent.0.is_null() {
+                    post_result(parent, false);
+                    let _ = unsafe { DestroyWindow(parent) };
+                }
+                return LRESULT(0);
+            }
+            forward_original(lb, message, wparam, lparam)
+        }
+        _ => forward_original(lb, message, wparam, lparam),
+    }
+}
+
+fn forward_original(lb: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        let old_proc = GetWindowLongPtrW(lb, GWLP_USERDATA);
+        if old_proc == 0 {
+            return DefWindowProcW(lb, message, wparam, lparam);
+        }
+        let old: WNDPROC = std::mem::transmute(old_proc);
+        CallWindowProcW(old, lb, message, wparam, lparam)
+    }
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -500,7 +666,9 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 } else {
                     0x001E1E1E
                 });
-                FillRect(draw.hDC, &draw.rcItem, CreateSolidBrush(bg));
+                let bg_brush = CreateSolidBrush(bg);
+                FillRect(draw.hDC, &draw.rcItem, bg_brush);
+                let _ = DeleteObject(bg_brush);
 
                 // Checkbox square on the left.
                 let mid = (draw.rcItem.top + draw.rcItem.bottom) / 2;
@@ -580,77 +748,16 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 return LRESULT(0);
             }
 
+            // Clicks inside the listbox are delivered to the listbox and
+            // handled by its subclassed proc; this handler only covers the
+            // picker's own surface (header and padding). Clicks outside the
+            // picker dismiss it.
             let mut client = RECT::default();
             let _ = unsafe { GetClientRect(hwnd, &mut client) };
             if x < client.left || x >= client.right || y < client.top || y >= client.bottom {
                 post_result(hwnd, true);
                 let _ = unsafe { DestroyWindow(hwnd) };
                 return LRESULT(0);
-            }
-
-            // Handle listbox click-to-toggle and double-click-to-confirm. The
-            // listbox is owner-drawn, so Windows does not manage selection on
-            // its own; toggling must happen here.
-            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
-            let Some(state) = (unsafe { state_ptr.as_ref() }) else {
-                return DefWindowProcW(hwnd, message, wparam, lparam);
-            };
-            let lb = state.listbox;
-            if lb.0.is_null() {
-                return DefWindowProcW(hwnd, message, wparam, lparam);
-            }
-
-            // Listbox bounds (after the header row).
-            let lb_y = HEADER_H;
-            let lb_h = ROW_HEIGHT * state.list.len().min(MAX_VISIBLE) as i32;
-            if y < lb_y || y >= lb_y + lb_h || !(0..WIDTH).contains(&x) {
-                return DefWindowProcW(hwnd, message, wparam, lparam);
-            }
-
-            let item_idx = (y - lb_y) / ROW_HEIGHT;
-            let count = unsafe { SendMessageW(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as i32;
-            if item_idx < 0 || item_idx >= count {
-                return DefWindowProcW(hwnd, message, wparam, lparam);
-            }
-            let i = item_idx as usize;
-
-            // Double-click detection: same item within 400ms = confirm.
-            let now = Instant::now();
-            let is_double = state.last_click_item == Some(i)
-                && state
-                    .last_click_time
-                    .is_some_and(|t| t.elapsed() < Duration::from_millis(400));
-
-            let state = unsafe { &mut *state_ptr };
-            state.last_click_item = Some(i);
-            state.last_click_time = Some(now);
-
-            if is_double {
-                post_result(hwnd, false);
-                let _ = unsafe { DestroyWindow(hwnd) };
-                return LRESULT(0);
-            }
-
-            // Single click: toggle the checkbox.
-            let data = unsafe { SendMessageW(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
-            let toggled = if data.0 as usize == BST_CHECKED {
-                BST_UNCHECKED
-            } else {
-                BST_CHECKED
-            };
-            let _ = unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
-            // Repaint just this item so the mark flips immediately.
-            let mut item_rect = RECT::default();
-            let _ = unsafe {
-                SendMessageW(
-                    lb,
-                    LB_GETITEMRECT,
-                    WPARAM(i),
-                    LPARAM(&mut item_rect as *mut RECT as isize),
-                )
-            };
-            unsafe {
-                let _ = InvalidateRect(lb, Some(&item_rect), false);
             }
             LRESULT(0)
         }
