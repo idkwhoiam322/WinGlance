@@ -680,6 +680,11 @@ impl OverlayState {
         self.content = None;
         self.dismiss_at = None;
         self.phase = Phase::Hidden;
+        // Clear the last-shown source label so a subsequent PlaybackStateChanged
+        // from the same source is no longer treated as redundant with a track
+        // pill that has already collapsed. The label is re-set in show_next()
+        // if a fresh TrackChanged is queued.
+        self.current_source = None;
         self.delete_anim_timer();
         unsafe {
             // Do NOT kill the debounce timer here: an event that arrived while
@@ -2114,5 +2119,32 @@ mod tests {
             lower < upper,
             "glyphs must not sit at the bottom of the row (lower={lower})"
         );
+    }
+
+    #[test]
+    fn current_source_is_cleared_when_the_pill_hides() {
+        // Regression: current_source was set by show_next() when a TrackChanged
+        // pill was shown and never cleared, so ALL subsequent PlaybackStateChanged
+        // pills from the same source were permanently suppressed — the user saw
+        // Paused pills but no Playing pills after the first track notification.
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+
+        // Simulate the state show_next() leaves behind after a TrackChanged.
+        state.current_source = Some("youtube-music".to_string());
+        state.content = Some(MediaEvent::TrackChanged(TrackInfo {
+            source_app: "youtube-music".to_string(),
+            ..TrackInfo::default()
+        }));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() + Duration::from_secs(1));
+
+        state.hide();
+
+        assert!(
+            state.current_source.is_none(),
+            "current_source must clear when the pill collapses"
+        );
+        assert!(matches!(state.phase, Phase::Hidden));
     }
 }
