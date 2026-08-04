@@ -56,10 +56,15 @@ for compositing; a value below 255 makes the pill slightly translucent.
 Beyond these knobs the pill derives its look from the playing track:
 
 - **Palette** — two vibrant colors extracted from the album art (on first
-  decode, in the UI thread). The primary recolors the playback symbols, the
-  clock icon and the music note; a muted variant tints the artist and
-  source-app rows. When the artwork yields no qualifying color, the accent
-  above is used.
+  decode, in the UI thread): a 4-bit-per-channel histogram, filtered through
+  a four-tier guard chain — vibrant scoring, strict guard (saturation ≥ 0.25,
+  luminance 0.20–0.85), a relaxed fallback for dark covers (S ≥ 0.10,
+  L ≥ 0.10),   and a monochrome tier for B&W and high-key covers (any pixel with Y ≥ 0.18)
+  — so moody portraits and bright white covers get their own tint
+  instead of the accent default. The primary recolors the playback
+  symbols, the clock icon and the music note; a muted variant tints the
+  artist and source-app rows. When the artwork yields no qualifying color,
+  the accent above is used.
 - **Aura** — a soft C₁→C₂ glow around the pill boundary, brighter on the left
   where the art sits. Intensity is hardcoded, not in the config.
 - **App icon** — the source app's icon (from its AUMID) renders next to the
