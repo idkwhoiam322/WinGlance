@@ -989,7 +989,7 @@ fn state_content_size(config: &Config, last_track: Option<&TrackInfo>) -> (f32, 
     let mut text_h = appearance.font_size_title * ROW_HEIGHT;
     if let Some(track) = last_track {
         if !track.artist.trim().is_empty() {
-            text_h += appearance.font_size_artist * 0.85 * ROW_HEIGHT;
+            text_h += appearance.font_size_artist * ROW_HEIGHT;
         }
         if !track.meta_line(true).is_empty() {
             text_h += appearance.font_size_artist * 0.85 * ROW_HEIGHT;
@@ -1573,6 +1573,150 @@ fn rounded_triangle_coverage(
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Draws the shared pill text layout used by every notification: title,
+/// artist, meta and source-app rows, fitted to the rows that are actually
+/// present. When `playback` is `Some`, the title row reserves space on its
+/// right for the play/pause/stop symbol; track-change pills pass `None` and
+/// use the full width. Every row marquee-scrolls when it overflows.
+#[allow(clippy::too_many_arguments)]
+fn draw_pill_text_rows(
+    state: &mut OverlayState,
+    pixels: &mut [u8],
+    width: i32,
+    scale: f32,
+    track: &TrackInfo,
+    playback: Option<PlaybackState>,
+) {
+    let appearance = &state.config.appearance;
+    let padding = (appearance.padding * scale) as i32;
+    let art = (appearance.art_size as f32 * scale) as i32;
+    let left = padding + art + (12.0 * scale) as i32;
+    let right = width - padding;
+
+    // Font-driven row heights: bands are sized from the actual fonts, so
+    // rows can never overlap at any pill size (including mid-animation)
+    // and pack tightly — the pill is fitted to the drawn rows, so each
+    // band keeps its natural line height instead of expanding.
+    let fs_title = appearance.font_size_title * scale;
+    let fs_artist = appearance.font_size_artist * scale;
+    let fs_meta = fs_artist * 0.85;
+    let fs_app = fs_artist * 0.85;
+    let rows: [(f32, f32); 4] = [
+        (fs_title * ROW_HEIGHT, fs_title),
+        (fs_artist * ROW_HEIGHT, fs_artist),
+        (fs_meta * ROW_HEIGHT, fs_meta),
+        (fs_app * ROW_HEIGHT, fs_app),
+    ];
+    // Only rows that will actually be drawn participate, so title expands
+    // to fill the pill when the artist, meta, or source-app line is absent.
+    let (meta_clock, meta) = track.meta_line_for_overlay(true);
+    let artist_active = !track.artist.trim().is_empty();
+    let active: [bool; 4] = [
+        true,
+        artist_active,
+        !meta.is_empty(),
+        !track.source_app.trim().is_empty(),
+    ];
+    let text_top = appearance.padding * scale;
+    let mut y = text_top;
+    let mut next_band = |i: usize| -> RECT {
+        let band_h = if active[i] { rows[i].0 } else { 0.0 };
+        let r = RECT {
+            left,
+            top: y as i32,
+            right,
+            bottom: (y + band_h) as i32,
+        };
+        y += band_h;
+        r
+    };
+
+    // Width reserved on the right of the title row for the playback state
+    // symbol (▶/‖/■), so it reads like a badge rather than a separate
+    // centered row.
+    let label_w = (80.0 * scale) as i32;
+
+    let title_rect = next_band(0);
+    let title_narrow = if playback.is_some() {
+        RECT {
+            left: title_rect.left,
+            top: title_rect.top,
+            right: title_rect.right - label_w,
+            bottom: title_rect.bottom,
+        }
+    } else {
+        title_rect
+    };
+    draw_text_line_pixels(
+        &mut state.text_scratch,
+        pixels,
+        width as usize,
+        &track.title,
+        &title_narrow,
+        rows[0].1 as i32,
+        appearance.text_color,
+        true,
+        false,
+        Some(&mut state.scroll[0]),
+    );
+    if let Some(playback) = playback {
+        draw_symbol_pixels(
+            pixels,
+            width as usize,
+            title_rect.right,
+            title_rect.top,
+            fs_title,
+            playback,
+            appearance.accent_color,
+        );
+    }
+
+    let artist_rect = next_band(1);
+    if artist_active {
+        draw_text_line_pixels(
+            &mut state.text_scratch,
+            pixels,
+            width as usize,
+            &track.artist,
+            &artist_rect,
+            rows[1].1 as i32,
+            [0xCC, 0xCC, 0xCC, 0xFF],
+            false,
+            false,
+            Some(&mut state.scroll[1]),
+        );
+    }
+
+    if active[2] {
+        let meta_rect = next_band(2);
+        draw_meta_line_pixels(
+            &mut state.text_scratch,
+            pixels,
+            width,
+            &meta_rect,
+            &meta,
+            meta_clock,
+            rows[2].1 as i32,
+            [0x99, 0x99, 0x99, 0xFF],
+            scale,
+            Some(&mut state.scroll[2]),
+        );
+    }
+    if active[3] {
+        let app_rect = next_band(3);
+        draw_source_app_row(
+            &mut state.text_scratch,
+            pixels,
+            width as usize,
+            track,
+            &app_rect,
+            rows[3].1 as i32,
+            scale,
+            Some(&mut state.scroll[3]),
+        );
+    }
+}
+
 /// Draws the pill's text rows into the same premultiplied pixel buffer as the
 /// shapes: glyph coverage from fontdue becomes alpha, so text alpha-composites
 /// exactly like every other element (GDI text cannot do this on a layered
@@ -1580,216 +1724,42 @@ fn rounded_triangle_coverage(
 fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &MediaEvent, width: i32, scale: f32) {
     match content {
         MediaEvent::TrackChanged(track) => {
-            let appearance = &state.config.appearance;
-            let padding = (appearance.padding * scale) as i32;
-            let art = (appearance.art_size as f32 * scale) as i32;
-            let left = padding + art + (12.0 * scale) as i32;
-            let right = width - padding;
-
-            // Font-driven row heights: bands are sized from the actual fonts, so
-            // rows can never overlap at any pill size (including mid-animation)
-            // and pack tightly — the pill is fitted to the drawn rows, so each
-            // band keeps its natural line height instead of expanding.
-            let fs_title = appearance.font_size_title * scale;
-            let fs_artist = appearance.font_size_artist * scale;
-            let fs_meta = fs_artist * 0.85;
-            let fs_app = fs_artist * 0.85;
-            let rows: [(f32, f32); 4] = [
-                (fs_title * ROW_HEIGHT, fs_title),
-                (fs_artist * ROW_HEIGHT, fs_artist),
-                (fs_meta * ROW_HEIGHT, fs_meta),
-                (fs_app * ROW_HEIGHT, fs_app),
-            ];
-            // Only rows that will actually be drawn participate, so title expands
-            // to fill the pill when the artist, meta, or source-app line is absent.
-            let (meta_clock, meta) = track.meta_line_for_overlay(true);
-            let artist_active = !track.artist.trim().is_empty();
-            let active: [bool; 4] = [
-                true,
-                artist_active,
-                !meta.is_empty(),
-                !track.source_app.trim().is_empty(),
-            ];
-            let text_top = appearance.padding * scale;
-            let mut y = text_top;
-            let mut next_band = |i: usize| -> RECT {
-                let band_h = if active[i] { rows[i].0 } else { 0.0 };
-                let r = RECT {
-                    left,
-                    top: y as i32,
-                    right,
-                    bottom: (y + band_h) as i32,
-                };
-                y += band_h;
-                r
-            };
-
-            let title_rect = next_band(0);
-            draw_text_line_pixels(
-                &mut state.text_scratch,
-                pixels,
-                width as usize,
-                &track.title,
-                &title_rect,
-                rows[0].1 as i32,
-                appearance.text_color,
-                true,
-                false,
-                Some(&mut state.scroll[0]),
-            );
-
-            let artist_rect = next_band(1);
-            if artist_active {
-                draw_text_line_pixels(
-                    &mut state.text_scratch,
-                    pixels,
-                    width as usize,
-                    &track.artist,
-                    &artist_rect,
-                    rows[1].1 as i32,
-                    [0xCC, 0xCC, 0xCC, 0xFF],
-                    false,
-                    false,
-                    Some(&mut state.scroll[1]),
-                );
-            }
-
-            if active[2] {
-                let meta_rect = next_band(2);
-                draw_meta_line_pixels(
-                    &mut state.text_scratch,
-                    pixels,
-                    width,
-                    &meta_rect,
-                    &meta,
-                    meta_clock,
-                    rows[2].1 as i32,
-                    [0x99, 0x99, 0x99, 0xFF],
-                    scale,
-                    Some(&mut state.scroll[2]),
-                );
-            }
-            if active[3] {
-                let app_rect = next_band(3);
-                draw_source_app_row(
-                    &mut state.text_scratch,
-                    pixels,
-                    width as usize,
-                    track,
-                    &app_rect,
-                    rows[3].1 as i32,
-                    scale,
-                    Some(&mut state.scroll[3]),
-                );
-            }
+            draw_pill_text_rows(state, pixels, width, scale, track, None);
         }
         MediaEvent::PlaybackStateChanged(playback, source_app) => {
-            let appearance = &state.config.appearance;
-            let padding = (appearance.padding * scale) as i32;
-            let art = (appearance.art_size as f32 * scale) as i32;
-            let left = padding + art + (12.0 * scale) as i32;
-            let right = width - padding;
-            let fs_title = appearance.font_size_title * scale;
-            let fs_artist = appearance.font_size_artist * scale;
-            let text_top = appearance.padding * scale;
-            let mut y = text_top;
-            let mut next_band = |h: f32| -> RECT {
-                let r = RECT {
-                    left,
-                    top: y as i32,
-                    right,
-                    bottom: (y + h) as i32,
-                };
-                y += h;
-                r
-            };
-
-            // Width reserved on the right of the title row for the playback
-            // state symbol (▶/‖/■), so it reads like a badge rather than a
-            // separate centered row — matching the TrackChanged pill layout.
-            let label_w = (80.0 * scale) as i32;
-
-            // Cached track: title row carries the symbol on the right.
+            // Cached track: render the shared layout with the state symbol
+            // on the title row.
             let cached = if source_app.is_empty() {
                 None
             } else {
                 state.track_cache.get(source_app).cloned()
             };
-
             if let Some(track) = cached {
-                let title_rect = next_band(fs_title * ROW_HEIGHT);
-                let title_narrow = RECT {
-                    left: title_rect.left,
-                    top: title_rect.top,
-                    right: title_rect.right - label_w,
-                    bottom: title_rect.bottom,
-                };
-                draw_text_line_pixels(
-                    &mut state.text_scratch,
-                    pixels,
-                    width as usize,
-                    &track.title,
-                    &title_narrow,
-                    fs_title as i32,
-                    appearance.text_color,
-                    true,
-                    false,
-                    None,
-                );
-                draw_symbol_pixels(
-                    pixels,
-                    width as usize,
-                    title_rect.right,
-                    title_rect.top,
-                    fs_title,
-                    *playback,
-                    appearance.accent_color,
-                );
-                if !track.artist.trim().is_empty() {
-                    let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
-                    draw_text_line_pixels(
-                        &mut state.text_scratch,
-                        pixels,
-                        width as usize,
-                        &track.artist,
-                        &artist_rect,
-                        (fs_artist * 0.85) as i32,
-                        [0xCC, 0xCC, 0xCC, 0xFF],
-                        false,
-                        false,
-                        None,
-                    );
-                }
-                let (meta_clock, meta) = track.meta_line_for_overlay(true);
-                if !meta.is_empty() {
-                    let meta_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
-                    draw_meta_line_pixels(
-                        &mut state.text_scratch,
-                        pixels,
-                        width,
-                        &meta_rect,
-                        &meta,
-                        meta_clock,
-                        (fs_artist * 0.85) as i32,
-                        [0x99, 0x99, 0x99, 0xFF],
-                        scale,
-                        None,
-                    );
-                }
-                if !track.source_app.trim().is_empty() {
-                    let source_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
-                    draw_source_app_row(
-                        &mut state.text_scratch,
-                        pixels,
-                        width as usize,
-                        &track,
-                        &source_rect,
-                        (fs_artist * 0.85) as i32,
-                        scale,
-                        None,
-                    );
-                }
+                draw_pill_text_rows(state, pixels, width, scale, &track, Some(*playback));
             } else {
+                // No cached track (the state change arrived before the first
+                // TrackChanged): fall back to the source name with an
+                // "Unknown" artist row.
+                let appearance = &state.config.appearance;
+                let padding = (appearance.padding * scale) as i32;
+                let art = (appearance.art_size as f32 * scale) as i32;
+                let left = padding + art + (12.0 * scale) as i32;
+                let right = width - padding;
+                let fs_title = appearance.font_size_title * scale;
+                let fs_artist = appearance.font_size_artist * scale;
+                let label_w = (80.0 * scale) as i32;
+                let mut y = appearance.padding * scale;
+                let mut next_band = |h: f32| -> RECT {
+                    let r = RECT {
+                        left,
+                        top: y as i32,
+                        right,
+                        bottom: (y + h) as i32,
+                    };
+                    y += h;
+                    r
+                };
+
                 let fallback_name = if !source_app.is_empty() {
                     Some(source_app.as_str())
                 } else {
