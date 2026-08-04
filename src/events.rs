@@ -88,6 +88,30 @@ impl TrackInfo {
         let line = self.meta_line(include_album);
         (line.contains('⏱'), line.replace("⏱ ", ""))
     }
+
+    /// Whether `other` denotes the same media item as `self` for the
+    /// update-vs-new-pill decision: same source, title and artist, and no
+    /// contradicting artwork. A different cover (both sides present)
+    /// identifies different media (e.g. a video vs audio version of the same
+    /// song); missing artwork on either side — SMTC fills the thumbnail a
+    /// moment after the title — is tolerated as the same item so the pill
+    /// updates in place instead of re-notifying. With no artwork on either
+    /// side, an equal-or-unknown duration is required, so two recordings can
+    /// still be told apart.
+    pub fn same_media(&self, other: &TrackInfo) -> bool {
+        self.source_app == other.source_app
+            && self.title == other.title
+            && self.artist == other.artist
+            && match (&self.artwork, &other.artwork) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref(),
+                (None, Some(_)) | (Some(_), None) => true,
+                (None, None) => {
+                    self.duration_secs == other.duration_secs
+                        || self.duration_secs.is_none()
+                        || other.duration_secs.is_none()
+                }
+            }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,5 +193,81 @@ mod tests {
         let (has_duration, text) = no_duration.meta_line_for_overlay(true);
         assert!(!has_duration);
         assert_eq!(text, no_duration.meta_line(true));
+    }
+
+    fn track(title: &str, artist: &str) -> TrackInfo {
+        TrackInfo {
+            title: title.into(),
+            artist: artist.into(),
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        }
+    }
+
+    fn art(bytes: &[u8]) -> Option<Arc<[u8]>> {
+        Some(Arc::from(bytes))
+    }
+
+    #[test]
+    fn same_media_requires_source_title_and_artist() {
+        let a = track("Love Me Not", "Ravyn Lenae");
+        assert!(a.same_media(&track("Love Me Not", "Ravyn Lenae")));
+        assert!(!a.same_media(&track("Other", "Ravyn Lenae")));
+        assert!(!a.same_media(&track("Love Me Not", "Other")));
+        let other_source = TrackInfo {
+            source_app: "spotify".into(),
+            ..a.clone()
+        };
+        assert!(!a.same_media(&other_source));
+    }
+
+    #[test]
+    fn same_media_tolerates_late_or_lost_artwork() {
+        // SMTC fills the thumbnail a moment after the title: gaining art for
+        // the same track must stay an in-place update, not a new pill.
+        let no_art = track("Love Me Not", "Ravyn Lenae");
+        let with_art = TrackInfo {
+            artwork: art(b"cover"),
+            ..no_art.clone()
+        };
+        assert!(no_art.same_media(&with_art));
+        assert!(with_art.same_media(&no_art));
+    }
+
+    #[test]
+    fn same_media_distinguishes_different_covers() {
+        let a = TrackInfo {
+            artwork: art(b"cover-a"),
+            ..track("Love Me Not", "Ravyn Lenae")
+        };
+        let b = TrackInfo {
+            artwork: art(b"cover-b"),
+            ..track("Love Me Not", "Ravyn Lenae")
+        };
+        assert!(!a.same_media(&b), "a different cover is different media");
+        // Identical bytes in separate Arcs still compare equal.
+        let a_copy = TrackInfo {
+            artwork: art(b"cover-a"),
+            ..track("Love Me Not", "Ravyn Lenae")
+        };
+        assert!(a.same_media(&a_copy));
+    }
+
+    #[test]
+    fn same_media_uses_duration_when_both_lack_artwork() {
+        let a = track("Love Me Not", "Ravyn Lenae");
+        let shorter = TrackInfo {
+            duration_secs: Some(115),
+            ..a.clone()
+        };
+        let longer = TrackInfo {
+            duration_secs: Some(218),
+            ..a.clone()
+        };
+        assert!(a.same_media(&shorter), "unknown duration matches anything");
+        assert!(
+            !shorter.same_media(&longer),
+            "both known and different -> different media"
+        );
     }
 }

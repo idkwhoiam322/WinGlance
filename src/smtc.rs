@@ -868,15 +868,30 @@ fn cached_artwork_for(
 }
 
 /// Whether a read of `merged` is a session recreation of the last emitted
-/// track `prev_track` (same title + artist). When `read_artwork` is false (the
-/// 2s poll, which never reads art), the artwork-presence clause is skipped —
-/// a poll always produces None, which would otherwise mismatch a last emit's
-/// Some and escape dedup as a duplicate pill. Used both by `refresh_session`
-/// and the tests, so the mirror cannot drift.
+/// track `prev_track` (same title + artist, same artwork identity). When
+/// `read_artwork` is false (the 2s poll, which never reads art), the artwork
+/// clause is skipped — a poll always produces None, which would otherwise
+/// mismatch a last emit's Some and escape dedup as a duplicate pill. Artwork
+/// is compared by bytes, not presence: a recreated session that re-reports
+/// the same track with a *different* cover (video vs audio version) is not a
+/// recreation — the artwork-changed emit must pass through, not be
+/// suppressed. Used both by `refresh_session` and the tests, so the mirror
+/// cannot drift.
 fn is_session_recreation(prev_track: &TrackInfo, merged: &TrackInfo, read_artwork: bool) -> bool {
     prev_track.title == merged.title
         && prev_track.artist == merged.artist
-        && (!read_artwork || prev_track.artwork.is_some() == merged.artwork.is_some())
+        && if !read_artwork {
+            true
+        } else {
+            match (&prev_track.artwork, &merged.artwork) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref(),
+                (None, None) => true,
+                // Art gained or lost on the recreated session: emit so the
+                // pill refreshes with the cover instead of keeping the stale
+                // one.
+                _ => false,
+            }
+        }
 }
 
 /// True if a session still needs a poll-driven artwork read: it has no artwork
@@ -1518,6 +1533,30 @@ mod tests {
             &track("Song", "Other"),
             true,
         ));
+    }
+
+    #[test]
+    fn session_recreation_does_not_suppress_a_cover_swap() {
+        // Same track re-reported with a different cover (video vs audio
+        // version): artwork bytes differ, so it is NOT a recreation — the
+        // artwork-changed emit must pass through instead of being suppressed.
+        let prev = TrackInfo {
+            title: "Love Me Not".into(),
+            artist: "Ravyn Lenae".into(),
+            artwork: Some(Arc::from(vec![1])),
+            ..TrackInfo::default()
+        };
+        let swapped = TrackInfo {
+            artwork: Some(Arc::from(vec![2])),
+            ..prev.clone()
+        };
+        assert!(!is_session_recreation(&prev, &swapped, true));
+        // Identical bytes (fresh Arc, same content) still count as recreation.
+        let same_bytes = TrackInfo {
+            artwork: Some(Arc::from(vec![1])),
+            ..prev.clone()
+        };
+        assert!(is_session_recreation(&prev, &same_bytes, true));
     }
 
     #[test]

@@ -431,14 +431,12 @@ impl OverlayState {
                     // (SMTC fills artwork/album progressively, a moment after
                     // the title) updates the pill in place instead of queueing
                     // a second notification for the same song. Cross-source
-                    // matches do not refresh in place: both sources notify
-                    // independently.
-                    let is_update = self.content.as_ref().is_some_and(|content| {
-                        matches!(content, MediaEvent::TrackChanged(shown)
-                            if shown.title == track.title
-                                && shown.artist == track.artist
-                                && shown.source_app == track.source_app)
-                    });
+                    // matches do not refresh in place, and a different cover
+                    // for the same title+artist (video vs audio version)
+                    // queues a fresh pill rather than morphing the old one.
+                    let is_update = self.content.as_ref().is_some_and(
+                        |content| matches!(content, MediaEvent::TrackChanged(shown) if shown.same_media(&track)),
+                    );
                     if is_update {
                         self.current_source = Some(track.source_app.clone());
                         self.last_track = Some(track.clone());
