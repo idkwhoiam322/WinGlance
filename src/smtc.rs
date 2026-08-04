@@ -72,6 +72,13 @@ const CHURN_COOLDOWN_MS: u64 = 30_000;
 /// so a source that never provides one still gets its pill after this.
 const ARTWORK_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Minimum gap between a TrackChanged emit and a forced artwork-changed
+/// re-emit for the same source. SMTC re-reads the thumbnail within ~1s of
+/// a change and can return different bytes for the same cover; this keeps
+/// that re-read from firing a duplicate pill while still surfacing a
+/// genuinely different cover that appears later.
+const ARTWORK_CHANGE_MIN_INTERVAL: Duration = Duration::from_secs(3);
+
 /// Maximum number of poll-driven artwork retries per session. A poll that
 /// never reads artwork (read_artwork=false) cannot surface a thumbnail, so
 /// when a session is still missing art we re-read it on the poll path up to
@@ -143,6 +150,11 @@ struct ListenerState {
     /// Cached app icons keyed by source_app label (derived from AUMID via
     /// `source_app_label`). Populated on first encounter of a source.
     icon_cache: HashMap<String, Option<Arc<[u8]>>>,
+    /// When the last TrackChanged was emitted per source, used to time-gate
+    /// the artwork-changed re-emit: SMTC re-reads the thumbnail within ~1s
+    /// of a change and may return different bytes for the same cover, which
+    /// would otherwise fire a duplicate pill for the same song.
+    last_emit_at: HashMap<String, Instant>,
 }
 
 pub struct SmtcListener {
@@ -218,6 +230,7 @@ impl ListenerState {
             rejected_seen: HashSet::new(),
             last_track_per_source: HashMap::new(),
             icon_cache: HashMap::new(),
+            last_emit_at: HashMap::new(),
             heartbeat,
         }
     }
@@ -416,12 +429,20 @@ impl ListenerState {
                     // for the same title+artist (e.g. a video vs audio
                     // version). content_differ only compares text fields, so
                     // compare the artwork bytes against the last emitted
-                    // track and surface the new cover as a refresh.
+                    // track and surface the new cover as a refresh. Gated by
+                    // ARTWORK_CHANGE_MIN_INTERVAL: SMTC re-reads the
+                    // thumbnail within ~1s of a change and can return
+                    // different bytes for the same cover, which would
+                    // otherwise fire a duplicate pill for the same song.
                     if !emit
                         && read_artwork
                         && let Some(prev_track) = self.last_track_per_source.get(&merged.source_app)
                         && prev_track.title == merged.title
                         && prev_track.artist == merged.artist
+                        && self
+                            .last_emit_at
+                            .get(&merged.source_app)
+                            .is_none_or(|t| t.elapsed() >= ARTWORK_CHANGE_MIN_INTERVAL)
                     {
                         let art_changed = match (&prev_track.artwork, &merged.artwork) {
                             (Some(a), Some(b)) => !Arc::ptr_eq(a, b) && a.as_ref() != b.as_ref(),
@@ -469,6 +490,7 @@ impl ListenerState {
                         events.push(MediaEvent::TrackChanged(merged.clone()));
                         self.last_track_per_source
                             .insert(merged.source_app.clone(), merged.clone());
+                        self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
                         next.deferred_at = None;
                     } else if session_recreation {
                         let label = track_label(&merged);
@@ -624,6 +646,7 @@ impl ListenerState {
         // otherwise persist forever, growing with every AUMID variant seen.
         self.last_track_per_source.retain(|source, _| active.contains(source));
         self.icon_cache.retain(|source, _| active.contains(source));
+        self.last_emit_at.retain(|source, _| active.contains(source));
     }
 
     /// Returns the last emitted artwork bytes for `source_app` if the cached
