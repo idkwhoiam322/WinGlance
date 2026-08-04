@@ -242,6 +242,10 @@ struct OverlayState {
     track_cache: HashMap<String, TrackInfo>,
     /// Scratch DC + DIB for GDI text rendering (cached across frames).
     text_scratch: Option<TextScratch>,
+    /// Reusable UTF-16 scratch buffer for GDI text rendering, cleared and
+    /// refilled on each text-line draw so the render tick performs no per-frame
+    /// heap allocation for text encoding.
+    scratch_utf16: Vec<u16>,
     /// Physical-pixel inset from the buffer edge to the pill body, computed
     /// each frame from `AURA_MARGIN_LOGICAL * dpi * shape`. The pill is
     /// drawn at `(aura_inset, aura_inset)` so the aura fills the outer ring.
@@ -337,6 +341,7 @@ impl OverlayState {
             current_source: None,
             track_cache: HashMap::new(),
             text_scratch: None,
+            scratch_utf16: Vec::new(),
             aura_inset: 0,
         }
     }
@@ -1950,6 +1955,7 @@ fn draw_pill_text_rows(
     };
     draw_text_line_pixels(
         &mut state.text_scratch,
+        &mut state.scratch_utf16,
         pixels,
         width as usize,
         &track.title,
@@ -1976,6 +1982,7 @@ fn draw_pill_text_rows(
     if artist_active {
         draw_text_line_pixels(
             &mut state.text_scratch,
+            &mut state.scratch_utf16,
             pixels,
             width as usize,
             &track.artist,
@@ -1992,6 +1999,7 @@ fn draw_pill_text_rows(
         let meta_rect = next_band(2);
         draw_meta_line_pixels(
             &mut state.text_scratch,
+            &mut state.scratch_utf16,
             pixels,
             width,
             &meta_rect,
@@ -2008,6 +2016,7 @@ fn draw_pill_text_rows(
         let app_rect = next_band(3);
         draw_source_app_row(
             &mut state.text_scratch,
+            &mut state.scratch_utf16,
             pixels,
             width as usize,
             track,
@@ -2080,6 +2089,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                     };
                     draw_text_line_pixels(
                         &mut state.text_scratch,
+                        &mut state.scratch_utf16,
                         pixels,
                         width as usize,
                         name,
@@ -2102,6 +2112,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                     let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
                     draw_text_line_pixels(
                         &mut state.text_scratch,
+                        &mut state.scratch_utf16,
                         pixels,
                         width as usize,
                         "Unknown",
@@ -2130,6 +2141,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
 #[allow(clippy::too_many_arguments)]
 fn draw_meta_line_pixels(
     text_scratch: &mut Option<TextScratch>,
+    scratch_utf16: &mut Vec<u16>,
     pixels: &mut [u8],
     width: i32,
     rect: &RECT,
@@ -2144,6 +2156,7 @@ fn draw_meta_line_pixels(
     if !clock {
         draw_text_line_pixels(
             text_scratch,
+            scratch_utf16,
             pixels,
             width as usize,
             meta,
@@ -2167,6 +2180,7 @@ fn draw_meta_line_pixels(
     };
     draw_text_line_pixels(
         text_scratch,
+        scratch_utf16,
         pixels,
         width as usize,
         meta,
@@ -2189,6 +2203,7 @@ fn draw_meta_line_pixels(
 #[allow(clippy::too_many_arguments)]
 fn draw_text_line_pixels(
     text_scratch: &mut Option<TextScratch>,
+    scratch_utf16: &mut Vec<u16>,
     pixels: &mut [u8],
     width: usize,
     value: &str,
@@ -2217,7 +2232,8 @@ fn draw_text_line_pixels(
     if font.0.is_null() {
         return;
     }
-    let mut text = wide(value);
+    scratch_utf16.clear();
+    scratch_utf16.extend(value.encode_utf16());
     unsafe {
         let old_font = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
@@ -2243,10 +2259,9 @@ fn draw_text_line_pixels(
         };
         if let Some(scroll) = marquee {
             let mut measured = RECT::default();
-            let mut measure_text = text.clone();
             let _ = DrawTextW(
                 hdc,
-                &mut measure_text,
+                &mut *scratch_utf16,
                 &mut measured,
                 DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT,
             );
@@ -2264,11 +2279,11 @@ fn draw_text_line_pixels(
             let hold_elapsed = scroll.started_at.map(|t| t.elapsed()).unwrap_or_default();
             if text_w <= rw {
                 // Text fits: render once statically (no scrolling needed).
-                let _ = DrawTextW(hdc, &mut text, &mut local, flags);
+                let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
             } else if hold_elapsed < MARQUEE_HOLD {
                 // Overflow but still in the static hold: render with ellipsis so
                 // the text is readable ("…") instead of hard-clipped at the edge.
-                let _ = DrawTextW(hdc, &mut text, &mut local, flags);
+                let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
             } else {
                 // Scrolling active: draw two copies offset by the marquee delta.
                 let total = text_w + MARQUEE_GAP as i32;
@@ -2286,8 +2301,8 @@ fn draw_text_line_pixels(
                     y,
                     ETO_CLIPPED,
                     Some(&clip),
-                    PCWSTR(text.as_ptr()),
-                    text.len() as u32,
+                    PCWSTR(scratch_utf16.as_ptr()),
+                    scratch_utf16.len() as u32,
                     None,
                 );
                 let x2 = x1 + total;
@@ -2298,14 +2313,14 @@ fn draw_text_line_pixels(
                         y,
                         ETO_CLIPPED,
                         Some(&clip),
-                        PCWSTR(text.as_ptr()),
-                        text.len() as u32,
+                        PCWSTR(scratch_utf16.as_ptr()),
+                        scratch_utf16.len() as u32,
                         None,
                     );
                 }
             }
         } else {
-            let _ = DrawTextW(hdc, &mut text, &mut local, flags);
+            let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
         }
         SelectObject(hdc, old_font);
     }
@@ -2634,6 +2649,7 @@ fn draw_icon_scaled(
 #[allow(clippy::too_many_arguments)]
 fn draw_source_app_row(
     text_scratch: &mut Option<TextScratch>,
+    scratch_utf16: &mut Vec<u16>,
     pixels: &mut [u8],
     width: usize,
     track: &TrackInfo,
@@ -2657,6 +2673,7 @@ fn draw_source_app_row(
         };
         draw_text_line_pixels(
             text_scratch,
+            scratch_utf16,
             pixels,
             width,
             &track.source_app,
@@ -2670,6 +2687,7 @@ fn draw_source_app_row(
     } else {
         draw_text_line_pixels(
             text_scratch,
+            scratch_utf16,
             pixels,
             width,
             &track.source_app,
@@ -3238,6 +3256,7 @@ mod tests {
         let mut state = OverlayState::new(config, EventQueue::default());
         draw_text_line_pixels(
             &mut state.text_scratch,
+            &mut state.scratch_utf16,
             &mut pixels,
             200,
             "Hello World",
@@ -3271,6 +3290,7 @@ mod tests {
         let mut state = OverlayState::new(config, EventQueue::default());
         draw_text_line_pixels(
             &mut state.text_scratch,
+            &mut state.scratch_utf16,
             &mut pixels,
             200,
             "MMMMMM",
@@ -3317,6 +3337,7 @@ mod tests {
         let mut state = OverlayState::new(config, EventQueue::default());
         draw_text_line_pixels(
             &mut state.text_scratch,
+            &mut state.scratch_utf16,
             &mut pixels,
             200,
             "Hello World",
@@ -3347,6 +3368,7 @@ mod tests {
         let mut scroll = LineScroll::default();
         draw_text_line_pixels(
             &mut state.text_scratch,
+            &mut state.scratch_utf16,
             &mut pixels,
             200,
             "Feel It (Official Music Video)",
@@ -3395,6 +3417,7 @@ mod tests {
         let mut state = OverlayState::new(config, EventQueue::default());
         draw_text_line_pixels(
             &mut state.text_scratch,
+            &mut state.scratch_utf16,
             &mut pixels,
             200,
             "Hello",
