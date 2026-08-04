@@ -397,14 +397,10 @@ impl ListenerState {
                     // Out case: same session key, duration drift, poll read art=None
                     // vs last emit art=Some). Cached artwork injection (above) makes
                     // event reads for recreated sessions also see Some==Some.
-                    let session_recreation =
-                        self.last_track_per_source
-                            .get(&merged.source_app)
-                            .is_some_and(|prev_track| {
-                                prev_track.title == merged.title
-                                    && prev_track.artist == merged.artist
-                                    && (!read_artwork || prev_track.artwork.is_some() == merged.artwork.is_some())
-                            });
+                    let session_recreation = self
+                        .last_track_per_source
+                        .get(&merged.source_app)
+                        .is_some_and(|prev_track| is_session_recreation(prev_track, &merged, read_artwork));
                     // A recreated session starts from a default LogicalState, so
                     // its first read reports the new session's default playback
                     // state (e.g. Paused while the user never touched anything)
@@ -807,6 +803,18 @@ fn cached_artwork_for(
             None
         }
     })
+}
+
+/// Whether a read of `merged` is a session recreation of the last emitted
+/// track `prev_track` (same title + artist). When `read_artwork` is false (the
+/// 2s poll, which never reads art), the artwork-presence clause is skipped —
+/// a poll always produces None, which would otherwise mismatch a last emit's
+/// Some and escape dedup as a duplicate pill. Used both by `refresh_session`
+/// and the tests, so the mirror cannot drift.
+fn is_session_recreation(prev_track: &TrackInfo, merged: &TrackInfo, read_artwork: bool) -> bool {
+    prev_track.title == merged.title
+        && prev_track.artist == merged.artist
+        && (!read_artwork || prev_track.artwork.is_some() == merged.artwork.is_some())
 }
 
 /// True if a session still needs a poll-driven artwork read: it has no artwork
@@ -1375,18 +1383,6 @@ mod tests {
 
         // No cached entry → None.
         assert_eq!(cached_artwork_for(&HashMap::new(), "unknown", "Song", "Artist"), None);
-    }
-
-    /// The session-recreation predicate used in `refresh_session` to decide
-    /// whether a TrackChanged for the same source should be suppressed.
-    /// Mirrors the inline comparison so the logic is tested in isolation.
-    /// When `read_artwork` is false (the 2s poll, which never reads art), the
-    /// artwork-presence clause is skipped — a poll always produces None, which
-    /// would otherwise mismatch a last emit's Some and escape dedup.
-    fn is_session_recreation(prev: &TrackInfo, merged: &TrackInfo, read_artwork: bool) -> bool {
-        prev.title == merged.title
-            && prev.artist == merged.artist
-            && (!read_artwork || prev.artwork.is_some() == merged.artwork.is_some())
     }
 
     #[test]
