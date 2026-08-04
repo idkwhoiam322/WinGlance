@@ -246,10 +246,25 @@ struct OverlayState {
     /// refilled on each text-line draw so the render tick performs no per-frame
     /// heap allocation for text encoding.
     scratch_utf16: Vec<u16>,
+    /// Mutex-free font cache: HFONT handles keyed by (height, bold, quality).
+    /// Used by the render path instead of the global `FONT_CACHE` so per-frame
+    /// text rendering performs no cross-thread synchronization. Fonts are
+    /// created with `CreateFontW` directly and deleted when the DPI changes or
+    /// the window is destroyed.
+    font_cache: HashMap<FontKey, HFONT>,
+    /// Last DPI value observed in render(), so the font cache can be flushed
+    /// when the window moves to another monitor or system scaling changes.
+    last_dpi: u32,
     /// Physical-pixel inset from the buffer edge to the pill body, computed
     /// each frame from `AURA_MARGIN_LOGICAL * dpi * shape`. The pill is
     /// drawn at `(aura_inset, aura_inset)` so the aura fills the outer ring.
     aura_inset: i32,
+}
+
+impl Drop for OverlayState {
+    fn drop(&mut self) {
+        self.flush_fonts();
+    }
 }
 
 /// Resolved placement for the notch pill, pulled from [overlay] config. `x`/`y`
@@ -342,6 +357,8 @@ impl OverlayState {
             track_cache: HashMap::new(),
             text_scratch: None,
             scratch_utf16: Vec::new(),
+            font_cache: HashMap::new(),
+            last_dpi: 0,
             aura_inset: 0,
         }
     }
@@ -373,6 +390,52 @@ impl OverlayState {
             self.decoded_art = artwork.and_then(|a| decode_artwork(a, base_size));
             self.decoded_art_source = artwork.cloned();
             self.palette = self.decoded_art.as_deref().and_then(crate::palette::palette_from_rgba);
+        }
+    }
+
+    /// Returns the Segoe UI (ANTIALIASED_QUALITY) HFONT for the given pixel
+    /// height and weight, creating it on first use and caching it locally on
+    /// the state. Unlike the global `cached_font`, this never takes a cross-
+    /// thread Mutex, so it is safe to call on every render tick. The cache is
+    /// flushed on DPI change and window destruction (see `flush_fonts`).
+    fn font_for(&mut self, height: i32, bold: bool) -> HFONT {
+        let key = (height, bold, ANTIALIASED_QUALITY.0 as u32);
+        if let Some(font) = self.font_cache.get(&key) {
+            return *font;
+        }
+        let font_name = wide("Segoe UI");
+        let font = unsafe {
+            CreateFontW(
+                -height.max(1),
+                0,
+                0,
+                0,
+                if bold { 600 } else { 400 },
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_DEFAULT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                ANTIALIASED_QUALITY.0 as u32,
+                DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+                PCWSTR(font_name.as_ptr()),
+            )
+        };
+        if !font.0.is_null() {
+            self.font_cache.insert(key, font);
+        }
+        font
+    }
+
+    /// Deletes all cached HFONT handles, releasing GDI resources. Called when
+    /// the DPI changes (fonts become invalid at the new scale) and on window
+    /// destruction.
+    fn flush_fonts(&mut self) {
+        for (_, font) in self.font_cache.drain() {
+            unsafe {
+                let _ = DeleteObject(font);
+            }
         }
     }
 
@@ -773,7 +836,12 @@ impl OverlayState {
             return;
         };
         let (alpha, shape) = self.frame();
-        let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
+        let raw_dpi = unsafe { GetDpiForWindow(self.hwnd) };
+        if raw_dpi != 0 && raw_dpi != self.last_dpi {
+            self.last_dpi = raw_dpi;
+            self.flush_fonts();
+        }
+        let dpi = raw_dpi.max(96) as f32 / 96.0;
         let (logical_width, logical_height) = self.size_of(&content);
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
@@ -1912,6 +1980,12 @@ fn draw_pill_text_rows(
         (fs_meta * ROW_HEIGHT, fs_meta),
         (fs_app * ROW_HEIGHT, fs_app),
     ];
+    let text_color = appearance.text_color;
+    let pad = appearance.padding;
+    let font_title = state.font_for(rows[0].1 as i32, true);
+    let font_artist = state.font_for(rows[1].1 as i32, false);
+    let font_meta = state.font_for(rows[2].1 as i32, false);
+    let font_app = state.font_for(rows[3].1 as i32, false);
     // Only rows that will actually be drawn participate, so title expands
     // to fill the pill when the artist, meta, or source-app line is absent.
     let (meta_clock, meta) = track.meta_line_for_overlay(true);
@@ -1922,7 +1996,7 @@ fn draw_pill_text_rows(
         !meta.is_empty(),
         !track.source_app.trim().is_empty(),
     ];
-    let text_top = inset as f32 + appearance.padding * scale;
+    let text_top = inset as f32 + pad * scale;
     let mut y = text_top;
     let mut next_band = |i: usize| -> RECT {
         let band_h = if active[i] { rows[i].0 } else { 0.0 };
@@ -1960,10 +2034,9 @@ fn draw_pill_text_rows(
         width as usize,
         &track.title,
         &title_narrow,
-        rows[0].1 as i32,
-        appearance.text_color,
+        font_title,
+        text_color,
         true,
-        false,
         Some(&mut state.scroll[0]),
     );
     if let Some(playback) = playback {
@@ -1987,9 +2060,8 @@ fn draw_pill_text_rows(
             width as usize,
             &track.artist,
             &artist_rect,
-            rows[1].1 as i32,
+            font_artist,
             muted_accent(accent),
-            false,
             false,
             Some(&mut state.scroll[1]),
         );
@@ -2005,6 +2077,7 @@ fn draw_pill_text_rows(
             &meta_rect,
             &meta,
             meta_clock,
+            font_meta,
             rows[2].1 as i32,
             accent,
             accent,
@@ -2021,7 +2094,7 @@ fn draw_pill_text_rows(
             width as usize,
             track,
             &app_rect,
-            rows[3].1 as i32,
+            font_app,
             muted,
             scale,
             Some(&mut state.scroll[3]),
@@ -2060,9 +2133,14 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 let right = width - inset - padding;
                 let fs_title = appearance.font_size_title * scale;
                 let fs_artist = appearance.font_size_artist * scale;
+                let text_color = appearance.text_color;
+                let accent_color = appearance.accent_color;
+                let pad = appearance.padding;
+                let font_title = state.font_for(fs_title as i32, true);
+                let font_artist = state.font_for((fs_artist * 0.85) as i32, false);
                 let symbol_size = (fs_title * 1.5).min(fs_title * ROW_HEIGHT);
                 let label_w = (symbol_size + 16.0 * scale) as i32;
-                let mut y = inset as f32 + appearance.padding * scale;
+                let mut y = inset as f32 + pad * scale;
                 let mut next_band = |h: f32| -> RECT {
                     let r = RECT {
                         left,
@@ -2094,10 +2172,9 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         width as usize,
                         name,
                         &title_narrow,
-                        fs_title as i32,
-                        appearance.text_color,
+                        font_title,
+                        text_color,
                         true,
-                        false,
                         None,
                     );
                     draw_symbol_pixels(
@@ -2107,7 +2184,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         title_rect.top,
                         symbol_size,
                         *playback,
-                        appearance.accent_color,
+                        accent_color,
                     );
                     let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
                     draw_text_line_pixels(
@@ -2117,9 +2194,8 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         width as usize,
                         "Unknown",
                         &artist_rect,
-                        (fs_artist * 0.85) as i32,
+                        font_artist,
                         [0xCC, 0xCC, 0xCC, 0xFF],
-                        false,
                         false,
                         None,
                     );
@@ -2147,6 +2223,7 @@ fn draw_meta_line_pixels(
     rect: &RECT,
     meta: &str,
     clock: bool,
+    font: HFONT,
     font_height: i32,
     color: [u8; 4],
     accent: [u8; 4],
@@ -2161,9 +2238,8 @@ fn draw_meta_line_pixels(
             width as usize,
             meta,
             rect,
-            font_height,
+            font,
             color,
-            false,
             false,
             marquee,
         );
@@ -2185,9 +2261,8 @@ fn draw_meta_line_pixels(
         width as usize,
         meta,
         &text_rect,
-        font_height,
+        font,
         color,
-        false,
         false,
         marquee,
     );
@@ -2208,9 +2283,8 @@ fn draw_text_line_pixels(
     width: usize,
     value: &str,
     rect: &RECT,
-    font_height: i32,
+    font: HFONT,
     color: [u8; 4],
-    bold: bool,
     centered: bool,
     marquee: Option<&mut LineScroll>,
 ) {
@@ -2228,7 +2302,6 @@ fn draw_text_line_pixels(
     unsafe {
         std::ptr::write_bytes(bits.cast::<u8>(), 0, (rw * rh * 4) as usize);
     }
-    let font = create_pill_font(font_height, bold);
     if font.0.is_null() {
         return;
     }
@@ -2474,6 +2547,7 @@ pub(crate) fn cached_font(height: i32, bold: bool, quality: u32) -> HFONT {
 /// fringes into the scratch DIB, and the text path derives glyph coverage from
 /// the RGB channels, so gray AA keeps the mask clean (see `draw_string` for
 /// the same call on the layered-window path).
+#[allow(dead_code)]
 fn create_pill_font(height: i32, bold: bool) -> HFONT {
     cached_font(height, bold, ANTIALIASED_QUALITY.0 as u32)
 }
@@ -2654,7 +2728,7 @@ fn draw_source_app_row(
     width: usize,
     track: &TrackInfo,
     rect: &RECT,
-    font_h: i32,
+    font: HFONT,
     color: [u8; 4],
     scale: f32,
     marquee: Option<&mut LineScroll>,
@@ -2678,9 +2752,8 @@ fn draw_source_app_row(
             width,
             &track.source_app,
             &text_rect,
-            font_h,
+            font,
             color,
-            false,
             false,
             marquee,
         );
@@ -2692,9 +2765,8 @@ fn draw_source_app_row(
             width,
             &track.source_app,
             rect,
-            font_h,
+            font,
             color,
-            false,
             false,
             marquee,
         );
@@ -2973,6 +3045,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                         let _ = DeleteDC(dib.hdc);
                     }
                 }
+                state.flush_fonts();
                 drop(Box::from_raw(state_ptr));
             }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -3254,6 +3327,7 @@ mod tests {
         };
         let config = Config::default();
         let mut state = OverlayState::new(config, EventQueue::default());
+        let font = state.font_for(12, false);
         draw_text_line_pixels(
             &mut state.text_scratch,
             &mut state.scratch_utf16,
@@ -3261,9 +3335,8 @@ mod tests {
             200,
             "Hello World",
             &rect,
-            12,
+            font,
             [255, 255, 255, 255],
-            false,
             false,
             None,
         );
@@ -3288,6 +3361,7 @@ mod tests {
         };
         let config = Config::default();
         let mut state = OverlayState::new(config, EventQueue::default());
+        let font = state.font_for(48, false);
         draw_text_line_pixels(
             &mut state.text_scratch,
             &mut state.scratch_utf16,
@@ -3295,9 +3369,8 @@ mod tests {
             200,
             "MMMMMM",
             &rect,
-            48,
+            font,
             [0x80, 0x80, 0x80, 0xFF],
-            false,
             false,
             None,
         );
@@ -3335,6 +3408,7 @@ mod tests {
         };
         let config = Config::default();
         let mut state = OverlayState::new(config, EventQueue::default());
+        let font = state.font_for(12, false);
         draw_text_line_pixels(
             &mut state.text_scratch,
             &mut state.scratch_utf16,
@@ -3342,9 +3416,8 @@ mod tests {
             200,
             "Hello World",
             &rect,
-            12,
+            font,
             [255, 255, 255, 255],
-            false,
             false,
             Some(&mut LineScroll::default()),
         );
@@ -3366,6 +3439,7 @@ mod tests {
         let config = Config::default();
         let mut state = OverlayState::new(config, EventQueue::default());
         let mut scroll = LineScroll::default();
+        let font = state.font_for(12, false);
         draw_text_line_pixels(
             &mut state.text_scratch,
             &mut state.scratch_utf16,
@@ -3373,9 +3447,8 @@ mod tests {
             200,
             "Feel It (Official Music Video)",
             &rect,
-            12,
+            font,
             [255, 255, 255, 255],
-            false,
             false,
             Some(&mut scroll),
         );
@@ -3415,6 +3488,7 @@ mod tests {
         };
         let config = Config::default();
         let mut state = OverlayState::new(config, EventQueue::default());
+        let font = state.font_for(12, false);
         draw_text_line_pixels(
             &mut state.text_scratch,
             &mut state.scratch_utf16,
@@ -3422,9 +3496,8 @@ mod tests {
             200,
             "Hello",
             &rect,
-            12,
+            font,
             [255, 255, 255, 255],
-            false,
             false,
             None,
         );
