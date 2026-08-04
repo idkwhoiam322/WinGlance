@@ -1297,13 +1297,37 @@ fn draw_pixels(
     let inset = state.aura_inset as usize;
     let pill_w = width.saturating_sub(inset * 2);
     let pill_h = height.saturating_sub(inset * 2);
+    // Aura: painted first (underneath the pill body) in the full buffer,
+    // fading outside the pill boundary. Uses the decoded artwork's palette
+    // when available; otherwise falls back to the config accent so even
+    // palette-less pills (e.g. the sample) glow.
+    let aura_palette = state.palette.unwrap_or(Palette {
+        primary: state.config.appearance.accent_color,
+        secondary: state.config.appearance.accent_color,
+    });
+    draw_aura(
+        pixels,
+        width,
+        height,
+        aura_palette,
+        inset,
+        pill_w,
+        pill_h,
+        radius,
+        scale,
+    );
+
     // Pill body: filled rounded rect inset from the DIB edges, leaving the
-    // outer ring transparent for the aura glow.
-    for y in inset..inset.saturating_add(pill_h) {
-        for x in inset..inset.saturating_add(pill_w) {
-            let coverage = round_rect_coverage(
-                (x - inset) as f32,
-                (y - inset) as f32,
+    // outer ring transparent for the aura glow. Rendered on top of the aura
+    // so the smooth supersampled edge blends with the glow beneath it. The
+    // loop spans the full `0..width` / `0..height` range so the exterior
+    // anti-aliasing pixels (which carry the supersampled blend at the rounded
+    // corners and right edge) are not truncated by `inset + pill_w`.
+    for y in 0..height {
+        for x in 0..width {
+            let coverage = round_rect_coverage_supersampled(
+                (x as i32 - inset as i32) as f32,
+                (y as i32 - inset as i32) as f32,
                 pill_w as f32,
                 pill_h as f32,
                 radius,
@@ -1321,24 +1345,6 @@ fn draw_pixels(
             }
         }
     }
-    // Aura: painted in the full buffer, fading outside the pill boundary.
-    // Uses the decoded artwork's palette when available; otherwise falls back
-    // to the config accent so even palette-less pills (e.g. the sample) glow.
-    let aura_palette = state.palette.unwrap_or(Palette {
-        primary: state.config.appearance.accent_color,
-        secondary: state.config.appearance.accent_color,
-    });
-    draw_aura(
-        pixels,
-        width,
-        height,
-        aura_palette,
-        inset,
-        pill_w,
-        pill_h,
-        radius,
-        scale,
-    );
 
     match content {
         MediaEvent::TrackChanged(_) => {
@@ -2687,20 +2693,35 @@ fn round_rect_signed_dist(x: f32, y: f32, width: f32, height: f32, radius: f32) 
 }
 
 /// Anti-aliased coverage (0..=1) of a rounded rectangle at pixel (x, y):
-/// signed distance to the boundary smoothed over ~1.5 px. Used for the pill's
-/// outer shape, the placeholder art and the album-artwork corner mask.
+/// signed distance to the boundary smoothed over a 1.5 px band via
+/// Hermite interpolation. Used for the pill's outer shape, the placeholder
+/// art and the album-artwork corner mask.
 fn round_rect_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> f32 {
     let dist = round_rect_signed_dist(x, y, width, height, radius);
-    let t = (0.5 - dist / 1.5).clamp(0.0, 1.0);
+    let t = ((0.75 - dist) / 1.5).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// 2×2 subpixel supersampled coverage of a rounded rectangle. Replaces the
+/// single-sample `round_rect_coverage` for the pill body to smooth the curved
+/// corners and straight edges, reducing stair-stepping on the anti-aliased
+/// boundary. `round_rect_coverage` treats its argument as a pixel corner (it
+/// adds 0.5 internally for the pixel centre), so offsets of ±0.35 land on the
+/// four sub-pixel sample points at 0.15 and 0.85 within the pixel — wide
+/// enough to fully span the 1.5 px anti-alias band for the black pill edge.
+fn round_rect_coverage_supersampled(x: f32, y: f32, width: f32, height: f32, radius: f32) -> f32 {
+    let cov = |dx: f32, dy: f32| round_rect_coverage(x + dx, y + dy, width, height, radius);
+    (cov(-0.35, -0.35) + cov(0.35, -0.35) + cov(-0.35, 0.35) + cov(0.35, 0.35)) * 0.25
 }
 
 /// Soft multi-color glow around the pill's boundary. The DIB is inflated by
 /// `AURA_MARGIN_LOGICAL` (scaled by DPI × shape) on every side so the halo
 /// can extend outside the pill into the desktop background.
 const AURA_MARGIN_LOGICAL: f32 = 10.0;
-/// Peak opacity of the outer aura ring, at the pill boundary.
-const AURA_PEAK_ALPHA: f32 = 767.0;
+/// Peak opacity of the outer aura ring, at the pill boundary. Capped at ~140
+/// so the glow stays soft beneath the pill body's supersampled edge instead
+/// of producing a hard 0→255 step at the boundary.
+const AURA_PEAK_ALPHA: f32 = 140.0;
 /// Exponential decay constant: the aura's outer edge sits at
 /// exp(-AURA_DECAY) of the peak opacity.
 const AURA_DECAY: f32 = 3.0;
@@ -2731,8 +2752,20 @@ fn draw_aura(
                 radius,
             );
 
-            // Render only outside the pill boundary
-            if d <= 0.0 || d > margin as f32 {
+            // Smooth inner anti-aliased transition at the pill boundary,
+            // replacing the hard `d <= 0` cutoff that produced an abrupt
+            // 0→peak alpha jump. `inner_aa` ramps from 0 (deep inside the pill)
+            // to 1 (at the boundary) over a ~1.5 px band, so the supersampled
+            // pill edge blends smoothly with the glow beneath it instead of
+            // hard-clipping the aura ring.
+            let inner_aa = if d < 0.0 {
+                let t = ((d + 1.5) / 1.5).clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            } else {
+                1.0
+            };
+
+            if inner_aa <= 0.0 || d > margin as f32 {
                 continue;
             }
 
@@ -2744,11 +2777,13 @@ fn draw_aura(
                 (c1[2] as f32 * (1.0 - t) + c2[2] as f32 * t).round() as u8,
             ];
 
-            // Exponential falloff curve: alpha(d) = A_peak * e^(-decay * d / margin)
+            // Exponential outer decay: alpha(d) = A_peak * inner_aa * e^(-decay * d / margin)
             let falloff = (-d / margin as f32 * AURA_DECAY).exp();
-            let alpha = (AURA_PEAK_ALPHA * falloff).round().min(255.0) as u32;
+            let alpha = (AURA_PEAK_ALPHA * inner_aa * falloff).round().min(140.0) as u32;
 
-            composite(pixels, buf_w, x, y, rgb, alpha);
+            if alpha > 0 {
+                composite(pixels, buf_w, x, y, rgb, alpha);
+            }
         }
     }
 }
