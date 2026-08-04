@@ -2134,11 +2134,14 @@ fn draw_text_line_pixels(
     }
     let rw = rect.right - rect.left;
     let rh = rect.bottom - rect.top;
-    let Ok((hdc, bits, sw, sh)) = text_scratch_for(text_scratch, rw, rh) else {
+    let Ok((hdc, bits, sw, _sh)) = text_scratch_for(text_scratch, rw, rh) else {
         return;
     };
+    // Only the row's own area is drawn into (GDI clips to rw×rh) and read
+    // back, so zero and composite just that. The scratch may be larger (it
+    // grows but never shrinks); the extra area is never touched.
     unsafe {
-        std::ptr::write_bytes(bits.cast::<u8>(), 0, (sw * sh * 4) as usize);
+        std::ptr::write_bytes(bits.cast::<u8>(), 0, (rw * rh * 4) as usize);
     }
     let font = create_pill_font(font_height, bold);
     if font.0.is_null() {
@@ -2237,9 +2240,10 @@ fn draw_text_line_pixels(
     // make GDI pre-dim the scratch, and reading that dimmed value as coverage
     // would render gray text at ~brightness² opacity.
     let sw = sw as usize;
-    let sh = sh as usize;
-    for y in 0..sh {
-        for x in 0..sw {
+    let rw = rw as usize;
+    let rh = rh as usize;
+    for y in 0..rh {
+        for x in 0..rw {
             let p = unsafe { bits.cast::<u8>().add((y * sw + x) * 4) };
             let b = unsafe { *p as u32 };
             let g = unsafe { *p.add(1) as u32 };
