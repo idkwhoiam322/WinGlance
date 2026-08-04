@@ -17,8 +17,8 @@ use windows::Win32::Graphics::Gdi::{
     DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
     ENUM_CURRENT_SETTINGS, ETO_CLIPPED, EnumDisplaySettingsW, ExtTextOutW, FF_DONTCARE, GetMonitorInfoW,
     GetTextMetricsW, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
-    MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW,
-    TRANSPARENT, ValidateRect,
+    MONITORINFO, MONITORINFOEXW, MonitorFromWindow, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor,
+    TEXTMETRICW, TRANSPARENT, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
@@ -44,36 +44,53 @@ const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
 
 /// Samples the monitor's current refresh period in ms, so the animation timer
 /// ticks once per presented frame on any display (60 Hz → 16 ms, 120 Hz → 8 ms,
-/// 144 Hz → 7 ms, 240 Hz → 4 ms). Prefers DWM's live compose rate, which stays
-/// correct on variable-refresh-rate monitors; falls back to the display mode's
-/// nominal frequency; last resort is 16 ms (60 Hz).
-fn refresh_period_ms(hwnd: HWND) -> u32 {
+/// 144 Hz → 7 ms, 240 Hz → 4 ms). The pill is positioned over the foreground
+/// window's monitor (see `position()`), so the query targets that same monitor:
+/// the primary display can run at a different rate on mixed-refresh setups.
+/// Prefers DWM's live compose rate, which stays correct on variable-refresh-rate
+/// monitors; falls back to the display mode's nominal frequency; last resort is
+/// 16 ms (60 Hz).
+fn refresh_period_ms() -> u32 {
+    let foreground = unsafe { GetForegroundWindow() };
     let dwm_period = unsafe {
         let mut timing = std::mem::zeroed::<DWM_TIMING_INFO>();
         timing.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
-        DwmGetCompositionTimingInfo(hwnd, &mut timing).ok().and_then(|()| {
-            let ratio = timing.rateRefresh;
-            // Refresh rate = numerator / denominator (Hz); 0/0 means DWM
-            // did not report a rate (e.g. composition paused).
-            if ratio.uiNumerator != 0 && ratio.uiDenominator != 0 {
-                Some(1000 * ratio.uiDenominator / ratio.uiNumerator)
-            } else {
-                None
-            }
-        })
+        DwmGetCompositionTimingInfo(foreground, &mut timing)
+            .ok()
+            .and_then(|()| {
+                let ratio = timing.rateRefresh;
+                // Refresh rate = numerator / denominator (Hz); 0/0 means DWM
+                // did not report a rate (e.g. composition paused).
+                if ratio.uiNumerator != 0 && ratio.uiDenominator != 0 {
+                    Some(1000 * ratio.uiDenominator / ratio.uiNumerator)
+                } else {
+                    None
+                }
+            })
     };
     if let Some(period) = dwm_period {
         return period.clamp(1, 100);
     }
+    // Fallback: the monitor's nominal frequency, resolved by device name so
+    // it hits the same monitor the pill will be shown on.
     let mode_period = unsafe {
-        let mut devmode = std::mem::zeroed::<DEVMODEW>();
-        devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-        EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut devmode)
-            .as_bool()
-            .then(|| 1000u32.checked_div(devmode.dmDisplayFrequency as u32))
-            .flatten()
+        let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+        if monitor.0.is_null() {
+            None
+        } else {
+            let mut info = MONITORINFOEXW::default();
+            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool().then(|| {
+                let mut devmode = std::mem::zeroed::<DEVMODEW>();
+                devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+                EnumDisplaySettingsW(PCWSTR(info.szDevice.as_ptr()), ENUM_CURRENT_SETTINGS, &mut devmode)
+                    .as_bool()
+                    .then(|| 1000u32.checked_div(devmode.dmDisplayFrequency as u32))
+                    .flatten()
+            })
+        }
     };
-    mode_period.unwrap_or(16).clamp(1, 100)
+    mode_period.flatten().unwrap_or(16).clamp(1, 100)
 }
 
 /// Reusable device context + DIB section for the pill's frames. The overlay
@@ -342,7 +359,7 @@ impl OverlayState {
     /// The tick cadence only affects how many frames the UI thread gets asked
     /// to paint; the easing is time-based, so motion is identical either way.
     fn sync_anim_timer(&mut self) {
-        let period = refresh_period_ms(self.hwnd);
+        let period = refresh_period_ms();
         if period != self.tick_period {
             debug!(
                 "animation tick {period}ms = {} Hz (refresh-rate matched)",
@@ -520,12 +537,44 @@ impl OverlayState {
     /// current animation phase, extends the visible time, and re-renders. If
     /// the new content has different dimensions (rows appearing/disappearing
     /// as artwork and album arrive), the size morphs from the on-screen size.
+    ///
+    /// A refresh that lands while a morph is already running does not restart
+    /// it: `from` is re-solved so the eased curve passes through the current
+    /// on-screen size at the current eased progress, and `started_at` is kept.
+    /// Restarting instead would reset the eased clock to 0, and the pill would
+    /// pause then re-accelerate (a velocity jump); keeping the clock and the
+    /// position keeps the motion continuous toward the new target.
     fn update_content(&mut self, event: MediaEvent) {
-        let from = self.content.as_ref().map_or((0.0, 0.0), |c| self.size_of(c));
         let target = content_size_of(&self.config, &event, self.last_track.as_ref());
-        if target != from {
+        let current = self.content.as_ref().map_or((0.0, 0.0), |c| self.size_of(c));
+        if target != current
+            && let Some(morph) = self.morph.filter(|morph| morph.started_at.elapsed() < MORPH_MS)
+        {
+            // Solve `from` such that from + (target - from) * eased == current:
+            // the curve still hits `current` at the already-elapsed progress
+            // and continues toward the new `target` without a jump.
+            let eased =
+                ease_out_quint((morph.started_at.elapsed().as_secs_f32() / MORPH_MS.as_secs_f32()).clamp(0.0, 1.0));
+            let remain = 1.0 - eased;
+            if remain > 1e-3 {
+                self.morph = Some(Morph {
+                    from: (
+                        (current.0 - eased * target.0) / remain,
+                        (current.1 - eased * target.1) / remain,
+                    ),
+                    started_at: morph.started_at,
+                });
+            } else {
+                // Morph is effectively complete: a fresh one from the current
+                // size is identical to finishing it.
+                self.morph = Some(Morph {
+                    from: current,
+                    started_at: Instant::now(),
+                });
+            }
+        } else if target != current {
             self.morph = Some(Morph {
-                from,
+                from: current,
                 started_at: Instant::now(),
             });
         }
@@ -2748,6 +2797,74 @@ mod tests {
             (done_h - full_h).abs() < 0.01,
             "morph must settle on {full_h}, got {done_h}"
         );
+    }
+
+    #[test]
+    fn mid_morph_update_preserves_the_eased_clock() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        let sparse = TrackInfo {
+            title: "Song".into(),
+            ..TrackInfo::default()
+        };
+        let full = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "Example Player".into(),
+            duration_secs: Some(225),
+            ..TrackInfo::default()
+        };
+        let (_, sparse_h) = content_size_of(&state.config, &MediaEvent::TrackChanged(sparse), None);
+        let (_, full_h) = content_size_of(&state.config, &MediaEvent::TrackChanged(full.clone()), None);
+        assert!(full_h > sparse_h, "test tracks must differ in height");
+        // Morph sparse → full, started 75ms ago (half the 150ms window).
+        let start = Instant::now() - Duration::from_millis(75);
+        state.content = Some(MediaEvent::TrackChanged(full.clone()));
+        state.morph = Some(Morph {
+            from: (0.0, sparse_h),
+            started_at: start,
+        });
+
+        // The full-size refresh lands mid-morph: the on-screen size is still
+        // smaller than the target, so the morph is retargeted, not restarted.
+        state.update_content(MediaEvent::TrackChanged(full.clone()));
+
+        let morph = state.morph.expect("a mid-morph size change must keep a morph");
+        assert_eq!(
+            morph.started_at, start,
+            "the eased clock must keep running instead of resetting"
+        );
+        assert!(
+            morph.from.1 < full_h,
+            "the curve must still approach {full_h} from below"
+        );
+        let (_, on_screen) = state.size_of(&MediaEvent::TrackChanged(full.clone()));
+        assert!(
+            on_screen > sparse_h && on_screen < full_h,
+            "the pill must still be mid-flight at {on_screen}, not snapped"
+        );
+    }
+
+    #[test]
+    fn retarget_solve_passes_through_the_current_size() {
+        // from' + (target - from') * eased == current  ⇒  the re-solved `from`
+        // keeps the curve pinned to the on-screen size at the already-elapsed
+        // eased progress, so retargeting never jumps the pill.
+        let current = (314.0f32, 96.0f32);
+        let target = (340.0f32, 112.0f32);
+        for &eased in &[0.1, 0.35, 0.6, 0.85, 0.99] {
+            let from = (
+                (current.0 - eased * target.0) / (1.0 - eased),
+                (current.1 - eased * target.1) / (1.0 - eased),
+            );
+            let re = (
+                from.0 + (target.0 - from.0) * eased,
+                from.1 + (target.1 - from.1) * eased,
+            );
+            assert!(
+                (re.0 - current.0).abs() < 1e-3 && (re.1 - current.1).abs() < 1e-3,
+                "re-solved curve must pass through {current:?} at eased={eased}, got {re:?}"
+            );
+        }
     }
 
     #[test]
