@@ -12,13 +12,13 @@ use windows::Win32::Foundation::BOOLEAN;
 use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::Graphics::Gdi::{
-    ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DEVMODEW, DIB_RGB_COLORS,
-    DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
-    ENUM_CURRENT_SETTINGS, ETO_CLIPPED, EnumDisplaySettingsW, ExtTextOutW, FF_DONTCARE, GetMonitorInfoW,
-    GetTextMetricsW, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
-    MONITORINFO, MONITORINFOEXW, MonitorFromWindow, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor,
-    TEXTMETRICW, TRANSPARENT, ValidateRect,
+    ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
+    CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DEVMODEW, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER,
+    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, ENUM_CURRENT_SETTINGS,
+    ETO_CLIPPED, EnumDisplaySettingsW, ExtTextOutW, FF_DONTCARE, GetMonitorInfoW, GetTextMetricsW, HBITMAP, HBRUSH,
+    HDC, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW,
+    MonitorFromWindow, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
+    ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
@@ -1850,10 +1850,12 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
 }
 
 /// Draws one pill text line into the pixel buffer using Windows' own GDI text
-/// engine (ClearType subpixel rendering, proper hinting). Text is rendered
+/// engine (grayscale antialiasing, proper hinting). Text is rendered in white
 /// into a scratch DIB; GDI writes alpha 0 for text into 32bpp DIBs, so each
-/// glyph pixel's RGB (text color × coverage) supplies the coverage, which is
-/// then composited into the pill's premultiplied buffer.
+/// glyph pixel's RGB (white × coverage) supplies the coverage, which is
+/// combined with the requested color at composite time. Drawing the final
+/// color instead would pre-dim the scratch, and reading that dimmed value as
+/// coverage would render gray text at ~brightness² opacity.
 #[allow(clippy::too_many_arguments)]
 fn draw_text_line_pixels(
     text_scratch: &mut Option<TextScratch>,
@@ -1886,10 +1888,10 @@ fn draw_text_line_pixels(
     unsafe {
         let old_font = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(
-            hdc,
-            COLORREF(color[0] as u32 | (color[1] as u32) << 8 | (color[2] as u32) << 16),
-        );
+        // Draw in pure white so the scratch RGB channels hold exactly the glyph
+        // coverage (gray antialiasing keeps R == G == B); the requested text
+        // color is applied when compositing below.
+        SetTextColor(hdc, COLORREF(0x00FFFFFF));
         // Row-local drawing: the scratch starts at the row's top-left, so the
         // clip rect is (0, 0, rw, rh) and the text y is centered like the
         // static path.
@@ -1968,9 +1970,12 @@ fn draw_text_line_pixels(
         SelectObject(hdc, old_font);
     }
 
-    // Composite the glyph pixels. Coverage = max(R,G,B); the scratch RGB is
-    // the text color premultiplied by that coverage (all pill text colors are
-    // fully opaque).
+    // Composite the glyph pixels. The scratch is white-on-black, so the RGB
+    // channels are the glyph coverage; alpha is coverage scaled by the text
+    // color's own alpha, and the color is premultiplied by alpha for
+    // `composite_pm`. Drawing the final color via SetTextColor instead would
+    // make GDI pre-dim the scratch, and reading that dimmed value as coverage
+    // would render gray text at ~brightness² opacity.
     let sw = sw as usize;
     let sh = sh as usize;
     for y in 0..sh {
@@ -1984,12 +1989,19 @@ fn draw_text_line_pixels(
                 continue;
             }
             let alpha = cov * color[3] as u32 / 255;
+            if alpha == 0 {
+                continue;
+            }
             composite_pm(
                 pixels,
                 width,
                 (rect.left + x as i32) as usize,
                 (rect.top + y as i32) as usize,
-                [r as u8, g as u8, b as u8],
+                [
+                    (color[0] as u32 * alpha / 255) as u8,
+                    (color[1] as u32 * alpha / 255) as u8,
+                    (color[2] as u32 * alpha / 255) as u8,
+                ],
                 alpha,
             );
         }
@@ -2101,10 +2113,13 @@ pub(crate) fn cached_font(height: i32, bold: bool, quality: u32) -> HFONT {
     }
 }
 
-/// Creates the pill's Segoe UI font with ClearType subpixel rendering,
-/// cached across frames.
+/// Creates the pill's Segoe UI font with grayscale antialiasing, cached across
+/// frames. ClearType subpixel rendering is unusable here: it paints colored
+/// fringes into the scratch DIB, and the text path derives glyph coverage from
+/// the RGB channels, so gray AA keeps the mask clean (see `draw_string` for
+/// the same call on the layered-window path).
 fn create_pill_font(height: i32, bold: bool) -> HFONT {
-    cached_font(height, bold, CLEARTYPE_QUALITY.0 as u32)
+    cached_font(height, bold, ANTIALIASED_QUALITY.0 as u32)
 }
 
 /// Source-over composite of a premultiplied source (rgb already multiplied by
@@ -2555,6 +2570,58 @@ mod tests {
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 100, "expected glyph pixels in the buffer, got {lit}");
+    }
+
+    #[test]
+    fn gray_glyph_interiors_carry_full_alpha() {
+        // Regression guard for the double-attenuation bug: when the text color
+        // was set on the scratch DC, GDI pre-dimmed the pixels (coverage ×
+        // color), and reading that dimmed value back as coverage made a #808080
+        // glyph render at ~50% opacity instead of solid. Drawing white and
+        // applying the color while compositing keeps the glyph interior at full
+        // alpha regardless of brightness.
+        let mut pixels = vec![0u8; 200 * 80 * 4];
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 80,
+        };
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+        draw_text_line_pixels(
+            &mut state.text_scratch,
+            &mut pixels,
+            200,
+            "MMMMMM",
+            &rect,
+            48,
+            [0x80, 0x80, 0x80, 0xFF],
+            false,
+            false,
+            None,
+        );
+        // Find the highest alpha in the buffer: the interior of the glyphs.
+        let max_alpha = pixels.chunks(4).map(|p| p[3]).max().unwrap_or(0);
+        assert!(
+            max_alpha >= 240,
+            "gray glyph interiors must be nearly opaque, got max alpha {max_alpha}"
+        );
+        // The interior pixel must also be the requested gray, not the color
+        // scaled down by the coverage mask under it.
+        let (px, py, pr, pb) = pixels
+            .chunks(4)
+            .enumerate()
+            .find(|(_, p)| p[3] == max_alpha)
+            .map(|(i, p)| (i % 200, i / 200, p[0], p[2]))
+            .expect("gray glyph must have an interior pixel");
+        assert!(
+            (pb as i32 - 0x80).abs() <= 8
+                && (pixels[(py * 200 + px) * 4 + 1] as i32 - 0x80).abs() <= 8
+                && (pr as i32 - 0x80).abs() <= 8,
+            "interior should render the requested gray, got [{pb}, {}, {pr}]",
+            pixels[(py * 200 + px) * 4 + 1]
+        );
     }
 
     #[test]
