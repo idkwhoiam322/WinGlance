@@ -2482,12 +2482,12 @@ fn round_rect_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> 
 /// Soft multi-color glow around the pill's boundary. The DIB is inflated by
 /// `AURA_MARGIN_LOGICAL` (scaled by DPI × shape) on every side so the halo
 /// can extend outside the pill into the desktop background.
-const AURA_MARGIN_LOGICAL: f32 = 22.0;
+const AURA_MARGIN_LOGICAL: f32 = 14.0;
 /// Peak opacity of the outer aura ring, at the pill boundary.
-const AURA_PEAK_ALPHA: u32 = 110;
+const AURA_PEAK_ALPHA: u32 = 180;
 /// Exponential decay constant: the aura's outer edge sits at
 /// exp(-AURA_DECAY) of the peak opacity.
-const AURA_DECAY: f32 = 2.5;
+const AURA_DECAY: f32 = 4.0;
 
 #[allow(clippy::too_many_arguments)]
 fn draw_aura(
@@ -2519,14 +2519,18 @@ fn draw_aura(
             }
             // Horizontal gradient: C(x) = C1 * (1 - x/W) + C2 * (x/W),
             // where W is the pill width for a consistent colour blend.
-            let t = (x as f32 - inset as f32) / pill_w as f32;
+            let t = ((x as f32 - inset as f32) / pill_w as f32).clamp(0.0, 1.0);
             let rgb = [
                 (c1[0] as f32 * (1.0 - t) + c2[0] as f32 * t).round() as u8,
                 (c1[1] as f32 * (1.0 - t) + c2[1] as f32 * t).round() as u8,
                 (c1[2] as f32 * (1.0 - t) + c2[2] as f32 * t).round() as u8,
             ];
+            // Left-heavy asymmetry: full brightness on the left (where the
+            // album art sits), reduced on the right — matching the reference
+            // mockup's concentrated left-side glow.
+            let asymmetry = 1.0 - t * 0.7;
             // Exponential falloff from the boundary outward.
-            let alpha = (AURA_PEAK_ALPHA as f32 * (-d / margin as f32 * AURA_DECAY).exp()).round() as u32;
+            let alpha = (AURA_PEAK_ALPHA as f32 * asymmetry * (-d / margin as f32 * AURA_DECAY).exp()).round() as u32;
             composite(pixels, buf_w, x, y, rgb, alpha);
         }
     }
