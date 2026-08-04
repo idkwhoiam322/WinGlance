@@ -429,7 +429,11 @@ impl ListenerState {
                         debug!("track emit skipped | reason=artwork-removed | {label}");
                     } else {
                         let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
-                        if is_first_read && read_artwork && merged.artwork.is_none() {
+                        if is_first_read
+                            && read_artwork
+                            && !is_placeholder_read(&prev, &merged)
+                            && merged.artwork.is_none()
+                        {
                             next.deferred_at = Some(Instant::now());
                             let label = track_label(&merged);
                             debug!("track emit deferred | reason=awaiting-artwork | {label}");
@@ -527,8 +531,19 @@ impl ListenerState {
             if !before.contains(&key) {
                 self.record_churn(&read_source_app(session));
             }
+            let is_new = !before.contains(&key);
             if let Err(error) = self.ensure_subscribed(session) {
                 debug!("subscribe failed for a session: {error:#}");
+            } else if is_new {
+                // Immediately read properties for newly discovered sessions.
+                // A source may fire MediaPropertiesChanged before we finish
+                // registering the event handler (the SessionsChanged event that
+                // revealed the session arrives first). Polling TryGetMediaProperties
+                // now catches data that would otherwise be lost until the next event
+                // burst — Windows's own SMTC widget does the same.
+                if let Err(error) = self.refresh_session(session, true) {
+                    debug!("initial refresh failed for session {key}: {error:#}");
+                }
             }
         }
         let alive: HashSet<usize> = sessions.iter().map(session_key).collect();
@@ -927,6 +942,17 @@ fn emit_track(prev: &LogicalState, merged: &TrackInfo, read_artwork: bool) -> (b
 /// should be emitted anyway, artwork or not.
 fn defer_expired(deferred_at: Option<Instant>) -> bool {
     deferred_at.is_some_and(|t| t.elapsed() >= ARTWORK_TIMEOUT)
+}
+
+/// Whether a fresh-session read returned no real metadata — the title is just
+/// the source-app fallback (i.e. `properties.Title()` was empty) and the artist
+/// is also empty. Such a read is a placeholder: it should not defer the pill
+/// (which would force-show a spurious title after the 2s timeout). The real
+/// `MediaPropertiesChanged` event, or the periodic poll, will surface actual
+/// data when YouTube Music (or another source) populates it.
+fn is_placeholder_read(prev: &LogicalState, merged: &TrackInfo) -> bool {
+    let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
+    is_first_read && merged.artist.is_empty() && merged.title == merged.source_app
 }
 
 fn register_sessions_handler(
@@ -1335,6 +1361,36 @@ mod tests {
         // Exactly at the boundary: expired.
         let boundary = now.checked_sub(ARTWORK_TIMEOUT).unwrap();
         assert!(defer_expired(Some(boundary)));
+    }
+
+    #[test]
+    fn is_placeholder_read_detects_empty_metadata_on_new_session() {
+        let empty = LogicalState::default();
+        // Title fell back to source_app, artist is empty → placeholder.
+        let placeholder = TrackInfo {
+            title: "youtube-music".into(),
+            artist: "".into(),
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        };
+        assert!(is_placeholder_read(&empty, &placeholder));
+
+        // Real title + empty artist → not a placeholder (source provided metadata).
+        let real_title = TrackInfo {
+            title: "Song".into(),
+            artist: "".into(),
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        };
+        assert!(!is_placeholder_read(&empty, &real_title));
+
+        // Real title + real artist → not a placeholder.
+        let real = track("Song", "Artist");
+        assert!(!is_placeholder_read(&empty, &real));
+
+        // Not a first read → not a placeholder (even if fields are empty).
+        let stored = state("Song", "Artist");
+        assert!(!is_placeholder_read(&stored, &placeholder));
     }
 
     #[test]
