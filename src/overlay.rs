@@ -1894,6 +1894,10 @@ fn draw_pill_text_rows(
         true,
         false,
         Some(&mut state.scroll[0]),
+        // The marquee threshold is the full title row, not the width
+        // narrowed by the symbol: text that fits the row must not scroll
+        // just because the symbol takes the right edge.
+        Some(title_rect.right - title_rect.left),
     );
     if let Some(playback) = playback {
         draw_symbol_pixels(
@@ -1920,6 +1924,7 @@ fn draw_pill_text_rows(
             false,
             false,
             Some(&mut state.scroll[1]),
+            None,
         );
     }
 
@@ -2024,6 +2029,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         true,
                         false,
                         None,
+                        None,
                     );
                     draw_symbol_pixels(
                         pixels,
@@ -2045,6 +2051,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         [0xCC, 0xCC, 0xCC, 0xFF],
                         false,
                         false,
+                        None,
                         None,
                     );
                 }
@@ -2088,6 +2095,7 @@ fn draw_meta_line_pixels(
             false,
             false,
             marquee,
+            None,
         );
         return;
     }
@@ -2111,6 +2119,7 @@ fn draw_meta_line_pixels(
         false,
         false,
         marquee,
+        None,
     );
 }
 
@@ -2133,6 +2142,7 @@ fn draw_text_line_pixels(
     bold: bool,
     centered: bool,
     marquee: Option<&mut LineScroll>,
+    marquee_width: Option<i32>,
 ) {
     if value.is_empty() || rect.right <= rect.left || rect.bottom <= rect.top {
         return;
@@ -2188,9 +2198,14 @@ fn draw_text_line_pixels(
             let text_w = measured.right - measured.left;
             // Whether this line overflows its band: while a fully-shown pill
             // has no overflowing line, the animation tick skips repainting.
-            scroll.scrolling = text_w > rw;
+            // The overflow threshold is the full row width when the caller
+            // provides it (e.g. the title row with a symbol narrowing the
+            // draw rect) — text that fits the row must not scroll just
+            // because the symbol took the right edge.
+            let overflow_w = marquee_width.unwrap_or(rw);
+            scroll.scrolling = text_w > overflow_w;
             let hold_elapsed = scroll.started_at.map(|t| t.elapsed()).unwrap_or_default();
-            if text_w <= rw {
+            if text_w <= overflow_w {
                 // Text fits: render once statically (no scrolling needed).
                 let _ = DrawTextW(hdc, &mut text, &mut local, flags);
             } else if hold_elapsed < MARQUEE_HOLD {
@@ -2594,6 +2609,10 @@ fn draw_source_app_row(
             false,
             false,
             marquee,
+            // The marquee threshold is the full row, not the width narrowed
+            // by the app icon: text that fits the row must not scroll just
+            // because the icon took the left edge.
+            Some(rect.right - rect.left),
         );
     } else {
         draw_text_line_pixels(
@@ -2607,6 +2626,7 @@ fn draw_source_app_row(
             false,
             false,
             marquee,
+            None,
         );
     }
 }
@@ -3146,6 +3166,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 100, "expected glyph pixels in the buffer, got {lit}");
@@ -3178,6 +3199,7 @@ mod tests {
             [0x80, 0x80, 0x80, 0xFF],
             false,
             false,
+            None,
             None,
         );
         // Find the highest alpha in the buffer: the interior of the glyphs.
@@ -3225,6 +3247,7 @@ mod tests {
             false,
             false,
             Some(&mut LineScroll::default()),
+            None,
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 100, "expected glyph pixels with marquee state, got {lit}");
@@ -3270,6 +3293,7 @@ mod tests {
             [255, 255, 255, 255],
             false,
             false,
+            None,
             None,
         );
         let upper = pixels
