@@ -1602,7 +1602,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
             ];
             // Only rows that will actually be drawn participate, so title expands
             // to fill the pill when the artist, meta, or source-app line is absent.
-            let meta = track.meta_line(true);
+            let (meta_clock, meta) = track.meta_line_for_overlay(true);
             let artist_active = !track.artist.trim().is_empty();
             let active: [bool; 4] = [
                 true,
@@ -1656,16 +1656,16 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
 
             if active[2] {
                 let meta_rect = next_band(2);
-                draw_text_line_pixels(
+                draw_meta_line_pixels(
                     &mut state.text_scratch,
                     pixels,
-                    width as usize,
-                    &meta,
+                    width,
                     &meta_rect,
+                    &meta,
+                    meta_clock,
                     rows[2].1 as i32,
                     [0x99, 0x99, 0x99, 0xFF],
-                    false,
-                    false,
+                    scale,
                     Some(&mut state.scroll[2]),
                 );
             }
@@ -1762,19 +1762,19 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         None,
                     );
                 }
-                let meta = track.meta_line(true);
+                let (meta_clock, meta) = track.meta_line_for_overlay(true);
                 if !meta.is_empty() {
                     let meta_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
-                    draw_text_line_pixels(
+                    draw_meta_line_pixels(
                         &mut state.text_scratch,
                         pixels,
-                        width as usize,
-                        &meta,
+                        width,
                         &meta_rect,
+                        &meta,
+                        meta_clock,
                         (fs_artist * 0.85) as i32,
                         [0x99, 0x99, 0x99, 0xFF],
-                        false,
-                        false,
+                        scale,
                         None,
                     );
                 }
@@ -1847,6 +1847,63 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
         // Never rendered: SessionRejected is filtered out before enqueue.
         MediaEvent::SessionRejected { .. } => {}
     }
+}
+
+/// Draws the meta row of a track pill: when it carries a duration (`clock`),
+/// a vector clock icon is pinned to the left edge of the band and the text
+/// (`meta`, already stripped of the stopwatch glyph by the caller) is drawn
+/// to its right; otherwise the line renders as plain text. When the line
+/// overflows and marquees, the icon stays anchored and the text scrolls in
+/// its offset box.
+#[allow(clippy::too_many_arguments)]
+fn draw_meta_line_pixels(
+    text_scratch: &mut Option<TextScratch>,
+    pixels: &mut [u8],
+    width: i32,
+    rect: &RECT,
+    meta: &str,
+    clock: bool,
+    font_height: i32,
+    color: [u8; 4],
+    scale: f32,
+    marquee: Option<&mut LineScroll>,
+) {
+    if !clock {
+        draw_text_line_pixels(
+            text_scratch,
+            pixels,
+            width as usize,
+            meta,
+            rect,
+            font_height,
+            color,
+            false,
+            false,
+            marquee,
+        );
+        return;
+    }
+    let icon_size = font_height as f32;
+    let icon_h = icon_size.round() as i32;
+    let gap = (4.0 * scale) as i32;
+    let icon_top = rect.top + (rect.bottom - rect.top - icon_h) / 2;
+    draw_clock_icon_pixels(pixels, width as usize, rect.left, icon_top, icon_size, color);
+    let text_rect = RECT {
+        left: rect.left + icon_h + gap,
+        ..*rect
+    };
+    draw_text_line_pixels(
+        text_scratch,
+        pixels,
+        width as usize,
+        meta,
+        &text_rect,
+        font_height,
+        color,
+        false,
+        false,
+        marquee,
+    );
 }
 
 /// Draws one pill text line into the pixel buffer using Windows' own GDI text
@@ -2253,6 +2310,68 @@ fn circle_coverage(x: f32, y: f32, size: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Anti-aliased coverage of a clock icon inside a `size`×`size` box at the
+/// pixel at (x, y) relative to the box's top-left corner: a thin ring with an
+/// hour hand pointing at 12 and a minute hand pointing at 3, both meeting at
+/// the center. Stroked like the pill's other shapes, so at small sizes it
+/// stays crisp instead of mushing like the ⏱ emoji routed through GDI text.
+fn clock_icon_coverage(x: f32, y: f32, size: f32) -> f32 {
+    let center = size / 2.0;
+    let px = x + 0.5 - center;
+    let py = y + 0.5 - center;
+    let dist = px.hypot(py);
+
+    // Ring: signed distance from the ring's centerline, negative inside the
+    // stroke band. The hole inside the ring stays uncovered, so the pill's
+    // background shows through like a real clock face.
+    let ring_r = size * 0.36;
+    let band = size * 0.055;
+    let d_ring = (dist - ring_r).abs() - band;
+    let t_ring = (0.5 - d_ring / 1.5).clamp(0.0, 1.0);
+    let ring = t_ring * t_ring * (3.0 - 2.0 * t_ring);
+
+    // Hands: thin stroked segments from the center outward, anti-aliased via
+    // distance to the segment.
+    let hand_w = size * 0.05;
+    let hour = point_segment_dist(px, py, 0.0, 0.0, 0.0, -ring_r * 0.55);
+    let minute = point_segment_dist(px, py, 0.0, 0.0, ring_r * 0.78, 0.0);
+    let d_hand = hour.min(minute) - hand_w;
+    let t_hand = (0.5 - d_hand / 1.5).clamp(0.0, 1.0);
+    let hands = t_hand * t_hand * (3.0 - 2.0 * t_hand);
+
+    ring.max(hands)
+}
+
+/// Draws a vector clock icon into the premultiplied pixel buffer, sized to
+/// `size` pixels at (`x`, `y`) with its top-left corner at that point.
+/// Procedural like the play/pause/stop symbols, so it renders identically on
+/// every Windows version with no font fallback involved.
+fn draw_clock_icon_pixels(pixels: &mut [u8], width: usize, x: i32, y: i32, size: f32, color: [u8; 4]) {
+    if size <= 0.0 {
+        return;
+    }
+    for dy in 0..size as i32 {
+        for dx in 0..size as i32 {
+            let cov = clock_icon_coverage(dx as f32, dy as f32, size);
+            if cov > 0.0 {
+                let px = x + dx;
+                let py = y + dy;
+                if px >= 0 && py >= 0 {
+                    let alpha = (color[3] as f32 * cov) as u32;
+                    composite(
+                        pixels,
+                        width,
+                        px as usize,
+                        py as usize,
+                        [color[0], color[1], color[2]],
+                        alpha,
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn draw_placeholder(pixels: &mut [u8], width: usize, x: usize, y: usize, size: usize, color: [u8; 4]) {
     for py in y..y.saturating_add(size) {
         for px in x..x.saturating_add(size) {
@@ -2543,6 +2662,54 @@ mod tests {
         // On the circle boundary (radius from the center): half coverage.
         let edge = circle_coverage(4.2, 4.2, 32.0);
         assert!((edge - 0.5).abs() < 0.2, "expected ~0.5 on the boundary, got {edge}");
+    }
+
+    #[test]
+    fn clock_icon_coverage_has_ring_hands_and_an_open_face() {
+        let size = 12.0;
+        // Ring at 3 o'clock (pixel center on the ring centerline).
+        assert!(
+            clock_icon_coverage(10.0, 6.0, size) > 0.8,
+            "the ring must cover its stroke, got {}",
+            clock_icon_coverage(10.0, 6.0, size)
+        );
+        // Hour hand (12 o'clock) and minute hand (3 o'clock), both near solid.
+        assert!(clock_icon_coverage(6.0, 4.0, size) > 0.5, "hour hand must be drawn");
+        assert!(clock_icon_coverage(9.0, 6.0, size) > 0.5, "minute hand must be drawn");
+        // The face is open: the center of the box is inside the ring and
+        // uncovered, and the corners are far outside everything.
+        assert!(
+            clock_icon_coverage(6.0, 6.0, size) < 1.0,
+            "the center must not be a solid filled disk"
+        );
+        assert_eq!(clock_icon_coverage(0.0, 0.0, size), 0.0, "corners stay empty");
+        let outside = clock_icon_coverage(0.0, 11.0, size);
+        assert!(outside < 0.9, "the icon must stay inside its box, got {outside}");
+    }
+
+    #[test]
+    fn clock_icon_renders_into_the_buffer() {
+        let mut pixels = vec![0u8; 40 * 40 * 4];
+        draw_clock_icon_pixels(&mut pixels, 40, 10, 10, 12.0, [153, 153, 153, 255]);
+        let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
+        assert!(lit > 30, "expected a visible clock icon, got {lit} lit pixels");
+        // The composite writes the icon's color, strongest where coverage is
+        // fullest, and respects the box: nothing outside its 12×12 footprint
+        // draws.
+        let (_, px) = pixels
+            .chunks(4)
+            .enumerate()
+            .filter(|(_, p)| p[3] > 0)
+            .max_by_key(|(_, p)| p[3])
+            .unwrap();
+        assert!(px[3] >= 120, "icon requires a near-solid stroke, got alpha {}", px[3]);
+        assert!(px[0] >= 70, "stroke must carry the icon color, got {px:?}");
+        assert_eq!(px[0], px[2], "gray icon color must stay neutral, got {px:?}");
+        let outside = pixels
+            .chunks(4)
+            .enumerate()
+            .any(|(i, p)| p[3] > 0 && !(i % 40 >= 10 && i % 40 < 22 && i / 40 >= 10 && i / 40 < 22));
+        assert!(!outside, "clock icon must stay inside its box");
     }
 
     #[test]

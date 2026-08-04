@@ -74,6 +74,17 @@ impl TrackInfo {
         }
         parts.join(" · ")
     }
+
+    /// Splits the meta line for the overlay: whether a duration is present
+    /// (the overlay then draws its own vector clock icon) and the text with
+    /// the stopwatch glyph removed, so the emoji never renders through the
+    /// GDI text path. The session history keeps `meta_line`'s glyph. The
+    /// glyph carries no content, so the stripped text is non-empty exactly
+    /// when `meta_line` is.
+    pub fn meta_line_for_overlay(&self, include_album: bool) -> (bool, String) {
+        let line = self.meta_line(include_album);
+        (line.contains('⏱'), line.replace("⏱ ", ""))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,5 +128,37 @@ mod tests {
             MediaEvent::PlaybackStateChanged(_, source) => assert_eq!(source, "spotify"),
             _ => panic!("expected PlaybackStateChanged"),
         }
+    }
+
+    #[test]
+    fn meta_line_for_overlay_strips_the_duration_glyph() {
+        let track = TrackInfo {
+            album: "Example".into(),
+            duration_secs: Some(225),
+            subtitle: "".into(),
+            album_artist: "".into(),
+            genre: Some("Pop".into()),
+            track_number: Some(3),
+            track_count: Some(12),
+            ..TrackInfo::default()
+        };
+        let line = track.meta_line(true);
+        assert!(line.contains('⏱'), "meta line must carry the duration glyph");
+        let (has_duration, text) = track.meta_line_for_overlay(true);
+        assert!(has_duration, "a duration must flag the clock icon");
+        assert!(!text.contains('⏱'), "the glyph must be removed: {text}");
+        assert!(!text.trim().is_empty(), "the rest of the line stays");
+        assert!(
+            text.contains("3:45") && text.contains("Example") && text.contains("3/12"),
+            "the remaining parts are preserved: {text}"
+        );
+        // Without a duration the line is left untouched and no icon is drawn.
+        let no_duration = TrackInfo {
+            album: "Example".into(),
+            ..TrackInfo::default()
+        };
+        let (has_duration, text) = no_duration.meta_line_for_overlay(true);
+        assert!(!has_duration);
+        assert_eq!(text, no_duration.meta_line(true));
     }
 }
