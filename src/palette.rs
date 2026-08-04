@@ -81,21 +81,45 @@ fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
     if candidates.is_empty() {
         return None;
     }
-    // Score by population × vibrancy (saturation + 0.3), matching AndroidX
-    // Palette's weighting so a vibrant pink outranks a dull-but-common blue.
-    candidates.sort_by(|a, b| {
-        let sa = a.0 as f32 * (rgb_to_hsl(a.1[0], a.1[1], a.1[2]).1 + 0.3);
-        let sb = b.0 as f32 * (rgb_to_hsl(b.1[0], b.1[1], b.1[2]).1 + 0.3);
-        sb.partial_cmp(&sa)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.cmp(&b.1))
-    });
-    // Let the allocator reclaim the 112KB histogram slab before the
-    // candidates vec borrows from it; shrink_to_fit trims the candidates
-    // heap to its actual length so the allocator gets clean pages back.
+    // Sort by population for iteration order; the final selection uses
+    // target-based scoring, not a global population sort.
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let max_count = candidates[0].0 as f32;
+    // Let the allocator reclaim the histogram slab; shrink_to_fit trims the
+    // candidates heap so the allocator gets clean pages back.
     drop(buckets);
     candidates.shrink_to_fit();
-    let primary = candidates.iter().find(|(_, c)| passes_guard(*c))?.1;
+
+    // AndroidX-style Vibrant target selection: hard-filter by L/S bounds,
+    // then score by proximity to ideal vibrant target (L=0.5, S=1.0)
+    // weighted with population. This ensures a vibrant pink beats a
+    // dull-but-dominant blue regardless of pixel count.
+    const VIBRANT_L_MIN: f32 = 0.3;
+    const VIBRANT_L_MAX: f32 = 0.7;
+    const VIBRANT_S_MIN: f32 = 0.35;
+    const IDEAL_L: f32 = 0.5;
+    const WEIGHT_L: f32 = 1.0;
+    const WEIGHT_S: f32 = 0.6;
+    const WEIGHT_POP: f32 = 0.2;
+
+    let mut best_score = f32::MIN;
+    let mut primary = None;
+    for (_, c) in &candidates {
+        let (_, s, l) = rgb_to_hsl(c[0], c[1], c[2]);
+        if !(VIBRANT_L_MIN..=VIBRANT_L_MAX).contains(&l) || s < VIBRANT_S_MIN {
+            continue;
+        }
+        let l_score = 1.0 - (l - IDEAL_L).abs();
+        let pop_score = candidates[0].0 as f32 / max_count;
+        let score = l_score * WEIGHT_L + s * WEIGHT_S + pop_score * WEIGHT_POP;
+        if score > best_score {
+            best_score = score;
+            primary = Some(*c);
+        }
+    }
+    // Fallback: if the Vibrant filter excluded everything (e.g. monochrome
+    // artwork), use the first candidate passing the guard.
+    let primary = primary.or_else(|| candidates.iter().find(|(_, c)| passes_guard(*c)).map(|(_, c)| *c))?;
     let primary_hue = rgb_to_hsl(primary[0], primary[1], primary[2]).0;
     let secondary = candidates
         .iter()
