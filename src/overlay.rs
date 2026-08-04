@@ -1211,6 +1211,24 @@ fn draw_pixels(
             let art_x = padding;
             let art_y = height.saturating_sub(art_size) / 2;
             state.ensure_art(track, art_base);
+            // Album art halo: subtle accent glow behind the art square.
+            if let Some(c) = palette.map(|p| p.primary) {
+                let halo_pad = (3.0 * scale).round() as usize;
+                let halo_size = art_size + halo_pad * 2;
+                let halo_x = art_x.saturating_sub(halo_pad);
+                let halo_y = art_y.saturating_sub(halo_pad);
+                let halo_radius = radius + halo_pad as f32;
+                for dy in 0..halo_size {
+                    for dx in 0..halo_size {
+                        let cov =
+                            round_rect_coverage(dx as f32, dy as f32, halo_size as f32, halo_size as f32, halo_radius);
+                        if cov > 0.0 {
+                            let alpha = (c[3] as f32 * 0.30 * cov) as u32;
+                            composite(pixels, width, halo_x + dx, halo_y + dy, [c[0], c[1], c[2]], alpha);
+                        }
+                    }
+                }
+            }
             if let Some(art) = state.decoded_art.as_deref() {
                 draw_art_scaled(
                     pixels,
@@ -1248,6 +1266,24 @@ fn draw_pixels(
             let art_size = art_size.min(height.saturating_sub(2 * padding));
             let art_x = padding;
             let art_y = height.saturating_sub(art_size) / 2;
+            // Album art halo: subtle accent glow behind the art square.
+            if let Some(c) = palette.map(|p| p.primary) {
+                let halo_pad = (3.0 * scale).round() as usize;
+                let halo_size = art_size + halo_pad * 2;
+                let halo_x = art_x.saturating_sub(halo_pad);
+                let halo_y = art_y.saturating_sub(halo_pad);
+                let halo_radius = radius + halo_pad as f32;
+                for dy in 0..halo_size {
+                    for dx in 0..halo_size {
+                        let cov =
+                            round_rect_coverage(dx as f32, dy as f32, halo_size as f32, halo_size as f32, halo_radius);
+                        if cov > 0.0 {
+                            let alpha = (c[3] as f32 * 0.30 * cov) as u32;
+                            composite(pixels, width, halo_x + dx, halo_y + dy, [c[0], c[1], c[2]], alpha);
+                        }
+                    }
+                }
+            }
             if let Some(art) = state.decoded_art.as_deref() {
                 draw_art_scaled(
                     pixels,
@@ -1584,6 +1620,19 @@ fn rounded_triangle_coverage(
     t * t * (3.0 - 2.0 * t)
 }
 
+/// A desaturated, lighter version of the accent color: mixes 40% toward gray
+/// and brightens 15%. Used for the artist and app-name rows so they complement
+/// rather than compete with the full accent used on the play symbol and clock.
+fn muted_accent(primary: [u8; 4]) -> [u8; 4] {
+    let avg = ((primary[0] as u16 + primary[1] as u16 + primary[2] as u16) / 3) as u8;
+    let mix = |c: u8, t: f32| -> u8 { (c as f32 * (1.0 - t) + avg as f32 * t).round() as u8 };
+    let r = mix(primary[0], 0.4);
+    let g = mix(primary[1], 0.4);
+    let b = mix(primary[2], 0.4);
+    let light = |c: u8| ((c as f32 * 1.15).min(255.0)) as u8;
+    [light(r), light(g), light(b), 255]
+}
+
 /// Draws the shared pill text layout used by every notification: title,
 /// artist, meta and source-app rows, fitted to the rows that are actually
 /// present. When `playback` is `Some`, the title row reserves space on its
@@ -1694,7 +1743,7 @@ fn draw_pill_text_rows(
             &track.artist,
             &artist_rect,
             rows[1].1 as i32,
-            [0xCC, 0xCC, 0xCC, 0xFF],
+            muted_accent(accent),
             false,
             false,
             Some(&mut state.scroll[1]),
@@ -1711,7 +1760,7 @@ fn draw_pill_text_rows(
             &meta,
             meta_clock,
             rows[2].1 as i32,
-            [0x99, 0x99, 0x99, 0xFF],
+            accent,
             accent,
             scale,
             Some(&mut state.scroll[2]),
@@ -2341,7 +2390,10 @@ fn draw_source_app_row(
     scale: f32,
     marquee: Option<&mut LineScroll>,
 ) {
-    let color = [0x77, 0x77, 0x77, 0xFF];
+    let color = track
+        .palette
+        .map(|p| muted_accent(p.primary))
+        .unwrap_or([0x77, 0x77, 0x77, 0xFF]);
     if let Some(icon) = track.app_icon.as_deref() {
         // The source bitmap is always 24x24; the destination size is the
         // 16px base scaled for DPI, clamped so it never overflows the band.
