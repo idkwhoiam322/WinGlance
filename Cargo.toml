@@ -41,5 +41,5 @@ toml = "0.8"
 [profile.release]
 codegen-units = 1
 debug = false
-lto = "thin"
+lto = "fat"
 strip = "symbols"
