@@ -32,6 +32,9 @@ const DEFAULT_MARGIN: f32 = 8.0;
 /// handle values: HWND is not Send, so the static holds usize.
 static OPEN_POSITIONER: OnceLock<Mutex<(usize, usize)>> = OnceLock::new(); // (positioner, overlay)
 
+/// Guards class registration: registering twice would leak the class brush.
+static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
+
 struct PositionerState {
     owner: HWND,
     overlay: HWND,
@@ -125,6 +128,9 @@ pub(crate) fn reset_position() {
 }
 
 fn register_class(instance: HINSTANCE, class_name: &[u16]) {
+    if CLASS_REGISTERED.get().is_some() {
+        return;
+    }
     unsafe {
         let cursor = LoadCursorW(None, IDC_ARROW).unwrap();
         let class = WNDCLASSEXW {
@@ -138,6 +144,7 @@ fn register_class(instance: HINSTANCE, class_name: &[u16]) {
             ..Default::default()
         };
         let _ = RegisterClassExW(&class);
+        let _ = CLASS_REGISTERED.set(());
     }
 }
 

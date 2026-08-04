@@ -1,5 +1,6 @@
 use crate::overlay::wide;
 use log::warn;
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -58,6 +59,9 @@ struct PickerState {
 
 static OPEN_PICKER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
 
+/// Guards class registration: registering twice would leak the class brush.
+static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
+
 fn get_open_picker() -> &'static Mutex<Option<isize>> {
     OPEN_PICKER.get_or_init(|| Mutex::new(None))
 }
@@ -72,6 +76,9 @@ fn close_btn_rect(client: &RECT) -> RECT {
 }
 
 fn register_class(instance: HINSTANCE) {
+    if CLASS_REGISTERED.get().is_some() {
+        return;
+    }
     unsafe {
         let cursor = LoadCursorW(None, IDC_ARROW).unwrap();
         let class = WNDCLASSEXW {
@@ -85,19 +92,59 @@ fn register_class(instance: HINSTANCE) {
             ..Default::default()
         };
         let _ = RegisterClassExW(&class);
+        let _ = CLASS_REGISTERED.set(());
     }
 }
 
-pub(crate) fn enumerate_app_processes() -> Vec<ProcessEntry> {
-    let mut found: Vec<(u32, ProcessEntry)> = Vec::new();
+/// Collects every process's executable name in one Toolhelp snapshot, so the
+/// window scan (which visits hundreds of windows) does not take a snapshot per
+/// window.
+fn process_names() -> HashMap<u32, String> {
+    let mut names = HashMap::new();
     unsafe {
-        let _ = EnumWindows(Some(enum_windows_proc), LPARAM(&mut found as *mut _ as isize));
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return names;
+        };
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                names.insert(
+                    entry.th32ProcessID,
+                    String::from_utf16_lossy(&entry.szExeFile)
+                        .trim_end_matches('\0')
+                        .to_string(),
+                );
+                if !Process32NextW(snapshot, &mut entry).is_ok() {
+                    break;
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Scan state threaded through the EnumWindows callback: the accumulated
+/// window entries and the prebuilt pid → exe-name map.
+struct WindowScan {
+    found: Vec<(u32, ProcessEntry)>,
+    exe_by_pid: HashMap<u32, String>,
+}
+
+pub(crate) fn enumerate_app_processes() -> Vec<ProcessEntry> {
+    let exe_by_pid = process_names();
+    let mut scan = WindowScan {
+        found: Vec::new(),
+        exe_by_pid,
+    };
+    unsafe {
+        let _ = EnumWindows(Some(enum_windows_proc), LPARAM(&mut scan as *mut _ as isize));
     }
 
     let our_pid = unsafe { GetCurrentProcessId() };
     let mut seen = std::collections::HashSet::new();
     let mut entries = Vec::new();
-    for (pid, entry) in found {
+    for (pid, entry) in scan.found {
         if pid == our_pid || !seen.insert(pid) {
             continue;
         }
@@ -153,7 +200,7 @@ fn pretty_source_label(value: &str) -> String {
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let found = unsafe { &mut *(lparam.0 as *mut Vec<(u32, ProcessEntry)>) };
+    let scan = unsafe { &mut *(lparam.0 as *mut WindowScan) };
 
     if !unsafe { IsWindowVisible(hwnd).as_bool() } {
         return BOOL(1);
@@ -179,10 +226,9 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         return BOOL(1);
     }
 
-    let exe_name = process_name_for_pid(pid);
-    if exe_name.is_empty() {
+    let Some(exe_name) = scan.exe_by_pid.get(&pid) else {
         return BOOL(1);
-    }
+    };
 
     let title = String::from_utf16_lossy(&title_buf[..len as usize]);
     let title = title.trim().to_string();
@@ -195,7 +241,7 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         .trim_end_matches(".EXE")
         .to_lowercase();
 
-    found.push((
+    scan.found.push((
         pid,
         ProcessEntry {
             display_name: title,
@@ -203,35 +249,6 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         },
     ));
     BOOL(1)
-}
-
-fn process_name_for_pid(pid: u32) -> String {
-    unsafe {
-        let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, pid) {
-            Ok(h) => h,
-            Err(_) => return String::new(),
-        };
-
-        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-        if !Process32FirstW(snapshot, &mut entry).is_ok() {
-            return String::new();
-        }
-
-        loop {
-            if entry.th32ProcessID == pid {
-                return String::from_utf16_lossy(&entry.szExeFile)
-                    .trim_end_matches('\0')
-                    .to_string();
-            }
-            if !Process32NextW(snapshot, &mut entry).is_ok() {
-                break;
-            }
-        }
-
-        String::new()
-    }
 }
 
 pub(crate) fn close_existing() {
@@ -588,11 +605,11 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             let old_font = unsafe { SelectObject(hdc, font) };
             let _ = unsafe { SetBkMode(hdc, TRANSPARENT) };
             let _ = unsafe { SetTextColor(hdc, COLORREF(0x00F0F0F0)) };
-            let title = wide("Select apps (Enter=apply, Esc=cancel)");
+            let mut title = wide("Select apps (Enter=apply, Esc=cancel)");
             let _ = unsafe {
                 DrawTextW(
                     hdc,
-                    &mut title.clone(),
+                    &mut title,
                     &mut RECT {
                         left: client.left + 12,
                         top: client.top + 6,
@@ -612,11 +629,11 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             let _ = unsafe { DeleteObject(btn_brush) };
 
             let _ = unsafe { SetTextColor(hdc, COLORREF(0x00F0F0F0)) };
-            let x_text = wide("\u{00D7}");
+            let mut x_text = wide("\u{00D7}");
             let _ = unsafe {
                 DrawTextW(
                     hdc,
-                    &mut x_text.clone(),
+                    &mut x_text,
                     &mut RECT {
                         left: btn.left,
                         top: btn.top,
@@ -668,10 +685,10 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 if draw.itemData == BST_CHECKED {
                     SetTextColor(draw.hDC, COLORREF(0x00F0F0F0));
                     SetBkMode(draw.hDC, TRANSPARENT);
-                    let tick = wide("X");
+                    let mut tick = wide("X");
                     DrawTextW(
                         draw.hDC,
-                        &mut tick.clone(),
+                        &mut tick,
                         &mut RECT {
                             left: cb.left,
                             top: cb.top,
@@ -685,9 +702,10 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 // Entry text.
                 SetTextColor(draw.hDC, COLORREF(0x00F0F0F0));
                 SetBkMode(draw.hDC, TRANSPARENT);
+                let mut name = wide(&entry.display_name);
                 DrawTextW(
                     draw.hDC,
-                    &mut wide(&entry.display_name).clone(),
+                    &mut name,
                     &mut RECT {
                         left: draw.rcItem.left + 24,
                         right: draw.rcItem.right - 4,
