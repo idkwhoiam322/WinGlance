@@ -192,8 +192,10 @@ struct OverlayState {
     phase: Phase,
     dismiss_at: Option<Instant>,
     /// When the cursor hovers over the pill, the dismiss deadline is
-    /// shortened to 500ms so the user can dismiss it by just pointing at it.
-    /// The original deadline is stashed here and restored on cursor leave.
+    /// shortened to 500ms. The arm is one-way: the pill dismisses 500ms
+    /// after the hover is first detected even if the cursor leaves before
+    /// then. The flag also stops the tick from re-arming (which would keep
+    /// pushing the deadline forward while the cursor stays put).
     hover_dismiss_at: Option<Instant>,
     position: OverlayPos,
     /// Per-row marquee state for the four track lines (title/subtitle/meta/app).
@@ -634,6 +636,9 @@ impl OverlayState {
         self.reset_scroll();
         let now = Instant::now();
         self.dismiss_at = Some(now + Duration::from_millis(duration_ms));
+        // A fresh pill must not inherit hover state from the previous one:
+        // re-arm hover-dismiss only if the cursor is still over the new pill.
+        self.hover_dismiss_at = None;
         self.morph = None;
         self.phase = if full_animation {
             Phase::Expanding(now)
@@ -684,17 +689,14 @@ impl OverlayState {
                 }
             }
         }
-        // Hover-to-dismiss: while the cursor is over the pill, shorten the
-        // remaining time to 500ms; leaving restores the original deadline.
+        // Hover-to-dismiss: the first tick that finds the cursor over the
+        // pill caps the remaining time at 500ms. One-way: leaving the pill
+        // before that does not cancel the early dismissal.
         if !matches!(self.phase, Phase::Hidden) {
-            if self.is_cursor_over_pill() {
-                if self.hover_dismiss_at.is_none() {
-                    self.hover_dismiss_at = Some(now);
-                    self.dismiss_at = Some(now + Duration::from_millis(500));
-                }
-            } else if self.hover_dismiss_at.is_some() {
-                self.hover_dismiss_at = None;
-                self.dismiss_at = None;
+            if self.is_cursor_over_pill() && self.hover_dismiss_at.is_none() {
+                self.hover_dismiss_at = Some(now);
+                self.dismiss_at = Some(now + Duration::from_millis(500));
+                debug!("pill hover-dismiss armed");
             }
         } else {
             self.hover_dismiss_at = None;
@@ -906,6 +908,7 @@ impl OverlayState {
     fn hide(&mut self) {
         self.content = None;
         self.dismiss_at = None;
+        self.hover_dismiss_at = None;
         self.phase = Phase::Hidden;
         self.morph = None;
         // Clear the last-shown source label so a subsequent PlaybackStateChanged
@@ -994,6 +997,7 @@ impl OverlayState {
         self.reset_scroll();
         let now = Instant::now();
         self.dismiss_at = Some(now + sample_duration(&self.config));
+        self.hover_dismiss_at = None;
         self.morph = None;
         self.phase = Phase::Light(now);
         self.sync_anim_timer();
