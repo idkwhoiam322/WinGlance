@@ -1,9 +1,14 @@
 use chrono::Utc;
 use log::{LevelFilter, Log, Metadata, Record};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+
+/// The live log is truncated when it exceeds this many bytes: the file is
+/// only cleared at startup, and a churn-heavy session can otherwise write
+/// tens of MB of Debug lines to disk.
+const LIVE_LOG_CAP: u64 = 1024 * 1024;
 
 pub fn init_logging(logs_dir: &Path) {
     let _ = fs::create_dir_all(logs_dir);
@@ -14,7 +19,7 @@ pub fn init_logging(logs_dir: &Path) {
         .truncate(true)
         .open(&live_path);
     let files = match file {
-        Ok(file) => Some(LogFiles { live: file }),
+        Ok(file) => Some(LogFiles { live: file, written: 0 }),
         Err(error) => {
             eprintln!("log file open failed ({live_path:?}): {error}");
             None
@@ -36,6 +41,8 @@ pub fn init_logging(logs_dir: &Path) {
 
 struct LogFiles {
     live: File,
+    /// Bytes written since the last truncation.
+    written: u64,
 }
 
 struct FileLogger {
@@ -63,6 +70,14 @@ impl Log for FileLogger {
         {
             let _ = files.live.write_all(line.as_bytes());
             let _ = files.live.flush();
+            files.written += line.len() as u64;
+            if files.written >= LIVE_LOG_CAP {
+                // Start the log fresh instead of growing without bound; the
+                // file is diagnostic scratch, not user data.
+                let _ = files.live.set_len(0);
+                let _ = files.live.seek(SeekFrom::Start(0));
+                files.written = 0;
+            }
         }
         eprint!("{line}");
     }
