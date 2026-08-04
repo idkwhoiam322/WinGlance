@@ -69,10 +69,14 @@ const MENU_DURATION_3S: usize = 1018;
 const MENU_DURATION_5S: usize = 1019;
 const MENU_DURATION_10S: usize = 1020;
 const LISTBOX_ID: usize = 2;
-const HISTORY_CAP: usize = 1000;
-/// Artwork decode size in pixels (2× the 96 logical tile, so the cached
-/// bitmap stays crisp up to 200% DPI and is only ever downscaled at paint).
-const ART_DECODE: u32 = 192;
+/// History rows are kept in the heap (as entries) and duplicated in the
+/// listbox as UTF-16 row strings, so the cap directly sizes the app's
+/// baseline memory (~1 KB per row across both copies).
+const HISTORY_CAP: usize = 400;
+/// Artwork decode size in pixels (1.33× the 96 logical tile, so the cached
+/// bitmap stays crisp up to ~133% DPI; below that it is only ever
+/// downscaled at paint). 128²×4 = 64 KB, versus 147 KB at 192².
+const ART_DECODE: u32 = 128;
 /// Timer used to clear the "Copied" feedback on the Copy logs button.
 const TIMER_LOGS_ID: usize = 101;
 /// Timer used to keep the native history tooltip's item rects in sync (scroll).

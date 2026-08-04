@@ -163,49 +163,57 @@ fn main() -> Result<()> {
     // Supervisor: runs the SMTC worker and restarts it when it stalls (a WinRT
     // call can hang under heavy session churn, which would otherwise silently
     // stop all events and pills). The hung worker thread is leaked; a fresh
-    // worker with its own manager takes over.
-    thread::Builder::new().name("notch-smtc".to_string()).spawn(move || {
-        loop {
-            let worker_heartbeat = supervisor_heartbeat.clone();
-            let event_tx_worker = event_tx.clone();
-            let listener_config_worker = listener_config.clone();
-            let worker = thread::Builder::new()
-                .name("notch-smtc-worker".to_string())
-                .spawn(move || {
-                    let _ = smtc::SmtcListener::new(event_tx_worker, listener_config_worker, worker_heartbeat).run();
-                });
-            let Ok(worker) = worker else {
-                warn!("could not start the SMTC worker; retrying in 5s");
-                std::thread::sleep(Duration::from_secs(5));
-                continue;
-            };
-            let mut stalled = false;
-            while !worker.is_finished() {
-                std::thread::sleep(Duration::from_secs(2));
-                let last = *supervisor_heartbeat.lock().unwrap();
-                if last.elapsed() > Duration::from_secs(30) {
-                    stalled = true;
-                    break;
+    // worker with its own manager takes over. Threads get explicit smaller
+    // stacks (Rust defaults to 2 MB reserve each) — the supervisor and the
+    // event forwarder only sleep and forward, and the worker's WinRT calls
+    // stay well under 1 MB.
+    thread::Builder::new()
+        .name("notch-smtc".to_string())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            loop {
+                let worker_heartbeat = supervisor_heartbeat.clone();
+                let event_tx_worker = event_tx.clone();
+                let listener_config_worker = listener_config.clone();
+                let worker = thread::Builder::new()
+                    .name("notch-smtc-worker".to_string())
+                    .stack_size(1024 * 1024)
+                    .spawn(move || {
+                        let _ =
+                            smtc::SmtcListener::new(event_tx_worker, listener_config_worker, worker_heartbeat).run();
+                    });
+                let Ok(worker) = worker else {
+                    warn!("could not start the SMTC worker; retrying in 5s");
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                };
+                let mut stalled = false;
+                while !worker.is_finished() {
+                    std::thread::sleep(Duration::from_secs(2));
+                    let last = *supervisor_heartbeat.lock().unwrap();
+                    if last.elapsed() > Duration::from_secs(30) {
+                        stalled = true;
+                        break;
+                    }
                 }
-            }
-            if stalled {
-                // Do not join: the worker may be blocked inside COM forever.
-                error!("SMTC worker stalled; restarting it");
-                std::thread::sleep(Duration::from_secs(5));
-                continue;
-            }
-            match worker.join() {
-                Ok(()) => {}
-                Err(panic) => {
-                    let payload = panic.downcast_ref::<&str>().copied().unwrap_or("unknown panic");
-                    error!("SMTC worker panicked: {payload}");
+                if stalled {
+                    // Do not join: the worker may be blocked inside COM forever.
+                    error!("SMTC worker stalled; restarting it");
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
                 }
+                match worker.join() {
+                    Ok(()) => {}
+                    Err(panic) => {
+                        let payload = panic.downcast_ref::<&str>().copied().unwrap_or("unknown panic");
+                        error!("SMTC worker panicked: {payload}");
+                    }
+                }
+                // The worker exited on its own (an error or a panic): restart it.
+                warn!("SMTC worker exited; restarting it");
+                std::thread::sleep(Duration::from_secs(5));
             }
-            // The worker exited on its own (an error or a panic): restart it.
-            warn!("SMTC worker exited; restarting it");
-            std::thread::sleep(Duration::from_secs(5));
-        }
-    })?;
+        })?;
 
     let main_queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
     let overlay_queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
@@ -235,6 +243,7 @@ fn spawn_event_forwarder(
     let overlay_raw = overlay_hwnd.0 as isize;
     thread::Builder::new()
         .name("notch-events".to_string())
+        .stack_size(256 * 1024)
         .spawn(move || {
             while let Ok(event) = receiver.recv() {
                 let mut posted = true;
