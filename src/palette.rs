@@ -95,22 +95,24 @@ fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
     // weighted with population. This ensures a vibrant pink beats a
     // dull-but-dominant blue regardless of pixel count.
     const VIBRANT_L_MIN: f32 = 0.3;
-    const VIBRANT_L_MAX: f32 = 0.7;
-    const VIBRANT_S_MIN: f32 = 0.35;
+    const VIBRANT_L_MAX: f32 = 0.78;
+    const VIBRANT_S_MIN: f32 = 0.25;
     const IDEAL_L: f32 = 0.5;
     const WEIGHT_L: f32 = 1.0;
     const WEIGHT_S: f32 = 0.6;
-    const WEIGHT_POP: f32 = 0.2;
+    const WEIGHT_POP: f32 = 0.5;
 
     let mut best_score = f32::MIN;
     let mut primary = None;
-    for (_, c) in &candidates {
+    for (count, c) in &candidates {
         let (_, s, l) = rgb_to_hsl(c[0], c[1], c[2]);
         if !(VIBRANT_L_MIN..=VIBRANT_L_MAX).contains(&l) || s < VIBRANT_S_MIN {
             continue;
         }
         let l_score = 1.0 - (l - IDEAL_L).abs();
-        let pop_score = candidates[0].0 as f32 / max_count;
+        // Population share of *this* candidate, not the top bucket's share
+        // of itself (which is always 1.0 and made WEIGHT_POP a no-op).
+        let pop_score = *count as f32 / max_count;
         let score = l_score * WEIGHT_L + s * WEIGHT_S + pop_score * WEIGHT_POP;
         if score > best_score {
             best_score = score;

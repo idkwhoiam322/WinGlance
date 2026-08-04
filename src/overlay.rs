@@ -1233,6 +1233,11 @@ fn draw_pixels(
         MediaEvent::TrackChanged(track) => {
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
+            // Must match the mask radius draw_art_scaled uses for the art
+            // bitmap itself, not the pill's corner_radius — otherwise the
+            // halo/rim are rounder than the art beneath them and visibly
+            // don't hug its corners.
+            let art_radius = art_size as f32 * 0.2;
             let art_x = inset + padding;
             let art_y = inset + pill_h.saturating_sub(art_size) / 2;
             state.ensure_art(track, art_base);
@@ -1242,7 +1247,7 @@ fn draw_pixels(
                 let halo_size = art_size + halo_pad * 2;
                 let halo_x = art_x.saturating_sub(halo_pad);
                 let halo_y = art_y.saturating_sub(halo_pad);
-                let halo_radius = radius + halo_pad as f32;
+                let halo_radius = art_radius + halo_pad as f32;
                 for dy in 0..halo_size {
                     for dx in 0..halo_size {
                         let cov =
@@ -1280,7 +1285,8 @@ fn draw_pixels(
                 let stroke_w = (1.5 * scale).round().max(1.0);
                 for dy in 0..art_size {
                     for dx in 0..art_size {
-                        let d = round_rect_signed_dist(dx as f32, dy as f32, art_size as f32, art_size as f32, radius);
+                        let d =
+                            round_rect_signed_dist(dx as f32, dy as f32, art_size as f32, art_size as f32, art_radius);
                         if d.abs() < stroke_w {
                             let edge = 1.0 - d.abs() / stroke_w;
                             let alpha = (c[3] as f32 * 0.9 * edge) as u32;
@@ -1303,6 +1309,11 @@ fn draw_pixels(
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
             let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
+            // Must match the mask radius draw_art_scaled uses for the art
+            // bitmap itself, not the pill's corner_radius — otherwise the
+            // halo/rim are rounder than the art beneath them and visibly
+            // don't hug its corners.
+            let art_radius = art_size as f32 * 0.2;
             let art_x = inset + padding;
             let art_y = inset + pill_h.saturating_sub(art_size) / 2;
             // Album art halo: subtle accent glow behind the art square.
@@ -1311,7 +1322,7 @@ fn draw_pixels(
                 let halo_size = art_size + halo_pad * 2;
                 let halo_x = art_x.saturating_sub(halo_pad);
                 let halo_y = art_y.saturating_sub(halo_pad);
-                let halo_radius = radius + halo_pad as f32;
+                let halo_radius = art_radius + halo_pad as f32;
                 for dy in 0..halo_size {
                     for dx in 0..halo_size {
                         let cov =
@@ -1349,7 +1360,8 @@ fn draw_pixels(
                 let stroke_w = (1.5 * scale).round().max(1.0);
                 for dy in 0..art_size {
                     for dx in 0..art_size {
-                        let d = round_rect_signed_dist(dx as f32, dy as f32, art_size as f32, art_size as f32, radius);
+                        let d =
+                            round_rect_signed_dist(dx as f32, dy as f32, art_size as f32, art_size as f32, art_radius);
                         if d.abs() < stroke_w {
                             let edge = 1.0 - d.abs() / stroke_w;
                             let alpha = (c[3] as f32 * 0.9 * edge) as u32;
@@ -2509,9 +2521,9 @@ fn round_rect_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> 
 /// Soft multi-color glow around the pill's boundary. The DIB is inflated by
 /// `AURA_MARGIN_LOGICAL` (scaled by DPI × shape) on every side so the halo
 /// can extend outside the pill into the desktop background.
-const AURA_MARGIN_LOGICAL: f32 = 15.0;
+const AURA_MARGIN_LOGICAL: f32 = 10.0;
 /// Peak opacity of the outer aura ring, at the pill boundary.
-const AURA_PEAK_ALPHA: f32 = 511.0;
+const AURA_PEAK_ALPHA: f32 = 767.0;
 /// Exponential decay constant: the aura's outer edge sits at
 /// exp(-AURA_DECAY) of the peak opacity.
 const AURA_DECAY: f32 = 3.0;
