@@ -1016,14 +1016,15 @@ impl MainWindowState {
 
         // Decode lazily here: the window starts hidden, so the first paint is
         // the first time the art is actually needed.
-        if let Some(current) = &mut self.current {
-            if current.art.is_none() && current.art_fingerprint.is_some() {
-                current.art = current
-                    .track
-                    .artwork
-                    .as_deref()
-                    .and_then(|data| decode_artwork_pm(data, ART_DECODE as usize));
-            }
+        if let Some(current) = &mut self.current
+            && current.art.is_none()
+            && current.art_fingerprint.is_some()
+        {
+            current.art = current
+                .track
+                .artwork
+                .as_deref()
+                .and_then(|data| decode_artwork_pm(data, ART_DECODE as usize));
         }
 
         if let Some(current) = &self.current {
