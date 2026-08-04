@@ -25,12 +25,13 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetForegroundWindow, GetWindowLongPtrW,
-    HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW, MA_NOACTIVATE, RegisterClassExW,
-    SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA,
-    WM_APP, WM_DESTROY, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASS_STYLES,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetCursorPos, GetForegroundWindow,
+    GetWindowLongPtrW, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW, MA_NOACTIVATE,
+    RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    ULW_ALPHA, WM_APP, WM_DESTROY, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER,
+    WNDCLASS_STYLES, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -190,6 +191,10 @@ struct OverlayState {
     last_track: Option<TrackInfo>,
     phase: Phase,
     dismiss_at: Option<Instant>,
+    /// When the cursor hovers over the pill, the dismiss deadline is
+    /// shortened to 500ms so the user can dismiss it by just pointing at it.
+    /// The original deadline is stashed here and restored on cursor leave.
+    hover_dismiss_at: Option<Instant>,
     position: OverlayPos,
     /// Per-row marquee state for the four track lines (title/subtitle/meta/app).
     scroll: [LineScroll; 4],
@@ -304,6 +309,7 @@ impl OverlayState {
             last_track: None,
             phase: Phase::Hidden,
             dismiss_at: None,
+            hover_dismiss_at: None,
             position,
             scroll: [LineScroll::default(); 4],
             anim_timer: HANDLE::default(),
@@ -662,6 +668,22 @@ impl OverlayState {
                 }
             }
         }
+        // Hover-to-dismiss: while the cursor is over the pill, shorten the
+        // remaining time to 500ms; leaving restores the original deadline.
+        if !matches!(self.phase, Phase::Hidden) {
+            if self.is_cursor_over_pill() {
+                if self.hover_dismiss_at.is_none() {
+                    self.hover_dismiss_at = Some(now);
+                    self.dismiss_at = Some(now + Duration::from_millis(500));
+                }
+            } else if self.hover_dismiss_at.is_some() {
+                self.hover_dismiss_at = None;
+                self.dismiss_at = None;
+            }
+        } else {
+            self.hover_dismiss_at = None;
+            self.dismiss_at = None;
+        }
         if self.dismiss_at.is_some_and(|deadline| deadline <= now)
             && !matches!(self.phase, Phase::Collapsing(_) | Phase::Hidden)
         {
@@ -816,6 +838,27 @@ impl OverlayState {
         let x = x.clamp(work.left, (work.right - width).max(work.left));
         let y = y.clamp(work.top, (work.bottom - height).max(work.top));
         Some(POINT { x, y })
+    }
+
+    /// Whether the cursor currently sits over the pill body (not the aura
+    /// ring). The overlay window is `WS_EX_TRANSPARENT`, so it receives no
+    /// mouse messages; the cursor is polled instead on the animation tick.
+    fn is_cursor_over_pill(&self) -> bool {
+        let mut pt = POINT::default();
+        if unsafe { GetCursorPos(&mut pt) }.is_err() {
+            return false;
+        }
+        let Some((width, height)) = self.content_size() else {
+            return false;
+        };
+        let Some(pos) = self.position(width, height) else {
+            return false;
+        };
+        let inset = self.aura_inset;
+        pt.x >= pos.x + inset
+            && pt.x <= pos.x + width + inset
+            && pt.y >= pos.y + inset
+            && pt.y <= pos.y + height + inset
     }
 
     /// Moves the live overlay window to its resolved position without a full redraw.
