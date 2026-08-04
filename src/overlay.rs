@@ -1780,18 +1780,46 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 }
                 if !track.source_app.trim().is_empty() {
                     let source_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
-                    draw_text_line_pixels(
-                        &mut state.text_scratch,
-                        pixels,
-                        width as usize,
-                        &track.source_app,
-                        &source_rect,
-                        (fs_artist * 0.85) as i32,
-                        [0x77, 0x77, 0x77, 0xFF],
-                        false,
-                        false,
-                        None,
-                    );
+                    let font_h = (fs_artist * 0.85) as i32;
+                    let icon_h = font_h.max(8) as usize;
+                    if let Some(icon) = track.app_icon.as_deref() {
+                        let icon_size = 24usize;
+                        let icon_x = source_rect.left as usize;
+                        let icon_y =
+                            source_rect.top as usize + ((source_rect.bottom - source_rect.top) as usize - icon_h) / 2;
+                        draw_icon_scaled(pixels, width as usize, icon, icon_size, icon_x, icon_y, icon_h);
+                        let text_rect = RECT {
+                            left: source_rect.left + icon_h as i32 + (4.0 * scale) as i32,
+                            top: source_rect.top,
+                            right: source_rect.right,
+                            bottom: source_rect.bottom,
+                        };
+                        draw_text_line_pixels(
+                            &mut state.text_scratch,
+                            pixels,
+                            width as usize,
+                            &track.source_app,
+                            &text_rect,
+                            font_h,
+                            [0x77, 0x77, 0x77, 0xFF],
+                            false,
+                            false,
+                            None,
+                        );
+                    } else {
+                        draw_text_line_pixels(
+                            &mut state.text_scratch,
+                            pixels,
+                            width as usize,
+                            &track.source_app,
+                            &source_rect,
+                            font_h,
+                            [0x77, 0x77, 0x77, 0xFF],
+                            false,
+                            false,
+                            None,
+                        );
+                    }
                 }
             } else {
                 let fallback_name = if !source_app.is_empty() {
@@ -2289,7 +2317,58 @@ fn composite(pixels: &mut [u8], width: usize, x: usize, y: usize, rgb: [u8; 3], 
     pixels[offset + 3] = (alpha + pixels[offset + 3] as u32 * inv / 255) as u8;
 }
 
-/// Anti-aliased coverage (0..=1) of a rounded rectangle at pixel (x, y):
+/// Bilinearly scales a premultiplied BGRA icon and composites it into the
+/// pixel buffer at (x, y) in pixel-space. The source `icon` has `icon_size`
+/// pixels per side; the destination renders at `dest_size` pixels per side.
+fn draw_icon_scaled(
+    pixels: &mut [u8],
+    width: usize,
+    icon: &[u8],
+    icon_size: usize,
+    x: usize,
+    y: usize,
+    dest_size: usize,
+) {
+    if dest_size == 0 || icon_size == 0 || icon.is_empty() {
+        return;
+    }
+    let src_stride = icon_size * 4;
+    for dy in 0..dest_size {
+        for dx in 0..dest_size {
+            let sx = (dx as f32 + 0.5) * icon_size as f32 / dest_size as f32 - 0.5;
+            let sy = (dy as f32 + 0.5) * icon_size as f32 / dest_size as f32 - 0.5;
+            let x0 = sx.max(0.0) as usize;
+            let y0 = sy.max(0.0) as usize;
+            let x1 = (x0 + 1).min(icon_size - 1);
+            let y1 = (y0 + 1).min(icon_size - 1);
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+            let p00 = y0 * src_stride + x0 * 4;
+            let p10 = y0 * src_stride + x1 * 4;
+            let p01 = y1 * src_stride + x0 * 4;
+            let p11 = y1 * src_stride + x1 * 4;
+            let b = lerp(lerp(icon[p00], icon[p10], fx), lerp(icon[p01], icon[p11], fx), fy);
+            let g = lerp(
+                lerp(icon[p00 + 1], icon[p10 + 1], fx),
+                lerp(icon[p01 + 1], icon[p11 + 1], fx),
+                fy,
+            );
+            let r = lerp(
+                lerp(icon[p00 + 2], icon[p10 + 2], fx),
+                lerp(icon[p01 + 2], icon[p11 + 2], fx),
+                fy,
+            );
+            let a = lerp(
+                lerp(icon[p00 + 3], icon[p10 + 3], fx),
+                lerp(icon[p01 + 3], icon[p11 + 3], fx),
+                fy,
+            );
+            if a > 0 {
+                composite_pm(pixels, width, x + dx, y + dy, [r, g, b], a as u32);
+            }
+        }
+    }
+}
 /// signed distance to the boundary smoothed over ~1.5 px. Used for the pill's
 /// outer shape, the placeholder art and the album-artwork corner mask.
 fn round_rect_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> f32 {

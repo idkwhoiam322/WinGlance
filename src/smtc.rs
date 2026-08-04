@@ -139,6 +139,9 @@ struct ListenerState {
     /// always sees a change. We compare title + artist + artwork-presence so
     /// that a genuine artwork gain still surfaces as an in-place refresh.
     last_track_per_source: HashMap<String, TrackInfo>,
+    /// Cached app icons keyed by source_app label (derived from AUMID via
+    /// `source_app_label`). Populated on first encounter of a source.
+    icon_cache: HashMap<String, Option<Arc<[u8]>>>,
 }
 
 pub struct SmtcListener {
@@ -213,6 +216,7 @@ impl ListenerState {
             churn_cooldown: HashMap::new(),
             rejected_seen: HashSet::new(),
             last_track_per_source: HashMap::new(),
+            icon_cache: HashMap::new(),
             heartbeat,
         }
     }
@@ -372,6 +376,21 @@ impl ListenerState {
                         && let Some(cached) = self.cached_artwork_for(&merged.source_app, &merged.title, &merged.artist)
                     {
                         merged.artwork = Some(cached);
+                    }
+                    // App icon extraction: one icon per source app, cached
+                    // (keyed by the source_app label, derived from the AUMID).
+                    // The AUMID is read from the live session; the icon is
+                    // attached to the track so the overlay can render it.
+                    if merged.app_icon.is_none() {
+                        if let Some(cached_icon) = self.icon_cache.get(&merged.source_app) {
+                            merged.app_icon = cached_icon.clone();
+                        } else if let Ok(aumid) = session.SourceAppUserModelId() {
+                            let aumid_str = aumid.to_string();
+                            let extracted = crate::icon::extract_app_icon(&aumid_str, 24);
+                            let cached = extracted.as_ref().map(|p| Arc::from(p.as_slice()));
+                            self.icon_cache.insert(merged.source_app.clone(), cached.clone());
+                            merged.app_icon = cached;
+                        }
                     }
                     let (mut emit, artwork_lost) = emit_track(&prev, &merged, read_artwork);
                     // Safety net: a first pill deferred for artwork shows
@@ -878,6 +897,7 @@ fn merge_track(prev: &LogicalState, read: &TrackInfo, read_artwork: bool) -> Tra
         album_artist: inherit(&read.album_artist, &prev.album_artist),
         subtitle: inherit(&read.subtitle, &prev.subtitle),
         artwork: if read_artwork { read.artwork.clone() } else { None },
+        app_icon: read.app_icon.clone(),
         source_app: read.source_app.clone(),
         duration_secs: if same_identity {
             read.duration_secs.or(prev.duration_secs)
@@ -1090,6 +1110,7 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_art
         album_artist,
         subtitle,
         artwork,
+        app_icon: None,
         source_app,
         duration_secs,
         track_number,

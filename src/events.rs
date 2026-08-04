@@ -27,6 +27,9 @@ pub struct TrackInfo {
     /// window queues, and history clones get stripped, so the byte copy would
     /// be pure waste on every track change.
     pub artwork: Option<Arc<[u8]>>,
+    /// App icon (premultiplied BGRA pixel data) extracted from the source's
+    /// AUMID via the shell, cached per-app and shared across track clones.
+    pub app_icon: Option<Arc<[u8]>>,
     pub source_app: String,
     /// Total duration in seconds, when the app reports timeline info.
     pub duration_secs: Option<u64>,

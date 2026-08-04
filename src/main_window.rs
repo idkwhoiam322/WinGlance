@@ -2734,6 +2734,7 @@ mod tests {
             album_artist: String::new(),
             subtitle: String::new(),
             artwork: None,
+            app_icon: None,
             source_app: "Spotify".into(),
             duration_secs: None,
             track_number: None,
