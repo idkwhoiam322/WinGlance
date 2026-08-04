@@ -40,6 +40,10 @@ const LIGHT_DURATION: Duration = Duration::from_millis(120);
 /// Duration of the in-place size morph when a metadata refresh changes the
 /// pill's dimensions. Short enough to read as a snap, long enough to notice.
 const MORPH_MS: Duration = Duration::from_millis(150);
+/// Remaining time left on the current pill when something newer wants the
+/// screen: hovering over the pill or a queued update both cap the exit at
+/// this, so the user never waits out the full duration to see a change.
+const EARLY_EXIT_MS: u64 = 500;
 
 /// Posted by the high-resolution animation timer to drive pill frames.
 const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
@@ -482,6 +486,15 @@ impl OverlayState {
             }
         }
         if !self.pending.is_empty() {
+            // A newer notification is waiting: don't make the user wait out
+            // the current pill's full duration (2-3s+ on a pause/play). Cap
+            // the remaining time at EARLY_EXIT_MS so the queued update shows
+            // promptly. min() never extends an already-sooner deadline
+            // (e.g. hover-dismiss).
+            if !matches!(self.phase, Phase::Hidden | Phase::Collapsing(_)) {
+                let early = Instant::now() + Duration::from_millis(EARLY_EXIT_MS);
+                self.dismiss_at = Some(self.dismiss_at.map_or(early, |d| d.min(early)));
+            }
             unsafe {
                 let _ = KillTimer(self.hwnd, TIMER_DEBOUNCE);
                 SetTimer(
@@ -695,7 +708,7 @@ impl OverlayState {
         if !matches!(self.phase, Phase::Hidden) {
             if self.is_cursor_over_pill() && self.hover_dismiss_at.is_none() {
                 self.hover_dismiss_at = Some(now);
-                self.dismiss_at = Some(now + Duration::from_millis(500));
+                self.dismiss_at = Some(now + Duration::from_millis(EARLY_EXIT_MS));
                 debug!("pill hover-dismiss armed");
             }
         } else {
@@ -3292,6 +3305,67 @@ mod tests {
             "current_source must clear when the pill collapses"
         );
         assert!(matches!(state.phase, Phase::Hidden));
+    }
+
+    #[test]
+    fn queued_update_caps_the_current_pill_remaining_time() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        // A pill is fully shown with a long remaining duration.
+        state.content = Some(MediaEvent::TrackChanged(TrackInfo {
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        }));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() + Duration::from_secs(5));
+
+        // A newer event arrives from another source (not an in-place update).
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(MediaEvent::TrackChanged(TrackInfo {
+                source_app: "spotify".into(),
+                title: "Next Song".into(),
+                ..TrackInfo::default()
+            }));
+        state.receive_events();
+
+        assert!(!state.pending.is_empty(), "the update must be queued for the next pill");
+        let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
+        assert!(
+            remaining <= Duration::from_millis(EARLY_EXIT_MS + 50),
+            "remaining time must be capped near EARLY_EXIT_MS, got {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn queued_update_never_extends_an_earlier_deadline() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.content = Some(MediaEvent::TrackChanged(TrackInfo {
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        }));
+        state.phase = Phase::Shown;
+        // Already sooner than EARLY_EXIT_MS (e.g. hover-dismiss armed).
+        let earlier = Instant::now() + Duration::from_millis(200);
+        state.dismiss_at = Some(earlier);
+
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(MediaEvent::TrackChanged(TrackInfo {
+                source_app: "spotify".into(),
+                title: "Next Song".into(),
+                ..TrackInfo::default()
+            }));
+        state.receive_events();
+
+        let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
+        assert!(
+            remaining <= Duration::from_millis(250),
+            "an earlier deadline must not be extended, got {remaining:?}"
+        );
     }
 
     #[test]
