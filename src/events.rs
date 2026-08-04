@@ -1,3 +1,4 @@
+use crate::palette::Palette;
 use std::sync::Arc;
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
@@ -30,6 +31,9 @@ pub struct TrackInfo {
     /// App icon (premultiplied BGRA pixel data) extracted from the source's
     /// AUMID via the shell, cached per-app and shared across track clones.
     pub app_icon: Option<Arc<[u8]>>,
+    /// Dominant artwork colors (computed on the SMTC worker thread at decode
+    /// time), used to recolor accents and drive the pill's boundary aura.
+    pub palette: Option<Palette>,
     pub source_app: String,
     /// Total duration in seconds, when the app reports timeline info.
     pub duration_secs: Option<u64>,

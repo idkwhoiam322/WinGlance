@@ -376,6 +376,14 @@ impl ListenerState {
                         && let Some(cached) = self.cached_artwork_for(&merged.source_app, &merged.title, &merged.artist)
                     {
                         merged.artwork = Some(cached);
+                        // The cached track carries the palette for this same
+                        // identity; reuse it so the recreated session's pill
+                        // keeps the same accent colors.
+                        if merged.palette.is_none()
+                            && let Some(cached_track) = self.last_track_per_source.get(&merged.source_app)
+                        {
+                            merged.palette = cached_track.palette;
+                        }
                     }
                     // App icon extraction: one icon per source app, cached
                     // (keyed by the source_app label, derived from the AUMID).
@@ -898,6 +906,7 @@ fn merge_track(prev: &LogicalState, read: &TrackInfo, read_artwork: bool) -> Tra
         subtitle: inherit(&read.subtitle, &prev.subtitle),
         artwork: if read_artwork { read.artwork.clone() } else { None },
         app_icon: read.app_icon.clone(),
+        palette: if read_artwork { read.palette } else { None },
         source_app: read.source_app.clone(),
         duration_secs: if same_identity {
             read.duration_secs.or(prev.duration_secs)
@@ -1087,6 +1096,10 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_art
     // Share the byte buffer via Arc: the event is cloned into two window
     // queues, so a per-clone copy of a multi-MB thumbnail is pure waste.
     let artwork = artwork.map(Arc::from);
+    // Dominant artwork colors for accent recoloring and the aura. Computed
+    // here on the worker thread (decode + quantization), never on the UI
+    // render tick.
+    let palette = artwork.as_deref().and_then(crate::palette::palette_from_artwork);
     let track_number = {
         let n = properties.TrackNumber()?;
         if n > 0 { Some(n as u32) } else { None }
@@ -1111,6 +1124,7 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_art
         subtitle,
         artwork,
         app_icon: None,
+        palette,
         source_app,
         duration_secs,
         track_number,

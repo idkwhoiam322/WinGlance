@@ -7,6 +7,7 @@ mod icon;
 mod logging;
 mod main_window;
 mod overlay;
+mod palette;
 mod positioner;
 mod process_picker;
 mod smtc;

@@ -1,5 +1,6 @@
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo};
+use crate::palette::Palette;
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
 use log::{debug, error};
@@ -1176,6 +1177,13 @@ fn draw_pixels(
 ) -> Result<()> {
     let radius = state.config.appearance.corner_radius * scale;
     let background = state.config.appearance.background_color;
+    // Palette for the boundary aura: track pills carry it directly; state
+    // pills reuse the cached track's palette for the source.
+    let palette = match content {
+        MediaEvent::TrackChanged(track) => track.palette,
+        MediaEvent::PlaybackStateChanged(_, source_app) => state.track_cache.get(source_app).and_then(|t| t.palette),
+        MediaEvent::SessionRejected { .. } => None,
+    };
     for y in 0..height {
         for x in 0..width {
             let coverage = round_rect_coverage(x as f32, y as f32, width as f32, height as f32, radius);
@@ -1191,6 +1199,9 @@ fn draw_pixels(
                 );
             }
         }
+    }
+    if let Some(palette) = palette {
+        draw_aura(pixels, width, height, palette, radius, scale);
     }
 
     match content {
@@ -1588,6 +1599,9 @@ fn draw_pill_text_rows(
     playback: Option<PlaybackState>,
 ) {
     let appearance = &state.config.appearance;
+    // Accent color: the artwork's primary palette color when available (gives
+    // the pill per-track theming), falling back to the configured accent.
+    let accent = track.palette.map(|p| p.primary).unwrap_or(appearance.accent_color);
     let padding = (appearance.padding * scale) as i32;
     let art = (appearance.art_size as f32 * scale) as i32;
     let left = padding + art + (12.0 * scale) as i32;
@@ -1667,7 +1681,7 @@ fn draw_pill_text_rows(
             title_rect.top,
             fs_title,
             playback,
-            appearance.accent_color,
+            accent,
         );
     }
 
@@ -1698,6 +1712,7 @@ fn draw_pill_text_rows(
             meta_clock,
             rows[2].1 as i32,
             [0x99, 0x99, 0x99, 0xFF],
+            accent,
             scale,
             Some(&mut state.scroll[2]),
         );
@@ -1818,9 +1833,10 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
 /// Draws the meta row of a track pill: when it carries a duration (`clock`),
 /// a vector clock icon is pinned to the left edge of the band and the text
 /// (`meta`, already stripped of the stopwatch glyph by the caller) is drawn
-/// to its right; otherwise the line renders as plain text. When the line
-/// overflows and marquees, the icon stays anchored and the text scrolls in
-/// its offset box.
+/// to its right; otherwise the line renders as plain text. The clock icon
+/// uses `accent` (the palette primary) while the text keeps `color`. When
+/// the line overflows and marquees, the icon stays anchored and the text
+/// scrolls in its offset box.
 #[allow(clippy::too_many_arguments)]
 fn draw_meta_line_pixels(
     text_scratch: &mut Option<TextScratch>,
@@ -1831,6 +1847,7 @@ fn draw_meta_line_pixels(
     clock: bool,
     font_height: i32,
     color: [u8; 4],
+    accent: [u8; 4],
     scale: f32,
     marquee: Option<&mut LineScroll>,
 ) {
@@ -1853,7 +1870,7 @@ fn draw_meta_line_pixels(
     let icon_h = icon_size.round() as i32;
     let gap = (4.0 * scale) as i32;
     let icon_top = rect.top + (rect.bottom - rect.top - icon_h) / 2;
-    draw_clock_icon_pixels(pixels, width as usize, rect.left, icon_top, icon_size, color);
+    draw_clock_icon_pixels(pixels, width as usize, rect.left, icon_top, icon_size, accent);
     let text_rect = RECT {
         left: rect.left + icon_h + gap,
         ..*rect
@@ -2364,15 +2381,59 @@ fn draw_source_app_row(
         );
     }
 }
-/// signed distance to the boundary smoothed over ~1.5 px. Used for the pill's
-/// outer shape, the placeholder art and the album-artwork corner mask.
-fn round_rect_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> f32 {
+/// Signed distance to a rounded rectangle's boundary at pixel (x, y),
+/// negative inside the shape. Used for the pill's outer shape, the
+/// placeholder art and the album-artwork corner mask.
+fn round_rect_signed_dist(x: f32, y: f32, width: f32, height: f32, radius: f32) -> f32 {
     let radius = radius.min(width / 2.0).min(height / 2.0);
     let qx = ((x + 0.5) - width / 2.0).abs() - (width / 2.0 - radius);
     let qy = ((y + 0.5) - height / 2.0).abs() - (height / 2.0 - radius);
-    let dist = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
+    qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius
+}
+
+/// Anti-aliased coverage (0..=1) of a rounded rectangle at pixel (x, y):
+/// signed distance to the boundary smoothed over ~1.5 px. Used for the pill's
+/// outer shape, the placeholder art and the album-artwork corner mask.
+fn round_rect_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> f32 {
+    let dist = round_rect_signed_dist(x, y, width, height, radius);
     let t = (0.5 - dist / 1.5).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Soft multi-color glow along the pill's boundary. The window is exactly
+/// pill-sized, so an outside halo would be clipped: the glow is painted over
+/// the card's edge as a band `AURA_MARGIN_BASE` deep, blending the palette
+/// primary into the secondary across the card width and fading exponentially
+/// toward the center at `AURA_PEAK_ALPHA` peak opacity. Skipped entirely
+/// (no work at all) when the content carries no palette.
+const AURA_MARGIN_BASE: f32 = 16.0;
+const AURA_PEAK_ALPHA: u32 = 40;
+/// Exponential decay constant: the band's outer edge sits at exp(-AURA_DECAY)
+/// of the peak opacity.
+const AURA_DECAY: f32 = 4.0;
+
+fn draw_aura(pixels: &mut [u8], width: usize, height: usize, palette: Palette, radius: f32, scale: f32) {
+    let margin = (AURA_MARGIN_BASE * scale).round().max(1.0);
+    let c1 = palette.primary;
+    let c2 = palette.secondary;
+    for y in 0..height {
+        for x in 0..width {
+            let d = round_rect_signed_dist(x as f32, y as f32, width as f32, height as f32, radius);
+            if d > 0.0 || d < -margin {
+                continue;
+            }
+            // Horizontal gradient: C(x) = C1 * (1 - x/W) + C2 * (x/W).
+            let t = x as f32 / width as f32;
+            let rgb = [
+                (c1[0] as f32 * (1.0 - t) + c2[0] as f32 * t).round() as u8,
+                (c1[1] as f32 * (1.0 - t) + c2[1] as f32 * t).round() as u8,
+                (c1[2] as f32 * (1.0 - t) + c2[2] as f32 * t).round() as u8,
+            ];
+            // Exponential falloff from the boundary inward.
+            let alpha = (AURA_PEAK_ALPHA as f32 * (d / margin * AURA_DECAY).exp()).round() as u32;
+            composite(pixels, width, x, y, rgb, alpha);
+        }
+    }
 }
 
 /// Anti-aliased coverage of a circle of the given pixel size, sampled at the
@@ -2727,6 +2788,22 @@ mod tests {
         assert!((edge - 0.5).abs() < 0.2, "expected ~0.5 on the arc, got {edge}");
         // Straight edge mid-pill: solid.
         assert_eq!(round_rect_coverage(0.5, 20.0, 100.0, 40.0, 16.0), 1.0);
+    }
+
+    #[test]
+    fn aura_fades_from_the_boundary_toward_the_center() {
+        let mut pixels = vec![0u8; 32 * 32 * 4];
+        let palette = Palette {
+            primary: [255, 0, 0, 255],
+            secondary: [0, 0, 255, 255],
+        };
+        draw_aura(&mut pixels, 32, 32, palette, 8.0, 1.0);
+        let alpha_at = |x: usize, y: usize| pixels[(y * 32 + x) * 4 + 3];
+        let edge = alpha_at(2, 16);
+        let center = alpha_at(16, 16);
+        assert!(edge > 0, "the boundary band must show the aura");
+        assert!(edge > center, "the glow must fade toward the center");
+        assert!(alpha_at(30, 30) == 0, "outside the card there is nothing");
     }
 
     #[test]
