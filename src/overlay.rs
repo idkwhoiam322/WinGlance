@@ -1671,16 +1671,14 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
             }
             if active[3] {
                 let app_rect = next_band(3);
-                draw_text_line_pixels(
+                draw_source_app_row(
                     &mut state.text_scratch,
                     pixels,
                     width as usize,
-                    &track.source_app,
+                    track,
                     &app_rect,
                     rows[3].1 as i32,
-                    [0x77, 0x77, 0x77, 0xFF],
-                    false,
-                    false,
+                    scale,
                     Some(&mut state.scroll[3]),
                 );
             }
@@ -1780,46 +1778,16 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 }
                 if !track.source_app.trim().is_empty() {
                     let source_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
-                    let font_h = (fs_artist * 0.85) as i32;
-                    let icon_h = font_h.max(8) as usize;
-                    if let Some(icon) = track.app_icon.as_deref() {
-                        let icon_size = 24usize;
-                        let icon_x = source_rect.left as usize;
-                        let icon_y =
-                            source_rect.top as usize + ((source_rect.bottom - source_rect.top) as usize - icon_h) / 2;
-                        draw_icon_scaled(pixels, width as usize, icon, icon_size, icon_x, icon_y, icon_h);
-                        let text_rect = RECT {
-                            left: source_rect.left + icon_h as i32 + (4.0 * scale) as i32,
-                            top: source_rect.top,
-                            right: source_rect.right,
-                            bottom: source_rect.bottom,
-                        };
-                        draw_text_line_pixels(
-                            &mut state.text_scratch,
-                            pixels,
-                            width as usize,
-                            &track.source_app,
-                            &text_rect,
-                            font_h,
-                            [0x77, 0x77, 0x77, 0xFF],
-                            false,
-                            false,
-                            None,
-                        );
-                    } else {
-                        draw_text_line_pixels(
-                            &mut state.text_scratch,
-                            pixels,
-                            width as usize,
-                            &track.source_app,
-                            &source_rect,
-                            font_h,
-                            [0x77, 0x77, 0x77, 0xFF],
-                            false,
-                            false,
-                            None,
-                        );
-                    }
+                    draw_source_app_row(
+                        &mut state.text_scratch,
+                        pixels,
+                        width as usize,
+                        &track,
+                        &source_rect,
+                        (fs_artist * 0.85) as i32,
+                        scale,
+                        None,
+                    );
                 }
             } else {
                 let fallback_name = if !source_app.is_empty() {
@@ -2367,6 +2335,63 @@ fn draw_icon_scaled(
                 composite_pm(pixels, width, x + dx, y + dy, [r, g, b], a as u32);
             }
         }
+    }
+}
+
+/// Draws the source-app row: the app icon (when the track carries one) at
+/// 16px base, DPI-scaled and capped at the row band, followed by the app-name
+/// text. The text glyphs sit centered in the band, so the icon is centered on
+/// the same midpoint to line up with them. Without an icon the text renders
+/// at the band's left edge, as before the icon was added.
+#[allow(clippy::too_many_arguments)]
+fn draw_source_app_row(
+    text_scratch: &mut Option<TextScratch>,
+    pixels: &mut [u8],
+    width: usize,
+    track: &TrackInfo,
+    rect: &RECT,
+    font_h: i32,
+    scale: f32,
+    marquee: Option<&mut LineScroll>,
+) {
+    let color = [0x77, 0x77, 0x77, 0xFF];
+    if let Some(icon) = track.app_icon.as_deref() {
+        // The source bitmap is always 24x24; the destination size is the
+        // 16px base scaled for DPI, clamped so it never overflows the band.
+        let band_h = (rect.bottom - rect.top) as usize;
+        let icon_size = ((16.0 * scale).round() as usize).min(band_h);
+        let icon_x = rect.left as usize;
+        let icon_y = rect.top as usize + (band_h - icon_size) / 2;
+        draw_icon_scaled(pixels, width, icon, 24, icon_x, icon_y, icon_size);
+        let text_rect = RECT {
+            left: rect.left + icon_size as i32 + 6,
+            ..*rect
+        };
+        draw_text_line_pixels(
+            text_scratch,
+            pixels,
+            width,
+            &track.source_app,
+            &text_rect,
+            font_h,
+            color,
+            false,
+            false,
+            marquee,
+        );
+    } else {
+        draw_text_line_pixels(
+            text_scratch,
+            pixels,
+            width,
+            &track.source_app,
+            rect,
+            font_h,
+            color,
+            false,
+            false,
+            marquee,
+        );
     }
 }
 /// signed distance to the boundary smoothed over ~1.5 px. Used for the pill's
