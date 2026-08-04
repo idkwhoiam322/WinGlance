@@ -60,7 +60,9 @@ impl TrackInfo {
             }
         }
         if let Some(d) = self.duration_secs {
-            parts.push(format!("{}:{:02}", d / 60, d % 60));
+            // The stopwatch glyph labels the number as a duration; without it
+            // "3:45" reads ambiguously in a line of text.
+            parts.push(format!("⏱ {}:{:02}", d / 60, d % 60));
         }
         if let (Some(n), Some(c)) = (self.track_number, self.track_count) {
             parts.push(format!("{n}/{c}"));
