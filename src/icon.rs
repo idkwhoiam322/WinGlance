@@ -6,6 +6,20 @@ use windows::Win32::System::Com::IBindCtx;
 use windows::Win32::UI::Shell::{IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY};
 use windows::core::{Interface, PCWSTR};
 
+/// RAII guard for a COM `IShellItem`: calls `IUnknown::Release` on drop so the
+/// shell object is freed even if an early-return unwinds past the extraction.
+struct ComItem(IShellItem);
+
+impl Drop for ComItem {
+    fn drop(&mut self) {
+        // Convert to `IUnknown` which implements `Drop` → `Release`.
+        // `IShellItem` itself has no `Drop` impl, so the raw pointer is safe
+        // to hand off here without double-free.
+        let unknown: windows::core::IUnknown = unsafe { Interface::from_raw(self.0.as_raw()) };
+        drop(unknown);
+    }
+}
+
 fn hbitmap_to_bgra_premul(hdc: HDC, bitmap: HBITMAP, size: usize) -> Option<Vec<u8>> {
     let total_bytes = size * size * 4;
     let mut buf = vec![0u8; total_bytes];
@@ -82,7 +96,9 @@ fn try_parsing_name(path: &str, size: usize) -> Option<Vec<u8>> {
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     let pcwstr = PCWSTR(wide.as_ptr());
     let item: IShellItem = unsafe { SHCreateItemFromParsingName(pcwstr, Option::<&IBindCtx>::None).ok() }?;
-    try_shell_item(&item, size)
+    let result = try_shell_item(&item, size);
+    let _guard = ComItem(item);
+    result
 }
 
 fn extract_from_aumid(aumid: &str, size: usize) -> Option<Vec<u8>> {

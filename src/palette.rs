@@ -90,6 +90,11 @@ fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.1.cmp(&b.1))
     });
+    // Let the allocator reclaim the 112KB histogram slab before the
+    // candidates vec borrows from it; shrink_to_fit trims the candidates
+    // heap to its actual length so the allocator gets clean pages back.
+    drop(buckets);
+    candidates.shrink_to_fit();
     let primary = candidates.iter().find(|(_, c)| passes_guard(*c))?.1;
     let primary_hue = rgb_to_hsl(primary[0], primary[1], primary[2]).0;
     let secondary = candidates
