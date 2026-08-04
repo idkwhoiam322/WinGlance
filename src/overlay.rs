@@ -1988,8 +1988,27 @@ pub(crate) fn draw_string(
     }
 }
 
+/// Artwork only ever displays at ~200px, so refusing anything larger than
+/// this defeats decompression bombs (a header can claim huge dimensions
+/// while the compressed payload is tiny) without affecting real album art.
+const ART_MAX_DIM: u32 = 4096;
+
+/// Decodes artwork bytes with a hard cap on source dimensions. The `image`
+/// crate's dimension limits are strict, so an oversized image fails here
+/// instead of allocating a huge buffer.
+fn decode_limited(data: &[u8]) -> Option<image::DynamicImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(ART_MAX_DIM);
+    limits.max_image_height = Some(ART_MAX_DIM);
+    reader.limits(limits);
+    reader.decode().ok()
+}
+
 pub(crate) fn decode_artwork(data: &[u8], size: usize) -> Option<Vec<u8>> {
-    let image = image::load_from_memory(data).ok()?.to_rgba8();
+    let image = decode_limited(data)?.to_rgba8();
     let image = image::imageops::resize(&image, size as u32, size as u32, FilterType::Triangle);
     Some(image.into_raw())
 }
@@ -1998,7 +2017,7 @@ pub(crate) fn decode_artwork(data: &[u8], size: usize) -> Option<Vec<u8>> {
 /// StretchDIBits consumes (top-down 32bpp DIB), so the main window can draw
 /// the cached bitmap with a single blit instead of re-converting per paint.
 pub(crate) fn decode_artwork_pm(data: &[u8], size: usize) -> Option<Vec<u8>> {
-    let image = image::load_from_memory(data).ok()?.to_rgba8();
+    let image = decode_limited(data)?.to_rgba8();
     let image = image::imageops::resize(&image, size as u32, size as u32, FilterType::Triangle);
     let raw = image.into_raw();
     let mut pm = Vec::with_capacity(raw.len());
