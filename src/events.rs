@@ -45,6 +45,11 @@ impl TrackInfo {
     /// artist is shown instead so the line still carries useful context.
     pub fn meta_line(&self, include_album: bool) -> String {
         let mut parts: Vec<String> = Vec::new();
+        if let Some(d) = self.duration_secs {
+            // The stopwatch glyph labels the number as a duration; without it
+            // "3:45" reads ambiguously in a line of text.
+            parts.push(format!("⏱ {}:{:02}", d / 60, d % 60));
+        }
         if include_album {
             let album_line = if !self.album.trim().is_empty() {
                 Some(self.album.clone())
@@ -58,11 +63,6 @@ impl TrackInfo {
             if let Some(line) = album_line {
                 parts.push(line);
             }
-        }
-        if let Some(d) = self.duration_secs {
-            // The stopwatch glyph labels the number as a duration; without it
-            // "3:45" reads ambiguously in a line of text.
-            parts.push(format!("⏱ {}:{:02}", d / 60, d % 60));
         }
         if let (Some(n), Some(c)) = (self.track_number, self.track_count) {
             parts.push(format!("{n}/{c}"));
@@ -151,6 +151,12 @@ mod tests {
         assert!(
             text.contains("3:45") && text.contains("Example") && text.contains("3/12"),
             "the remaining parts are preserved: {text}"
+        );
+        // Duration must precede album so the clock icon (drawn at the left
+        // edge of the overlay row) visually anchors to the duration.
+        assert!(
+            text.find("3:45").unwrap() < text.find("Example").unwrap(),
+            "duration must precede album: {text}"
         );
         // Without a duration the line is left untouched and no icon is drawn.
         let no_duration = TrackInfo {
