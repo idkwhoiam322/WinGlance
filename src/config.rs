@@ -74,7 +74,7 @@ impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             duration_ms: 3000,
-            animation_ms: 200,
+            animation_ms: 280,
             vertical: VerticalPosition::Top,
             horizontal: HorizontalPosition::Center,
             margin: 8,

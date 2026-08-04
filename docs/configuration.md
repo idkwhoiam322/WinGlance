@@ -15,7 +15,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | Key            | Default | Range   | Effect                                            |
 |----------------|---------|---------|---------------------------------------------------|
 | `duration_ms`  | `3000`  | 500–60000 | How long the pill stays visible before collapsing |
-| `animation_ms` | `200`   | 100–500 | Expand/collapse animation length                  |
+| `animation_ms` | `280`   | 100–500 | Expand/collapse animation length                  |
 | `vertical`     | `"top"` | `top` \| `bottom` | Which monitor edge the pill anchors to |
 | `horizontal`   | `"center"` | `left` \| `center` \| `right` | Horizontal anchor within the work area |
 | `margin`       | `8`     | 0–500   | Distance from the chosen edge (logical px)        |
