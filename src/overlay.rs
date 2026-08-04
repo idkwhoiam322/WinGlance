@@ -609,16 +609,23 @@ impl OverlayState {
         match self.phase {
             Phase::Hidden => (0, 0.55),
             Phase::Expanding(start) => {
-                let progress = ease_out(start.elapsed().as_secs_f32() / animation_duration(&self.config).as_secs_f32());
-                ((64.0 + progress * 191.0) as u8, 0.55 + progress * 0.45)
+                let total_dur = animation_duration(&self.config).as_secs_f32();
+                let t = (start.elapsed().as_secs_f32() / total_dur).clamp(0.0, 1.0);
+                // Opacity lands by ~35% of the animation so the pill reads as
+                // solid while it is still growing; scale carries the spring.
+                let alpha_t = (t / 0.35).min(1.0);
+                let alpha = (64.0 + ease_out_quint(alpha_t) * 191.0) as u8;
+                let shape = 0.55 + ease_out_back(t) * 0.45;
+                (alpha, shape)
             }
             Phase::Light(start) => {
-                let progress = ease_out(start.elapsed().as_secs_f32() / LIGHT_DURATION.as_secs_f32());
+                let progress = ease_out_quint(start.elapsed().as_secs_f32() / LIGHT_DURATION.as_secs_f32());
                 ((64.0 + progress * 191.0) as u8, 1.0)
             }
             Phase::Shown => (255, 1.0),
             Phase::Collapsing(start) => {
-                let progress = ease_out(start.elapsed().as_secs_f32() / animation_duration(&self.config).as_secs_f32());
+                let progress =
+                    ease_out_quint(start.elapsed().as_secs_f32() / animation_duration(&self.config).as_secs_f32());
                 (((1.0 - progress) * 255.0) as u8, 1.0 - progress * 0.45)
             }
         }
@@ -2189,9 +2196,21 @@ fn animation_duration(config: &Config) -> Duration {
     Duration::from_millis(config.overlay.animation_ms.clamp(100, 500))
 }
 
-fn ease_out(value: f32) -> f32 {
+/// Quintic ease-out: a fast start with a long, soft settle. Used for opacity
+/// (and collapse), where a punchy fade-in reads better than a slow cubic ramp.
+fn ease_out_quint(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
-    1.0 - (1.0 - value).powi(3)
+    1.0 - (1.0 - value).powi(5)
+}
+
+/// Cubic ease-out-back with a subtle spring overshoot (~8% past 1.0), the
+/// standard "physical snap" curve for expanding UI elements. The overshoot is
+/// clamped modest so the pill never visibly exceeds its final size.
+fn ease_out_back(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    let c1 = 1.40;
+    let c3 = c1 + 1.0;
+    1.0 + c3 * (value - 1.0).powi(3) + c1 * (value - 1.0).powi(2)
 }
 
 pub(crate) fn wide(value: &str) -> Vec<u16> {
@@ -2550,6 +2569,56 @@ mod tests {
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 0, "play symbol must draw pixels");
+    }
+
+    #[test]
+    fn ease_out_quint_is_monotonic_and_clamped() {
+        assert_eq!(ease_out_quint(0.0), 0.0);
+        assert_eq!(ease_out_quint(1.0), 1.0);
+        // Out-of-range inputs clamp, never panic or overshoot.
+        assert_eq!(ease_out_quint(-1.0), 0.0);
+        assert_eq!(ease_out_quint(2.0), 1.0);
+        let mut last = 0.0;
+        for i in 0..=100 {
+            let v = ease_out_quint(i as f32 / 100.0);
+            assert!(v >= last - 1e-6, "quint must be non-decreasing");
+            last = v;
+        }
+    }
+
+    #[test]
+    fn ease_out_back_overshoots_then_settles() {
+        // Floating point keeps the t=0 endpoint at ~-1e-7; anything that tiny
+        // is visually identical to 0 and harmless (render clamps sizes).
+        assert!(ease_out_back(0.0).abs() < 1e-6);
+        assert!((ease_out_back(1.0) - 1.0).abs() < 1e-6);
+        // The spring peaks above 1.0 in the middle of the curve...
+        let peak = (0..=100)
+            .map(|i| ease_out_back(i as f32 / 100.0))
+            .fold(0.0_f32, f32::max);
+        assert!(peak > 1.0 && peak < 1.2, "spring overshoot out of range: {peak}");
+        // ...and never dips below the start or above the sanity bound.
+        for i in 0..=100 {
+            let v = ease_out_back(i as f32 / 100.0);
+            assert!((-1e-6..=1.2).contains(&v), "ease_out_back out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn expanding_alpha_reaches_full_before_the_end() {
+        let mut config = Config::default();
+        config.overlay.animation_ms = 200;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.phase = Phase::Expanding(Instant::now() - Duration::from_millis(100));
+        // At half the duration the scale is still mid-flight (overshooting, so
+        // not settled at 1.0), but alpha must already be at full strength
+        // (decoupled opacity).
+        let (alpha, shape) = state.frame();
+        assert_eq!(alpha, 255);
+        assert!(
+            (shape - 1.0).abs() > 1e-3,
+            "scale should not be settled at t=0.5, got {shape}"
+        );
     }
 
     #[test]
