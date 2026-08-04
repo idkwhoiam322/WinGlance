@@ -35,6 +35,9 @@ use windows::core::PCWSTR;
 
 const TIMER_DEBOUNCE: usize = 1;
 const LIGHT_DURATION: Duration = Duration::from_millis(120);
+/// Duration of the in-place size morph when a metadata refresh changes the
+/// pill's dimensions. Short enough to read as a snap, long enough to notice.
+const MORPH_MS: Duration = Duration::from_millis(150);
 
 /// Posted by the high-resolution animation timer to drive pill frames.
 const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
@@ -122,6 +125,15 @@ struct LineScroll {
     scrolling: bool,
 }
 
+/// In-place size morph between two versions of the shown content (a metadata
+/// refresh). Tracks the logical size when the update landed; the target is the
+/// new content's size, reached by interpolation over `MORPH_MS`.
+#[derive(Clone, Copy)]
+struct Morph {
+    from: (f32, f32),
+    started_at: Instant,
+}
+
 /// Hold time before an overflowing line starts scrolling.
 const MARQUEE_HOLD: Duration = Duration::from_millis(600);
 /// Horizontal gap between the end of the text and its repeated copy.
@@ -168,6 +180,9 @@ struct OverlayState {
     /// Animation tick period in ms, matched to the monitor's refresh rate.
     /// Re-detected on every show; the timer is recreated only when it changes.
     tick_period: u32,
+    /// Active size morph, set when a metadata refresh changes the pill's
+    /// dimensions; `None` while static.
+    morph: Option<Morph>,
     /// Cached decoded artwork for the current track (RGBA8 at the full art
     /// size), so animation frames never re-decode the JPEG/PNG.
     decoded_art: Option<Vec<u8>>,
@@ -271,6 +286,7 @@ impl OverlayState {
             scroll: [LineScroll::default(); 4],
             anim_timer: HANDLE::default(),
             tick_period: 16,
+            morph: None,
             decoded_art: None,
             decoded_art_key: None,
             dib: None,
@@ -501,8 +517,18 @@ impl OverlayState {
     }
 
     /// Refreshes the shown content in place (metadata-only change): keeps the
-    /// current animation phase, extends the visible time, and re-renders.
+    /// current animation phase, extends the visible time, and re-renders. If
+    /// the new content has different dimensions (rows appearing/disappearing
+    /// as artwork and album arrive), the size morphs from the on-screen size.
     fn update_content(&mut self, event: MediaEvent) {
+        let from = self.content.as_ref().map_or((0.0, 0.0), |c| self.size_of(c));
+        let target = content_size_of(&self.config, &event, self.last_track.as_ref());
+        if target != from {
+            self.morph = Some(Morph {
+                from,
+                started_at: Instant::now(),
+            });
+        }
         self.content = Some(event);
         self.reset_scroll();
         if let Some(deadline) = self.dismiss_at {
@@ -531,6 +557,7 @@ impl OverlayState {
         self.reset_scroll();
         let now = Instant::now();
         self.dismiss_at = Some(now + Duration::from_millis(duration_ms));
+        self.morph = None;
         self.phase = if full_animation {
             Phase::Expanding(now)
         } else {
@@ -615,10 +642,12 @@ impl OverlayState {
             }
         }
         // A fully-shown pill is static unless a marquee line is actually
-        // overflowing: skip the render (and its UpdateLayeredWindow) entirely
-        // when nothing changed. The animation phases still repaint every tick.
+        // overflowing or a size morph is mid-flight: skip the render (and its
+        // UpdateLayeredWindow) entirely when nothing changed. The animation
+        // phases still repaint every tick.
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
-        if animating || marquee_active {
+        let morph_active = self.morph.is_some_and(|morph| morph.started_at.elapsed() < MORPH_MS);
+        if animating || marquee_active || morph_active {
             self.render();
         }
     }
@@ -629,13 +658,7 @@ impl OverlayState {
         };
         let (alpha, shape) = self.frame();
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
-        let (logical_width, logical_height) = match &content {
-            MediaEvent::TrackChanged(track) => track_content_size(&self.config, track),
-            MediaEvent::PlaybackStateChanged(_, _) => state_content_size(&self.config, self.last_track.as_ref()),
-            // Never shown (receive_events skips it); the .max(1.0) guards
-            // below keep the size sane if this dead arm is ever reached.
-            MediaEvent::SessionRejected { .. } => (0.0, 0.0),
-        };
+        let (logical_width, logical_height) = self.size_of(&content);
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
         let Some(position) = self.position(width, height) else {
@@ -762,6 +785,7 @@ impl OverlayState {
         self.content = None;
         self.dismiss_at = None;
         self.phase = Phase::Hidden;
+        self.morph = None;
         // Clear the last-shown source label so a subsequent PlaybackStateChanged
         // from the same source is no longer treated as redundant with a track
         // pill that has already collapsed. The label is re-set in show_next()
@@ -806,14 +830,25 @@ impl OverlayState {
         let content = self.content.as_ref()?;
         let (_, shape) = self.frame();
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
-        let (logical_width, logical_height) = match content {
-            MediaEvent::TrackChanged(track) => track_content_size(&self.config, track),
-            MediaEvent::PlaybackStateChanged(_, _) => state_content_size(&self.config, self.last_track.as_ref()),
-            MediaEvent::SessionRejected { .. } => (0.0, 0.0),
-        };
+        let (logical_width, logical_height) = self.size_of(content);
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
         Some((width, height))
+    }
+
+    /// Logical (96-DPI) size of the shown content. While a size morph is
+    /// running, interpolates from the size captured when the update landed to
+    /// the new content's size; otherwise the plain content size.
+    fn size_of(&self, content: &MediaEvent) -> (f32, f32) {
+        let target = content_size_of(&self.config, content, self.last_track.as_ref());
+        let Some(morph) = self.morph else {
+            return target;
+        };
+        let t = ease_out_quint((morph.started_at.elapsed().as_secs_f32() / MORPH_MS.as_secs_f32()).clamp(0.0, 1.0));
+        (
+            morph.from.0 + (target.0 - morph.from.0) * t,
+            morph.from.1 + (target.1 - morph.from.1) * t,
+        )
     }
 
     /// Shows a short-lived preview of the overlay at its current position, used by
@@ -834,6 +869,7 @@ impl OverlayState {
         self.reset_scroll();
         let now = Instant::now();
         self.dismiss_at = Some(now + sample_duration(&self.config));
+        self.morph = None;
         self.phase = Phase::Light(now);
         self.sync_anim_timer();
         unsafe {
@@ -853,6 +889,19 @@ fn sample_duration(config: &Config) -> Duration {
 /// configured duration so a short setting is never silently extended.
 fn update_min_duration(config: &Config) -> Duration {
     Duration::from_millis(config.overlay.duration_ms.min(1500))
+}
+
+/// Logical (96-DPI) size of a pill for the given content. Single source of
+/// truth shared by `render()` and `content_size()` (via `size_of`) so they
+/// cannot drift.
+fn content_size_of(config: &Config, content: &MediaEvent, last_track: Option<&TrackInfo>) -> (f32, f32) {
+    match content {
+        MediaEvent::TrackChanged(track) => track_content_size(config, track),
+        MediaEvent::PlaybackStateChanged(_, _) => state_content_size(config, last_track),
+        // Never shown (receive_events skips it); the .max(1.0) guards keep the
+        // size sane if this dead arm is ever reached.
+        MediaEvent::SessionRejected { .. } => (0.0, 0.0),
+    }
 }
 
 /// Logical (96-DPI) size of a track-changed pill. The height fits exactly the
@@ -2606,6 +2655,112 @@ mod tests {
             clusters, 2,
             "expected two bars with a gap, got {clusters} lit cluster(s)"
         );
+    }
+
+    #[test]
+    fn update_content_starts_a_morph_when_the_size_changes() {
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+        // Sparse track: title row only.
+        let sparse = TrackInfo {
+            title: "Song".into(),
+            ..TrackInfo::default()
+        };
+        // Full track: artist + meta + source rows make the pill taller.
+        let full = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "Example Player".into(),
+            duration_secs: Some(225),
+            ..TrackInfo::default()
+        };
+        state.content = Some(MediaEvent::TrackChanged(sparse.clone()));
+        state.update_content(MediaEvent::TrackChanged(full.clone()));
+
+        let morph = state.morph.expect("a size change must start a morph");
+        let (_, full_h) = content_size_of(&state.config, &MediaEvent::TrackChanged(full.clone()), None);
+        let from = content_size_of(&state.config, &MediaEvent::TrackChanged(sparse), None);
+        assert!(full_h > from.1, "test tracks must differ in height");
+        // The morph starts from the on-screen (sparse) track's size.
+        assert_eq!(morph.from, from);
+    }
+
+    #[test]
+    fn same_sized_update_does_not_morph() {
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+        let track = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "Example Player".into(),
+            duration_secs: Some(225),
+            ..TrackInfo::default()
+        };
+        state.content = Some(MediaEvent::TrackChanged(track.clone()));
+        // Same rows, only the album changed: no size change, no morph.
+        let with_album = TrackInfo {
+            album: "Album".into(),
+            ..track
+        };
+        state.update_content(MediaEvent::TrackChanged(with_album));
+        assert!(
+            state.morph.is_none(),
+            "a metadata-only update that keeps the size must not morph"
+        );
+    }
+
+    #[test]
+    fn morph_interpolates_toward_the_target_size() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        let sparse = TrackInfo {
+            title: "Song".into(),
+            ..TrackInfo::default()
+        };
+        let full = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "Example Player".into(),
+            duration_secs: Some(225),
+            ..TrackInfo::default()
+        };
+        let (_, sparse_h) = content_size_of(&state.config, &MediaEvent::TrackChanged(sparse), None);
+        let (_, full_h) = content_size_of(&state.config, &MediaEvent::TrackChanged(full.clone()), None);
+
+        let start = Instant::now() - Duration::from_millis(75);
+        state.content = Some(MediaEvent::TrackChanged(full.clone()));
+        state.morph = Some(Morph {
+            from: (0.0, sparse_h),
+            started_at: start,
+        });
+        let (_, mid_h) = state.size_of(&MediaEvent::TrackChanged(full.clone()));
+        assert!(
+            mid_h > sparse_h && mid_h < full_h,
+            "mid-morph height {mid_h} must sit between {sparse_h} and {full_h}"
+        );
+
+        // After the morph window, the size is exactly the target's.
+        state.morph = Some(Morph {
+            from: (0.0, sparse_h),
+            started_at: Instant::now() - MORPH_MS,
+        });
+        let (_, done_h) = state.size_of(&MediaEvent::TrackChanged(full));
+        assert!(
+            (done_h - full_h).abs() < 0.01,
+            "morph must settle on {full_h}, got {done_h}"
+        );
+    }
+
+    #[test]
+    fn hide_clears_an_active_morph() {
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.content = Some(MediaEvent::TrackChanged(TrackInfo::default()));
+        state.morph = Some(Morph {
+            from: (0.0, 10.0),
+            started_at: Instant::now(),
+        });
+        state.hide();
+        assert!(state.morph.is_none(), "hiding must clear the size morph");
     }
 
     #[test]
