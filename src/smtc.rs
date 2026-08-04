@@ -561,7 +561,7 @@ impl ListenerState {
     /// track matches the given title+artist identity. This only returns art for
     /// the *same track* — never cross-track — so a recreated session reports the
     /// cover without re-reading the (often transiently-empty) thumbnail stream.
-    fn cached_artwork_for(&self, source_app: &str, title: &str, artist: &str) -> Option<Vec<u8>> {
+    fn cached_artwork_for(&self, source_app: &str, title: &str, artist: &str) -> Option<Arc<[u8]>> {
         cached_artwork_for(&self.last_track_per_source, source_app, title, artist)
     }
 
@@ -799,7 +799,7 @@ fn cached_artwork_for(
     source_app: &str,
     title: &str,
     artist: &str,
-) -> Option<Vec<u8>> {
+) -> Option<Arc<[u8]>> {
     last_track_per_source.get(source_app).and_then(|cached| {
         if cached.title == title && cached.artist == artist {
             cached.artwork.clone()
@@ -1030,6 +1030,9 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_art
     } else {
         None
     };
+    // Share the byte buffer via Arc: the event is cloned into two window
+    // queues, so a per-clone copy of a multi-MB thumbnail is pure waste.
+    let artwork = artwork.map(Arc::from);
     let track_number = {
         let n = properties.TrackNumber()?;
         if n > 0 { Some(n as u32) } else { None }
@@ -1273,7 +1276,7 @@ mod tests {
         let with_art = TrackInfo {
             title: "Song".into(),
             artist: "Artist".into(),
-            artwork: Some(vec![1]),
+            artwork: Some(Arc::from(vec![1])),
             ..TrackInfo::default()
         };
         assert_eq!(emit_track(&prev, &with_art, true), (true, false));
@@ -1341,7 +1344,7 @@ mod tests {
     fn cached_artwork_reused_only_for_same_track_identity() {
         // Build a last_track_per_source map directly — no ListenerState needed.
         let mut last_track_per_source = HashMap::new();
-        let art = vec![0x89, 0x50, 0x4E, 0x47];
+        let art: Arc<[u8]> = Arc::from(vec![0x89, 0x50, 0x4E, 0x47]);
         last_track_per_source.insert(
             "youtube-music".to_string(),
             TrackInfo {
@@ -1397,7 +1400,7 @@ mod tests {
         let with_art = TrackInfo {
             title: "Song".into(),
             artist: "Artist".into(),
-            artwork: Some(vec![1]),
+            artwork: Some(Arc::from(vec![1])),
             ..TrackInfo::default()
         };
         assert!(!is_session_recreation(&prev, &with_art, true));
@@ -1424,7 +1427,7 @@ mod tests {
         let last_emit = TrackInfo {
             title: "Song".into(),
             artist: "Artist".into(),
-            artwork: Some(vec![1]),
+            artwork: Some(Arc::from(vec![1])),
             ..TrackInfo::default()
         };
         let poll_read = track("Song", "Artist");
@@ -1468,7 +1471,7 @@ mod tests {
         let with_art = TrackInfo {
             title: "Song".into(),
             artist: "Artist".into(),
-            artwork: Some(vec![1]),
+            artwork: Some(Arc::from(vec![1])),
             ..TrackInfo::default()
         };
         assert!(retry_should_emit(&with_art, None));
@@ -1490,7 +1493,7 @@ mod tests {
         let other = TrackInfo {
             title: "Other".into(),
             artist: "Artist".into(),
-            artwork: Some(vec![2]),
+            artwork: Some(Arc::from(vec![2])),
             ..TrackInfo::default()
         };
         assert!(retry_should_emit(&other, Some(&with_art)));

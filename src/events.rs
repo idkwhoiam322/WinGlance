@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
 /// Posted by the event forwarder to wake the main window and the overlay
@@ -22,7 +23,10 @@ pub struct TrackInfo {
     pub album_artist: String,
     /// Subtitle (e.g. a podcast episode name or video title), when provided.
     pub subtitle: String,
-    pub artwork: Option<Vec<u8>>,
+    /// Raw artwork bytes (JPEG/PNG) behind an Arc: events are cloned into two
+    /// window queues, and history clones get stripped, so the byte copy would
+    /// be pure waste on every track change.
+    pub artwork: Option<Arc<[u8]>>,
     pub source_app: String,
     /// Total duration in seconds, when the app reports timeline info.
     pub duration_secs: Option<u64>,
