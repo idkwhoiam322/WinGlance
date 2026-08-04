@@ -22,7 +22,6 @@ jobs:
         run: cargo test --locked
       - name: Build (release)
         run: cargo build --release --locked
+      - uses: taiki-e/install-action@cargo-deny
       - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
+        run: cargo deny check
