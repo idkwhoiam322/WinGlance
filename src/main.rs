@@ -17,12 +17,16 @@ use anyhow::Result;
 use log::{error, info, warn};
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_ALWAYS, WriteFile,
+};
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
 };
@@ -37,12 +41,77 @@ use windows::core::PCWSTR;
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent};
 use crate::overlay::{EventQueue, wide};
 
-static CRASH_LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
+static CRASH_LOG_PATH: OnceLock<Vec<u16>> = OnceLock::new();
+
+/// Writes literal bytes into the stack buffer, truncating if the buffer is full.
+/// Returns the new write position.
+fn crash_write_str(buf: &mut [u8], pos: usize, s: &[u8]) -> usize {
+    let end = (pos + s.len()).min(buf.len());
+    buf[pos..end].copy_from_slice(&s[..end - pos]);
+    end
+}
+
+/// Writes "0x" followed by exactly 16 lowercase hex digits.
+fn crash_write_hex16(buf: &mut [u8], pos: usize, value: usize) -> usize {
+    let p = crash_write_str(buf, pos, b"0x");
+    let mut digits = [0u8; 16];
+    let mut v = value;
+    for i in (0..16).rev() {
+        let nibble = (v & 0xF) as u8;
+        digits[i] = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + (nibble - 10)
+        };
+        v >>= 4;
+    }
+    crash_write_str(buf, p, &digits)
+}
+
+/// Writes "0x" followed by the minimum hex digits needed (no leading zeros).
+fn crash_write_hex_any(buf: &mut [u8], pos: usize, value: usize) -> usize {
+    let p = crash_write_str(buf, pos, b"0x");
+    if value == 0 {
+        return crash_write_str(buf, p, b"0");
+    }
+    let mut digits = [0u8; 16];
+    let mut v = value;
+    let mut len = 0usize;
+    while v > 0 {
+        let nibble = (v & 0xF) as u8;
+        digits[15 - len] = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + (nibble - 10)
+        };
+        v >>= 4;
+        len += 1;
+    }
+    crash_write_str(buf, p, &digits[16 - len..])
+}
+
+/// Writes an unsigned integer in decimal (no leading zeros).
+fn crash_write_dec(buf: &mut [u8], pos: usize, value: usize) -> usize {
+    if value == 0 {
+        return crash_write_str(buf, pos, b"0");
+    }
+    let mut digits = [0u8; 20];
+    let mut v = value;
+    let mut len = 0usize;
+    while v > 0 {
+        digits[19 - len] = b'0' + (v % 10) as u8;
+        v /= 10;
+        len += 1;
+    }
+    crash_write_str(buf, pos, &digits[20 - len..])
+}
 
 /// Diagnostic vectored exception handler: on an access violation it appends the
-/// faulting instruction address and a raw backtrace to crash.log (no locks, no
-/// allocations that can deadlock), then lets Windows continue with default crash
-/// handling.
+/// faulting instruction address and a raw backtrace to crash.log using only
+/// stack-allocated buffers and raw Win32 file APIs — no `std::fs`, no `String`,
+/// no `format!`, no heap allocation — then lets Windows continue with default
+/// crash handling.  This is safe even when the access violation is a symptom of
+/// heap corruption, because the handler never touches the allocator.
 unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if info.is_null() {
         return 0;
@@ -64,29 +133,64 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     for (i, r) in raw.iter().take(count).enumerate() {
         frames[i] = *r as usize;
     }
-    let mut out = String::from("CRASH access violation\n");
-    out += &format!("  ip    = 0x{ip:016x} (rva 0x{:x})\n", ip.wrapping_sub(base));
-    out += &format!("  addr  = 0x{addr:016x}\n");
-    out += &format!("  base  = 0x{base:016x}\n");
-    for (i, f) in frames.iter().take(count as usize).enumerate() {
-        out += &format!("  frame[{i}] = 0x{f:016x} (rva 0x{:x})\n", f.wrapping_sub(base));
+
+    // Build the entire crash log in a stack-allocated buffer.  No String,
+    // no format!, no heap allocation — safe under heap corruption.
+    let mut buf = [0u8; 2048];
+    let mut pos = 0usize;
+    pos = crash_write_str(&mut buf, pos, b"CRASH access violation\n");
+    pos = crash_write_str(&mut buf, pos, b"  ip    = ");
+    pos = crash_write_hex16(&mut buf, pos, ip);
+    pos = crash_write_str(&mut buf, pos, b" (rva ");
+    pos = crash_write_hex_any(&mut buf, pos, ip.wrapping_sub(base));
+    pos = crash_write_str(&mut buf, pos, b")\n");
+    pos = crash_write_str(&mut buf, pos, b"  addr  = ");
+    pos = crash_write_hex16(&mut buf, pos, addr);
+    pos = crash_write_str(&mut buf, pos, b"\n");
+    pos = crash_write_str(&mut buf, pos, b"  base  = ");
+    pos = crash_write_hex16(&mut buf, pos, base);
+    pos = crash_write_str(&mut buf, pos, b"\n");
+    for (i, f) in frames.iter().take(count).enumerate() {
+        pos = crash_write_str(&mut buf, pos, b"  frame[");
+        pos = crash_write_dec(&mut buf, pos, i);
+        pos = crash_write_str(&mut buf, pos, b"] = ");
+        pos = crash_write_hex16(&mut buf, pos, *f);
+        pos = crash_write_str(&mut buf, pos, b" (rva ");
+        pos = crash_write_hex_any(&mut buf, pos, f.wrapping_sub(base));
+        pos = crash_write_str(&mut buf, pos, b")\n");
     }
-    if let Some(dir) = CRASH_LOG_DIR.get() {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("crash.log"))
-            .and_then(|mut f| {
-                use std::io::Write;
-                f.write_all(out.as_bytes())
-            });
+
+    // Write via raw Win32 APIs: CreateFileW (append), WriteFile, CloseHandle.
+    // The path was pre-computed as a null-terminated UTF-16 string at install
+    // time, so no allocation happens here.
+    if let Some(path) = CRASH_LOG_PATH.get() {
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                FILE_APPEND_DATA.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                HANDLE::default(),
+            )
+        };
+        if let Ok(handle) = handle {
+            let mut written: u32 = 0;
+            let _ = unsafe { WriteFile(handle, Some(&buf[..pos]), Some(&mut written as *mut _), None) };
+            let _ = unsafe { CloseHandle(handle) };
+        }
     }
     0 // EXCEPTION_CONTINUE_SEARCH
 }
 
 fn install_crash_handler(logs_dir: &Path) {
-    let _ = CRASH_LOG_DIR.set(logs_dir.to_path_buf());
+    // Pre-build the crash.log path as a null-terminated UTF-16 string so the
+    // exception handler can pass it to CreateFileW without any heap allocation
+    // during a crash.
+    let full_path = logs_dir.join("crash.log");
+    let wide: Vec<u16> = full_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let _ = CRASH_LOG_PATH.set(wide);
     unsafe {
         AddVectoredExceptionHandler(1, Some(crash_handler));
     }
