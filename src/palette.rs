@@ -81,7 +81,15 @@ fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
     if candidates.is_empty() {
         return None;
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    // Score by population × vibrancy (saturation + 0.3), matching AndroidX
+    // Palette's weighting so a vibrant pink outranks a dull-but-common blue.
+    candidates.sort_by(|a, b| {
+        let sa = a.0 as f32 * (rgb_to_hsl(a.1[0], a.1[1], a.1[2]).1 + 0.3);
+        let sb = b.0 as f32 * (rgb_to_hsl(b.1[0], b.1[1], b.1[2]).1 + 0.3);
+        sb.partial_cmp(&sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
     let primary = candidates.iter().find(|(_, c)| passes_guard(*c))?.1;
     let primary_hue = rgb_to_hsl(primary[0], primary[1], primary[2]).0;
     let secondary = candidates
