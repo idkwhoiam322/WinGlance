@@ -14,6 +14,7 @@ use windows::Media::Control::{
 };
 use windows::Storage::Streams::{Buffer, DataReader, InputStreamOptions};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
 use windows::core::Interface;
 
 enum Signal {
@@ -225,6 +226,16 @@ impl ListenerState {
         let session_check_interval = Duration::from_secs(2);
         loop {
             *self.heartbeat.lock().unwrap() = Instant::now();
+            // The Windows heap keeps freed blocks (artwork decodes, thumbnail
+            // bytes) in its free lists instead of returning them to the OS,
+            // so RSS climbs as songs change. Compacting on this ≤5s cadence
+            // releases that free space back to the OS. Cheap on a small heap
+            // and safe cross-thread (heap functions are serialized).
+            unsafe {
+                if let Ok(heap) = GetProcessHeap() {
+                    let _ = HeapCompact(heap, HEAP_FLAGS(0));
+                }
+            }
             let timeout = self
                 .pending_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
