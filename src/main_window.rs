@@ -399,6 +399,7 @@ struct CurrentActivity {
     state: PlaybackState,
     /// Decoded artwork: premultiplied BGRA at ART_DECODE×ART_DECODE, cached
     /// so paint is a single StretchDIBits (no decode or conversion per paint).
+    /// Filled lazily on the first paint that needs it.
     art: Option<Vec<u8>>,
     /// FNV-1a of the artwork bytes this cache was decoded from, so a metadata
     /// refresh with unchanged artwork does not re-decode.
@@ -828,14 +829,11 @@ impl MainWindowState {
         if is_update {
             if let Some(current) = &mut self.current {
                 current.track = track.clone();
-                // Re-decode only when the artwork bytes actually changed; a
-                // metadata refresh re-reporting the same cover must not pay
-                // for another JPEG decode.
+                // Artwork is decoded lazily on first paint; a metadata refresh
+                // re-reporting the same cover must not re-decode, so only bump
+                // the fingerprint and drop the cached bitmap when bytes changed.
                 if current.art_fingerprint != art_fingerprint {
-                    current.art = track
-                        .artwork
-                        .as_deref()
-                        .and_then(|data| decode_artwork_pm(data, ART_DECODE as usize));
+                    current.art = None;
                     current.art_fingerprint = art_fingerprint;
                 }
             }
@@ -880,10 +878,6 @@ impl MainWindowState {
         let mut history_track = track.clone();
         history_track.artwork = None;
         self.push_history(history_track, state, true);
-        let art = track
-            .artwork
-            .as_deref()
-            .and_then(|data| decode_artwork_pm(data, ART_DECODE as usize));
         self.current = Some(CurrentActivity {
             track,
             state: self
@@ -891,7 +885,10 @@ impl MainWindowState {
                 .as_ref()
                 .map(|current| current.state)
                 .unwrap_or(PlaybackState::Playing),
-            art,
+            // Art is decoded lazily on first paint; the window starts hidden
+            // (start_in_tray), so a track that never gets looked at pays no
+            // decode cost.
+            art: None,
             art_fingerprint,
         });
         self.invalidate();
@@ -1017,9 +1014,20 @@ impl MainWindowState {
         let accent_color = self.cfg().appearance.accent_color;
         let text_color = self.cfg().appearance.text_color;
 
+        // Decode lazily here: the window starts hidden, so the first paint is
+        // the first time the art is actually needed.
+        if let Some(current) = &mut self.current {
+            if current.art.is_none() && current.art_fingerprint.is_some() {
+                current.art = current
+                    .track
+                    .artwork
+                    .as_deref()
+                    .and_then(|data| decode_artwork_pm(data, ART_DECODE as usize));
+            }
+        }
+
         if let Some(current) = &self.current {
-            // Artwork is decoded and premultiplied when the event is received;
-            // paint just blits the cached bitmap.
+            // Artwork is cached after first paint; paint just blits it.
             if let Some(art_pixels) = current.art.as_deref() {
                 draw_art_pm(hdc, art_pixels, ART_DECODE as i32, art, art_x, art_y);
             } else {
