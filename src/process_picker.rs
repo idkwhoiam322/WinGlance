@@ -17,16 +17,16 @@ use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE,
-    GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId,
-    HWND_TOPMOST, IDC_ARROW, IsIconic, IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT,
-    LB_SETCURSEL, LB_SETITEMDATA, LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED,
-    LoadCursorW, PostMessageW, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW,
-    SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT,
-    WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWLP_USERDATA,
+    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IDC_ARROW,
+    IsIconic, IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT, LB_SETCURSEL, LB_SETITEMDATA,
+    LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, PostMessageW,
+    RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WNDCLASS_STYLES, WNDCLASSEXW,
+    WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -43,6 +43,9 @@ const BST_UNCHECKED: usize = 0;
 const CB_SIZE: i32 = 13;
 
 pub(crate) const PICKER_RESULT_MSG: u32 = WM_APP + 7;
+
+/// Identifier for the listbox's Comctl32 subclass registration.
+const LISTBOX_SUBCLASS_ID: usize = 1;
 
 pub(crate) struct ProcessEntry {
     pub display_name: String,
@@ -369,13 +372,14 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
             let state_ref = &mut *state_ptr;
             state_ref.listbox = lb;
 
-            // Mouse and keyboard messages go to the listbox child, not to the
-            // picker window, so route them through our own proc. The original
-            // proc is kept in the listbox's user data for forwarding.
-            let old_proc = SetWindowLongPtrW(lb, GWLP_WNDPROC, listbox_proc as *const () as isize);
-            if old_proc != 0 {
-                let _ = SetWindowLongPtrW(lb, GWLP_USERDATA, old_proc);
-            }
+            // Route mouse and keyboard messages from the listbox child through
+            // our own subclass proc; DefSubclassProc forwards every message we
+            // do not consume. Comctl32 tracks the original proc internally, so no
+            // GWLP_WNDPROC swap or stored original proc is needed. The parent
+            // (picker) HWND is carried in the subclass ref data; PickerState is
+            // read from that window's GWLP_USERDATA and the subclass is unhooked
+            // on WM_NCDESTROY.
+            let _ = SetWindowSubclass(lb, Some(listbox_proc), LISTBOX_SUBCLASS_ID, hwnd.0 as usize);
 
             let _ = SendMessageW(lb, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(ROW_HEIGHT as isize));
             // Cached font: reused across opens and never leaked.
@@ -449,21 +453,32 @@ fn hit_test_close(hwnd: HWND, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
 
-/// Subclassed window proc for the picker's listbox. Mouse messages go to the
-/// child control under the cursor, never to the picker window, so
-/// click-to-toggle and double-click-to-confirm are handled here. The original
-/// listbox proc is stored in the listbox's GWLP_USERDATA and receives every
-/// message we do not consume.
+/// Comctl32 subclass proc for the picker's listbox. Mouse and keyboard
+/// messages are delivered to the listbox child rather than the picker window,
+/// so click-to-toggle and double-click-to-confirm are handled here. The parent
+/// (picker) HWND is carried in `ref_data`; PickerState is read from that
+/// window's GWLP_USERDATA. Every message we do not consume is forwarded via
+/// DefSubclassProc, which dispatches to the original listbox proc that Comctl32
+/// tracks internally — no GWLP_WNDPROC swap or stored original proc is needed.
+/// The subclass is unhooked on WM_NCDESTROY.
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe extern "system" fn listbox_proc(lb: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn listbox_proc(
+    lb: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    ref_data: usize,
+) -> LRESULT {
+    let parent = HWND(ref_data as *mut std::ffi::c_void);
     match message {
+        WM_NCDESTROY => {
+            // Unhook cleanly before deflecting the rest of destruction.
+            let _ = unsafe { RemoveWindowSubclass(lb, Some(listbox_proc), LISTBOX_SUBCLASS_ID) };
+            unsafe { DefSubclassProc(lb, message, wparam, lparam) }
+        }
         WM_LBUTTONDOWN => {
-            let parent = unsafe { GetParent(lb).unwrap_or_default() };
-            let state_ptr = if parent.0.is_null() {
-                std::ptr::null_mut()
-            } else {
-                unsafe { GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut PickerState }
-            };
+            let state_ptr = unsafe { GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut PickerState };
             if !state_ptr.is_null() {
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                 let item_idx = y / ROW_HEIGHT;
@@ -512,41 +527,25 @@ unsafe extern "system" fn listbox_proc(lb: HWND, message: u32, wparam: WPARAM, l
                     return LRESULT(0);
                 }
             }
-            forward_original(lb, message, wparam, lparam)
+            unsafe { DefSubclassProc(lb, message, wparam, lparam) }
         }
         WM_KEYDOWN => {
             // The listbox takes keyboard focus when clicked, so Enter/Esc must
             // work here as well as on the picker window itself.
-            let parent = unsafe { GetParent(lb).unwrap_or_default() };
             let key = wparam.0 as u16;
             if key == VK_ESCAPE.0 {
-                if !parent.0.is_null() {
-                    post_result(parent, true);
-                    let _ = unsafe { DestroyWindow(parent) };
-                }
+                post_result(parent, true);
+                let _ = unsafe { DestroyWindow(parent) };
                 return LRESULT(0);
             }
             if key == 0x0D {
-                if !parent.0.is_null() {
-                    post_result(parent, false);
-                    let _ = unsafe { DestroyWindow(parent) };
-                }
+                post_result(parent, false);
+                let _ = unsafe { DestroyWindow(parent) };
                 return LRESULT(0);
             }
-            forward_original(lb, message, wparam, lparam)
+            unsafe { DefSubclassProc(lb, message, wparam, lparam) }
         }
-        _ => forward_original(lb, message, wparam, lparam),
-    }
-}
-
-fn forward_original(lb: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe {
-        let old_proc = GetWindowLongPtrW(lb, GWLP_USERDATA);
-        if old_proc == 0 {
-            return DefWindowProcW(lb, message, wparam, lparam);
-        }
-        let old: WNDPROC = std::mem::transmute(old_proc);
-        CallWindowProcW(old, lb, message, wparam, lparam)
+        _ => unsafe { DefSubclassProc(lb, message, wparam, lparam) },
     }
 }
 
