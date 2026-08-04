@@ -409,6 +409,28 @@ impl ListenerState {
                         let label = track_label(&merged);
                         debug!("track emit forced | reason=artwork-timeout | {label}");
                     }
+                    // Same song, different cover: some sources swap album art
+                    // for the same title+artist (e.g. a video vs audio
+                    // version). content_differ only compares text fields, so
+                    // compare the artwork bytes against the last emitted
+                    // track and surface the new cover as a refresh.
+                    if !emit
+                        && read_artwork
+                        && let Some(prev_track) = self.last_track_per_source.get(&merged.source_app)
+                        && prev_track.title == merged.title
+                        && prev_track.artist == merged.artist
+                    {
+                        let art_changed = match (&prev_track.artwork, &merged.artwork) {
+                            (Some(a), Some(b)) => !Arc::ptr_eq(a, b) && a.as_ref() != b.as_ref(),
+                            (None, Some(_)) | (Some(_), None) => true,
+                            (None, None) => false,
+                        };
+                        if art_changed {
+                            emit = true;
+                            let label = track_label(&merged);
+                            debug!("track emit forced | reason=artwork-changed | {label}");
+                        }
+                    }
                     // Per-source session-recreation dedup: a source that
                     // recreates its session (e.g. YouTube Music ~60s and on
                     // every song change) re-reports the same track on a new
@@ -592,7 +614,13 @@ impl ListenerState {
         // open, including apps whose sessions were rejected: checking them
         // is how the user adds them to the allow-list.
         let active_sources: Vec<String> = sessions.iter().map(read_source_app).collect();
+        let active: HashSet<String> = active_sources.iter().cloned().collect();
         set_active_session_sources(active_sources);
+        // Evict source-level caches for apps that no longer have an open
+        // session: their cached track (with artwork bytes) and icon would
+        // otherwise persist forever, growing with every AUMID variant seen.
+        self.last_track_per_source.retain(|source, _| active.contains(source));
+        self.icon_cache.retain(|source, _| active.contains(source));
     }
 
     /// Returns the last emitted artwork bytes for `source_app` if the cached
