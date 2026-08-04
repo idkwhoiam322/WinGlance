@@ -848,9 +848,12 @@ impl OverlayState {
             (px as f32 * scale).round() as i32
         } else {
             match self.position.horizontal {
-                HorizontalPosition::Left => work.left + margin,
+                // The DIB extends `inset` beyond the pill on each side, so
+                // the glow reaches `margin` from the work-area edge — the
+                // pill itself sits `margin + inset` in.
+                HorizontalPosition::Left => work.left + margin + inset,
                 HorizontalPosition::Center => work.left + (span_w - width) / 2 - inset,
-                HorizontalPosition::Right => work.right - width - margin,
+                HorizontalPosition::Right => work.right - width - margin - inset,
             }
         };
         let y = if let Some(py) = self.position.y {
