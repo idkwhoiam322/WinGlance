@@ -24,9 +24,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LB_SETCURSEL, LB_SETITEMDATA, LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED,
     LoadCursorW, PostMessageW, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW,
     SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SETFONT, WNDCLASS_STYLES,
-    WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
-    WS_VSCROLL,
+    WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT,
+    WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -784,6 +784,17 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 *guard = None;
             }
             LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            // Free the heap-allocated PickerState stashed at WM_NCCREATE.
+            // Every close path (Escape/Enter/click-outside) goes through
+            // DestroyWindow; without this the state leaked on each open.
+            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+            if !state_ptr.is_null() {
+                drop(Box::from_raw(state_ptr));
+            }
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
