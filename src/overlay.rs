@@ -2036,7 +2036,7 @@ fn draw_pill_text_rows(
         &title_narrow,
         font_title,
         text_color,
-        true,
+        false,
         Some(&mut state.scroll[0]),
     );
     if let Some(playback) = playback {
@@ -2174,7 +2174,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         &title_narrow,
                         font_title,
                         text_color,
-                        true,
+                        false,
                         None,
                     );
                     draw_symbol_pixels(
@@ -2293,14 +2293,16 @@ fn draw_text_line_pixels(
     }
     let rw = rect.right - rect.left;
     let rh = rect.bottom - rect.top;
-    let Ok((hdc, bits, sw, _sh)) = text_scratch_for(text_scratch, rw, rh) else {
+    let Ok((hdc, bits, sw, sh)) = text_scratch_for(text_scratch, rw, rh) else {
         return;
     };
-    // Only the row's own area is drawn into (GDI clips to rw×rh) and read
-    // back, so zero and composite just that. The scratch may be larger (it
-    // grows but never shrinks); the extra area is never touched.
+    // The scratch DIB is reused across rows (it grows but never shrinks), so a
+    // narrower row reuses a wider buffer. Zeroing only `rw * rh * 4` contiguous
+    // bytes leaves stale pixels from a previous wider row in the scratch's full
+    // stride (sw * 4 per row); they ghost through as stray colored dots. Clear
+    // the entire scratch buffer so every pixel read during compositing is clean.
     unsafe {
-        std::ptr::write_bytes(bits.cast::<u8>(), 0, (rw * rh * 4) as usize);
+        std::ptr::write_bytes(bits.cast::<u8>(), 0, (sw * sh * 4) as usize);
     }
     if font.0.is_null() {
         return;
