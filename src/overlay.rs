@@ -1542,12 +1542,13 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
-/// Draws a playback-state symbol (play ▶ / pause ‖ / stop ■) as custom
-/// anti-aliased vector shapes directly into the pixel buffer, replacing the
-/// old GDI text glyphs. The symbol box is `size`×`size` pixels (size = font
-/// height); bars are 0.20×S wide × 0.62×S tall with a 0.22×S gap. Play is a
-/// triangle of the same height whose corners are rounded at the pause bars'
-/// radius; pause and stop use rounded corners with radius 0.2×S
+/// Draws a playback-state symbol (play ▶ / pause ‖ / stop ■ / music note ♪)
+/// as custom anti-aliased vector shapes directly into the pixel buffer,
+/// replacing the old GDI text glyphs. The symbol box is `size`×`size` pixels
+/// (size = font height); the symbols are ~0.88×S tall, vertically centered in
+/// the box. Pause bars are 0.22×S wide with a 0.16×S gap; play is a triangle
+/// 0.60×S wide of the same height whose corners are rounded at the pause
+/// bars' radius; pause and stop use rounded corners with radius 0.2×S
 /// (clamped to half the bar width — capsule ends for the bars, matching the
 /// artwork tile's `size * 0.2` rounding convention and the pill's soft look).
 /// The symbol is positioned with its right edge at `right` and vertically
@@ -1563,57 +1564,63 @@ fn draw_symbol_pixels(
     color: [u8; 4],
 ) {
     let bar_w = 0.20 * size;
-    let bar_h = 0.62 * size;
-    let gap = 0.22 * size;
     let radius = (0.20 * size).min(bar_w / 2.0).max(0.0);
     let box_left = (right as f32 - size).round() as i32;
-    let v_center = y as f32 + (bar_h / 2.0);
+    // The symbols are ~0.88×S tall; center them in the S×S box.
+    let v_center = y as f32 + size * 0.5;
     match playback {
         PlaybackState::Playing => {
-            // Triangle, height ≈ bar_h, point on the left. The width matches
-            // the pause symbol's total width (bars + gap ≈ 0.62×S) so the
-            // play glyph carries the same visual weight as the pause bars;
-            // its corners use the pause bars' rounding radius.
-            let tri_w = 0.50 * size;
-            let tri_h = bar_h;
-            let left = box_left as f32 + (size - tri_w) * 0.5;
-            let top = v_center - tri_h / 2.0;
+            // Larger Triangle (▶) — synced to 0.88
+            let icon_h = 0.88 * size;
+            let tri_w = 0.60 * size;
+
+            let left = box_left as f32 + (size - tri_w) * 0.5 + (tri_w * 0.05);
+            let top = v_center - icon_h / 2.0;
+
             draw_triangle_filled(
                 pixels,
                 width,
                 (left as i32, top as i32),
-                (left as i32 + tri_w as i32, (top + tri_h / 2.0) as i32),
-                (left as i32, (top + tri_h) as i32),
+                ((left + tri_w) as i32, (top + icon_h / 2.0) as i32),
+                (left as i32, (top + icon_h) as i32),
                 radius,
                 color,
             );
         }
         PlaybackState::Paused => {
-            // Two rounded bars, centered horizontally in the box.
+            // Larger Rounded Bars (❚❚) — synced to 0.88
+            let icon_h = 0.88 * size;
+            let bar_w = (0.22 * size).round().max(2.0);
+            let gap = (0.16 * size).round().max(2.0);
+
             let total = bar_w * 2.0 + gap;
             let origin = box_left as f32 + (size - total) * 0.5;
+
             for offset in [0.0, bar_w + gap] {
                 draw_rounded_rect_filled(
                     pixels,
                     width,
                     (origin + offset) as i32,
-                    (v_center - bar_h / 2.0) as i32,
+                    (v_center - icon_h / 2.0) as i32,
                     bar_w as i32,
-                    bar_h as i32,
+                    icon_h as i32,
                     radius,
                     color,
                 );
             }
         }
         PlaybackState::Stopped => {
-            // Rounded square, same height as the bars.
-            let sq = bar_h;
+            // Larger Stop Square (◼) — scaled to 82% of 0.88 height for optical weight
+            let icon_h = 0.88 * size;
+            let sq = (icon_h * 0.82).round();
             let left = box_left as f32 + (size - sq) * 0.5;
+            let top = v_center - sq / 2.0;
+
             draw_rounded_rect_filled(
                 pixels,
                 width,
                 left as i32,
-                (v_center - sq / 2.0) as i32,
+                top as i32,
                 sq as i32,
                 sq as i32,
                 radius,
@@ -1621,16 +1628,13 @@ fn draw_symbol_pixels(
             );
         }
         PlaybackState::NowPlaying => {
-            // Eighth note (♪):
-            // 1. Note head at bottom-left
-            // 2. Stem rising along the right edge of the note head
-            // 3. Flag extending right & down from the top of the stem
-            let head_d = 0.38 * size;
-            let stem_w = (0.09 * size).round().max(1.0);
+            // Eighth note (♪) — synced to 0.88
+            let note_h = 0.88 * size;
+            let head_d = 0.40 * size;
+            let stem_w = (0.14 * size).round().max(2.0);
 
-            // Note head at bottom-left
-            let head_x = box_left as f32 + 0.18 * size;
-            let head_y = y as f32 + 0.52 * size;
+            let head_x = box_left as f32 + 0.20 * size;
+            let head_y = v_center + (note_h / 2.0) - head_d;
 
             draw_rounded_rect_filled(
                 pixels,
@@ -1643,9 +1647,8 @@ fn draw_symbol_pixels(
                 color,
             );
 
-            // Stem attached to the right edge of the note head
             let stem_x = head_x + head_d - stem_w;
-            let stem_top = y as f32 + 0.08 * size;
+            let stem_top = v_center - (note_h / 2.0);
             let stem_h = (head_y + head_d * 0.5) - stem_top;
 
             draw_rounded_rect_filled(
@@ -1659,9 +1662,8 @@ fn draw_symbol_pixels(
                 color,
             );
 
-            // Flag extending right from the top of the stem
-            let flag_w = 0.28 * size;
-            let flag_h = 0.22 * size;
+            let flag_w = 0.32 * size;
+            let flag_h = 0.26 * size;
 
             draw_rounded_rect_filled(
                 pixels,
