@@ -1866,10 +1866,11 @@ fn draw_pill_text_rows(
         r
     };
 
-    // Width reserved on the right of the title row for the playback state
-    // symbol (▶/‖/■), so it reads like a badge rather than a separate
-    // centered row.
-    let label_w = (80.0 * scale) as i32;
+    // The symbol box is ~1.5× the title font, capped at the title row's own
+    // height so it never overflows the band. The width reserved on the right
+    // of the title row follows the actual symbol size.
+    let symbol_size = (fs_title * 1.5).min(fs_title * ROW_HEIGHT);
+    let label_w = (symbol_size + 16.0 * scale) as i32;
 
     let title_rect = next_band(0);
     let title_narrow = if playback.is_some() {
@@ -1900,7 +1901,7 @@ fn draw_pill_text_rows(
             width as usize,
             title_rect.right,
             title_rect.top,
-            fs_title,
+            symbol_size,
             playback,
             accent,
         );
@@ -1985,7 +1986,8 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 let right = width - inset - padding;
                 let fs_title = appearance.font_size_title * scale;
                 let fs_artist = appearance.font_size_artist * scale;
-                let label_w = (80.0 * scale) as i32;
+                let symbol_size = (fs_title * 1.5).min(fs_title * ROW_HEIGHT);
+                let label_w = (symbol_size + 16.0 * scale) as i32;
                 let mut y = inset as f32 + appearance.padding * scale;
                 let mut next_band = |h: f32| -> RECT {
                     let r = RECT {
@@ -2028,7 +2030,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         width as usize,
                         title_rect.right,
                         title_rect.top,
-                        fs_title,
+                        symbol_size,
                         *playback,
                         appearance.accent_color,
                     );
