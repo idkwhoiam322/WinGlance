@@ -140,7 +140,14 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(&config_path, content)?;
+        // Write to a temp file and rename so a crash mid-write cannot leave a
+        // truncated config behind (the rename is atomic on the same volume).
+        let tmp_path = config_path.with_extension("toml.tmp");
+        std::fs::write(&tmp_path, content)?;
+        if let Err(e) = std::fs::rename(&tmp_path, &config_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
         Ok(())
     }
 
