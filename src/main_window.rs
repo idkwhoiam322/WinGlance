@@ -2676,19 +2676,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             LRESULT(0)
         }
         PICKER_RESULT_MSG => {
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                if wparam.0 == 0 {
-                    // Confirmed: read the selected patterns.
-                    let patterns = unsafe { Box::from_raw(lparam.0 as *mut Vec<String>) };
+            // Confirmed results carry a heap-allocated Vec<String> in lparam
+            // that must be reclaimed even when the window is being destroyed
+            // (state_ptr null) — the Box::from_raw must live outside the
+            // state_ptr guard or the allocation leaks on teardown. When the
+            // window is still alive, the patterns are applied to config.
+            if lparam.0 != 0 {
+                let patterns = unsafe { Box::from_raw(lparam.0 as *mut Vec<String>) };
+                if !state_ptr.is_null() {
+                    let state = &mut *state_ptr;
                     state.config.write().unwrap().behavior.allowed_sources = *patterns;
                     let _ = state.config.write().unwrap().save();
                     state.invalidate();
-                } else {
-                    // Cancelled: free the pointer.
-                    if lparam.0 != 0 {
-                        let _ = unsafe { Box::from_raw(lparam.0 as *mut Vec<String>) };
-                    }
                 }
             }
             LRESULT(0)
