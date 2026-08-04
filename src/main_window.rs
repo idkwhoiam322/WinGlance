@@ -2,7 +2,7 @@ use crate::autostart;
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo};
 use crate::overlay::{
-    EventQueue, OverlayPos, decode_artwork, draw_string, set_duration, set_position, show_sample, wide,
+    EventQueue, OverlayPos, decode_artwork_pm, draw_string, set_duration, set_position, show_sample, wide,
 };
 use crate::process_picker;
 use crate::process_picker::PICKER_RESULT_MSG;
@@ -70,6 +70,9 @@ const MENU_DURATION_5S: usize = 1019;
 const MENU_DURATION_10S: usize = 1020;
 const LISTBOX_ID: usize = 2;
 const HISTORY_CAP: usize = 1000;
+/// Artwork decode size in pixels (2× the 96 logical tile, so the cached
+/// bitmap stays crisp up to 200% DPI and is only ever downscaled at paint).
+const ART_DECODE: u32 = 192;
 /// Timer used to clear the "Copied" feedback on the Copy logs button.
 const TIMER_LOGS_ID: usize = 101;
 /// Timer used to keep the native history tooltip's item rects in sync (scroll).
@@ -147,6 +150,17 @@ fn mix(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
         (a[2] as f32 * t + b[2] as f32 * (1.0 - t)) as u8,
         0xFF,
     ]
+}
+
+/// FNV-1a 64 hash, used to detect artwork byte changes cheaply (compared to
+/// re-decoding the image to find out).
+fn fingerprint(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
 }
 
 /// Which sub-control of a settings row is being hovered/clicked.
@@ -227,6 +241,16 @@ const ANCHOR_LABELS: [&str; 6] = ["TL", "TC", "TR", "BL", "BC", "BR"];
 
 /// Draws a small bordered button (active/hover highlighted with accent).
 #[allow(clippy::too_many_arguments)]
+/// Fixed-color brushes for the settings pane, created once with the window
+/// and freed at destroy, so paints no longer create/delete ~40 brushes.
+#[derive(Clone, Copy)]
+struct SettingsBrushes {
+    border: HBRUSH,
+    surface: HBRUSH,
+    hover: HBRUSH,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_segment_button(
     hdc: HDC,
     rect: &RECT,
@@ -236,18 +260,20 @@ fn draw_segment_button(
     accent: [u8; 4],
     accent_soft: [u8; 4],
     scale: f32,
+    brushes: SettingsBrushes,
 ) {
-    let border = if active {
-        colorref(accent[0], accent[1], accent[2])
+    if active {
+        let b = unsafe { CreateSolidBrush(colorref(accent[0], accent[1], accent[2])) };
+        unsafe {
+            let _ = FillRect(hdc, rect, b);
+        }
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(b.0));
+        }
     } else {
-        colorref(SETTINGS_BORDER[0], SETTINGS_BORDER[1], SETTINGS_BORDER[2])
-    };
-    let b = unsafe { CreateSolidBrush(border) };
-    unsafe {
-        let _ = FillRect(hdc, rect, b);
-    }
-    unsafe {
-        let _ = DeleteObject(HGDIOBJ(b.0));
+        unsafe {
+            let _ = FillRect(hdc, rect, brushes.border);
+        }
     }
     let inner = RECT {
         left: rect.left + 1,
@@ -255,19 +281,18 @@ fn draw_segment_button(
         right: rect.right - 1,
         bottom: rect.bottom - 1,
     };
-    let fill = if active {
-        accent_soft
-    } else if hovered {
-        SETTINGS_HOVER
+    if active {
+        let f = unsafe { CreateSolidBrush(colorref(accent_soft[0], accent_soft[1], accent_soft[2])) };
+        unsafe {
+            let _ = FillRect(hdc, &inner, f);
+        }
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(f.0));
+        }
     } else {
-        SETTINGS_SURFACE
-    };
-    let f = unsafe { CreateSolidBrush(colorref(fill[0], fill[1], fill[2])) };
-    unsafe {
-        let _ = FillRect(hdc, &inner, f);
-    }
-    unsafe {
-        let _ = DeleteObject(HGDIOBJ(f.0));
+        unsafe {
+            let _ = FillRect(hdc, &inner, if hovered { brushes.hover } else { brushes.surface });
+        }
     }
     let mut t = inner;
     let tc = if active { SETTINGS_TEXT } else { SETTINGS_MUTED };
@@ -322,6 +347,9 @@ fn segment_rects(rect: &RECT, count: usize, gap: i32) -> Vec<RECT> {
 #[allow(dead_code)]
 struct HistoryEntry {
     at: DateTime<Local>,
+    /// Pre-formatted HH:MM:SS time, so the listbox paint never re-formats
+    /// (or allocates) per row per repaint.
+    at_label: String,
     track: TrackInfo,
     state: PlaybackState,
     /// Whether the source session passed the `allowed_sources` filter.
@@ -365,7 +393,12 @@ impl History {
 struct CurrentActivity {
     track: TrackInfo,
     state: PlaybackState,
+    /// Decoded artwork: premultiplied BGRA at ART_DECODE×ART_DECODE, cached
+    /// so paint is a single StretchDIBits (no decode or conversion per paint).
     art: Option<Vec<u8>>,
+    /// FNV-1a of the artwork bytes this cache was decoded from, so a metadata
+    /// refresh with unchanged artwork does not re-decode.
+    art_fingerprint: Option<u64>,
 }
 
 struct MainWindowState {
@@ -380,6 +413,12 @@ struct MainWindowState {
     listbox_font: HFONT,
     gray_brush: HBRUSH,
     accent_brush: HBRUSH,
+    black_brush: HBRUSH,
+    sidebar_bg_brush: HBRUSH,
+    sidebar_highlight_brush: HBRUSH,
+    settings_border_brush: HBRUSH,
+    settings_surface_brush: HBRUSH,
+    settings_hover_brush: HBRUSH,
     notifications_enabled: bool,
     active_pane: Pane,
     /// Hovered settings row (row index, sub-control) for highlight.
@@ -466,6 +505,12 @@ impl MainWindowState {
             listbox_font: HFONT::default(),
             gray_brush: HBRUSH::default(),
             accent_brush: HBRUSH::default(),
+            black_brush: HBRUSH::default(),
+            sidebar_bg_brush: HBRUSH::default(),
+            sidebar_highlight_brush: HBRUSH::default(),
+            settings_border_brush: HBRUSH::default(),
+            settings_surface_brush: HBRUSH::default(),
+            settings_hover_brush: HBRUSH::default(),
             notifications_enabled: true,
             active_pane: Pane::Activity,
             settings_hover: None,
@@ -501,6 +546,17 @@ impl MainWindowState {
         self.gray_brush = unsafe { CreateSolidBrush(colorref(0x1E, 0x1E, 0x1E)) };
         let accent = self.cfg().appearance.accent_color;
         self.accent_brush = unsafe { CreateSolidBrush(colorref(accent[0], accent[1], accent[2])) };
+        // Fixed-color brushes for the panes, created once instead of per paint
+        // (a settings repaint previously created ~40 brushes).
+        self.black_brush = unsafe { CreateSolidBrush(COLORREF(0)) };
+        self.sidebar_bg_brush = unsafe { CreateSolidBrush(COLORREF(0x0A0A0A)) };
+        self.sidebar_highlight_brush = unsafe { CreateSolidBrush(COLORREF(0x1A1A2E)) };
+        self.settings_border_brush =
+            unsafe { CreateSolidBrush(colorref(SETTINGS_BORDER[0], SETTINGS_BORDER[1], SETTINGS_BORDER[2])) };
+        self.settings_surface_brush =
+            unsafe { CreateSolidBrush(colorref(SETTINGS_SURFACE[0], SETTINGS_SURFACE[1], SETTINGS_SURFACE[2])) };
+        self.settings_hover_brush =
+            unsafe { CreateSolidBrush(colorref(SETTINGS_HOVER[0], SETTINGS_HOVER[1], SETTINGS_HOVER[2])) };
 
         self.listbox = unsafe {
             CreateWindowExW(
@@ -688,10 +744,15 @@ impl MainWindowState {
     /// bytes would be pure waste across hundreds of rows.
     fn push_history(&mut self, mut track: TrackInfo, state: PlaybackState, accepted: bool) {
         track.artwork = None;
+        let at = Local::now();
+        let at_label = at.format("%H:%M:%S").to_string();
+        let row = history_row(&track, at, state);
+        let row = wide(&row);
         let before = self.history.len();
         self.history.push(HistoryEntry {
-            at: Local::now(),
-            track: track.clone(),
+            at,
+            at_label,
+            track,
             state,
             accepted,
         });
@@ -703,8 +764,6 @@ impl MainWindowState {
                 let _ = unsafe { SendMessageW(self.listbox, LB_DELETESTRING, WPARAM(count - 1), LPARAM(0)) };
             }
         }
-        let row = history_row(&track, Local::now(), state);
-        let row = wide(&row);
         if !self.listbox.0.is_null() {
             unsafe {
                 // Insert after the header row (index 0), so the newest entry
@@ -719,17 +778,23 @@ impl MainWindowState {
     }
 
     fn add_state_change(&mut self, state: PlaybackState) {
-        let track = self.current.as_ref().map(|c| c.track.clone()).unwrap_or_default();
+        let Some(current) = &self.current else {
+            return;
+        };
         // Skip a state row that duplicates the newest one (same track, same
         // state). Session recreation re-reports "Playing" for the same song,
         // which would otherwise flood the history with identical rows while
         // the user never changed anything.
         let is_duplicate = self.history.entries.front().is_some_and(|last| {
-            last.state == state && last.track.title == track.title && last.track.artist == track.artist
+            last.state == state && last.track.title == current.track.title && last.track.artist == current.track.artist
         });
         if is_duplicate {
             return;
         }
+        // Clone text-only: the artwork bytes (up to MBs) are stripped before
+        // the clone so they are never copied just to be discarded.
+        let mut track = current.track.clone();
+        track.artwork = None;
         self.push_history(track, state, true);
     }
 
@@ -747,6 +812,7 @@ impl MainWindowState {
     }
 
     fn add_track(&mut self, track: TrackInfo) {
+        let art_fingerprint = track.artwork.as_deref().map(fingerprint);
         // Metadata refresh for the same song (album/artwork arriving late): update
         // the current activity and the last history row in place instead of
         // appending a duplicate entry.
@@ -758,7 +824,16 @@ impl MainWindowState {
         if is_update {
             if let Some(current) = &mut self.current {
                 current.track = track.clone();
-                current.art = None;
+                // Re-decode only when the artwork bytes actually changed; a
+                // metadata refresh re-reporting the same cover must not pay
+                // for another JPEG decode.
+                if current.art_fingerprint != art_fingerprint {
+                    current.art = track
+                        .artwork
+                        .as_deref()
+                        .and_then(|data| decode_artwork_pm(data, ART_DECODE as usize));
+                    current.art_fingerprint = art_fingerprint;
+                }
             }
             // Rejected-session rows can be pushed on top of the current
             // track's row, so find the entry by identity instead of assuming
@@ -797,7 +872,14 @@ impl MainWindowState {
         }
 
         let state = self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing);
-        self.push_history(track.clone(), state, true);
+        // History row is text-only: strip the artwork bytes before the clone.
+        let mut history_track = track.clone();
+        history_track.artwork = None;
+        self.push_history(history_track, state, true);
+        let art = track
+            .artwork
+            .as_deref()
+            .and_then(|data| decode_artwork_pm(data, ART_DECODE as usize));
         self.current = Some(CurrentActivity {
             track,
             state: self
@@ -805,7 +887,8 @@ impl MainWindowState {
                 .as_ref()
                 .map(|current| current.state)
                 .unwrap_or(PlaybackState::Playing),
-            art: None,
+            art,
+            art_fingerprint,
         });
         self.invalidate();
     }
@@ -846,9 +929,7 @@ impl MainWindowState {
 
         // Fill background
         unsafe {
-            let black = CreateSolidBrush(COLORREF(0));
-            let _ = FillRect(hdc, &whole, black);
-            let _ = DeleteObject(black);
+            let _ = FillRect(hdc, &whole, self.black_brush);
         }
 
         // Draw sidebar
@@ -859,14 +940,13 @@ impl MainWindowState {
             bottom: client_h,
         };
         unsafe {
-            let sidebar_bg = CreateSolidBrush(COLORREF(0x0A0A0A));
-            let _ = FillRect(hdc, &sidebar_rect, sidebar_bg);
-            let _ = DeleteObject(sidebar_bg);
+            let _ = FillRect(hdc, &sidebar_rect, self.sidebar_bg_brush);
         }
 
         // Sidebar items
         let item_h = (32.0 * scale) as i32;
         let items = [("Now Playing", Pane::Activity), ("Settings", Pane::Settings)];
+        let accent = self.cfg().appearance.accent_color;
         for (i, (label, pane)) in items.iter().enumerate() {
             let y = (40.0 * scale) as i32 + (i as i32) * (item_h + (4.0 * scale) as i32);
             let item_rect = RECT {
@@ -877,9 +957,7 @@ impl MainWindowState {
             };
             if *pane == self.active_pane {
                 unsafe {
-                    let highlight = CreateSolidBrush(COLORREF(0x1A1A2E));
-                    let _ = FillRect(hdc, &item_rect, highlight);
-                    let _ = DeleteObject(highlight);
+                    let _ = FillRect(hdc, &item_rect, self.sidebar_highlight_brush);
                 }
             }
             let mut text_rect = item_rect;
@@ -889,7 +967,7 @@ impl MainWindowState {
                 &mut text_rect,
                 (10.0 * scale) as i32,
                 if *pane == self.active_pane {
-                    self.cfg().appearance.accent_color
+                    accent
                 } else {
                     [0x88, 0x88, 0x88, 0xFF]
                 },
@@ -935,16 +1013,11 @@ impl MainWindowState {
         let accent_color = self.cfg().appearance.accent_color;
         let text_color = self.cfg().appearance.text_color;
 
-        if let Some(current) = &mut self.current {
-            if current.art.is_none() {
-                current.art = current
-                    .track
-                    .artwork
-                    .as_deref()
-                    .and_then(|data| decode_artwork(data, (ART_SIZE * scale).round() as usize));
-            }
+        if let Some(current) = &self.current {
+            // Artwork is decoded and premultiplied when the event is received;
+            // paint just blits the cached bitmap.
             if let Some(art_pixels) = current.art.as_deref() {
-                draw_art(hdc, art_pixels, art, art_x, art_y);
+                draw_art_pm(hdc, art_pixels, ART_DECODE as i32, art, art_x, art_y);
             } else {
                 let art_rect = RECT {
                     left: art_x,
@@ -1249,8 +1322,19 @@ impl MainWindowState {
     }
 
     fn paint_settings(&self, hdc: HDC, content_left: i32, client_w: i32, _client_h: i32, scale: f32, pad: i32) {
-        let accent = self.cfg().appearance.accent_color;
+        // Read the config once per paint instead of ~10 lock acquisitions,
+        // and snapshot the hover/flag state so the row loop stays pure.
+        let cfg = self.cfg();
+        let accent = cfg.appearance.accent_color;
         let accent_soft = mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], 0.28);
+        let notifications_enabled = self.notifications_enabled;
+        let settings_hover = self.settings_hover;
+        let duration_ms = cfg.overlay.duration_ms;
+        let start_on_login = cfg.behavior.start_on_login;
+        let close_to_tray = cfg.behavior.close_to_tray;
+        let allowed_sources = cfg.behavior.allowed_sources.join(", ");
+        let custom_position = cfg.overlay.position_x.is_some();
+        let position_label = self.position_label();
 
         let mut hdr = RECT {
             left: content_left + pad,
@@ -1261,6 +1345,11 @@ impl MainWindowState {
         draw_string(hdc, "SETTINGS", &mut hdr, (13.0 * scale) as i32, accent, true, false);
 
         let items = self.settings_items(content_left, client_w, pad, scale);
+        let brushes = SettingsBrushes {
+            border: self.settings_border_brush,
+            surface: self.settings_surface_brush,
+            hover: self.settings_hover_brush,
+        };
         let mut row_index = 0usize;
         for item in &items {
             match item {
@@ -1269,7 +1358,7 @@ impl MainWindowState {
                     draw_string(hdc, text, &mut hr, (9.0 * scale) as i32, SETTINGS_FAINT, true, false);
                 }
                 SettingsItem::Row { id, rect } => {
-                    let hovered_row = self.settings_hover.is_some_and(|(r, _)| r == row_index);
+                    let hovered_row = settings_hover.is_some_and(|(r, _)| r == row_index);
                     let label_w = (((rect.right - rect.left) as f32) * 0.42) as i32;
                     let label_rect = RECT {
                         left: rect.left + (12.0 * scale) as i32,
@@ -1286,14 +1375,8 @@ impl MainWindowState {
                     };
 
                     // Card: border + surface fill (+ hover tint)
-                    let border_brush = unsafe {
-                        CreateSolidBrush(colorref(SETTINGS_BORDER[0], SETTINGS_BORDER[1], SETTINGS_BORDER[2]))
-                    };
                     unsafe {
-                        let _ = FillRect(hdc, rect, border_brush);
-                    }
-                    unsafe {
-                        let _ = DeleteObject(HGDIOBJ(border_brush.0));
+                        let _ = FillRect(hdc, rect, self.settings_border_brush);
                     }
                     let inner = RECT {
                         left: rect.left + 1,
@@ -1301,67 +1384,51 @@ impl MainWindowState {
                         right: rect.right - 1,
                         bottom: rect.bottom - 1,
                     };
-                    let bg = if hovered_row { SETTINGS_HOVER } else { SETTINGS_SURFACE };
-                    let bg_brush = unsafe { CreateSolidBrush(colorref(bg[0], bg[1], bg[2])) };
                     unsafe {
-                        let _ = FillRect(hdc, &inner, bg_brush);
-                    }
-                    unsafe {
-                        let _ = DeleteObject(HGDIOBJ(bg_brush.0));
+                        let bg = if hovered_row {
+                            self.settings_hover_brush
+                        } else {
+                            self.settings_surface_brush
+                        };
+                        let _ = FillRect(hdc, &inner, bg);
                     }
 
                     let (label, value_text, value_color) = match id {
                         SettingId::Notifications => (
                             "Notifications",
-                            if self.notifications_enabled {
+                            if notifications_enabled {
                                 "ON".to_string()
                             } else {
                                 "OFF".to_string()
                             },
-                            if self.notifications_enabled {
-                                accent
-                            } else {
-                                SETTINGS_FAINT
-                            },
+                            if notifications_enabled { accent } else { SETTINGS_FAINT },
                         ),
                         SettingId::StartOnLogin => (
                             "Start on login",
-                            if self.cfg().behavior.start_on_login {
+                            if start_on_login {
                                 "ON".to_string()
                             } else {
                                 "OFF".to_string()
                             },
-                            if self.cfg().behavior.start_on_login {
-                                accent
-                            } else {
-                                SETTINGS_FAINT
-                            },
+                            if start_on_login { accent } else { SETTINGS_FAINT },
                         ),
                         SettingId::CloseToTray => (
                             "Close to tray",
-                            if self.cfg().behavior.close_to_tray {
+                            if close_to_tray {
                                 "ON".to_string()
                             } else {
                                 "OFF".to_string()
                             },
-                            if self.cfg().behavior.close_to_tray {
-                                accent
-                            } else {
-                                SETTINGS_FAINT
-                            },
+                            if close_to_tray { accent } else { SETTINGS_FAINT },
                         ),
-                        SettingId::Duration => (
-                            "Duration",
-                            format!("{}s", self.cfg().overlay.duration_ms / 1000),
-                            SETTINGS_MUTED,
-                        ),
-                        SettingId::Position => ("Position", self.position_label(), SETTINGS_MUTED),
+                        SettingId::Duration => ("Duration", format!("{}s", duration_ms / 1000), SETTINGS_MUTED),
+                        SettingId::Position => ("Position", position_label.clone(), SETTINGS_MUTED),
                         SettingId::AllowedApps => (
                             "Allowed apps",
-                            if self.cfg().behavior.allowed_sources.is_empty() {
+                            if allowed_sources.is_empty() {
                                 "All".to_string()
                             } else {
-                                self.cfg().behavior.allowed_sources.join(", ")
+                                allowed_sources.clone()
                             },
                             SETTINGS_MUTED,
                         ),
@@ -1398,7 +1465,6 @@ impl MainWindowState {
                         SettingId::Duration => {
                             let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
                             let values = [2000u64, 3000, 5000, 10000];
-                            let duration_ms = self.cfg().overlay.duration_ms;
                             let exact = values.contains(&duration_ms);
                             // Nearest preset, for when the config holds a value
                             // outside the four presets (e.g. hand-edited).
@@ -1411,7 +1477,7 @@ impl MainWindowState {
                             for (i, seg) in segments.iter().enumerate() {
                                 let active = duration_ms == values[i];
                                 let near = !exact && i == nearest;
-                                let seg_hovered = self.settings_hover == Some((row_index, SettingSub::Seg(i)));
+                                let seg_hovered = settings_hover == Some((row_index, SettingSub::Seg(i)));
                                 let border = if active || near {
                                     colorref(accent[0], accent[1], accent[2])
                                 } else {
@@ -1460,11 +1526,10 @@ impl MainWindowState {
                         }
                         SettingId::Position => {
                             let parts = position_parts(rect, scale);
-                            let custom = self.cfg().overlay.position_x.is_some();
-                            let active_anchor = if custom {
+                            let active_anchor = if custom_position {
                                 None
                             } else {
-                                Some(match (self.cfg().overlay.vertical, self.cfg().overlay.horizontal) {
+                                Some(match (cfg.overlay.vertical, cfg.overlay.horizontal) {
                                     (VerticalPosition::Top, HorizontalPosition::Left) => 0,
                                     (VerticalPosition::Top, HorizontalPosition::Center) => 1,
                                     (VerticalPosition::Top, HorizontalPosition::Right) => 2,
@@ -1485,13 +1550,13 @@ impl MainWindowState {
                                 false,
                                 false,
                             );
-                            let reset_hovered = self.settings_hover == Some((row_index, SettingSub::Reset));
+                            let reset_hovered = settings_hover == Some((row_index, SettingSub::Reset));
                             draw_small_button(hdc, &parts.reset, "Reset", accent, reset_hovered, scale);
 
                             // Anchor segments + Adjust button row
                             for (i, seg) in parts.anchors.iter().enumerate() {
                                 let active = active_anchor == Some(i);
-                                let seg_hovered = self.settings_hover == Some((row_index, SettingSub::Anchor(i)));
+                                let seg_hovered = settings_hover == Some((row_index, SettingSub::Anchor(i)));
                                 draw_segment_button(
                                     hdc,
                                     seg,
@@ -1501,9 +1566,10 @@ impl MainWindowState {
                                     accent,
                                     accent_soft,
                                     scale,
+                                    brushes,
                                 );
                             }
-                            let adjust_hovered = self.settings_hover == Some((row_index, SettingSub::Adjust));
+                            let adjust_hovered = settings_hover == Some((row_index, SettingSub::Adjust));
                             let adjust_fill = if adjust_hovered {
                                 mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], 0.45)
                             } else {
@@ -1763,14 +1829,7 @@ impl MainWindowState {
             } else {
                 ([0x66, 0x66, 0x66, 0xFF], false)
             };
-            cell(
-                col_x[0],
-                time_w,
-                &entry.at.format("%H:%M:%S").to_string(),
-                row_font,
-                row_color,
-                bold,
-            );
+            cell(col_x[0], time_w, &entry.at_label, row_font, row_color, bold);
             cell(col_x[1], state_w, status, row_font, row_color, bold);
             cell(title_x, title_w, &entry.track.title, row_font, row_color, bold);
             cell(artist_x, artist_w, artist, row_font, row_color, bold);
@@ -1796,12 +1855,45 @@ impl MainWindowState {
             if !self.accent_brush.0.is_null() {
                 let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.accent_brush.0));
             }
+            for brush in [
+                &self.black_brush,
+                &self.sidebar_bg_brush,
+                &self.sidebar_highlight_brush,
+                &self.settings_border_brush,
+                &self.settings_surface_brush,
+                &self.settings_hover_brush,
+            ] {
+                if !brush.0.is_null() {
+                    let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
+                }
+            }
         }
     }
 
     fn invalidate(&self) {
         unsafe {
             let _ = InvalidateRect(self.hwnd, None, false);
+        }
+    }
+
+    /// Invalidates only the given client-space region, so hover highlights
+    /// repaint a small band instead of the whole window.
+    fn invalidate_rect(&self, rect: &RECT) {
+        unsafe {
+            let _ = InvalidateRect(self.hwnd, Some(rect), false);
+        }
+    }
+
+    /// The client-space region the settings pane occupies (right of the
+    /// sidebar), repainted on hover changes.
+    fn settings_region(&self, client_w: i32, client_h: i32) -> RECT {
+        let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
+        let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+        RECT {
+            left: sidebar_w,
+            top: 0,
+            right: client_w,
+            bottom: client_h,
         }
     }
 
@@ -1901,22 +1993,15 @@ fn history_row(track: &TrackInfo, at: DateTime<Local>, state: PlaybackState) -> 
     row
 }
 
-fn draw_art(hdc: HDC, rgba: &[u8], px: i32, x: i32, y: i32) {
-    let mut bgra = Vec::with_capacity(rgba.len());
-    for chunk in rgba.chunks_exact(4) {
-        let [r, g, b, a] = [chunk[0], chunk[1], chunk[2], chunk[3]];
-        bgra.extend([
-            (b as u32 * a as u32 / 255) as u8,
-            (g as u32 * a as u32 / 255) as u8,
-            (r as u32 * a as u32 / 255) as u8,
-            a,
-        ]);
-    }
+/// Blits the cached premultiplied BGRA artwork (decoded once at `base` size
+/// when the track changed) into the tile at `px` pixels — no per-paint
+/// decode or pixel conversion.
+fn draw_art_pm(hdc: HDC, pm: &[u8], base: i32, px: i32, x: i32, y: i32) {
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: px,
-            biHeight: -px,
+            biWidth: base,
+            biHeight: -base,
             biPlanes: 1,
             biBitCount: 32,
             biCompression: 0,
@@ -1933,9 +2018,9 @@ fn draw_art(hdc: HDC, rgba: &[u8], px: i32, x: i32, y: i32) {
             px,
             0,
             0,
-            px,
-            px,
-            Some(bgra.as_ptr().cast()),
+            base,
+            base,
+            Some(pm.as_ptr().cast()),
             &info,
             DIB_RGB_COLORS,
             SRCCOPY,
@@ -2502,7 +2587,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                     let sidebar_w = (SIDEBAR_W * scale).round() as i32;
                     let pad = (PAD * scale) as i32;
-                    let (client_w, _) = client_size(hwnd);
+                    let (client_w, client_h) = client_size(hwnd);
                     let hover = if x < sidebar_w {
                         None
                     } else {
@@ -2510,7 +2595,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     };
                     if hover != state.settings_hover {
                         state.settings_hover = hover;
-                        state.invalidate();
+                        let region = state.settings_region(client_w, client_h);
+                        state.invalidate_rect(&region);
                     }
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -2521,7 +2607,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     let _ = TrackMouseEvent(&mut tme);
                 } else if state.settings_hover.is_some() {
                     state.settings_hover = None;
-                    state.invalidate();
+                    let (client_w, client_h) = client_size(hwnd);
+                    let region = state.settings_region(client_w, client_h);
+                    state.invalidate_rect(&region);
                 }
             }
             LRESULT(0)
@@ -2531,7 +2619,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 let state = &mut *state_ptr;
                 if state.settings_hover.is_some() {
                     state.settings_hover = None;
-                    state.invalidate();
+                    let (client_w, client_h) = client_size(hwnd);
+                    let region = state.settings_region(client_w, client_h);
+                    state.invalidate_rect(&region);
                 }
             }
             LRESULT(0)
@@ -2645,6 +2735,7 @@ mod tests {
         for index in 0..5 {
             history.push(HistoryEntry {
                 at: Local::now(),
+                at_label: String::new(),
                 track: track(&format!("Track {index}")),
                 state: PlaybackState::Playing,
                 accepted: true,
@@ -2661,12 +2752,14 @@ mod tests {
         let mut history = History::new(3);
         history.push(HistoryEntry {
             at: Local::now(),
+            at_label: String::new(),
             track: track("Track A"),
             state: PlaybackState::Playing,
             accepted: true,
         });
         history.push(HistoryEntry {
             at: Local::now(),
+            at_label: String::new(),
             track: track("Track B"),
             state: PlaybackState::Paused,
             accepted: false,

@@ -1994,6 +1994,24 @@ pub(crate) fn decode_artwork(data: &[u8], size: usize) -> Option<Vec<u8>> {
     Some(image.into_raw())
 }
 
+/// Decodes artwork directly into the premultiplied BGRA layout that
+/// StretchDIBits consumes (top-down 32bpp DIB), so the main window can draw
+/// the cached bitmap with a single blit instead of re-converting per paint.
+pub(crate) fn decode_artwork_pm(data: &[u8], size: usize) -> Option<Vec<u8>> {
+    let image = image::load_from_memory(data).ok()?.to_rgba8();
+    let image = image::imageops::resize(&image, size as u32, size as u32, FilterType::Triangle);
+    let raw = image.into_raw();
+    let mut pm = Vec::with_capacity(raw.len());
+    for px in raw.chunks_exact(4) {
+        let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
+        pm.push((b * a / 255) as u8);
+        pm.push((g * a / 255) as u8);
+        pm.push((r * a / 255) as u8);
+        pm.push(a as u8);
+    }
+    Some(pm)
+}
+
 /// Source-over composite of a premultiplied source (rgb, alpha) onto the
 /// buffer. The buffer holds premultiplied BGRA, exactly what
 /// UpdateLayeredWindow(ULW_ALPHA) consumes, so every shape and glyph goes
