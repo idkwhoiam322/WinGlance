@@ -1248,7 +1248,7 @@ fn draw_pixels(
                         let cov =
                             round_rect_coverage(dx as f32, dy as f32, halo_size as f32, halo_size as f32, halo_radius);
                         if cov > 0.0 {
-                            let alpha = (c[3] as f32 * 0.30 * cov) as u32;
+                            let alpha = (c[3] as f32 * 0.75 * cov) as u32;
                             composite(pixels, width, halo_x + dx, halo_y + dy, [c[0], c[1], c[2]], alpha);
                         }
                     }
@@ -1274,6 +1274,20 @@ fn draw_pixels(
                     art_size,
                     state.config.appearance.accent_color,
                 );
+            }
+            // Glowing rim: thin 1.5px accent stroke around the album art.
+            if let Some(c) = palette.map(|p| p.primary) {
+                let stroke_w = (1.5 * scale).round().max(1.0);
+                for dy in 0..art_size {
+                    for dx in 0..art_size {
+                        let d = round_rect_signed_dist(dx as f32, dy as f32, art_size as f32, art_size as f32, radius);
+                        if d.abs() < stroke_w {
+                            let edge = 1.0 - d.abs() / stroke_w;
+                            let alpha = (c[3] as f32 * 0.9 * edge) as u32;
+                            composite(pixels, width, art_x + dx, art_y + dy, [c[0], c[1], c[2]], alpha);
+                        }
+                    }
+                }
             }
         }
         MediaEvent::PlaybackStateChanged(_, source_app) => {
@@ -1303,7 +1317,7 @@ fn draw_pixels(
                         let cov =
                             round_rect_coverage(dx as f32, dy as f32, halo_size as f32, halo_size as f32, halo_radius);
                         if cov > 0.0 {
-                            let alpha = (c[3] as f32 * 0.30 * cov) as u32;
+                            let alpha = (c[3] as f32 * 0.75 * cov) as u32;
                             composite(pixels, width, halo_x + dx, halo_y + dy, [c[0], c[1], c[2]], alpha);
                         }
                     }
@@ -1329,6 +1343,20 @@ fn draw_pixels(
                     art_size,
                     state.config.appearance.accent_color,
                 );
+            }
+            // Glowing rim: thin 1.5px accent stroke around the album art.
+            if let Some(c) = palette.map(|p| p.primary) {
+                let stroke_w = (1.5 * scale).round().max(1.0);
+                for dy in 0..art_size {
+                    for dx in 0..art_size {
+                        let d = round_rect_signed_dist(dx as f32, dy as f32, art_size as f32, art_size as f32, radius);
+                        if d.abs() < stroke_w {
+                            let edge = 1.0 - d.abs() / stroke_w;
+                            let alpha = (c[3] as f32 * 0.9 * edge) as u32;
+                            composite(pixels, width, art_x + dx, art_y + dy, [c[0], c[1], c[2]], alpha);
+                        }
+                    }
+                }
             }
         }
         // Never rendered: SessionRejected is filtered out before enqueue.
@@ -1645,17 +1673,16 @@ fn rounded_triangle_coverage(
     t * t * (3.0 - 2.0 * t)
 }
 
-/// A desaturated, lighter version of the accent color: mixes 40% toward gray
-/// and brightens 15%. Used for the artist and app-name rows so they complement
-/// rather than compete with the full accent used on the play symbol and clock.
+/// A softened version of the accent color: lifts each channel towards white
+/// by 35%, producing a vibrant pastel rather than a muddy gray. Used for
+/// the artist and app-name rows so they complement the full accent without
+/// competing with it.
 fn muted_accent(primary: [u8; 4]) -> [u8; 4] {
-    let avg = ((primary[0] as u16 + primary[1] as u16 + primary[2] as u16) / 3) as u8;
-    let mix = |c: u8, t: f32| -> u8 { (c as f32 * (1.0 - t) + avg as f32 * t).round() as u8 };
-    let r = mix(primary[0], 0.4);
-    let g = mix(primary[1], 0.4);
-    let b = mix(primary[2], 0.4);
-    let light = |c: u8| ((c as f32 * 1.15).min(255.0)) as u8;
-    [light(r), light(g), light(b), 255]
+    let lift = |c: u8| -> u8 {
+        let float = c as f32;
+        (float + (255.0 - float) * 0.35).clamp(0.0, 255.0) as u8
+    };
+    [lift(primary[0]), lift(primary[1]), lift(primary[2]), 255]
 }
 
 /// Draws the shared pill text layout used by every notification: title,
@@ -2482,12 +2509,12 @@ fn round_rect_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> 
 /// Soft multi-color glow around the pill's boundary. The DIB is inflated by
 /// `AURA_MARGIN_LOGICAL` (scaled by DPI × shape) on every side so the halo
 /// can extend outside the pill into the desktop background.
-const AURA_MARGIN_LOGICAL: f32 = 14.0;
+const AURA_MARGIN_LOGICAL: f32 = 15.0;
 /// Peak opacity of the outer aura ring, at the pill boundary.
-const AURA_PEAK_ALPHA: u32 = 180;
+const AURA_PEAK_ALPHA: f32 = 511.0;
 /// Exponential decay constant: the aura's outer edge sits at
 /// exp(-AURA_DECAY) of the peak opacity.
-const AURA_DECAY: f32 = 4.0;
+const AURA_DECAY: f32 = 3.0;
 
 #[allow(clippy::too_many_arguments)]
 fn draw_aura(
@@ -2504,6 +2531,7 @@ fn draw_aura(
     let c1 = palette.primary;
     let c2 = palette.secondary;
     let margin = (AURA_MARGIN_LOGICAL * scale).round().max(1.0) as usize;
+
     for y in 0..buf_h {
         for x in 0..buf_w {
             let d = round_rect_signed_dist(
@@ -2513,24 +2541,24 @@ fn draw_aura(
                 pill_h as f32,
                 radius,
             );
-            // Only the outer band (d > 0, d ≤ margin) is visible.
+
+            // Render only outside the pill boundary
             if d <= 0.0 || d > margin as f32 {
                 continue;
             }
-            // Horizontal gradient: C(x) = C1 * (1 - x/W) + C2 * (x/W),
-            // where W is the pill width for a consistent colour blend.
+
+            // Horizontal color transition from primary (left) to secondary (right)
             let t = ((x as f32 - inset as f32) / pill_w as f32).clamp(0.0, 1.0);
             let rgb = [
                 (c1[0] as f32 * (1.0 - t) + c2[0] as f32 * t).round() as u8,
                 (c1[1] as f32 * (1.0 - t) + c2[1] as f32 * t).round() as u8,
                 (c1[2] as f32 * (1.0 - t) + c2[2] as f32 * t).round() as u8,
             ];
-            // Left-heavy asymmetry: full brightness on the left (where the
-            // album art sits), reduced on the right — matching the reference
-            // mockup's concentrated left-side glow.
-            let asymmetry = 1.0 - t * 0.7;
-            // Exponential falloff from the boundary outward.
-            let alpha = (AURA_PEAK_ALPHA as f32 * asymmetry * (-d / margin as f32 * AURA_DECAY).exp()).round() as u32;
+
+            // Exponential falloff curve: alpha(d) = A_peak * e^(-decay * d / margin)
+            let falloff = (-d / margin as f32 * AURA_DECAY).exp();
+            let alpha = (AURA_PEAK_ALPHA * falloff).round().min(255.0) as u32;
+
             composite(pixels, buf_w, x, y, rgb, alpha);
         }
     }

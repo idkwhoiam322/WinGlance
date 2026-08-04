@@ -102,15 +102,15 @@ impl Default for BehaviorConfig {
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
-            background_color: [0x00, 0x00, 0x00, 0xFF],
+            background_color: [0x12, 0x14, 0x1C, 0xEB],
             text_color: [0xFF, 0xFF, 0xFF, 0xFF],
             // Single hardcoded pink accent, used across the pill, the sidebar
             // highlights and the window title bar. Deliberately not derived
             // from the Windows theme: arbitrary accent colors clash with the
             // pill's white text.
-            accent_color: [0xE0, 0x6C, 0x9F, 0xFF],
-            corner_radius: 18.0,
-            padding: 12.0,
+            accent_color: [240, 110, 155, 255],
+            corner_radius: 26.0,
+            padding: 15.0,
             art_size: 48,
             font_size_title: 16.0,
             font_size_artist: 13.0,
