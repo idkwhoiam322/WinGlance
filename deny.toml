@@ -26,21 +26,14 @@ allow = [
 #     windows 0.58.
 #   - dirs -> dirs-sys pulls windows-sys 0.48, a separate line from the
 #     windows 0.58 targets.
-#   - hashbrown 0.15 (fontdue's glyph cache) vs 0.17 (indexmap, via
-#     toml -> toml_edit): independent leaf families; only the fontdue copy is
-#     skipped so the newer one stays fully checked.
 [bans]
 skip-tree = [
     { name = "iana-time-zone" },
     { name = "dirs-sys" },
-    { name = "hashbrown", version = "0.15.5" },
 ]
 
-# RUSTSEC-2026-0192: ttf-parser (fontdue's font parser) is unmaintained.
-# Accepted: fontdue is the recommended dependency-light glyph rasterizer for
-# the pill; the parser only reads the local Segoe UI font file at startup —
-# no remote or untrusted input. Revisit if a maintained parser with the same
-# coverage-based rasterization API becomes available.
+# No advisories are currently ignored; the ttf-parser/fontdue RUSTSEC-2026-0192
+# ignore was dropped when those crates left the dependency tree.
 [advisories]
-ignore = ["RUSTSEC-2026-0192"]
+ignore = []
 
