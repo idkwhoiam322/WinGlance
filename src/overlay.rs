@@ -224,6 +224,10 @@ struct OverlayState {
     track_cache: HashMap<String, TrackInfo>,
     /// Scratch DC + DIB for GDI text rendering (cached across frames).
     text_scratch: Option<TextScratch>,
+    /// Physical-pixel inset from the buffer edge to the pill body, computed
+    /// each frame from `AURA_MARGIN_LOGICAL * dpi * shape`. The pill is
+    /// drawn at `(aura_inset, aura_inset)` so the aura fills the outer ring.
+    aura_inset: i32,
 }
 
 /// Resolved placement for the notch pill, pulled from [overlay] config. `x`/`y`
@@ -313,6 +317,7 @@ impl OverlayState {
             current_source: None,
             track_cache: HashMap::new(),
             text_scratch: None,
+            aura_inset: 0,
         }
     }
 
@@ -711,6 +716,7 @@ impl OverlayState {
         let (logical_width, logical_height) = self.size_of(&content);
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
+        self.aura_inset = (AURA_MARGIN_LOGICAL * dpi * shape).round() as i32;
         let Some(position) = self.position(width, height) else {
             self.content = Some(content);
             return;
@@ -781,12 +787,16 @@ impl OverlayState {
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let margin = (self.position.margin as f32 * scale).round() as i32;
         let span_w = work.right - work.left;
+        // The DIB is inflated by `aura_inset` on each side, but the PILL
+        // (not the window) must be centered. Subtract the inset so the pill
+        // lands where the user expects it.
+        let inset = self.aura_inset;
         let x = if let Some(px) = self.position.x {
             (px as f32 * scale).round() as i32
         } else {
             match self.position.horizontal {
                 HorizontalPosition::Left => work.left + margin,
-                HorizontalPosition::Center => work.left + (span_w - width) / 2,
+                HorizontalPosition::Center => work.left + (span_w - width) / 2 - inset,
                 HorizontalPosition::Right => work.right - width - margin,
             }
         };
@@ -1062,14 +1072,17 @@ fn render_layered(
     alpha: u8,
     position: POINT,
 ) -> Result<()> {
+    let inset = state.aura_inset;
+    let buf_w = (width + inset * 2).max(1);
+    let buf_h = (height + inset * 2).max(1);
     // Draw straight into the cached DIB: no per-frame pixel Vec allocation and
     // no copy. The DIB is zeroed first so the transparent corners of the
     // rounded pill do not accumulate stale pixels from the previous frame.
     let bitmap_info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height,
+            biWidth: buf_w,
+            biHeight: -buf_h,
             biPlanes: 1,
             biBitCount: 32,
             biCompression: 0,
@@ -1077,16 +1090,16 @@ fn render_layered(
         },
         ..Default::default()
     };
-    let (hdc, _bitmap, bits) = dib_for(state, &bitmap_info, width, height)?;
-    let pixel_count = width as usize * height as usize * 4;
+    let (hdc, _bitmap, bits) = dib_for(state, &bitmap_info, buf_w, buf_h)?;
+    let pixel_count = buf_w as usize * buf_h as usize * 4;
     unsafe {
         std::ptr::write_bytes(bits.cast::<u8>(), 0, pixel_count);
     }
     let pixels = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), pixel_count) };
-    draw_pixels(state, pixels, content, width as usize, height as usize, scale, art_base)?;
-    draw_text_pixels(state, pixels, content, width, scale);
+    draw_pixels(state, pixels, content, buf_w as usize, buf_h as usize, scale, art_base)?;
+    draw_text_pixels(state, pixels, content, buf_w, scale);
 
-    let size = SIZE { cx: width, cy: height };
+    let size = SIZE { cx: buf_w, cy: buf_h };
     let source = POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION {
         BlendOp: 0,
@@ -1114,8 +1127,8 @@ fn render_layered(
             HWND_TOPMOST,
             position.x,
             position.y,
-            width,
-            height,
+            buf_w,
+            buf_h,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
     }
@@ -1184,9 +1197,20 @@ fn draw_pixels(
         MediaEvent::PlaybackStateChanged(_, source_app) => state.track_cache.get(source_app).and_then(|t| t.palette),
         MediaEvent::SessionRejected { .. } => None,
     };
-    for y in 0..height {
-        for x in 0..width {
-            let coverage = round_rect_coverage(x as f32, y as f32, width as f32, height as f32, radius);
+    let inset = state.aura_inset as usize;
+    let pill_w = width.saturating_sub(inset * 2);
+    let pill_h = height.saturating_sub(inset * 2);
+    // Pill body: filled rounded rect inset from the DIB edges, leaving the
+    // outer ring transparent for the aura glow.
+    for y in inset..inset.saturating_add(pill_h) {
+        for x in inset..inset.saturating_add(pill_w) {
+            let coverage = round_rect_coverage(
+                (x - inset) as f32,
+                (y - inset) as f32,
+                pill_w as f32,
+                pill_h as f32,
+                radius,
+            );
             if coverage > 0.0 {
                 let alpha = (background[3] as f32 * coverage) as u32;
                 composite(
@@ -1200,16 +1224,17 @@ fn draw_pixels(
             }
         }
     }
+    // Aura: painted in the full buffer, fading outside the pill boundary.
     if let Some(palette) = palette {
-        draw_aura(pixels, width, height, palette, radius, scale);
+        draw_aura(pixels, width, height, palette, inset, pill_w, pill_h, radius, scale);
     }
 
     match content {
         MediaEvent::TrackChanged(track) => {
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
-            let art_x = padding;
-            let art_y = height.saturating_sub(art_size) / 2;
+            let art_x = inset + padding;
+            let art_y = inset + pill_h.saturating_sub(art_size) / 2;
             state.ensure_art(track, art_base);
             // Album art halo: subtle accent glow behind the art square.
             if let Some(c) = palette.map(|p| p.primary) {
@@ -1263,9 +1288,9 @@ fn draw_pixels(
             }
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
-            let art_size = art_size.min(height.saturating_sub(2 * padding));
-            let art_x = padding;
-            let art_y = height.saturating_sub(art_size) / 2;
+            let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
+            let art_x = inset + padding;
+            let art_y = inset + pill_h.saturating_sub(art_size) / 2;
             // Album art halo: subtle accent glow behind the art square.
             if let Some(c) = palette.map(|p| p.primary) {
                 let halo_pad = (3.0 * scale).round() as usize;
@@ -1647,14 +1672,15 @@ fn draw_pill_text_rows(
     track: &TrackInfo,
     playback: Option<PlaybackState>,
 ) {
+    let inset = state.aura_inset;
     let appearance = &state.config.appearance;
     // Accent color: the artwork's primary palette color when available (gives
     // the pill per-track theming), falling back to the configured accent.
     let accent = track.palette.map(|p| p.primary).unwrap_or(appearance.accent_color);
     let padding = (appearance.padding * scale) as i32;
     let art = (appearance.art_size as f32 * scale) as i32;
-    let left = padding + art + (12.0 * scale) as i32;
-    let right = width - padding;
+    let left = inset + padding + art + (12.0 * scale) as i32;
+    let right = width - inset - padding;
 
     // Font-driven row heights: bands are sized from the actual fonts, so
     // rows can never overlap at any pill size (including mid-animation)
@@ -1680,7 +1706,7 @@ fn draw_pill_text_rows(
         !meta.is_empty(),
         !track.source_app.trim().is_empty(),
     ];
-    let text_top = appearance.padding * scale;
+    let text_top = inset as f32 + appearance.padding * scale;
     let mut y = text_top;
     let mut next_band = |i: usize| -> RECT {
         let band_h = if active[i] { rows[i].0 } else { 0.0 };
@@ -1805,14 +1831,15 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 // TrackChanged): fall back to the source name with an
                 // "Unknown" artist row.
                 let appearance = &state.config.appearance;
+                let inset = state.aura_inset;
                 let padding = (appearance.padding * scale) as i32;
                 let art = (appearance.art_size as f32 * scale) as i32;
-                let left = padding + art + (12.0 * scale) as i32;
-                let right = width - padding;
+                let left = inset + padding + art + (12.0 * scale) as i32;
+                let right = width - inset - padding;
                 let fs_title = appearance.font_size_title * scale;
                 let fs_artist = appearance.font_size_artist * scale;
                 let label_w = (80.0 * scale) as i32;
-                let mut y = appearance.padding * scale;
+                let mut y = inset as f32 + appearance.padding * scale;
                 let mut next_band = |h: f32| -> RECT {
                     let r = RECT {
                         left,
@@ -2452,38 +2479,55 @@ fn round_rect_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> 
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Soft multi-color glow along the pill's boundary. The window is exactly
-/// pill-sized, so an outside halo would be clipped: the glow is painted over
-/// the card's edge as a band `AURA_MARGIN_BASE` deep, blending the palette
-/// primary into the secondary across the card width and fading exponentially
-/// toward the center at `AURA_PEAK_ALPHA` peak opacity. Skipped entirely
-/// (no work at all) when the content carries no palette.
-const AURA_MARGIN_BASE: f32 = 16.0;
-const AURA_PEAK_ALPHA: u32 = 40;
-/// Exponential decay constant: the band's outer edge sits at exp(-AURA_DECAY)
-/// of the peak opacity.
-const AURA_DECAY: f32 = 4.0;
+/// Soft multi-color glow around the pill's boundary. The DIB is inflated by
+/// `AURA_MARGIN_LOGICAL` (scaled by DPI × shape) on every side so the halo
+/// can extend outside the pill into the desktop background.
+const AURA_MARGIN_LOGICAL: f32 = 22.0;
+/// Peak opacity of the outer aura ring, at the pill boundary.
+const AURA_PEAK_ALPHA: u32 = 110;
+/// Exponential decay constant: the aura's outer edge sits at
+/// exp(-AURA_DECAY) of the peak opacity.
+const AURA_DECAY: f32 = 2.5;
 
-fn draw_aura(pixels: &mut [u8], width: usize, height: usize, palette: Palette, radius: f32, scale: f32) {
-    let margin = (AURA_MARGIN_BASE * scale).round().max(1.0);
+#[allow(clippy::too_many_arguments)]
+fn draw_aura(
+    pixels: &mut [u8],
+    buf_w: usize,
+    buf_h: usize,
+    palette: Palette,
+    inset: usize,
+    pill_w: usize,
+    pill_h: usize,
+    radius: f32,
+    scale: f32,
+) {
     let c1 = palette.primary;
     let c2 = palette.secondary;
-    for y in 0..height {
-        for x in 0..width {
-            let d = round_rect_signed_dist(x as f32, y as f32, width as f32, height as f32, radius);
-            if d > 0.0 || d < -margin {
+    let margin = (AURA_MARGIN_LOGICAL * scale).round().max(1.0) as usize;
+    for y in 0..buf_h {
+        for x in 0..buf_w {
+            let d = round_rect_signed_dist(
+                (x as f32) - inset as f32,
+                (y as f32) - inset as f32,
+                pill_w as f32,
+                pill_h as f32,
+                radius,
+            );
+            // Only the outer band (d > 0, d ≤ margin) is visible.
+            if d <= 0.0 || d > margin as f32 {
                 continue;
             }
-            // Horizontal gradient: C(x) = C1 * (1 - x/W) + C2 * (x/W).
-            let t = x as f32 / width as f32;
+            // Horizontal gradient: C(x) = C1 * (1 - x/W) + C2 * (x/W),
+            // where W is the pill width for a consistent colour blend.
+            let t = (x as f32 - inset as f32) / pill_w as f32;
             let rgb = [
                 (c1[0] as f32 * (1.0 - t) + c2[0] as f32 * t).round() as u8,
                 (c1[1] as f32 * (1.0 - t) + c2[1] as f32 * t).round() as u8,
                 (c1[2] as f32 * (1.0 - t) + c2[2] as f32 * t).round() as u8,
             ];
-            // Exponential falloff from the boundary inward.
-            let alpha = (AURA_PEAK_ALPHA as f32 * (d / margin * AURA_DECAY).exp()).round() as u32;
-            composite(pixels, width, x, y, rgb, alpha);
+            // Exponential falloff from the boundary outward.
+            let alpha = (AURA_PEAK_ALPHA as f32 * (-d / margin as f32 * AURA_DECAY).exp()).round() as u32;
+            composite(pixels, buf_w, x, y, rgb, alpha);
         }
     }
 }
@@ -2843,19 +2887,29 @@ mod tests {
     }
 
     #[test]
-    fn aura_fades_from_the_boundary_toward_the_center() {
-        let mut pixels = vec![0u8; 32 * 32 * 4];
+    fn aura_glow_appears_outside_the_pill() {
+        // Buffer larger than the pill so the outer ring has room for the glow.
+        let buf = 50;
+        let mut pixels = vec![0u8; buf * buf * 4];
         let palette = Palette {
             primary: [255, 0, 0, 255],
             secondary: [0, 0, 255, 255],
         };
-        draw_aura(&mut pixels, 32, 32, palette, 8.0, 1.0);
-        let alpha_at = |x: usize, y: usize| pixels[(y * 32 + x) * 4 + 3];
-        let edge = alpha_at(2, 16);
-        let center = alpha_at(16, 16);
-        assert!(edge > 0, "the boundary band must show the aura");
-        assert!(edge > center, "the glow must fade toward the center");
-        assert!(alpha_at(30, 30) == 0, "outside the card there is nothing");
+        let inset = 12usize;
+        let pill_w = buf - inset * 2;
+        let pill_h = buf - inset * 2;
+        draw_aura(&mut pixels, buf, buf, palette, inset, pill_w, pill_h, 8.0, 1.0);
+        let alpha_at = |x: usize, y: usize| pixels[(y * buf + x) * 4 + 3];
+        // Just outside the pill boundary (d ≈ 1): visible.
+        let near = alpha_at(inset + pill_w + 1, inset + pill_h / 2);
+        assert!(near > 0, "outer glow must be visible just outside the pill");
+        // Farther out (d ≈ 10): still visible but weaker.
+        let far = alpha_at(inset + pill_w + 10, inset + pill_h / 2);
+        assert!(far > 0, "glow must extend well beyond the pill edge");
+        assert!(near > far, "glow must fade with distance from the pill");
+        // Inside the pill: no aura (covered by body fill).
+        let inside = alpha_at(inset + 2, inset + pill_h / 2);
+        assert_eq!(inside, 0, "inside the pill there must be no aura");
     }
 
     #[test]
