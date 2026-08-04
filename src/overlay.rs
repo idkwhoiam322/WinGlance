@@ -758,8 +758,19 @@ impl OverlayState {
 
     /// Shows a short-lived preview of the overlay at its current position, used by
     /// the tray "Show sample" command to preview placement without real media.
+    /// Uses the track-change pill with sample data so the preview exercises the
+    /// exact render path real notifications use (an empty-source state pill would
+    /// fall through to the fallback branch and look unlike any real pill).
     fn show_sample(&mut self) {
-        self.content = Some(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, String::new()));
+        let track = TrackInfo {
+            title: "Sample Track".into(),
+            artist: "Sample Artist".into(),
+            album: "Sample Album".into(),
+            source_app: "Example Player".into(),
+            duration_secs: Some(3 * 60 + 45),
+            ..Default::default()
+        };
+        self.content = Some(MediaEvent::TrackChanged(track));
         self.reset_scroll();
         let now = Instant::now();
         self.dismiss_at = Some(now + sample_duration(&self.config));
