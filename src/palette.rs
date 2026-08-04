@@ -33,6 +33,7 @@ const MONOCHROME_MIN_LUMINANCE: f32 = 0.18;
 const MIN_HUE_DISTANCE: f32 = 30.0;
 /// 4 bits per channel: 4096 histogram buckets.
 const CHANNEL_BITS: u32 = 4;
+const BUCKET_COUNT: usize = 1 << (CHANNEL_BITS * 3);
 
 #[derive(Default, Clone, Copy)]
 struct Bucket {
@@ -52,8 +53,7 @@ struct Bucket {
 /// `ensure_art`.
 pub(crate) fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
     let shift = 8 - CHANNEL_BITS;
-    let bucket_count = 1usize << (CHANNEL_BITS * 3);
-    let mut buckets = vec![Bucket::default(); bucket_count];
+    let mut buckets = [Bucket::default(); BUCKET_COUNT];
     for px in rgba.chunks_exact(4) {
         let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
         if a < 32 {
@@ -78,9 +78,8 @@ pub(crate) fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
     // target-based scoring, not a global population sort.
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let max_count = candidates[0].0 as f32;
-    // Let the allocator reclaim the histogram slab; shrink_to_fit trims the
-    // candidates heap so the allocator gets clean pages back.
-    drop(buckets);
+    // The histogram is stack-allocated; trim the candidates heap so the
+    // allocator gets clean pages back during candidate selection.
     candidates.shrink_to_fit();
 
     // AndroidX-style Vibrant target selection: hard-filter by L/S bounds,
