@@ -19,7 +19,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `vertical`     | `"top"` | `top` \| `bottom` | Which monitor edge the pill anchors to |
 | `horizontal`   | `"center"` | `left` \| `center` \| `right` | Horizontal anchor within the work area |
 | `margin`       | `8`     | 0–500   | Distance from the chosen edge (logical px)        |
-| `max_width`    | `240`   | 180–800 | Maximum pill width in logical pixels              |
+| `max_width`    | `340`   | 180–800 | Maximum pill width in logical pixels              |
 | `position_x`   | *(unset)* | integer | Absolute X override (96-DPI logical px); set by *Adjust position…* |
 | `position_y`   | *(unset)* | integer | Absolute Y override (96-DPI logical px); set by *Adjust position…* |
 
@@ -39,17 +39,32 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 
 | Key                | Default       | Range    | Effect                                  |
 |--------------------|---------------|----------|-----------------------------------------|
-| `background_color` | `[0, 0, 0, 255]` | RGBA 0–255 | Pill background (opaque by default; lower alpha for translucency) |
+| `background_color` | `[18, 20, 28, 235]` | RGBA 0–255 | Glassy dark-slate pill background (alpha 235; lower for more translucency) |
 | `text_color`       | `[255, 255, 255, 255]` | RGBA 0–255 | Title and state-label color |
-| `accent_color`     | `[0, 212, 170, 255]` | RGBA 0–255 | Placeholder circle when no artwork |
-| `corner_radius`    | `16.0`     | 4–48    | Corner rounding in logical pixels       |
-| `padding`          | `8.0`      | 4–32    | Gap between pill edge and content       |
-| `art_size`         | `32`       | 24–96   | Album-art square size (pill height is derived from this) |
-| `font_size_title`  | `12.0`     | 8–32    | Track title font size                   |
-| `font_size_artist` | `10.0`     | 8–28    | Artist (or source app) font size        |
+| `accent_color`     | `[240, 110, 155, 255]` | RGBA 0–255 | Playback symbols, music note, album-art rim; aura fallback when the artwork palette has no vibrant color |
+| `corner_radius`    | `26.0`     | 4–48    | Corner rounding in logical pixels       |
+| `padding`          | `15.0`      | 4–32    | Gap between pill edge and content       |
+| `art_size`         | `48`       | 24–96   | Album-art square size (pill height is derived from this) |
+| `font_size_title`  | `16.0`     | 8–32    | Track title font size                   |
+| `font_size_artist` | `13.0`     | 8–28    | Artist (or source app) font size        |
 
 Colors are `[R, G, B, A]` with 0–255 components. The alpha channel is used
 for compositing; a value below 255 makes the pill slightly translucent.
+
+## Per-track theming (not configurable)
+
+Beyond these knobs the pill derives its look from the playing track:
+
+- **Palette** — two vibrant colors extracted from the album art (on first
+  decode, in the UI thread). The primary recolors the playback symbols, the
+  clock icon and the music note; a muted variant tints the artist and
+  source-app rows. When the artwork yields no qualifying color, the accent
+  above is used.
+- **Aura** — a soft C₁→C₂ glow around the pill boundary, brighter on the left
+  where the art sits. Intensity is hardcoded, not in the config.
+- **App icon** — the source app's icon (from its AUMID) renders next to the
+  source-app name.
+- **Album-art rim** — a thin accent stroke around the art square.
 
 ## Logging
 
@@ -74,7 +89,8 @@ The tray menu mirrors the `[behavior]` toggles in real time:
 
 ## Compact notch defaults
 
-The shipped defaults produce a slim pill: 240 px wide, height derived from
-`art_size` (32 px) plus padding — about 52 px tall — anchored 8 px below the
-top of the work area, near-black background, small 32 px artwork, and compact
-two-line title/artist text. All of these can be widened or recolored here.
+The shipped defaults produce a slim pill: up to 340 px wide, height derived
+from `art_size` (48 px) plus padding — about 110 px tall — anchored 8 px from
+the top of the work area, glassy dark-slate background with a pink aura, 48 px
+artwork with a palette-tinted glow and rim, and compact title/artist text with
+per-track accent colors. All of these can be widened or recolored here.

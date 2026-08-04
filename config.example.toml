@@ -28,13 +28,16 @@ close_to_tray = true
 # allowed_sources = ["spotify"]
 
 [appearance]
-# Opaque pill background (alpha 255). Lower the alpha for translucency.
-background_color = [0, 0, 0, 255]
+# Translucent dark-slate pill background (alpha 235). Lower the alpha for more
+# translucency so the desktop shows through the glassy surface.
+background_color = [18, 20, 28, 235]
 text_color = [255, 255, 255, 255]
-# Accent color used across the pill, sidebar highlights and the title bar.
-accent_color = [224, 108, 159, 255]
-corner_radius = 18.0
-padding = 12.0
+# Accent color used across the pill: playback symbols, the music note, the
+# album-art rim, and the aura fallback when the artwork yields no vibrant
+# palette color.
+accent_color = [240, 110, 155, 255]
+corner_radius = 26.0
+padding = 15.0
 art_size = 48
 font_size_title = 16.0
 font_size_artist = 13.0

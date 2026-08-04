@@ -31,6 +31,8 @@ WinGlance/
     ├── logging.rs          Single-file logger (log-Live.log, current run)
     ├── smtc.rs             Isolated SMTC listener on its own COM thread
     ├── overlay.rs          Win32 layered pill; GDI rendering, position math
+    ├── icon.rs             Source-app icon extraction (shell COM, worker thread)
+    ├── palette.rs          Vibrant-color quantizer for the accent/aura
     ├── main_window.rs      Maximized tracking window + tray icon/menu
     ├── autostart.rs        HKCU Run-key start-on-login sync
     └── positioner.rs       Draggable sample window for custom placement
@@ -46,12 +48,21 @@ WinGlance/
   `MediaEvent::TrackChanged(TrackInfo)` / `MediaEvent::PlaybackStateChanged`,
   plus `WM_APP` ids (`MEDIA_EVENT_MSG` to both windows, `TOGGLE_MSG` to the
   overlay).
-- **smtc.rs** — owns the WinRT `SystemMediaTransportControls` handle. Resolves
-  the session, subscribes to `PlaybackInfoChanged`/`MediaPropertiesChanged`,
-  loads artwork bytes, deduplicates, and sends events down the channel.
-- **overlay.rs** — passive pill: `UpdateLayeredWindow`, DPI-aware position, and
-  the expand/light/collapse state machine. `set_position`/`show_sample` are the
-  only entry points other windows reach into.
+- **smtc.rs** — owns the WinRT `SystemMediaTransportControls` manager on its
+  own COM thread. Subscribes to every session's `PlaybackInfoChanged` /
+  `MediaPropertiesChanged`, reads metadata and artwork bytes, extracts app
+  icons, deduplicates (content diff, session-recreation, artwork-change
+  time-gate, per-source churn cool-down), and sends events down the channel.
+- **overlay.rs** — passive pill: `UpdateLayeredWindow`, DPI-aware position,
+  the expand/light/collapse state machine, the palette aura, vector playback
+  glyphs (play/pause/stop/music note), marquee rows, and hover-dismiss.
+  `set_position`/`show_sample` are the only entry points other windows reach
+  into.
+- **icon.rs** — resolves a source app's icon from its AUMID through the shell
+  (`SHCreateItemFromParsingName` + `IShellItemImageFactory`), run on the SMTC
+  worker with a per-source cache and RAII COM lifetime.
+- **palette.rs** — the two-color quantizer (4-bit histogram, saturation/
+  luminance guard, ≥ 30° hue separation) that feeds the accents and the aura.
 - **main_window.rs** — the tracking window (current activity + history) and the
   full tray menu: Open, Toggle notifications, Start with Windows, Close to tray,
   Position submenu, and Quit.
@@ -82,7 +93,7 @@ checks, `-NoThrottle` uses all CPU cores.
 ## Self-contained distribution
 
 The release build produces a single `target\release\notch.exe` (profile:
-`codegen-units = 1`, `lto = "thin"`, `strip = "symbols"`). It has no data
+`codegen-units = 1`, `lto = "fat"`, `strip = "symbols"`). It has no data
 dependencies: config and logs are created at first run under
 `%APPDATA%\notch\notch\data\`, and every icon/resource is drawn with system GDI
 calls. Launching from the Start menu (or at logon) surfaces only the tray icon and
@@ -94,7 +105,7 @@ the always-visible pill — no window, no console, no dialogs.
 |---------------|--------------------------------------------------|
 | Config        | `%APPDATA%\notch\notch\data\config.toml`         |
 | Logs          | `%APPDATA%\notch\notch\data\logs\log-Live.log`  |
-| Artwork cache | none (decoded in memory per event)               |
+| Artwork cache | In memory only: one decoded buffer per unique cover (overlay), plus per-source track/icon caches evicted when a session closes |
 
 ## Testing notes
 

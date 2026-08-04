@@ -56,9 +56,12 @@ SystemMediaTransportControls            create_window x2 (pill + main)
 - The event forwarder is a thin thread that drains the `mpsc` receiver into a
   `Mutex<VecDeque>` and pokes the UI thread with `PostMessageW`. It exists so
   the UI thread stays responsive even if several SMTC callbacks fire at once.
-- The UI thread only touches Win32 windows, the queue, and GDI surfaces. All
-  long work (artwork resize, decode) happens on the SMTC worker before the
-  event is sent.
+- The UI thread owns all Win32 windows, the queue, and GDI surfaces. SMTC
+  reads (metadata + artwork bytes) and app-icon extraction (COM shell calls)
+  run on the worker; image *decoding* happens on the UI thread in
+  `ensure_art`, once per unique cover, cached for the animation frames.
+  The palette is derived from that same decoded buffer (~0.1 ms), so no
+  separate full-resolution decode is ever needed.
 
 ## SMTC session selection
 
@@ -83,6 +86,14 @@ A fresh read is merged into the stored `LogicalState` and diffed against it:
 - Artwork presence is diffed separately: a late-arriving cover re-emits the
   track (the pill refreshes in place), a disappearing one is stored silently —
   absence is already shown as a placeholder.
+- A same-media identity (`TrackInfo::same_media`: source + title + artist +
+  artwork identity) drives the overlay's update-vs-new-pill decision: the same
+  song with a genuinely different cover queues a fresh pill; missing art on
+  either side is tolerated so a late thumbnail updates in place.
+- A cover whose *bytes* differ from the last emit forces a re-emit only after
+  `ARTWORK_CHANGE_MIN_INTERVAL` (3 s) — SMTC re-reads the thumbnail within a
+  second and can return different bytes for the same cover, which would
+  otherwise duplicate every pill.
 - Events for one session arriving within the debounce window are coalesced:
   the key is marked dirty and read exactly once per window.
 
@@ -115,13 +126,16 @@ shows the last track.
 
 ## Rendering pipeline
 
-Each frame is rendered into an in-memory RGBA buffer:
+Each frame is rendered into an in-memory premultiplied-BGRA buffer:
 
-1. `draw_pixels` fills a rounded-rect background, draws the album art (or an
-   accent-colored placeholder circle), and returns premultiplied BGRA pixels.
-2. The buffer is copied into a `CreateDIBSection` backing store.
-3. `draw_text` paints title/artist (or a state label) with GDI `DrawTextW`.
-4. `UpdateLayeredWindow` with `ULW_ALPHA` composites the window; the window
+1. `draw_pixels` resolves the artwork and decodes it once per unique cover
+   (`ensure_art`, keyed by the artwork bytes), then draws — in order — the
+   palette aura ring in the DIB margin, the glassy rounded-rect body, the
+   album art with its accent glow and rim, and the vector playback glyph.
+2. `draw_text_pixels` paints the title/artist/meta/source-app rows with GDI
+   `DrawTextW` into a scratch DIB and composites them alpha-correctly; rows
+   marquee-scroll only while their text overflows the visible band.
+3. `UpdateLayeredWindow` with `ULW_ALPHA` composites the window; the window
    uses per-monitor DPI-aware scaling via `GetDpiForWindow`.
 
 The window is created with `WS_EX_LAYERED | WS_EX_TRANSPARENT |
@@ -130,7 +144,22 @@ WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`, returns `HTTRANSPARENT` from
 be clicked through to, activated, or tabbed to.
 
 Animation is a simple three-phase ease-out: expanding (grow + fade in), light
-(short fade for playback-state changes), collapsing (shrink + fade out).
+(short fade for playback-state changes), collapsing (shrink + fade out),
+driven by a high-resolution timer matched to the monitor's refresh rate. The
+pill repaints only while animating or marquee-scrolling; a static pill does no
+per-frame drawing. Hovering the cursor over the pill, or queueing a newer
+notification, caps the remaining display time at 500 ms.
+
+## Palette and aura
+
+Two vibrant colors are extracted from the album art (a 4-bit-per-channel
+histogram over the decoded display buffer, guarded by saturation ≥ 0.25 and
+luminance 0.20–0.85, secondary ≥ 30° away in hue). The primary recolors the
+playback symbols, the clock icon and the music note; a muted pastel variant
+tints the artist and source-app rows. The aura is a soft C₁→C₂ glow drawn in
+the DIB margin around the pill, brighter on the album-art side, with peak
+opacity ~94% of the accent — the window is inflated by the aura margin so the
+glow extends into the desktop rather than being clipped.
 
 ## Placement and resolution
 
