@@ -804,8 +804,11 @@ impl OverlayState {
             (py as f32 * scale).round() as i32
         } else {
             match self.position.vertical {
-                VerticalPosition::Top => work.top + margin,
-                VerticalPosition::Bottom => work.bottom - height - margin,
+                // The DIB extends `inset` beyond the pill on each side; shift
+                // the window so the PILL body (not the aura) sits at the
+                // configured margin from the work-area edge.
+                VerticalPosition::Top => work.top + margin + inset,
+                VerticalPosition::Bottom => work.bottom - height - margin - inset,
             }
         };
         // Clamp to the current work area so absolute overrides stay usable after a
@@ -913,19 +916,22 @@ impl OverlayState {
 
     /// Shows a short-lived preview of the overlay at its current position, used by
     /// the tray "Show sample" command to preview placement without real media.
-    /// Uses the track-change pill with sample data so the preview exercises the
-    /// exact render path real notifications use (an empty-source state pill would
-    /// fall through to the fallback branch and look unlike any real pill).
+    /// Reuses the last shown pill when one exists, so the preview shows real
+    /// content (and its palette/aura) instead of synthetic data; on a fresh
+    /// start it falls back to a track-change pill with sample data.
     fn show_sample(&mut self) {
-        let track = TrackInfo {
-            title: "Sample Track".into(),
-            artist: "Sample Artist".into(),
-            album: "Sample Album".into(),
-            source_app: "Example Player".into(),
-            duration_secs: Some(3 * 60 + 45),
-            ..Default::default()
-        };
-        self.content = Some(MediaEvent::TrackChanged(track));
+        let content = self.content.clone().unwrap_or_else(|| {
+            let track = TrackInfo {
+                title: "Sample Track".into(),
+                artist: "Sample Artist".into(),
+                album: "Sample Album".into(),
+                source_app: "Example Player".into(),
+                duration_secs: Some(3 * 60 + 45),
+                ..Default::default()
+            };
+            MediaEvent::TrackChanged(track)
+        });
+        self.content = Some(content);
         self.reset_scroll();
         let now = Instant::now();
         self.dismiss_at = Some(now + sample_duration(&self.config));
@@ -1225,9 +1231,23 @@ fn draw_pixels(
         }
     }
     // Aura: painted in the full buffer, fading outside the pill boundary.
-    if let Some(palette) = palette {
-        draw_aura(pixels, width, height, palette, inset, pill_w, pill_h, radius, scale);
-    }
+    // Uses the track's palette colors when available; otherwise falls back to
+    // the config accent so even palette-less pills (e.g. the sample) glow.
+    let aura_palette = palette.unwrap_or(Palette {
+        primary: state.config.appearance.accent_color,
+        secondary: state.config.appearance.accent_color,
+    });
+    draw_aura(
+        pixels,
+        width,
+        height,
+        aura_palette,
+        inset,
+        pill_w,
+        pill_h,
+        radius,
+        scale,
+    );
 
     match content {
         MediaEvent::TrackChanged(track) => {
@@ -2944,12 +2964,12 @@ mod tests {
         let pill_h = buf - inset * 2;
         draw_aura(&mut pixels, buf, buf, palette, inset, pill_w, pill_h, 8.0, 1.0);
         let alpha_at = |x: usize, y: usize| pixels[(y * buf + x) * 4 + 3];
-        // Just outside the pill boundary (d ≈ 1): visible.
+        // Just outside the pill boundary (d ≈ 1.5): visible.
         let near = alpha_at(inset + pill_w + 1, inset + pill_h / 2);
         assert!(near > 0, "outer glow must be visible just outside the pill");
-        // Farther out (d ≈ 10): still visible but weaker.
-        let far = alpha_at(inset + pill_w + 10, inset + pill_h / 2);
-        assert!(far > 0, "glow must extend well beyond the pill edge");
+        // Farther out (d ≈ 5.5, within the 10px margin): still visible but weaker.
+        let far = alpha_at(inset + pill_w + 5, inset + pill_h / 2);
+        assert!(far > 0, "glow must extend beyond the pill edge");
         assert!(near > far, "glow must fade with distance from the pill");
         // Inside the pill: no aura (covered by body fill).
         let inside = alpha_at(inset + 2, inset + pill_h / 2);
