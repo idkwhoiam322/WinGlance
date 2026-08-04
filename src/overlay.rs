@@ -1620,6 +1620,60 @@ fn draw_symbol_pixels(
                 color,
             );
         }
+        PlaybackState::NowPlaying => {
+            // Eighth note (♪):
+            // 1. Note head at bottom-left
+            // 2. Stem rising along the right edge of the note head
+            // 3. Flag extending right & down from the top of the stem
+            let head_d = 0.38 * size;
+            let stem_w = (0.09 * size).round().max(1.0);
+
+            // Note head at bottom-left
+            let head_x = box_left as f32 + 0.18 * size;
+            let head_y = y as f32 + 0.52 * size;
+
+            draw_rounded_rect_filled(
+                pixels,
+                width,
+                head_x.round() as i32,
+                head_y.round() as i32,
+                head_d.round() as i32,
+                head_d.round() as i32,
+                head_d / 2.0,
+                color,
+            );
+
+            // Stem attached to the right edge of the note head
+            let stem_x = head_x + head_d - stem_w;
+            let stem_top = y as f32 + 0.08 * size;
+            let stem_h = (head_y + head_d * 0.5) - stem_top;
+
+            draw_rounded_rect_filled(
+                pixels,
+                width,
+                stem_x.round() as i32,
+                stem_top.round() as i32,
+                stem_w.round() as i32,
+                stem_h.round() as i32,
+                stem_w / 2.0,
+                color,
+            );
+
+            // Flag extending right from the top of the stem
+            let flag_w = 0.28 * size;
+            let flag_h = 0.22 * size;
+
+            draw_rounded_rect_filled(
+                pixels,
+                width,
+                stem_x.round() as i32,
+                stem_top.round() as i32,
+                flag_w.round() as i32,
+                flag_h.round() as i32,
+                stem_w / 2.0,
+                color,
+            );
+        }
     }
 }
 
@@ -1967,7 +2021,7 @@ fn draw_pill_text_rows(
 fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &MediaEvent, width: i32, scale: f32) {
     match content {
         MediaEvent::TrackChanged(track) => {
-            draw_pill_text_rows(state, pixels, width, scale, track, None);
+            draw_pill_text_rows(state, pixels, width, scale, track, Some(PlaybackState::NowPlaying));
         }
         MediaEvent::PlaybackStateChanged(playback, source_app) => {
             // Cached track: render the shared layout with the state symbol

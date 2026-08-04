@@ -119,6 +119,9 @@ pub enum PlaybackState {
     Playing,
     Paused,
     Stopped,
+    /// Overlay-only "a new track is now playing" state, used to draw the
+    /// music-note symbol on track-change pills. Never produced by SMTC.
+    NowPlaying,
 }
 
 #[derive(Debug, Clone)]

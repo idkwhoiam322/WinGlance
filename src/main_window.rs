@@ -1046,6 +1046,7 @@ impl MainWindowState {
                 PlaybackState::Playing => "Playing",
                 PlaybackState::Paused => "Paused",
                 PlaybackState::Stopped => "Stopped",
+                PlaybackState::NowPlaying => "Playing",
             };
             let state_color = if current.state == PlaybackState::Playing {
                 accent_color
@@ -1828,6 +1829,7 @@ impl MainWindowState {
                 PlaybackState::Playing => "▶",
                 PlaybackState::Paused => "‖",
                 PlaybackState::Stopped => "■",
+                PlaybackState::NowPlaying => "♪",
             };
             let artist = if entry.track.artist.trim().is_empty() {
                 ""
@@ -1998,6 +2000,7 @@ fn history_row(track: &TrackInfo, at: DateTime<Local>, state: PlaybackState) -> 
         PlaybackState::Playing => "▶",
         PlaybackState::Paused => "‖",
         PlaybackState::Stopped => "■",
+        PlaybackState::NowPlaying => "♪",
     };
     let mut row = format!("{}  {}  {} — {}", at.format("%H:%M:%S"), status, track.title, artist);
     if !track.album.trim().is_empty() {
@@ -2062,6 +2065,7 @@ fn entry_detail(entry: &HistoryEntry) -> String {
                 PlaybackState::Playing => "Playing",
                 PlaybackState::Paused => "Paused",
                 PlaybackState::Stopped => "Stopped",
+                PlaybackState::NowPlaying => "Playing",
             }
         ),
         entry.track.title.clone(),
