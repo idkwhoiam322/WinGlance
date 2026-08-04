@@ -209,7 +209,14 @@ struct OverlayState {
     /// Cached decoded artwork for the current track (RGBA8 at the full art
     /// size), so animation frames never re-decode the JPEG/PNG.
     decoded_art: Option<Vec<u8>>,
-    decoded_art_key: Option<(String, String)>,
+    /// The artwork bytes that produced `decoded_art`, so a cover change for
+    /// the same song (same title+artist, different art) re-decodes instead of
+    /// showing the stale image.
+    decoded_art_source: Option<Arc<[u8]>>,
+    /// Dominant colors derived from `decoded_art` (recomputed only when the
+    /// artwork re-decodes): the aura gradient and the accent recoloring read
+    /// from here, so they always match the cover that is actually displayed.
+    palette: Option<Palette>,
     /// Cached DIB (DC + bitmap) reused across frames of the same size.
     dib: Option<DibCache>,
     /// Timestamp of the previous animation tick, for time-based marquee
@@ -316,7 +323,8 @@ impl OverlayState {
             tick_period: 16,
             morph: None,
             decoded_art: None,
-            decoded_art_key: None,
+            decoded_art_source: None,
+            palette: None,
             dib: None,
             last_tick: Instant::now(),
             last_reassert: None,
@@ -337,13 +345,23 @@ impl OverlayState {
         }
     }
 
-    /// Decodes (once per track) and caches the artwork bitmap at the full art
-    /// size, so animation frames never re-decode the JPEG/PNG.
-    fn ensure_art(&mut self, track: &TrackInfo, base_size: usize) {
-        let key = (track.title.clone(), track.artist.clone());
-        if self.decoded_art_key.as_ref() != Some(&key) || self.decoded_art.is_none() {
-            self.decoded_art = track.artwork.as_deref().and_then(|a| decode_artwork(a, base_size));
-            self.decoded_art_key = Some(key);
+    /// Decodes (once per artwork) and caches the artwork bitmap at the full
+    /// art size, so animation frames never re-decode the JPEG/PNG. Keyed by
+    /// the artwork bytes themselves: the same song with a different cover
+    /// re-decodes, while unchanged art (session recreation, re-render) is
+    /// served from the cache. The palette is derived from the same decoded
+    /// buffer (~0.1ms, only when a re-decode happens), so no separate
+    /// full-resolution decode is ever needed for color extraction.
+    fn ensure_art(&mut self, artwork: Option<&Arc<[u8]>>, base_size: usize) {
+        let same_art = match (&self.decoded_art_source, artwork) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref(),
+            (None, None) => true,
+            _ => false,
+        };
+        if self.decoded_art.is_none() || !same_art {
+            self.decoded_art = artwork.and_then(|a| decode_artwork(a, base_size));
+            self.decoded_art_source = artwork.cloned();
+            self.palette = self.decoded_art.as_deref().and_then(crate::palette::palette_from_rgba);
         }
     }
 
@@ -1239,13 +1257,22 @@ fn draw_pixels(
 ) -> Result<()> {
     let radius = state.config.appearance.corner_radius * scale;
     let background = state.config.appearance.background_color;
-    // Palette for the boundary aura: track pills carry it directly; state
-    // pills reuse the cached track's palette for the source.
-    let palette = match content {
-        MediaEvent::TrackChanged(track) => track.palette,
-        MediaEvent::PlaybackStateChanged(_, source_app) => state.track_cache.get(source_app).and_then(|t| t.palette),
+    // Resolve the artwork that will be displayed and decode it (once per
+    // unique cover) up front, so the aura palette below is ready and the
+    // cover is never shown stale. Track pills carry the artwork directly;
+    // state pills reuse the cached track's for the source.
+    let artwork: Option<Arc<[u8]>> = match content {
+        MediaEvent::TrackChanged(track) => track.artwork.clone(),
+        MediaEvent::PlaybackStateChanged(_, source_app) => {
+            if source_app.is_empty() {
+                None
+            } else {
+                state.track_cache.get(source_app).and_then(|t| t.artwork.clone())
+            }
+        }
         MediaEvent::SessionRejected { .. } => None,
     };
+    state.ensure_art(artwork.as_ref(), art_base);
     let inset = state.aura_inset as usize;
     let pill_w = width.saturating_sub(inset * 2);
     let pill_h = height.saturating_sub(inset * 2);
@@ -1274,9 +1301,9 @@ fn draw_pixels(
         }
     }
     // Aura: painted in the full buffer, fading outside the pill boundary.
-    // Uses the track's palette colors when available; otherwise falls back to
-    // the config accent so even palette-less pills (e.g. the sample) glow.
-    let aura_palette = palette.unwrap_or(Palette {
+    // Uses the decoded artwork's palette when available; otherwise falls back
+    // to the config accent so even palette-less pills (e.g. the sample) glow.
+    let aura_palette = state.palette.unwrap_or(Palette {
         primary: state.config.appearance.accent_color,
         secondary: state.config.appearance.accent_color,
     });
@@ -1293,7 +1320,7 @@ fn draw_pixels(
     );
 
     match content {
-        MediaEvent::TrackChanged(track) => {
+        MediaEvent::TrackChanged(_) => {
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
             // Must match the mask radius draw_art_scaled uses for the art
@@ -1303,9 +1330,8 @@ fn draw_pixels(
             let art_radius = art_size as f32 * 0.2;
             let art_x = inset + padding;
             let art_y = inset + pill_h.saturating_sub(art_size) / 2;
-            state.ensure_art(track, art_base);
             // Album art halo: subtle accent glow behind the art square.
-            if let Some(c) = palette.map(|p| p.primary) {
+            if let Some(c) = state.palette.map(|p| p.primary) {
                 let halo_pad = (3.0 * scale).round() as usize;
                 let halo_size = art_size + halo_pad * 2;
                 let halo_x = art_x.saturating_sub(halo_pad);
@@ -1344,7 +1370,7 @@ fn draw_pixels(
                 );
             }
             // Glowing rim: thin 1.5px accent stroke around the album art.
-            if let Some(c) = palette.map(|p| p.primary) {
+            if let Some(c) = state.palette.map(|p| p.primary) {
                 let stroke_w = (1.5 * scale).round().max(1.0);
                 for dy in 0..art_size {
                     for dx in 0..art_size {
@@ -1359,16 +1385,11 @@ fn draw_pixels(
                 }
             }
         }
-        MediaEvent::PlaybackStateChanged(_, source_app) => {
+        MediaEvent::PlaybackStateChanged(_, _) => {
             // State pills reuse the cached track's artwork for the source that
             // produced the state change, so a pause/play pill still shows the
             // right cover. Falls back to the accent placeholder when nothing
             // has been cached for this source yet.
-            if !source_app.is_empty()
-                && let Some(track) = state.track_cache.get(source_app).cloned()
-            {
-                state.ensure_art(&track, art_base);
-            }
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
             let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
@@ -1380,7 +1401,7 @@ fn draw_pixels(
             let art_x = inset + padding;
             let art_y = inset + pill_h.saturating_sub(art_size) / 2;
             // Album art halo: subtle accent glow behind the art square.
-            if let Some(c) = palette.map(|p| p.primary) {
+            if let Some(c) = state.palette.map(|p| p.primary) {
                 let halo_pad = (3.0 * scale).round() as usize;
                 let halo_size = art_size + halo_pad * 2;
                 let halo_x = art_x.saturating_sub(halo_pad);
@@ -1419,7 +1440,7 @@ fn draw_pixels(
                 );
             }
             // Glowing rim: thin 1.5px accent stroke around the album art.
-            if let Some(c) = palette.map(|p| p.primary) {
+            if let Some(c) = state.palette.map(|p| p.primary) {
                 let stroke_w = (1.5 * scale).round().max(1.0);
                 for dy in 0..art_size {
                     for dx in 0..art_size {
@@ -1776,9 +1797,14 @@ fn draw_pill_text_rows(
 ) {
     let inset = state.aura_inset;
     let appearance = &state.config.appearance;
-    // Accent color: the artwork's primary palette color when available (gives
-    // the pill per-track theming), falling back to the configured accent.
-    let accent = track.palette.map(|p| p.primary).unwrap_or(appearance.accent_color);
+    // Accent color: the displayed artwork's primary palette color when
+    // available (gives the pill per-track theming), falling back to the
+    // configured accent.
+    let accent = state.palette.map(|p| p.primary).unwrap_or(appearance.accent_color);
+    let muted = state
+        .palette
+        .map(|p| muted_accent(p.primary))
+        .unwrap_or([0x77, 0x77, 0x77, 0xFF]);
     let padding = (appearance.padding * scale) as i32;
     let art = (appearance.art_size as f32 * scale) as i32;
     let left = inset + padding + art + (12.0 * scale) as i32;
@@ -1903,6 +1929,7 @@ fn draw_pill_text_rows(
             track,
             &app_rect,
             rows[3].1 as i32,
+            muted,
             scale,
             Some(&mut state.scroll[3]),
         );
@@ -2516,13 +2543,10 @@ fn draw_source_app_row(
     track: &TrackInfo,
     rect: &RECT,
     font_h: i32,
+    color: [u8; 4],
     scale: f32,
     marquee: Option<&mut LineScroll>,
 ) {
-    let color = track
-        .palette
-        .map(|p| muted_accent(p.primary))
-        .unwrap_or([0x77, 0x77, 0x77, 0xFF]);
     if let Some(icon) = track.app_icon.as_deref() {
         // The source bitmap is always 24x24; the destination size is the
         // 16px base scaled for DPI, clamped so it never overflows the band.

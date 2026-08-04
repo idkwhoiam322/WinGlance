@@ -2735,7 +2735,6 @@ mod tests {
             subtitle: String::new(),
             artwork: None,
             app_icon: None,
-            palette: None,
             source_app: "Spotify".into(),
             duration_secs: None,
             track_number: None,

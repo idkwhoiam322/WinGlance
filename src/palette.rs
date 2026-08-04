@@ -1,5 +1,3 @@
-use std::io::Cursor;
-
 /// Two dominant colors extracted from track artwork at decode time, used to
 /// recolor UI accents (playback symbols, clock icon) and to drive the pill's
 /// boundary aura gradient. Both colors pass the saturation/luminance guard,
@@ -22,12 +20,6 @@ const MIN_LUMINANCE: f32 = 0.20;
 const MAX_LUMINANCE: f32 = 0.85;
 /// Minimum circular distance in HSL hue (degrees) between the two picks.
 const MIN_HUE_DISTANCE: f32 = 30.0;
-/// Artwork side length after downscale: 48×48 ≈ 2.3k samples, far more than
-/// a two-color histogram needs while staying cheap on the worker thread.
-const SAMPLE_SIZE: u32 = 48;
-/// Rejects decompression bombs the same way the overlay's artwork decode
-/// does: a header can claim huge dimensions with a tiny payload.
-const MAX_DIM: u32 = 4096;
 /// 4 bits per channel: 4096 histogram buckets.
 const CHANNEL_BITS: u32 = 4;
 
@@ -39,25 +31,13 @@ struct Bucket {
     sum_b: u64,
 }
 
-/// Decodes artwork bytes (guarded against oversized images) and returns the
-/// two dominant, guard-passing colors. `None` when the artwork cannot be
-/// decoded, is fully transparent, or yields no color that passes the guard.
-/// Runs on the SMTC worker thread only — never during a render tick.
-pub(crate) fn palette_from_artwork(data: &[u8]) -> Option<Palette> {
-    let mut reader = image::ImageReader::new(Cursor::new(data)).with_guessed_format().ok()?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_DIM);
-    limits.max_image_height = Some(MAX_DIM);
-    reader.limits(limits);
-    let image = reader.decode().ok()?.to_rgba8();
-    let image = image::imageops::resize(&image, SAMPLE_SIZE, SAMPLE_SIZE, image::imageops::FilterType::Triangle);
-    palette_from_rgba(&image.into_raw())
-}
-
 /// Quantizes raw RGBA pixels into a two-color palette: 4-bit-per-channel
 /// histogram, candidates ranked by pixel count, filtered by the
 /// saturation/luminance guard, secondary picked for ≥ 30° hue separation.
-fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
+/// The input is the overlay's already-decoded artwork buffer (≤ art_size
+/// square), so no extra image decode is needed — computing the palette here
+/// is ~0.1ms, done once per unique cover in `ensure_art`.
+pub(crate) fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
     let shift = 8 - CHANNEL_BITS;
     let bucket_count = 1usize << (CHANNEL_BITS * 3);
     let mut buckets = vec![Bucket::default(); bucket_count];
@@ -197,7 +177,6 @@ mod tests {
     #[test]
     fn empty_input_returns_none() {
         assert!(palette_from_rgba(&[]).is_none());
-        assert!(palette_from_artwork(b"").is_none());
     }
 
     #[test]
@@ -257,23 +236,5 @@ mod tests {
             !(30.0..=330.0).contains(&hue),
             "primary should be red-ish, got hue {hue}"
         );
-    }
-
-    #[test]
-    fn decodes_encoded_artwork_bytes() {
-        let mut img = image::RgbaImage::new(8, 4);
-        for (x, _, px) in img.enumerate_pixels_mut() {
-            *px = if x < 4 {
-                image::Rgba([220, 50, 50, 255])
-            } else {
-                image::Rgba([50, 50, 220, 255])
-            };
-        }
-        let mut buf = Vec::new();
-        image::DynamicImage::ImageRgba8(img)
-            .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-            .unwrap();
-        let palette = palette_from_artwork(&buf).unwrap();
-        assert_hue_distance_at_least(palette.primary, palette.secondary, MIN_HUE_DISTANCE);
     }
 }
