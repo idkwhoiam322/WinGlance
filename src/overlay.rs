@@ -10,13 +10,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::BOOLEAN;
 use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT,
-    DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, ETO_CLIPPED,
-    ExtTextOutW, FF_DONTCARE, GetMonitorInfoW, GetTextMetricsW, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS,
-    SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT, ValidateRect,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DEVMODEW, DIB_RGB_COLORS,
+    DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
+    ENUM_CURRENT_SETTINGS, ETO_CLIPPED, EnumDisplaySettingsW, ExtTextOutW, FF_DONTCARE, GetMonitorInfoW,
+    GetTextMetricsW, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+    MONITORINFO, MonitorFromWindow, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW,
+    TRANSPARENT, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
@@ -36,10 +38,40 @@ const LIGHT_DURATION: Duration = Duration::from_millis(120);
 
 /// Posted by the high-resolution animation timer to drive pill frames.
 const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
-/// Animation timer period in ms. On a 300Hz display a full frame is ~3.3ms;
-/// 4ms targets that without flooding slower machines (the effective frame
-/// rate self-throttles to the UI thread's render speed).
-const ANIM_TICK_MS: u32 = 4;
+
+/// Samples the monitor's current refresh period in ms, so the animation timer
+/// ticks once per presented frame on any display (60 Hz → 16 ms, 120 Hz → 8 ms,
+/// 144 Hz → 7 ms, 240 Hz → 4 ms). Prefers DWM's live compose rate, which stays
+/// correct on variable-refresh-rate monitors; falls back to the display mode's
+/// nominal frequency; last resort is 16 ms (60 Hz).
+fn refresh_period_ms(hwnd: HWND) -> u32 {
+    let dwm_period = unsafe {
+        let mut timing = std::mem::zeroed::<DWM_TIMING_INFO>();
+        timing.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
+        DwmGetCompositionTimingInfo(hwnd, &mut timing).ok().and_then(|()| {
+            let ratio = timing.rateRefresh;
+            // Refresh rate = numerator / denominator (Hz); 0/0 means DWM
+            // did not report a rate (e.g. composition paused).
+            if ratio.uiNumerator != 0 && ratio.uiDenominator != 0 {
+                Some(1000 * ratio.uiDenominator / ratio.uiNumerator)
+            } else {
+                None
+            }
+        })
+    };
+    if let Some(period) = dwm_period {
+        return period.clamp(1, 100);
+    }
+    let mode_period = unsafe {
+        let mut devmode = std::mem::zeroed::<DEVMODEW>();
+        devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut devmode)
+            .as_bool()
+            .then(|| 1000u32.checked_div(devmode.dmDisplayFrequency as u32))
+            .flatten()
+    };
+    mode_period.unwrap_or(16).clamp(1, 100)
+}
 
 /// Reusable device context + DIB section for the pill's frames. The overlay
 /// redraws every animation tick; recreating the DIB per frame is pure waste.
@@ -133,6 +165,9 @@ struct OverlayState {
     scroll: [LineScroll; 4],
     /// High-resolution timer driving the pill animation.
     anim_timer: HANDLE,
+    /// Animation tick period in ms, matched to the monitor's refresh rate.
+    /// Re-detected on every show; the timer is recreated only when it changes.
+    tick_period: u32,
     /// Cached decoded artwork for the current track (RGBA8 at the full art
     /// size), so animation frames never re-decode the JPEG/PNG.
     decoded_art: Option<Vec<u8>>,
@@ -235,6 +270,7 @@ impl OverlayState {
             position,
             scroll: [LineScroll::default(); 4],
             anim_timer: HANDLE::default(),
+            tick_period: 16,
             decoded_art: None,
             decoded_art_key: None,
             dib: None,
@@ -277,12 +313,29 @@ impl OverlayState {
                 None,
                 Some(animation_timer_proc),
                 Some(self.hwnd.0 as *const c_void),
-                ANIM_TICK_MS,
-                ANIM_TICK_MS,
+                self.tick_period,
+                self.tick_period,
                 WT_EXECUTEDEFAULT,
             );
         }
         self.anim_timer = handle;
+    }
+
+    /// Re-samples the monitor's refresh period and recreates the animation
+    /// timer when it changed (display switched, DPI changed, VRR kicked in).
+    /// The tick cadence only affects how many frames the UI thread gets asked
+    /// to paint; the easing is time-based, so motion is identical either way.
+    fn sync_anim_timer(&mut self) {
+        let period = refresh_period_ms(self.hwnd);
+        if period != self.tick_period {
+            debug!(
+                "animation tick {period}ms = {} Hz (refresh-rate matched)",
+                1000 / period.max(1)
+            );
+            self.tick_period = period;
+            self.delete_anim_timer();
+        }
+        self.ensure_anim_timer();
     }
 
     fn delete_anim_timer(&mut self) {
@@ -483,7 +536,7 @@ impl OverlayState {
         } else {
             Phase::Light(now)
         };
-        self.ensure_anim_timer();
+        self.sync_anim_timer();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
@@ -782,7 +835,7 @@ impl OverlayState {
         let now = Instant::now();
         self.dismiss_at = Some(now + sample_duration(&self.config));
         self.phase = Phase::Light(now);
-        self.ensure_anim_timer();
+        self.sync_anim_timer();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
