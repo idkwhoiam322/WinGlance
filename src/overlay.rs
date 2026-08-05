@@ -1553,7 +1553,7 @@ fn draw_pixels(
             let art_y = inset + pill_h.saturating_sub(art_size) / 2;
             // Album art halo: subtle accent glow behind the art square.
             if let Some(c) = state.palette.map(|p| p.primary) {
-                let halo_pad = (3.0 * scale).round() as usize;
+                let halo_pad = (1.5 * scale).round() as usize;
                 let halo_size = art_size + halo_pad * 2;
                 let halo_x = art_x.saturating_sub(halo_pad);
                 let halo_y = art_y.saturating_sub(halo_pad);
@@ -1623,7 +1623,7 @@ fn draw_pixels(
             let art_y = inset + pill_h.saturating_sub(art_size) / 2;
             // Album art halo: subtle accent glow behind the art square.
             if let Some(c) = state.palette.map(|p| p.primary) {
-                let halo_pad = (3.0 * scale).round() as usize;
+                let halo_pad = (1.5 * scale).round() as usize;
                 let halo_size = art_size + halo_pad * 2;
                 let halo_x = art_x.saturating_sub(halo_pad);
                 let halo_y = art_y.saturating_sub(halo_pad);
