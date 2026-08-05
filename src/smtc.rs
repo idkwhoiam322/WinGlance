@@ -33,9 +33,9 @@ struct SessionSubscription {
 
 /// The last known displayed state of one (source, session). Every field is a
 /// field the pill can show; a fresh read is merged into this, diffed against
-/// it, and only the fields that actually changed are emitted. There is no
-/// "current session": every subscribed session is tracked independently, so
-/// simultaneous sources never displace each other.
+/// it, and only the fields that actually changed are emitted. Same-source
+/// sessions are filtered against Windows' current session; different sources
+/// remain independent.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct LogicalState {
     title: String,
@@ -293,6 +293,13 @@ impl ListenerState {
             }
             Signal::MediaProperties(session) | Signal::PlaybackInfo(session) => {
                 let key = session_key(&session);
+                if !self.should_follow_session(&session) {
+                    debug!(
+                        "SMTC session event skipped | reason=not-current-session | key={key} | source={}",
+                        read_source_app(&session)
+                    );
+                    return Ok(());
+                }
                 if !self.subscriptions.contains_key(&key) {
                     // An event for a session we are not tracking (it appeared
                     // between syncs): subscribe now so its state is tracked.
@@ -345,6 +352,13 @@ impl ListenerState {
     ) -> Result<()> {
         let key = session_key(session);
         if !self.session_source_allowed(session) {
+            return Ok(());
+        }
+        if !self.should_follow_session(session) {
+            debug!(
+                "SMTC session read skipped | reason=not-current-session | key={key} | source={}",
+                read_source_app(session)
+            );
             return Ok(());
         }
         let status = session.GetPlaybackInfo()?.PlaybackStatus()?;
@@ -563,18 +577,35 @@ impl ListenerState {
     }
 
     /// Re-syncs the subscription map with the current session list: subscribes
-    /// to every open session from an allowed source, drops subscriptions and
-    /// stored state for sessions that disappeared, and accounts per-source
-    /// session churn for the cool-down.
+    /// to the current session for an allowed source, drops stale subscriptions
+    /// and stored state, and accounts per-source session churn for the cool-down.
     fn sync_subscriptions(&mut self) {
         let Ok(sessions) = self.manager.GetSessions() else {
             debug!("SMTC GetSessions failed; keeping the current subscription map");
             return;
         };
-        let sessions: Vec<_> = sessions.into_iter().collect();
+        let mut sessions: Vec<_> = sessions.into_iter().collect();
+        let current = self.manager.GetCurrentSession().ok();
+        let current_key = current.as_ref().map(session_key);
+        let current_source = current.as_ref().map(read_source_app);
+        if let (Some(key), Some(source)) = (current_key, current_source.as_deref()) {
+            debug!("SMTC current session | key={key} | source={source}");
+        }
+        // Under browser session churn, GetCurrentSession can briefly return a
+        // session that is missing from the GetSessions snapshot. It is still
+        // authoritative, so include it explicitly instead of filtering every
+        // listed session and ending up with no subscribed source.
+        if let Some(current) = current.as_ref()
+            && !sessions
+                .iter()
+                .any(|session| session_key(session) == session_key(current))
+        {
+            sessions.push(current.clone());
+        }
         let before: HashSet<usize> = self.subscriptions.keys().copied().collect();
         for session in &sessions {
             let key = session_key(session);
+            let source = read_source_app(session);
             let allowed = self.session_source_allowed(session);
             debug!(
                 "SMTC session {} | key={key} | source={} | allowed_sources={:?}",
@@ -599,6 +630,10 @@ impl ListenerState {
                 }
                 continue;
             }
+            if !session_matches_current_source(key, &source, current_key, current_source.as_deref()) {
+                debug!("SMTC session ignored | reason=not-current-session | key={key} | source={source}");
+                continue;
+            }
             // A previously-rejected session that became allowed (config edit)
             // should re-report as accepted on its next rejection, if any.
             self.rejected_seen.remove(&key);
@@ -621,12 +656,21 @@ impl ListenerState {
             }
         }
         let alive: HashSet<usize> = sessions.iter().map(session_key).collect();
-        let stale: Vec<usize> = self
+        let mut stale: Vec<usize> = self
             .subscriptions
             .keys()
             .filter(|k| !alive.contains(k))
             .copied()
             .collect();
+        if let (Some(current_key), Some(current_source)) = (current_key, current_source.as_deref()) {
+            for (key, subscription) in &self.subscriptions {
+                if *key != current_key && read_source_app(&subscription.session) == current_source {
+                    stale.push(*key);
+                }
+            }
+        }
+        stale.sort_unstable();
+        stale.dedup();
         for key in stale {
             debug!("SMTC session disappeared | key={key}");
             self.evict(key);
@@ -649,6 +693,22 @@ impl ListenerState {
         self.last_emit_at.retain(|source, _| active.contains(source));
     }
 
+    /// YouTube Music and similar browser clients can leave several sessions
+    /// open for one source. Keep other sources independent, but for the source
+    /// owning Windows' current session only that exact session may emit. If
+    /// Windows cannot answer the current-session query during a transition,
+    /// keep the permissive fallback until the next sync.
+    fn should_follow_session(&self, session: &GlobalSystemMediaTransportControlsSession) -> bool {
+        let Ok(current) = self.manager.GetCurrentSession() else {
+            return true;
+        };
+        let key = session_key(session);
+        let source = read_source_app(session);
+        let current_key = session_key(&current);
+        let current_source = read_source_app(&current);
+        session_matches_current_source(key, &source, Some(current_key), Some(&current_source))
+    }
+
     /// Returns the last emitted artwork bytes for `source_app` if the cached
     /// track matches the given title+artist identity. This only returns art for
     /// the *same track* — never cross-track — so a recreated session reports the
@@ -664,7 +724,7 @@ impl ListenerState {
     /// is exhausted.
     fn retry_artwork(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<()> {
         let key = session_key(session);
-        if !should_poll_artwork(self.states.get(&key)) {
+        if !self.should_follow_session(session) || !should_poll_artwork(self.states.get(&key)) {
             return Ok(());
         }
         let read = match read_track_info(session, true) {
@@ -879,6 +939,21 @@ fn track_label(track: &TrackInfo) -> String {
         track.genre,
         track.source_app,
     )
+}
+
+/// If Windows reports a current session for a source, only that exact session
+/// is authoritative for the source. Other sources remain independent so one
+/// app becoming current does not erase another app's session state.
+fn session_matches_current_source(
+    key: usize,
+    source: &str,
+    current_key: Option<usize>,
+    current_source: Option<&str>,
+) -> bool {
+    match (current_key, current_source) {
+        (Some(current_key), Some(current_source)) if current_source == source => key == current_key,
+        _ => true,
+    }
 }
 
 /// Returns the last emitted artwork bytes for `source_app` if the cached
@@ -1306,6 +1381,26 @@ mod tests {
             normalize_for_match("com.github.th-ch.youtube-music"),
             "comgithubthchyoutubemusic"
         );
+    }
+
+    #[test]
+    fn current_session_filter_rejects_stale_sessions_for_the_same_source() {
+        assert!(session_matches_current_source(10, "spotify", Some(10), Some("spotify")));
+        assert!(!session_matches_current_source(
+            11,
+            "spotify",
+            Some(10),
+            Some("spotify")
+        ));
+        // A different source remains independent.
+        assert!(session_matches_current_source(
+            11,
+            "youtube-music",
+            Some(10),
+            Some("spotify")
+        ));
+        // A transient GetCurrentSession failure uses the permissive fallback.
+        assert!(session_matches_current_source(11, "spotify", None, None));
     }
 
     #[test]
