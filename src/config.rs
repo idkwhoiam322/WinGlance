@@ -7,6 +7,11 @@ pub struct Config {
     pub overlay: OverlayConfig,
     pub behavior: BehaviorConfig,
     pub appearance: AppearanceConfig,
+    /// Anything in config.toml this build does not know about (written by a
+    /// newer version or hand-edited). Captured and re-emitted on save so a
+    /// settings change never silently deletes unknown fields from disk.
+    #[serde(flatten)]
+    pub unknown: toml::Table,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +27,9 @@ pub struct OverlayConfig {
     pub position_x: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position_y: Option<i32>,
+    /// Unknown keys under `[overlay]`, preserved across saves.
+    #[serde(flatten)]
+    pub unknown: toml::Table,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -55,6 +63,9 @@ pub struct BehaviorConfig {
     /// non-cooldown sources are allowed (default). When non-empty, only matching
     /// sources generate pill notifications.
     pub allowed_sources: Vec<String>,
+    /// Unknown keys under `[behavior]`, preserved across saves.
+    #[serde(flatten)]
+    pub unknown: toml::Table,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +79,9 @@ pub struct AppearanceConfig {
     pub art_size: u32,
     pub font_size_title: f32,
     pub font_size_artist: f32,
+    /// Unknown keys under `[appearance]`, preserved across saves.
+    #[serde(flatten)]
+    pub unknown: toml::Table,
 }
 
 impl Default for OverlayConfig {
@@ -81,6 +95,7 @@ impl Default for OverlayConfig {
             max_width: 340,
             position_x: None,
             position_y: None,
+            unknown: toml::Table::new(),
         }
     }
 }
@@ -95,6 +110,7 @@ impl Default for BehaviorConfig {
             start_in_tray: true,
             close_to_tray: true,
             allowed_sources: Vec::new(),
+            unknown: toml::Table::new(),
         }
     }
 }
@@ -114,6 +130,7 @@ impl Default for AppearanceConfig {
             art_size: 48,
             font_size_title: 16.0,
             font_size_artist: 13.0,
+            unknown: toml::Table::new(),
         }
     }
 }
@@ -200,5 +217,51 @@ mod tests {
         assert!(!config.behavior.start_on_login);
         assert!(config.behavior.start_in_tray);
         assert!(config.behavior.close_to_tray);
+    }
+
+    #[test]
+    fn unknown_config_fields_survive_a_save_round_trip() {
+        // Simulates a config.toml written by a newer build or by hand: unknown
+        // keys at every level must survive load → save → reload. In-memory
+        // strings stand in for save()/load(), which touch the real %APPDATA%
+        // config path.
+        let source = r#"
+future_feature = true
+
+[overlay]
+duration_ms = 4000
+nested_overlay = "kept"
+
+[behavior]
+start_in_tray = false
+nested_behavior = 42
+
+[appearance]
+art_size = 64
+nested_appearance = [1, 2, 3]
+"#;
+        let mut config: Config = toml::from_str(source).unwrap();
+        // A real settings change must not delete the unknown fields either.
+        config.overlay.duration_ms = 5000;
+        let saved = toml::to_string_pretty(&config).unwrap();
+        let reloaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            reloaded.unknown.get("future_feature").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            reloaded.overlay.unknown.get("nested_overlay").and_then(|v| v.as_str()),
+            Some("kept")
+        );
+        assert_eq!(
+            reloaded
+                .behavior
+                .unknown
+                .get("nested_behavior")
+                .and_then(|v| v.as_integer()),
+            Some(42)
+        );
+        assert!(reloaded.appearance.unknown.contains_key("nested_appearance"));
+        assert_eq!(reloaded.overlay.duration_ms, 5000);
     }
 }
