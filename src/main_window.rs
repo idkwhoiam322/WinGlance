@@ -497,6 +497,14 @@ impl MainWindowState {
         self.config.read().unwrap()
     }
 
+    /// Mutates the config under a single write-lock scope, then persists it.
+    /// Never call `self.cfg()` (a read lock) from inside `mutate`.
+    fn mutate_config(&mut self, mutate: impl FnOnce(&mut Config)) {
+        let mut cfg = self.config.write().unwrap();
+        mutate(&mut cfg);
+        let _ = cfg.save();
+    }
+
     fn new(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwnd: HWND, instance: HINSTANCE) -> Self {
         Self {
             hwnd: HWND::default(),
@@ -1971,14 +1979,12 @@ impl MainWindowState {
     /// Pins the overlay to a vertical/horizontal anchor: clears any absolute
     /// override, persists the choice, and nudges the live overlay into place.
     fn apply_anchor(&mut self, vertical: VerticalPosition, horizontal: HorizontalPosition) {
-        {
-            let mut cfg = self.config.write().unwrap();
+        self.mutate_config(|cfg| {
             cfg.overlay.vertical = vertical;
             cfg.overlay.horizontal = horizontal;
             cfg.overlay.position_x = None;
             cfg.overlay.position_y = None;
-            let _ = cfg.save();
-        }
+        });
         set_position(self.overlay_hwnd, OverlayPos::from_config(&self.cfg()));
     }
 
@@ -2326,15 +2332,15 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     let _ = PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0));
                 }
                 MENU_AUTOSTART_ID => {
-                    state.config.write().unwrap().behavior.start_on_login = !state.cfg().behavior.start_on_login;
-                    let _ = state.config.write().unwrap().save();
+                    let new_value = !state.cfg().behavior.start_on_login;
+                    state.mutate_config(|cfg| cfg.behavior.start_on_login = new_value);
                     if let Err(error) = autostart::apply(state.cfg().behavior.start_on_login) {
                         error!("start-on-login update failed: {error:#}");
                     }
                 }
                 MENU_CLOSE_TRAY_ID => {
-                    state.config.write().unwrap().behavior.close_to_tray = !state.cfg().behavior.close_to_tray;
-                    let _ = state.config.write().unwrap().save();
+                    let new_value = !state.cfg().behavior.close_to_tray;
+                    state.mutate_config(|cfg| cfg.behavior.close_to_tray = new_value);
                 }
                 MENU_QUIT_ID => {
                     let _ = DestroyWindow(state.hwnd);
@@ -2355,23 +2361,19 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     state.reset_position();
                 }
                 MENU_DURATION_2S => {
-                    state.config.write().unwrap().overlay.duration_ms = 2000;
-                    let _ = state.config.write().unwrap().save();
+                    state.mutate_config(|cfg| cfg.overlay.duration_ms = 2000);
                     set_duration(state.overlay_hwnd, 2000);
                 }
                 MENU_DURATION_3S => {
-                    state.config.write().unwrap().overlay.duration_ms = 3000;
-                    let _ = state.config.write().unwrap().save();
+                    state.mutate_config(|cfg| cfg.overlay.duration_ms = 3000);
                     set_duration(state.overlay_hwnd, 3000);
                 }
                 MENU_DURATION_5S => {
-                    state.config.write().unwrap().overlay.duration_ms = 5000;
-                    let _ = state.config.write().unwrap().save();
+                    state.mutate_config(|cfg| cfg.overlay.duration_ms = 5000);
                     set_duration(state.overlay_hwnd, 5000);
                 }
                 MENU_DURATION_10S => {
-                    state.config.write().unwrap().overlay.duration_ms = 10000;
-                    let _ = state.config.write().unwrap().save();
+                    state.mutate_config(|cfg| cfg.overlay.duration_ms = 10000);
                     set_duration(state.overlay_hwnd, 10000);
                 }
                 _ => {}
@@ -2518,18 +2520,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     state.invalidate();
                                 }
                                 SettingId::StartOnLogin => {
-                                    state.config.write().unwrap().behavior.start_on_login =
-                                        !state.cfg().behavior.start_on_login;
-                                    let _ = state.config.write().unwrap().save();
+                                    let new_value = !state.cfg().behavior.start_on_login;
+                                    state.mutate_config(|cfg| cfg.behavior.start_on_login = new_value);
                                     if let Err(error) = autostart::apply(state.cfg().behavior.start_on_login) {
                                         error!("start-on-login update failed: {error:#}");
                                     }
                                     state.invalidate();
                                 }
                                 SettingId::CloseToTray => {
-                                    state.config.write().unwrap().behavior.close_to_tray =
-                                        !state.cfg().behavior.close_to_tray;
-                                    let _ = state.config.write().unwrap().save();
+                                    let new_value = !state.cfg().behavior.close_to_tray;
+                                    state.mutate_config(|cfg| cfg.behavior.close_to_tray = new_value);
                                     state.invalidate();
                                 }
                                 SettingId::Duration => {
@@ -2538,9 +2538,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     if let Some((i, _)) =
                                         segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right)
                                     {
-                                        state.config.write().unwrap().overlay.duration_ms = values[i];
-                                        let _ = state.config.write().unwrap().save();
-                                        set_duration(state.overlay_hwnd, values[i]);
+                                        let duration = values[i];
+                                        state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
+                                        set_duration(state.overlay_hwnd, duration);
                                         state.invalidate();
                                     }
                                 }
@@ -2668,9 +2668,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 // Custom position posted by the positioner (logical pixels).
-                state.config.write().unwrap().overlay.position_x = Some(wparam.0 as i32);
-                state.config.write().unwrap().overlay.position_y = Some(lparam.0 as i32);
-                let _ = state.config.write().unwrap().save();
+                let x = wparam.0 as i32;
+                let y = lparam.0 as i32;
+                state.mutate_config(|cfg| {
+                    cfg.overlay.position_x = Some(x);
+                    cfg.overlay.position_y = Some(y);
+                });
                 set_position(state.overlay_hwnd, OverlayPos::from_config(&state.cfg()));
             }
             LRESULT(0)
@@ -2685,8 +2688,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 let patterns = unsafe { Box::from_raw(lparam.0 as *mut Vec<String>) };
                 if !state_ptr.is_null() {
                     let state = &mut *state_ptr;
-                    state.config.write().unwrap().behavior.allowed_sources = *patterns;
-                    let _ = state.config.write().unwrap().save();
+                    let patterns = *patterns;
+                    state.mutate_config(|cfg| cfg.behavior.allowed_sources = patterns);
                     state.invalidate();
                 }
             }
