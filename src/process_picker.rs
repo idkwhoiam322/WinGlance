@@ -3,7 +3,7 @@ use log::warn;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, COLORREF, CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BDR_SUNKENOUTER, BF_RECT, BeginPaint, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
     DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect, InvalidateRect,
@@ -99,6 +99,20 @@ fn register_class(instance: HINSTANCE) {
     }
 }
 
+/// RAII guard for the Toolhelp process snapshot handle. The kernel handle
+/// must reach `CloseHandle` on every exit path (enumeration failure, early
+/// return); wrapping it means a future early return cannot reintroduce the
+/// leak.
+struct SnapshotGuard(HANDLE);
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 /// Collects every process's executable name in one Toolhelp snapshot, so the
 /// window scan (which visits hundreds of windows) does not take a snapshot per
 /// window.
@@ -108,9 +122,10 @@ fn process_names() -> HashMap<u32, String> {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return names;
         };
+        let snapshot = SnapshotGuard(snapshot);
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        if Process32FirstW(snapshot, &mut entry).is_ok() {
+        if Process32FirstW(snapshot.0, &mut entry).is_ok() {
             loop {
                 names.insert(
                     entry.th32ProcessID,
@@ -118,7 +133,7 @@ fn process_names() -> HashMap<u32, String> {
                         .trim_end_matches('\0')
                         .to_string(),
                 );
-                if !Process32NextW(snapshot, &mut entry).is_ok() {
+                if !Process32NextW(snapshot.0, &mut entry).is_ok() {
                     break;
                 }
             }
