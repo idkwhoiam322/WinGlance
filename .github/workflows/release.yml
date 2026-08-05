@@ -4,12 +4,6 @@ on:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
-    branches: ["v*"]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag to publish (e.g. v0.1.0)"
-        required: true
 
 permissions:
   contents: write
@@ -17,15 +11,26 @@ permissions:
 
 jobs:
   publish:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Build release exe (manual dispatch)
-        if: github.event_name == 'workflow_dispatch'
-        run: cargo build --release --locked
+      - name: Find release tag at the CI commit
+        id: find
+        shell: pwsh
+        run: |
+          git fetch --tags --force
+          $tag = git tag --points-at "${{ github.event.workflow_run.head_sha }}" |
+            Where-Object { $_ -match '^v\d+\.\d+\.\d+$' } |
+            Select-Object -First 1
+          if ($tag) {
+            Write-Host "Release tag found: $tag"
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
+          } else {
+            Write-Host "No vN.N.N tag at the CI commit; nothing to publish"
+          }
       - name: Download CI artifact
-        if: github.event_name == 'workflow_run'
+        if: steps.find.outputs.tag != ''
         uses: actions/download-artifact@v4
         with:
           name: WinGlance-windows
@@ -33,26 +38,20 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Stage release assets
+        if: steps.find.outputs.tag != ''
         shell: pwsh
         run: |
-          if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
-            New-Item -ItemType Directory -Path staging -Force | Out-Null
-            Copy-Item target\release\WinGlance.exe staging\WinGlance.exe
-          }
-          $fullSha = if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
-            "${{ github.sha }}"
-          } else {
-            "${{ github.event.workflow_run.head_sha }}"
-          }
+          $fullSha = "${{ github.event.workflow_run.head_sha }}"
           $shortSha = $fullSha.Substring(0, [Math]::Min(7, $fullSha.Length))
           $stamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss")
           $assetName = "WinGlance-$stamp-$shortSha.exe"
           Copy-Item staging\WinGlance.exe "staging\$assetName"
           Add-Content -Path $env:GITHUB_ENV -Value "RELEASE_ASSET=$assetName"
       - name: Publish GitHub Release
+        if: steps.find.outputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+          tag_name: ${{ steps.find.outputs.tag }}
           files: |
             staging/${{ env.RELEASE_ASSET }}
             config.example.toml

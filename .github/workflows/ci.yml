@@ -6,6 +6,14 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Release tag to create after a successful build ('none' = plain CI run, 'auto' = next patch, or type a tag like v0.2.0)"
+        required: false
+        default: "none"
+
+permissions:
+  contents: write
 
 jobs:
   check:
@@ -33,3 +41,23 @@ jobs:
       - uses: taiki-e/install-action@cargo-deny
       - name: cargo-deny
         run: cargo deny check
+      - name: Create release tag
+        if: github.event_name == 'workflow_dispatch' && inputs.release != 'none'
+        shell: pwsh
+        run: |
+          if ("${{ inputs.release }}" -eq "auto") {
+            git fetch --tags --force
+            $latest = git tag --sort=-v:refname |
+              Where-Object { $_ -match '^v\d+\.\d+\.\d+$' } |
+              Select-Object -First 1
+            if ($latest) {
+              $m = [regex]::Match($latest, '^v(\d+)\.(\d+)\.(\d+)$')
+              $tag = "v$($m.Groups[1].Value).$($m.Groups[2].Value).$([int]$m.Groups[3].Value + 1)"
+            } else {
+              $tag = "v0.1.0"
+            }
+          } else {
+            $tag = "${{ inputs.release }}"
+          }
+          Write-Host "Creating release tag $tag at $env:GITHUB_SHA"
+          gh api -X POST repos/${{ github.repository }}/git/refs -f ref="refs/tags/$tag" -f sha=$env:GITHUB_SHA
