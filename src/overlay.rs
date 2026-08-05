@@ -212,6 +212,10 @@ struct OverlayState {
     /// Active size morph, set when a metadata refresh changes the pill's
     /// dimensions; `None` while static.
     morph: Option<Morph>,
+    /// Clock source for morph timing. Wall-clock `Instant::now` in production;
+    /// tests inject a controllable clock so size-morph assertions are exact
+    /// instead of racing the scheduler on loaded CI machines.
+    now: Box<dyn Fn() -> Instant>,
     /// Cached decoded artwork for the current track (RGBA8 at the full art
     /// size), so animation frames never re-decode the JPEG/PNG.
     decoded_art: Option<Vec<u8>>,
@@ -362,6 +366,7 @@ impl OverlayState {
             anim_timer: HANDLE::default(),
             tick_period: 16,
             morph: None,
+            now: Box::new(Instant::now),
             decoded_art: None,
             decoded_art_source: None,
             palette: None,
@@ -377,6 +382,16 @@ impl OverlayState {
             last_dpi: 0,
             aura_inset: 0,
         }
+    }
+
+    /// Test-only constructor with an injected clock for the morph timing, so
+    /// morph tests can pin the elapsed time exactly instead of depending on
+    /// how fast the test thread gets scheduled.
+    #[cfg(test)]
+    fn with_clock(clock: Box<dyn Fn() -> Instant>) -> Self {
+        let mut state = Self::new(Config::default(), EventQueue::default());
+        state.now = clock;
+        state
     }
 
     fn reset_scroll(&mut self) {
@@ -691,13 +706,16 @@ impl OverlayState {
         let target = content_size_of(&self.config, &event, self.last_track.as_ref());
         let current = self.content.as_ref().map_or((0.0, 0.0), |c| self.size_of(c));
         if target != current
-            && let Some(morph) = self.morph.filter(|morph| morph.started_at.elapsed() < MORPH_MS)
+            && let Some(morph) = self
+                .morph
+                .filter(|morph| (self.now)().duration_since(morph.started_at) < MORPH_MS)
         {
             // Solve `from` such that from + (target - from) * eased == current:
             // the curve still hits `current` at the already-elapsed progress
             // and continues toward the new `target` without a jump.
-            let eased =
-                ease_out_quint((morph.started_at.elapsed().as_secs_f32() / MORPH_MS.as_secs_f32()).clamp(0.0, 1.0));
+            let eased = ease_out_quint(
+                ((self.now)().duration_since(morph.started_at).as_secs_f32() / MORPH_MS.as_secs_f32()).clamp(0.0, 1.0),
+            );
             let remain = 1.0 - eased;
             if remain > 1e-3 {
                 self.morph = Some(Morph {
@@ -712,13 +730,13 @@ impl OverlayState {
                 // size is identical to finishing it.
                 self.morph = Some(Morph {
                     from: current,
-                    started_at: Instant::now(),
+                    started_at: (self.now)(),
                 });
             }
         } else if target != current {
             self.morph = Some(Morph {
                 from: current,
-                started_at: Instant::now(),
+                started_at: (self.now)(),
             });
         }
         self.content = Some(event);
@@ -857,7 +875,9 @@ impl OverlayState {
         // UpdateLayeredWindow) entirely when nothing changed. The animation
         // phases still repaint every tick.
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
-        let morph_active = self.morph.is_some_and(|morph| morph.started_at.elapsed() < MORPH_MS);
+        let morph_active = self
+            .morph
+            .is_some_and(|morph| (self.now)().duration_since(morph.started_at) < MORPH_MS);
         if animating || marquee_active || morph_active {
             self.render();
         }
@@ -1093,7 +1113,9 @@ impl OverlayState {
         let Some(morph) = self.morph else {
             return target;
         };
-        let t = ease_out_quint((morph.started_at.elapsed().as_secs_f32() / MORPH_MS.as_secs_f32()).clamp(0.0, 1.0));
+        let t = ease_out_quint(
+            ((self.now)().duration_since(morph.started_at).as_secs_f32() / MORPH_MS.as_secs_f32()).clamp(0.0, 1.0),
+        );
         (
             morph.from.0 + (target.0 - morph.from.0) * t,
             morph.from.1 + (target.1 - morph.from.1) * t,
@@ -3267,6 +3289,8 @@ pub(crate) fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     /// This is the test that would have caught the original stride bug: it
     /// constructs a destination buffer *larger* than the packed source (an
@@ -4000,7 +4024,11 @@ mod tests {
 
     #[test]
     fn morph_interpolates_toward_the_target_size() {
-        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        // A frozen injected clock pins the elapsed time exactly, so the
+        // assertions cannot drift with the scheduler on loaded CI machines.
+        let clock = Rc::new(Cell::new(Instant::now()));
+        let state_clock = Rc::clone(&clock);
+        let mut state = OverlayState::with_clock(Box::new(move || state_clock.get()));
         let sparse = TrackInfo {
             title: "Song".into(),
             ..TrackInfo::default()
@@ -4015,7 +4043,7 @@ mod tests {
         let (_, sparse_h) = content_size_of(&state.config, &MediaEvent::TrackChanged(sparse), None);
         let (_, full_h) = content_size_of(&state.config, &MediaEvent::TrackChanged(full.clone()), None);
 
-        let start = Instant::now() - Duration::from_millis(75);
+        let start = clock.get() - Duration::from_millis(30);
         state.content = Some(MediaEvent::TrackChanged(full.clone()));
         state.morph = Some(Morph {
             from: (0.0, sparse_h),
@@ -4030,7 +4058,7 @@ mod tests {
         // After the morph window, the size is exactly the target's.
         state.morph = Some(Morph {
             from: (0.0, sparse_h),
-            started_at: Instant::now() - MORPH_MS,
+            started_at: clock.get() - MORPH_MS,
         });
         let (_, done_h) = state.size_of(&MediaEvent::TrackChanged(full));
         assert!(
@@ -4041,7 +4069,11 @@ mod tests {
 
     #[test]
     fn mid_morph_update_preserves_the_eased_clock() {
-        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        // Frozen injected clock: elapsed times are exact, so the mid-flight
+        // assertions cannot snap under scheduling load.
+        let clock = Rc::new(Cell::new(Instant::now()));
+        let state_clock = Rc::clone(&clock);
+        let mut state = OverlayState::with_clock(Box::new(move || state_clock.get()));
         let sparse = TrackInfo {
             title: "Song".into(),
             ..TrackInfo::default()
@@ -4056,8 +4088,8 @@ mod tests {
         let (_, sparse_h) = content_size_of(&state.config, &MediaEvent::TrackChanged(sparse), None);
         let (_, full_h) = content_size_of(&state.config, &MediaEvent::TrackChanged(full.clone()), None);
         assert!(full_h > sparse_h, "test tracks must differ in height");
-        // Morph sparse → full, started 75ms ago (half the 150ms window).
-        let start = Instant::now() - Duration::from_millis(75);
+        // Morph sparse → full, started 30ms ago (a fifth of the 150ms window).
+        let start = clock.get() - Duration::from_millis(30);
         state.content = Some(MediaEvent::TrackChanged(full.clone()));
         state.morph = Some(Morph {
             from: (0.0, sparse_h),
