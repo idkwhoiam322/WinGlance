@@ -44,6 +44,8 @@ jobs:
       - name: Create release tag
         if: github.event_name == 'workflow_dispatch' && inputs.release != 'none'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if ("${{ inputs.release }}" -eq "auto") {
             git fetch --tags --force
