@@ -1255,21 +1255,12 @@ fn render_layered(
     let buf_w = (width + inset * 2).max(1);
     let buf_h = (height + inset * 2).max(1);
     // Draw straight into the cached DIB: no per-frame pixel Vec allocation and
-    // no copy. The DIB is zeroed first so the transparent corners of the
-    // rounded pill do not accumulate stale pixels from the previous frame.
-    let bitmap_info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: buf_w,
-            biHeight: -buf_h,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: 0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let (hdc, _bitmap, bits) = dib_for(state, &bitmap_info, buf_w, buf_h)?;
+    // no copy. The backing buffer may be larger than the requested frame (see
+    // dib_for); only the requested `buf_w * buf_h * 4` leading bytes are
+    // zeroed so the transparent corners of the rounded pill do not accumulate
+    // stale pixels from the previous frame, and every draw call uses the
+    // requested `buf_w` as the stride.
+    let (hdc, _bitmap, bits) = dib_for(state, buf_w, buf_h)?;
     let pixel_count = buf_w as usize * buf_h as usize * 4;
     unsafe {
         std::ptr::write_bytes(bits.cast::<u8>(), 0, pixel_count);
@@ -1314,17 +1305,40 @@ fn render_layered(
     result.context("UpdateLayeredWindow")
 }
 
+/// Generous upper bound on the DIB backing buffer for the current config:
+/// the pill's logical size never exceeds `max_width` wide and the fitted
+/// height for the largest allowed art/font rows (both from
+/// `content_size_of`), inflated by the aura margin on every side, the ~3%
+/// ease-out-back shape overshoot mid-expand, and rounding. Allocating to
+/// this bound means animation frames reuse the buffer instead of recreating
+/// it every tick; a request that still exceeds it (e.g. config changed
+/// mid-run) just recreates once — the bound is an efficiency knob, never a
+/// correctness constraint.
+fn backing_upper_bound(config: &Config, dpi: u32) -> (i32, i32) {
+    let dpi = dpi.max(96) as f32 / 96.0;
+    let appearance = &config.appearance;
+    let max_w = config.overlay.max_width.max(180) as f32;
+    let max_text_h = 4.0 * appearance.font_size_title.max(appearance.font_size_artist) * ROW_HEIGHT;
+    let max_h =
+        (appearance.art_size as f32 + 2.0 * appearance.padding).max(max_text_h + 2.0 * appearance.padding + 8.0);
+    let scale = dpi * 1.1;
+    (
+        ((max_w + 2.0 * AURA_MARGIN_LOGICAL) * scale).ceil() as i32,
+        ((max_h + 2.0 * AURA_MARGIN_LOGICAL) * scale).ceil() as i32,
+    )
+}
+
 /// Returns the cached DIB for the given size, creating (or replacing) it when
-/// the size changed. The DIB stays alive across frames and is released at
-/// window destruction.
-fn dib_for(
-    state: &mut OverlayState,
-    info: &BITMAPINFO,
-    width: i32,
-    height: i32,
-) -> Result<(HDC, HBITMAP, *mut c_void)> {
+/// the cache is too small. The backing buffer is allocated to the generous
+/// config bound, so during expand/collapse the requested size changes every
+/// frame but the buffer is created once and reused for the rest of the
+/// process's life (per DPI/config). The DIB stays alive across frames and is
+/// released at window destruction. Callers must draw with the *requested*
+/// width as the stride and only touch the requested `width * height * 4`
+/// leading bytes — the backing buffer may be larger.
+fn dib_for(state: &mut OverlayState, width: i32, height: i32) -> Result<(HDC, HBITMAP, *mut c_void)> {
     if let Some(dib) = &state.dib {
-        if dib.width == width && dib.height == height {
+        if dib.width >= width && dib.height >= height {
             return Ok((dib.hdc, dib.bitmap, dib.bits));
         }
         unsafe {
@@ -1334,12 +1348,27 @@ fn dib_for(
         }
         state.dib = None;
     }
+    let (bound_w, bound_h) = backing_upper_bound(&state.config, state.last_dpi);
+    let alloc_w = width.max(bound_w).max(1);
+    let alloc_h = height.max(bound_h).max(1);
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: alloc_w,
+            biHeight: -alloc_h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let hdc = unsafe { CreateCompatibleDC(None) };
     if hdc.0.is_null() {
         anyhow::bail!("CreateCompatibleDC failed");
     }
     let mut bits: *mut c_void = null_mut();
-    let bitmap = unsafe { CreateDIBSection(hdc, info, DIB_RGB_COLORS, &mut bits, None, 0) }?;
+    let bitmap = unsafe { CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &mut bits, None, 0) }?;
     if bits.is_null() {
         unsafe {
             let _ = DeleteDC(hdc);
@@ -1352,8 +1381,8 @@ fn dib_for(
         bitmap,
         old_bitmap,
         bits,
-        width,
-        height,
+        width: alloc_w,
+        height: alloc_h,
     });
     Ok((hdc, bitmap, bits))
 }
