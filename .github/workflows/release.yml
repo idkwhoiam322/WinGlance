@@ -5,6 +5,11 @@ on:
     workflows: ["CI"]
     types: [completed]
     branches: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.1.0)"
+        required: true
 
 permissions:
   contents: write
@@ -12,11 +17,16 @@ permissions:
 
 jobs:
   publish:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - name: Build release exe (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: cargo build --release --locked
+      - name: Download CI artifact
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
         with:
           name: WinGlance-windows
           path: staging
@@ -25,7 +35,15 @@ jobs:
       - name: Stage release assets
         shell: pwsh
         run: |
-          $fullSha = "${{ github.event.workflow_run.head_sha }}"
+          if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+            New-Item -ItemType Directory -Path staging -Force | Out-Null
+            Copy-Item target\release\WinGlance.exe staging\WinGlance.exe
+          }
+          $fullSha = if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+            "${{ github.sha }}"
+          } else {
+            "${{ github.event.workflow_run.head_sha }}"
+          }
           $shortSha = $fullSha.Substring(0, [Math]::Min(7, $fullSha.Length))
           $stamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss")
           $assetName = "WinGlance-$stamp-$shortSha.exe"
@@ -34,7 +52,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.workflow_run.head_branch }}
+          tag_name: ${{ inputs.tag || github.event.workflow_run.head_branch }}
           files: |
             staging/${{ env.RELEASE_ASSET }}
             config.example.toml
