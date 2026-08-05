@@ -13,7 +13,10 @@ const VALUE_NAME: &str = "notch";
 /// removes the entry. A missing value while disabling is not an error.
 pub fn apply(enabled: bool) -> Result<()> {
     let exe = std::env::current_exe().context("getting the executable path")?;
-    let exe = wide(exe.to_string_lossy().as_ref());
+    // Quote the path: Windows splits an unquoted Run-key command line on
+    // spaces when resolving the executable, so an install path containing a
+    // space could fail to launch at logon or resolve to a different program.
+    let exe = wide(&format!("\"{}\"", exe.to_string_lossy()));
     let value = wide(VALUE_NAME);
     let run_key = wide(RUN_KEY);
     unsafe {
