@@ -23,7 +23,7 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked
       - name: Upload release exe
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: WinGlance-windows
           path: target/release/WinGlance.exe
