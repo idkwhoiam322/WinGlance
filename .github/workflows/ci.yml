@@ -22,6 +22,12 @@ jobs:
         run: cargo test --locked
       - name: Build (release)
         run: cargo build --release --locked
+      - name: Upload release exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinGlance-windows
+          path: target/release/WinGlance.exe
+          if-no-files-found: error
       - uses: taiki-e/install-action@cargo-deny
       - name: cargo-deny
         run: cargo deny check
