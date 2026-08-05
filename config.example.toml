@@ -17,9 +17,9 @@ max_width = 340
 enable_track_change = true
 enable_playback_state_change = true
 debounce_ms = 200
-# Launch quietly to the system tray: no window pops up, just the notch + tray icon.
+# Launch quietly to the system tray: no window pops up, just the WinGlance + tray icon.
 start_in_tray = true
-# Create a startup registry entry so Windows launches notch at logon.
+# Create a startup registry entry so Windows launches WinGlance at logon.
 start_on_login = false
 # Instead of closing the app, hide the window to the tray when its X is pressed.
 close_to_tray = true

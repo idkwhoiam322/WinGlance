@@ -4,7 +4,7 @@ set -e
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-# Match the NewsAggregator workflow: format staged Rust changes automatically.
+# Format staged Rust changes automatically.
 staged_rs=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')
 if [ -n "$staged_rs" ]; then
     if ! cargo fmt --all -- --check >/dev/null 2>&1; then
@@ -14,7 +14,7 @@ if [ -n "$staged_rs" ]; then
     fi
 fi
 
-# Security and dependency policy checks are advisory, matching NewsAggregator.
+# Security and dependency policy checks are advisory.
 if command -v cargo-audit >/dev/null 2>&1; then
     if ! cargo audit >/dev/null 2>&1; then
         echo "cargo-audit: issues found (advisory):"

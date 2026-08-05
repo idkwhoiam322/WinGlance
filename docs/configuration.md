@@ -1,12 +1,12 @@
 # Configuration reference
 
-The config file is `%APPDATA%\notch\notch\data\config.toml`. It is created
+The config file is `%APPDATA%\WinGlance\WinGlance\data\config.toml`. It is created
 automatically with the defaults below on first run. `Config::normalize()`
 clamps every value to the safe ranges listed; out-of-range values are
 corrected silently but the file is not rewritten (see `docs/architecture.md`).
 
 > **Known limitation:** a hand-edited `config.toml` is only read at startup.
-> There is no live reload while the app is running — restart Notch after
+> There is no live reload while the app is running — restart WinGlance after
 > editing the file by hand. Settings changed from the tray menu or the
 > Settings pane are applied immediately and persisted.
 
@@ -31,7 +31,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `enable_playback_state_change`  | `true`  | bool   | Show a small state pill on play/pause   |
 | `debounce_ms`                   | `200`   | 150–250 | Coalescing window for bursty SMTC events |
 | `start_in_tray`                 | `true`  | bool   | Start silently: no window, only the tray icon + pill |
-| `start_on_login`                | `false` | bool   | Register a Windows startup entry to launch notch at logon |
+| `start_on_login`                | `false` | bool   | Register a Windows startup entry to launch WinGlance at logon |
 | `close_to_tray`                 | `true`  | bool   | Hide (instead of close) the window when its X is pressed |
 | `allowed_sources`               | `[]`    | list   | Source apps (case-insensitive substrings) to allow; empty = all apps |
 
@@ -79,20 +79,20 @@ history is retained.
 
 ## [main window] and the system tray
 
-Notch keeps a maximized tracking window alongside the notch pill. The window shows
+WinGlance keeps a maximized tracking window alongside the WinGlance pill. The window shows
 the current activity (art, state, title/artist/album) and the per-session history;
-it is opened from the tray icon (double-click, or the **Open Notch** menu item).
+it is opened from the tray icon (double-click, or the **Open WinGlance** menu item).
 It is never shown as a pop-up on launch.
 
 The tray menu mirrors the `[behavior]` toggles in real time:
 
-- **Open Notch** — restore the tracking window.
+- **Open WinGlance** — restore the tracking window.
 - **Toggle notifications** — enable/disable SMTC track-change + state-change events.
 - **Start with Windows** — write/remove the `%APPDATA%\...\Run` registry entry.
 - **Close window to tray** — on-off (mirrors `close_to_tray`).
 - **Quit** — stop the process and remove the tray icon.
 
-## Compact notch defaults
+## Compact WinGlance defaults
 
 The shipped defaults produce a slim pill: up to 340 px wide, height derived
 from `art_size` (48 px) plus padding — about 110 px tall — anchored 8 px from

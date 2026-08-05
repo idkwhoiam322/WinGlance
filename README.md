@@ -1,7 +1,7 @@
-# Notch
+# WinGlance
 
 A passive, always-on-top media overlay for Windows 10/11. When the track or
-playback state changes, Notch shows a small glassy pill with the album art,
+playback state changes, WinGlance shows a small glassy pill with the album art,
 a palette-tinted glow, and the app that's playing — without ever stealing
 focus or intercepting clicks. Built for gaming and fullscreen use: it never
 interrupts and never needs interaction.
@@ -34,14 +34,14 @@ interrupts and never needs interaction.
 
 ## Getting started
 
-Download `notch.exe` from the latest [release](../../releases), run it, and
+Download `WinGlance.exe` from the latest [release](../../releases), run it, and
 it sits in the tray. It starts silently (no window); the pill appears when
 media plays. Double-click the tray icon for the tracking window with a
 per-source history.
 
 ### Tray menu
 
-- **Open Notch** — the tracking window (current activity + history list)
+- **Open WinGlance** — the tracking window (current activity + history list)
 - **Toggle notifications** — enable/disable pills
 - **Start with Windows** — launch at logon
 - **Close window to tray** — hide instead of quit when the window is closed
@@ -52,14 +52,14 @@ per-source history.
 
 ## Configuration
 
-Config lives at `%APPDATA%\notch\notch\data\config.toml` (created on first
+Config lives at `%APPDATA%\WinGlance\WinGlance\data\config.toml` (created on first
 run; see [`config.example.toml`](config.example.toml)). It controls pill
 duration/animation, edge anchor and margin, which source apps notify, and the
 appearance: background, accent color, corner radius, padding, art size and
 fonts. Hand-edits apply after a restart; tray-menu changes apply immediately.
 See [`docs/configuration.md`](docs/configuration.md) for the full reference.
 
-Logs: `%APPDATA%\notch\notch\data\logs\log-Live.log` (current run, truncated
+Logs: `%APPDATA%\WinGlance\WinGlance\data\logs\log-Live.log` (current run, truncated
 at startup) — useful for answering "why did/didn't a notification fire".
 
 ## Building from source
@@ -70,7 +70,7 @@ Requires the stable MSVC Rust toolchain (or use the CI/release builds):
 .\create_exe.ps1 -Release -Start
 ```
 
-The script format-checks, lints, tests, builds an optimized `notch.exe`,
+The script format-checks, lints, tests, builds an optimized `WinGlance.exe`,
 runs `cargo-audit`/`cargo-deny`, stops any running instance, and relaunches
 it into the tray. Flags: `-NoRestart` (don't relaunch), `-SkipAudit` (fast
 loop), `-NoThrottle` / `-Jobs N` (parallelism). Direct checks:
@@ -98,7 +98,7 @@ rendering pipeline and dedup design.
 ## CI and releases
 
 `ci.yml` runs format/lint/test/release-build/cargo-deny on every push and PR.
-`release.yml` builds a self-contained `notch.exe` on tag pushes (`v*`) and
+`release.yml` builds a self-contained `WinGlance.exe` on tag pushes (`v*`) and
 attaches it (plus the example config) to a GitHub Release.
 
 ## License

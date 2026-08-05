@@ -229,7 +229,7 @@ fn install_panic_hook(logs_dir: &Path) {
 /// exits without touching the existing instance's windows.
 fn is_already_running() -> bool {
     unsafe {
-        let name = wide("NotchSingleInstance");
+        let name = wide("WinGlanceSingleInstance");
         let _ = CreateMutexW(None, true, PCWSTR(name.as_ptr())).ok();
         GetLastError() == ERROR_ALREADY_EXISTS
     }
@@ -244,11 +244,11 @@ fn main() -> Result<()> {
     // Only one instance may run at a time; the mutex lives for the process
     // lifetime and is released automatically when the process exits.
     if is_already_running() {
-        warn!("another instance of Notch is already running; exiting");
+        warn!("another instance of WinGlance is already running; exiting");
         return Ok(());
     }
 
-    info!("starting Notch");
+    info!("starting WinGlance");
 
     if let Err(error) = autostart::apply(config.behavior.start_on_login) {
         warn!("start-on-login sync failed: {error:#}");
@@ -274,7 +274,7 @@ fn main() -> Result<()> {
     // event forwarder only sleep and forward, and the worker's WinRT calls
     // stay well under 1 MB.
     thread::Builder::new()
-        .name("notch-smtc".to_string())
+        .name("WinGlance-smtc".to_string())
         .stack_size(256 * 1024)
         .spawn(move || {
             loop {
@@ -282,7 +282,7 @@ fn main() -> Result<()> {
                 let event_tx_worker = event_tx.clone();
                 let listener_config_worker = listener_config.clone();
                 let worker = thread::Builder::new()
-                    .name("notch-smtc-worker".to_string())
+                    .name("WinGlance-smtc-worker".to_string())
                     .stack_size(1024 * 1024)
                     .spawn(move || {
                         let _ =
@@ -348,7 +348,7 @@ fn spawn_event_forwarder(
     let main_raw = main_hwnd.0 as isize;
     let overlay_raw = overlay_hwnd.0 as isize;
     thread::Builder::new()
-        .name("notch-events".to_string())
+        .name("WinGlance-events".to_string())
         .stack_size(256 * 1024)
         .spawn(move || {
             while let Ok(event) = receiver.recv() {

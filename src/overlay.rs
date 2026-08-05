@@ -282,7 +282,7 @@ impl Drop for OverlayState {
     }
 }
 
-/// Resolved placement for the notch pill, pulled from [overlay] config. `x`/`y`
+/// Resolved placement for the WinGlance pill, pulled from [overlay] config. `x`/`y`
 /// are absolute overrides (96-DPI logical pixels) that take precedence over the
 /// vertical/horizontal anchors when `Some`; the pill snaps back to the anchor when
 /// they are cleared.
@@ -1219,12 +1219,12 @@ pub(crate) fn show_sample(hwnd: HWND) {
     }
 }
 
-/// Creates the passive notch overlay window. It owns no message loop: the caller
+/// Creates the passive WinGlance overlay window. It owns no message loop: the caller
 /// runs the loop and destroys the window at exit.
 pub(crate) fn create_window(config: Config, queue: EventQueue) -> Result<HWND> {
     let module = unsafe { GetModuleHandleW(None) }.context("getting the process module")?;
     let instance: HINSTANCE = module.into();
-    let class_name = wide("NotchOverlayWindow");
+    let class_name = wide("WinGlanceOverlayWindow");
     register_window_class(instance, &class_name)?;
 
     let state = Box::new(OverlayState::new(config, queue));
@@ -1233,7 +1233,7 @@ pub(crate) fn create_window(config: Config, queue: EventQueue) -> Result<HWND> {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             PCWSTR(class_name.as_ptr()),
-            PCWSTR(wide("Notch").as_ptr()),
+            PCWSTR(wide("WinGlance").as_ptr()),
             WS_POPUP,
             0,
             0,

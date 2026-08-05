@@ -1,7 +1,7 @@
 # Competitive research: Windows media overlay apps
 
 Research date: 2026-08. Goal: find similar "now playing" overlays for Windows and
-extract ideas for improving Notch. Sources: GitHub, the ModernFlyouts wiki and its
+extract ideas for improving WinGlance. Sources: GitHub, the ModernFlyouts wiki and its
 GSMTC support matrix.
 
 ## Apps analyzed
@@ -30,7 +30,7 @@ useful artifact. Key takeaways:
 - Browsers (Chrome, Edge, Chromium, Firefox) support thumbnail/title/artist but
   **App Info is marked incomplete** — i.e. even the reference app cannot reliably
   show the source-app icon/name for browsers. This confirms the app-icon gap is a
-  platform limitation of SMTC, not a Notch bug. We already surface the readable
+  platform limitation of SMTC, not a WinGlance bug. We already surface the readable
   source-app name.
 - Timeline info (progress bar) exists only for a handful of apps (Spotify,
   Dopamine, FeelUOwn, Rise, Groove). Most players and all browsers report nothing.
@@ -51,11 +51,11 @@ useful artifact. Key takeaways:
   is why macOS overlays look "complete". Windows SMTC does not expose source-app
   icons directly.
 
-## Improvement roadmap for Notch
+## Improvement roadmap for WinGlance
 
 Prioritized by impact/effort.
 
-**Scope constraint (decision):** Notch stays a passive, state-change-driven
+**Scope constraint (decision):** WinGlance stays a passive, state-change-driven
 notification overlay. No clickable in-pill controls (play/pause/next/stop) and no
 continuous visual updates (progress bar / timeline). The pill appears and changes
 only when the media state changes (track change, play/pause/stop).

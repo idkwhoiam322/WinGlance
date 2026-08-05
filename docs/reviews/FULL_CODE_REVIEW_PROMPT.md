@@ -1,11 +1,11 @@
-# External Review: WinGlance (notch)
+# External Review: WinGlance
 
 Perform a deep technical audit of the provided repository. This is a **Windows-native
 (Win32 + [windows-rs](https://github.com/microsoft/windows-rs)) media overlay called
-**Notch**: an always-on, borderless SMTC (System Media Transport Control) listener that
-shows a compact "notch" pill plus an optional maximized tracking window with per-session
-history, all driven by the tray icon. Ships as a single self-contained `notch.exe`; all
-mutable user data lives under `%APPDATA%\notch\notch\data\config.toml` (+ `logs/`). No
+**WinGlance**: an always-on, borderless SMTC (System Media Transport Control) listener that
+shows a compact WinGlance pill plus an optional maximized tracking window with per-session
+history, all driven by the tray icon. Ships as a single self-contained `WinGlance.exe`; all
+mutable user data lives under `%APPDATA%\WinGlance\WinGlance\data\config.toml` (+ `logs/`). No
 accounts, no keys, no telemetry.
 
 **Before you start:** read `README.md`, `docs/architecture.md`, `docs/development.md`,
@@ -21,7 +21,7 @@ src/
   config.rs            Config load/save/normalize (TOML); Overlay/Behavior/AppearanceConfig
   events.rs            TrackInfo/PlaybackState/MediaEvent + WM_APP message ids
   smtc.rs              Windows.Media.Control SMTC listener; coalesce/debounce
-  overlay.rs           borderless notch pill overlay (layered, click-through)
+  overlay.rs           borderless WinGlance pill overlay (layered, click-through)
   main_window.rs       maximized tracking window, history listbox, tray icon + menu,
                        autostart toggle
   autostart.rs         HKCU Run-key start-on-login sync
@@ -54,20 +54,20 @@ config.example.toml
    overlay and main-window render paths, tray menu / autostart lifecycle.
 
 ## Mandatory rules & constraints (flag violations as High or Critical)
-1. User data under `%APPDATA%\notch\notch\data\` (config.toml, logs, future db/cache) must
+1. User data under `%APPDATA%\WinGlance\WinGlance\data\` (config.toml, logs, future db/cache) must
    NEVER be deleted or overwritten with defaults by the app once it exists. Unknown config
    fields must be preserved on save (or explicitly stated otherwise). `log-Live.log` may be
    truncated at startup (it is).
-2. Single-exe, fully self-contained distribution — everything ships in `notch.exe`; the app
+2. Single-exe, fully self-contained distribution — everything ships in `WinGlance.exe`; the app
    creates its data dir at first run. No bundled data files, no external DLLs, no installed
    runtimes. Launching from the Start menu (or at Windows logon) must produce **no pop-ups**:
-   no console, no dialogs, no UAC, no message boxes — only the tray icon + notch pill.
+   no console, no dialogs, no UAC, no message boxes — only the tray icon + WinGlance pill.
 3. Backward compatibility: `config.toml` is additive only; new `[behavior]` keys
    (`start_in_tray`, `start_on_login`, `close_to_tray`) have safe defaults and must not break
    existing user files.
 4. No accounts, no keys, no telemetry — SMTC metadata comes only from the OS; artwork is
    kept in-memory only.
-5. The notch pill is always visible while the process is alive; the maximized window is
+5. The WinGlance pill is always visible while the process is alive; the maximized window is
    optional UI opened only from the tray.
 6. `unsafe` is confined to small, audited Win32 boundaries with `#[allow(unsafe_op_in_unsafe_fn)]`
    where needed; no unchecked raw-pointer derefs outside those boundaries.

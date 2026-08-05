@@ -120,8 +120,7 @@ enum Pane {
     Settings,
 }
 
-/// Settings rows, mirroring NewsAggregator's settings layout: section headers
-/// with label-left / control-right card rows.
+/// Settings rows: section headers with label-left / control-right card rows.
 #[derive(Clone, Copy, PartialEq)]
 enum SettingId {
     Notifications,
@@ -451,7 +450,7 @@ struct MainWindowState {
 pub fn create_window(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwnd: HWND) -> Result<HWND> {
     let module = unsafe { GetModuleHandleW(None) }.context("getting the process module")?;
     let instance: HINSTANCE = module.into();
-    let class_name = wide("NotchMainWindow");
+    let class_name = wide("WinGlanceMainWindow");
     register_main_class(instance, &class_name)?;
 
     let state = Box::new(MainWindowState::new(config.clone(), queue, overlay_hwnd, instance));
@@ -460,7 +459,7 @@ pub fn create_window(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwn
         CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
             PCWSTR(class_name.as_ptr()),
-            PCWSTR(wide("Notch").as_ptr()),
+            PCWSTR(wide("WinGlance").as_ptr()),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             0,
             0,
@@ -2183,7 +2182,7 @@ fn tray_data(hwnd: HWND) -> Result<NOTIFYICONDATAW> {
         hIcon: icon,
         ..Default::default()
     };
-    let tip = wide("Notch media overlay");
+    let tip = wide("WinGlance media overlay");
     let count = tip.len().min(data.szTip.len());
     data.szTip[..count].copy_from_slice(&tip[..count]);
     Ok(data)
@@ -2207,7 +2206,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
         close_tray_flags |= MF_CHECKED;
     }
     unsafe {
-        let _ = AppendMenuW(menu, open_flags, MENU_OPEN_ID, PCWSTR(wide("Open Notch").as_ptr()));
+        let _ = AppendMenuW(menu, open_flags, MENU_OPEN_ID, PCWSTR(wide("Open WinGlance").as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
             menu,

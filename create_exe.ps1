@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    Builds the standalone notch.exe binary.
+    Builds the standalone WinGlance.exe binary.
 
 .DESCRIPTION
-    Follows NewsAggregator's Cargo workflow: optional throttling, format and
-    all-target checks, a locked Cargo build, advisory dependency checks, and
-    optional restart of an already-running process.
+    Optional throttling, format and all-target checks, a locked Cargo build,
+    advisory dependency checks, and optional restart of an already-running
+    process.
 
 .PARAMETER Clean
     Remove target before building.
@@ -16,15 +16,15 @@
 .PARAMETER Jobs
     Override Cargo's parallel job count.
 .PARAMETER NoRestart
-    Do not restart notch.exe if it was running before the build.
+    Do not restart WinGlance.exe if it was running before the build.
 .PARAMETER Start
-    Launch notch.exe after the build.
+    Launch WinGlance.exe after the build.
 .PARAMETER SkipFormat
     Skip cargo fmt --check.
 .PARAMETER SkipAudit
     Skip cargo-audit and cargo-deny advisory checks.
 .PARAMETER FreshInstall
-    Delete Notch's app data before the build. This is DEV-ONLY and explicit.
+    Delete WinGlance's app data before the build. This is DEV-ONLY and explicit.
 #>
 
 [CmdletBinding()]
@@ -47,7 +47,7 @@ param(
 # explicitly via $LASTEXITCODE instead; cmdlets that must fail hard carry an
 # explicit -ErrorAction Stop.
 $ErrorActionPreference = "Continue"
-$AppName = "notch"
+$AppName = "WinGlance"
 
 function Write-Step($Message) {
     Write-Host ""
@@ -129,7 +129,7 @@ try {
     if ($LASTEXITCODE -ne 0) { Fail "cargo check --all-targets failed (exit code $LASTEXITCODE)" }
 
     $profileFlag = if ($Release) { "--release" } else { "" }
-    Write-Step "Building notch.exe $profileFlag"
+    Write-Step "Building WinGlance.exe $profileFlag"
     cargo build $profileFlag --locked $cargoJobsFlag
     if ($LASTEXITCODE -ne 0) { Fail "cargo build failed (exit code $LASTEXITCODE)" }
 

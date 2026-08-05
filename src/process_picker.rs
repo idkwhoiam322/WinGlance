@@ -30,7 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-const CLASS_NAME: &str = "NotchProcessPicker";
+const CLASS_NAME: &str = "WinGlanceProcessPicker";
 const WIDTH: i32 = 400;
 const HEADER_H: i32 = 30;
 const ROW_HEIGHT: i32 = 22;

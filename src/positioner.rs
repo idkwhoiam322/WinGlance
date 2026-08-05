@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-const CLASS_NAME: &str = "NotchPositioner";
+const CLASS_NAME: &str = "WinGlancePositioner";
 const WIDTH: i32 = 320;
 const HEIGHT: i32 = 60;
 const SNAP_THRESHOLD: i32 = 30;
@@ -42,7 +42,7 @@ struct PositionerState {
     drag_offset: POINT,
 }
 
-/// Opens a floating sample notification that the user can drag to set the notch's
+/// Opens a floating sample notification that the user can drag to set WinGlance's
 /// placement. The window stays open until the user clicks X or presses Escape.
 pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
     unsafe {
@@ -63,7 +63,7 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             PCWSTR(class_name.as_ptr()),
-            PCWSTR(wide("Place the notch").as_ptr()),
+            PCWSTR(wide("Place the WinGlance").as_ptr()),
             WS_POPUP | WS_VISIBLE,
             0,
             0,
@@ -305,7 +305,7 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
                     };
                     let _ = SetBkMode(hdc, TRANSPARENT);
                     let _ = SetTextColor(hdc, COLORREF(0xCCCCCC));
-                    let mut text = wide("Drag to place the notch");
+                    let mut text = wide("Drag to place the WinGlance");
                     let _ = DrawTextW(hdc, &mut text, &mut text_rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
                     // Draw X button (cross lines — always perfectly centered,

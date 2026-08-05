@@ -174,7 +174,7 @@ impl Config {
 
     pub fn data_dir() -> anyhow::Result<PathBuf> {
         let base = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("Could not find the Windows app-data directory"))?;
-        Ok(base.join("notch").join("notch").join("data"))
+        Ok(base.join("WinGlance").join("WinGlance").join("data"))
     }
 
     pub fn logs_dir(&self) -> PathBuf {

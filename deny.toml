@@ -1,4 +1,4 @@
-# cargo-deny policy for the notch build.
+# cargo-deny policy for the WinGlance build.
 #
 # The allowlist covers every license in the locked dependency tree. All are
 # OSI-approved and FSF Free/Libre:

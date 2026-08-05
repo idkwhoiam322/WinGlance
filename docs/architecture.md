@@ -1,7 +1,7 @@
 # Architecture
 
-Notch is a Rust media overlay for Windows. It watches the System Media
-Transport Controls (SMTC) and shows a small, click-through "notch" pill near
+WinGlance is a Rust media overlay for Windows. It watches the System Media
+Transport Controls (SMTC) and shows a small, click-through "WinGlance" pill near
 the top of the screen when the track or the playback state changes.
 
 ## Design principles
@@ -13,7 +13,7 @@ the top of the screen when the track or the playback state changes.
   runs on a dedicated worker thread. The Windows UI runs on the UI thread with a
   classic `GetMessageW` loop. They communicate only through an `mpsc` channel and
   `PostMessageW`.
-- **Two windows, one queue.** There is a borderless "notch" pill overlay window
+- **Two windows, one queue.** There is a borderless "WinGlance" pill overlay window
   and a maximized "tracking" window; both register a `WM_MEDIA_EVENT` handler.
   A single forwarder thread drains the SMTC `mpsc` receiver into a shared
   `Arc<Mutex<VecDeque<MediaEvent>>` and pokes **both** windows with
@@ -181,6 +181,6 @@ calls `reposition()` without a full redraw).
 
 ## Configuration
 
-`Config::load()` reads `%APPDATA%\notch\notch\data\config.toml`, falls back
+`Config::load()` reads `%APPDATA%\WinGlance\WinGlance\data\config.toml`, falls back
 to defaults, clamps every value in `normalize()`, and writes the file only if
 it does not exist yet. See `docs/configuration.md` for the full reference.

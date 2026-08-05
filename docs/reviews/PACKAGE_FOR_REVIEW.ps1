@@ -7,7 +7,7 @@
     meant for an external reviewer agent: source, docs, configs, and workflows only —
     no build artifacts, no git history, no transient data.
 
-    The shipped artifact of this repo is a single, self-contained `notch.exe`; this zip
+    The shipped artifact of this repo is a single, self-contained `WinGlance.exe`; this zip
     is the source for auditing that contract.
 
 .EXAMPLE

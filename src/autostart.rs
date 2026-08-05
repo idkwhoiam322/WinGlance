@@ -6,10 +6,10 @@ use windows::Win32::System::Registry::{
 use windows::core::PCWSTR;
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-const VALUE_NAME: &str = "notch";
+const VALUE_NAME: &str = "WinGlance";
 
 /// Syncs the HKCU Run entry with the configured start-on-login state.
-/// Writing the key lets Windows launch notch.exe at logon; deleting it
+/// Writing the key lets Windows launch WinGlance.exe at logon; deleting it
 /// removes the entry. A missing value while disabling is not an error.
 pub fn apply(enabled: bool) -> Result<()> {
     let exe = std::env::current_exe().context("getting the executable path")?;

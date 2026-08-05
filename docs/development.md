@@ -15,7 +15,7 @@ WinGlance/
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml          fmt / clippy / test / build / cargo-deny on push/PR
-│       └── release.yml     builds the self-contained notch.exe and attaches it
+│       └── release.yml     builds the self-contained WinGlance.exe and attaches it
 │                           to a GitHub Release on tag push
 ├── docs/
 │   ├── architecture.md     Design, threading, SMTC selection, rendering, placement
@@ -85,17 +85,17 @@ cargo deny check
 ```
 
 The default build is `.\create_exe.ps1 -Release -Start`: it formats, checks,
-builds the optimized `notch.exe`, audits, and relaunches it into the tray
+builds the optimized `WinGlance.exe`, audits, and relaunches it into the tray
 (silent — the app runs in the background by default). Useful flags: `-NoRestart`
 leaves the previous instance stopped, `-SkipAudit` skips advisory/dependency
 checks, `-NoThrottle` uses all CPU cores.
 
 ## Self-contained distribution
 
-The release build produces a single `target\release\notch.exe` (profile:
+The release build produces a single `target\release\WinGlance.exe` (profile:
 `codegen-units = 1`, `lto = "fat"`, `strip = "symbols"`). It has no data
 dependencies: config and logs are created at first run under
-`%APPDATA%\notch\notch\data\`, and every icon/resource is drawn with system GDI
+`%APPDATA%\WinGlance\WinGlance\data\`, and every icon/resource is drawn with system GDI
 calls. Launching from the Start menu (or at logon) surfaces only the tray icon and
 the always-visible pill — no window, no console, no dialogs.
 
@@ -103,8 +103,8 @@ the always-visible pill — no window, no console, no dialogs.
 
 | What          | Where                                            |
 |---------------|--------------------------------------------------|
-| Config        | `%APPDATA%\notch\notch\data\config.toml`         |
-| Logs          | `%APPDATA%\notch\notch\data\logs\log-Live.log`  |
+| Config        | `%APPDATA%\WinGlance\WinGlance\data\config.toml`         |
+| Logs          | `%APPDATA%\WinGlance\WinGlance\data\logs\log-Live.log`  |
 | Artwork cache | In memory only: one decoded buffer per unique cover (overlay), plus per-source track/icon caches evicted when a session closes |
 
 ## Testing notes

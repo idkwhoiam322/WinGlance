@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidelines for working in this repository (Notch — a Windows SMTC media
+Guidelines for working in this repository (WinGlance — a Windows SMTC media
 overlay, Rust, raw Win32 + GDI).
 
 ## Build and verify
@@ -13,7 +13,7 @@ script as the default build path:
 .\create_exe.ps1 -Release -Start
 ```
 
-This formats-check, checks all targets, builds the optimized `notch.exe`,
+This formats-check, checks all targets, builds the optimized `WinGlance.exe`,
 runs cargo-audit + cargo-deny, stops any running instance, and relaunches it
 into the tray. Use `-NoRestart` when you do not want it relaunched,
 `-SkipAudit` for a quick loop, `-NoThrottle`/`-Jobs N` to control parallelism.
@@ -36,12 +36,12 @@ verified headless.
 
 ## Runtime data
 
-- Config: `%APPDATA%\notch\notch\data\config.toml` (hand-edits need a restart;
+- Config: `%APPDATA%\WinGlance\WinGlance\data\config.toml` (hand-edits need a restart;
   no live reload).
-- Logs: `%APPDATA%\notch\notch\data\logs\log-Live.log`, truncated at startup,
+- Logs: `%APPDATA%\WinGlance\WinGlance\data\logs\log-Live.log`, truncated at startup,
   at Debug level (session churn, dedup skips and suppressed events are logged
   — use it to answer "why did/didn't a notification fire").
-- Never delete user data under `%APPDATA%\notch\notch\data\` (only the
+- Never delete user data under `%APPDATA%\WinGlance\WinGlance\data\` (only the
   log file may be truncated at startup). The Settings pane has a "Copy logs"
   button that puts the log on the clipboard.
 
@@ -52,7 +52,7 @@ verified headless.
   launches, no GUI/screenshot tooling) — the user may be in a fullscreen
   game. This is a hard rule.
 - Verify through log files only: `log-Live.log` (+ `crash.log`) under
-  `%APPDATA%\notch\notch\data\logs\`, and temporary files under
+  `%APPDATA%\WinGlance\WinGlance\data\logs\`, and temporary files under
   `C:\Users\admin\AppData\Local\Temp\opencode\`. All diagnostic output goes
   to those files, never to the screen.
 - If a visual check is needed, tell the user what to look at and let them
