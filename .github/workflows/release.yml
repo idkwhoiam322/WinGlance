@@ -1,37 +1,41 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
-  workflow_dispatch:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: ["v*"]
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
-  build:
+  publish:
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build release exe
-        run: cargo build --release --locked
-      - name: Stage artifacts
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path staging -Force | Out-Null
-          Copy-Item target\release\WinGlance.exe staging\
-          Copy-Item config.example.toml staging\
-      - uses: actions/upload-artifact@v7
+      - uses: actions/download-artifact@v4
         with:
           name: WinGlance-windows
-          path: staging/
+          path: staging
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Stage release assets
+        shell: pwsh
+        run: |
+          $fullSha = "${{ github.event.workflow_run.head_sha }}"
+          $shortSha = $fullSha.Substring(0, [Math]::Min(7, $fullSha.Length))
+          $stamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss")
+          $assetName = "WinGlance-$stamp-$shortSha.exe"
+          Copy-Item staging\WinGlance.exe "staging\$assetName"
+          Add-Content -Path $env:GITHUB_ENV -Value "RELEASE_ASSET=$assetName"
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.workflow_run.head_branch }}
           files: |
-            staging/WinGlance.exe
-            staging/config.example.toml
+            staging/${{ env.RELEASE_ASSET }}
+            config.example.toml
           generate_release_notes: true
