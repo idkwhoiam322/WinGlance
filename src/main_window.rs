@@ -1950,10 +1950,15 @@ impl MainWindowState {
             let _ = EmptyClipboard();
             let ok = GlobalAlloc(GMEM_MOVEABLE, bytes).is_ok_and(|hmem| {
                 let ptr = GlobalLock(hmem);
-                if !ptr.is_null() {
-                    std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr.cast(), wide.len());
-                    let _ = GlobalUnlock(hmem);
+                if ptr.is_null() {
+                    // Lock failed: the buffer was never written, so it must
+                    // not reach the clipboard (it would hold uninitialized
+                    // bytes and the UI would report "Copied" on garbage).
+                    let _ = GlobalFree(hmem);
+                    return false;
                 }
+                std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr.cast(), wide.len());
+                let _ = GlobalUnlock(hmem);
                 if SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0)).is_ok() {
                     true
                 } else {
