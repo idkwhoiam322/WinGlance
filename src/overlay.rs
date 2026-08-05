@@ -225,6 +225,19 @@ struct OverlayState {
     palette: Option<Palette>,
     /// Cached DIB (DC + bitmap) reused across frames of the same size.
     dib: Option<DibCache>,
+    /// Tightly-packed per-frame scratch buffer (stride == the requested
+    /// frame width), reused and grown but never shrunk across frames. The
+    /// real DIB backing buffer (`dib`) is allocated to a generous upper
+    /// bound and reused across animation frames, so its scanline stride
+    /// does not match the requested per-frame size; `draw_pixels` and
+    /// `draw_text_pixels` render into this buffer instead, at the stride
+    /// they have always assumed, and `render_layered` blits the result into
+    /// the real DIB at its real stride right before the GDI call. See
+    /// `render_layered` for why: drawing straight into the oversized DIB at
+    /// the requested width as its stride was tried once and produced a
+    /// torn image, because the two strides only match when the pill is at
+    /// its fully expanded size.
+    frame_scratch: Vec<u8>,
     /// Timestamp of the previous animation tick, for time-based marquee
     /// scrolling.
     last_tick: Instant,
@@ -353,6 +366,7 @@ impl OverlayState {
             decoded_art_source: None,
             palette: None,
             dib: None,
+            frame_scratch: Vec::new(),
             last_tick: Instant::now(),
             last_reassert: None,
             current_source: None,
@@ -1254,20 +1268,56 @@ fn render_layered(
     let inset = state.aura_inset;
     let buf_w = (width + inset * 2).max(1);
     let buf_h = (height + inset * 2).max(1);
-    // Draw straight into the cached DIB: no per-frame pixel Vec allocation and
-    // no copy. The backing buffer may be larger than the requested frame (see
-    // dib_for); only the requested `buf_w * buf_h * 4` leading bytes are
-    // zeroed so the transparent corners of the rounded pill do not accumulate
-    // stale pixels from the previous frame, and every draw call uses the
-    // requested `buf_w` as the stride.
+    // The DIB backing buffer may be larger than the requested frame (dib_for
+    // allocates to a generous upper bound and reuses it across animation
+    // frames instead of recreating it every tick). Its real scanline stride
+    // is therefore `alloc_w`, which only equals `buf_w` when the pill is at
+    // its fully expanded size. Rendering straight into it at a `buf_w`
+    // stride was tried once and tore the image (every row past the first
+    // landed at the wrong offset). To avoid threading a second stride
+    // parameter through every pixel-writing function, render into a
+    // tightly-packed scratch buffer at the *requested* size instead — the
+    // stride `draw_pixels`/`draw_text_pixels` have always assumed — and
+    // blit the result into the real DIB at its real stride right before the
+    // GDI call. The scratch buffer is grown but never shrunk across frames,
+    // so after warm-up this performs no per-frame heap allocation, matching
+    // the existing `text_scratch` buffer's pattern elsewhere in this file.
     let (hdc, _bitmap, bits) = dib_for(state, buf_w, buf_h)?;
-    let pixel_count = buf_w as usize * buf_h as usize * 4;
-    unsafe {
-        std::ptr::write_bytes(bits.cast::<u8>(), 0, pixel_count);
+    let alloc_w = state.dib.as_ref().map(|dib| dib.width).unwrap_or(buf_w) as usize;
+    let alloc_h = state.dib.as_ref().map(|dib| dib.height).unwrap_or(buf_h) as usize;
+
+    let needed = buf_w as usize * buf_h as usize * 4;
+    let mut scratch = std::mem::take(&mut state.frame_scratch);
+    if scratch.len() < needed {
+        scratch.resize(needed, 0);
+    } else {
+        scratch[..needed].fill(0);
     }
-    let pixels = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), pixel_count) };
-    draw_pixels(state, pixels, content, buf_w as usize, buf_h as usize, scale, art_base)?;
-    draw_text_pixels(state, pixels, content, buf_w, scale);
+    draw_pixels(
+        state,
+        &mut scratch[..needed],
+        content,
+        buf_w as usize,
+        buf_h as usize,
+        scale,
+        art_base,
+    )?;
+    draw_text_pixels(state, &mut scratch[..needed], content, buf_w, scale);
+    state.frame_scratch = scratch;
+
+    // Blit the packed frame into the real DIB, row by row, at the DIB's real
+    // stride. `dib_for` guarantees `alloc_w >= buf_w` and `alloc_h >= buf_h`,
+    // so `dib_len` stays within the buffer's real allocated capacity
+    // (`alloc_w * alloc_h * 4`).
+    let dib_len = alloc_w * buf_h as usize * 4;
+    let dib_slice = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), dib_len.min(alloc_w * alloc_h * 4)) };
+    blit_packed_rows(
+        dib_slice,
+        alloc_w * 4,
+        &state.frame_scratch,
+        buf_w as usize * 4,
+        buf_h as usize,
+    );
 
     let size = SIZE { cx: buf_w, cy: buf_h };
     let source = POINT { x: 0, y: 0 };
@@ -1305,6 +1355,27 @@ fn render_layered(
     result.context("UpdateLayeredWindow")
 }
 
+/// Copies `rows` rows of `row_bytes` each from a tightly-packed `src` buffer
+/// into `dst`, which uses a real stride of `dst_stride_bytes` per row
+/// (`dst_stride_bytes >= row_bytes`; equal when the destination has no extra
+/// padding). Used to blit the packed per-frame scratch buffer into the
+/// oversized, reused DIB backing buffer, whose real scanline stride does not
+/// match the requested frame size during most of the expand/collapse
+/// animation. Pure and GDI-free so it can be unit tested directly.
+fn blit_packed_rows(dst: &mut [u8], dst_stride_bytes: usize, src: &[u8], row_bytes: usize, rows: usize) {
+    debug_assert!(row_bytes <= dst_stride_bytes);
+    debug_assert!(src.len() >= row_bytes * rows);
+    if rows == 0 || row_bytes == 0 {
+        return;
+    }
+    debug_assert!(dst.len() >= dst_stride_bytes * (rows - 1) + row_bytes);
+    for row in 0..rows {
+        let src_off = row * row_bytes;
+        let dst_off = row * dst_stride_bytes;
+        dst[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
+    }
+}
+
 /// Generous upper bound on the DIB backing buffer for the current config:
 /// the pill's logical size never exceeds `max_width` wide and the fitted
 /// height for the largest allowed art/font rows (both from
@@ -1333,9 +1404,12 @@ fn backing_upper_bound(config: &Config, dpi: u32) -> (i32, i32) {
 /// config bound, so during expand/collapse the requested size changes every
 /// frame but the buffer is created once and reused for the rest of the
 /// process's life (per DPI/config). The DIB stays alive across frames and is
-/// released at window destruction. Callers must draw with the *requested*
-/// width as the stride and only touch the requested `width * height * 4`
-/// leading bytes — the backing buffer may be larger.
+/// released at window destruction. The returned buffer's *real* scanline
+/// stride is `state.dib`'s cached `width`, which may be larger than the
+/// requested `width` — callers must not draw into it directly at the
+/// requested width as the stride (see `render_layered`, which renders into a
+/// packed scratch buffer and blits into this one via `blit_packed_rows`
+/// instead).
 fn dib_for(state: &mut OverlayState, width: i32, height: i32) -> Result<(HDC, HBITMAP, *mut c_void)> {
     if let Some(dib) = &state.dib {
         if dib.width >= width && dib.height >= height {
@@ -3193,6 +3267,69 @@ pub(crate) fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This is the test that would have caught the original stride bug: it
+    /// constructs a destination buffer *larger* than the packed source (an
+    /// oversized DIB, standing in for the reused animation-frame backing
+    /// buffer) and asserts every row lands at its real stride, not the
+    /// source's packed width.
+    #[test]
+    fn blit_packed_rows_respects_the_larger_destination_stride() {
+        let row_bytes = 3 * 4; // 3 pixels wide, BGRA
+        let rows = 4;
+        let dst_stride_bytes = 10 * 4; // destination is much wider (10px) per row
+
+        // Distinct byte pattern per row so a stride mismatch is unmistakable.
+        let mut src = vec![0u8; row_bytes * rows];
+        for row in 0..rows {
+            for b in 0..row_bytes {
+                src[row * row_bytes + b] = (row * 10 + b) as u8;
+            }
+        }
+
+        let mut dst = vec![0xAAu8; dst_stride_bytes * rows]; // 0xAA marks untouched bytes
+        blit_packed_rows(&mut dst, dst_stride_bytes, &src, row_bytes, rows);
+
+        for row in 0..rows {
+            let dst_row = &dst[row * dst_stride_bytes..row * dst_stride_bytes + dst_stride_bytes];
+            let src_row = &src[row * row_bytes..row * row_bytes + row_bytes];
+            // The row's own data lands at the start of its (wider) destination row.
+            assert_eq!(
+                &dst_row[..row_bytes],
+                src_row,
+                "row {row} landed at the wrong offset — this is the stride bug"
+            );
+            // The padding past the packed row width is untouched, proving the
+            // copy did not run past the packed row into the next one (which
+            // would happen if the packed stride were used instead of the
+            // real one).
+            assert!(
+                dst_row[row_bytes..].iter().all(|&b| b == 0xAA),
+                "row {row} overwrote destination padding past its packed width"
+            );
+        }
+    }
+
+    #[test]
+    fn blit_packed_rows_is_a_no_op_for_zero_rows_or_width() {
+        let mut dst = vec![0xAAu8; 40];
+        blit_packed_rows(&mut dst, 10, &[], 4, 0);
+        assert!(dst.iter().all(|&b| b == 0xAA));
+        let mut dst2 = vec![0xAAu8; 40];
+        blit_packed_rows(&mut dst2, 10, &[1, 2, 3], 0, 3);
+        assert!(dst2.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn blit_packed_rows_is_identity_when_strides_match() {
+        // When dst_stride_bytes == row_bytes (the pre-oversized-DIB case,
+        // i.e. the pill at its fully expanded size), the blit degenerates to
+        // a straight contiguous copy.
+        let src: Vec<u8> = (0..24u8).collect();
+        let mut dst = vec![0u8; 24];
+        blit_packed_rows(&mut dst, 6, &src, 6, 4);
+        assert_eq!(dst, src);
+    }
 
     #[test]
     fn sample_duration_scales_with_config() {
