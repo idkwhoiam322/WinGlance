@@ -424,6 +424,10 @@ struct MainWindowState {
     settings_border_brush: HBRUSH,
     settings_surface_brush: HBRUSH,
     settings_hover_brush: HBRUSH,
+    history_header_brush: HBRUSH,
+    history_selected_brush: HBRUSH,
+    history_row_even_brush: HBRUSH,
+    history_row_odd_brush: HBRUSH,
     notifications_enabled: bool,
     active_pane: Pane,
     /// Hovered settings row (row index, sub-control) for highlight.
@@ -524,6 +528,10 @@ impl MainWindowState {
             settings_border_brush: HBRUSH::default(),
             settings_surface_brush: HBRUSH::default(),
             settings_hover_brush: HBRUSH::default(),
+            history_header_brush: HBRUSH::default(),
+            history_selected_brush: HBRUSH::default(),
+            history_row_even_brush: HBRUSH::default(),
+            history_row_odd_brush: HBRUSH::default(),
             notifications_enabled: true,
             active_pane: Pane::Activity,
             settings_hover: None,
@@ -570,6 +578,12 @@ impl MainWindowState {
             unsafe { CreateSolidBrush(colorref(SETTINGS_SURFACE[0], SETTINGS_SURFACE[1], SETTINGS_SURFACE[2])) };
         self.settings_hover_brush =
             unsafe { CreateSolidBrush(colorref(SETTINGS_HOVER[0], SETTINGS_HOVER[1], SETTINGS_HOVER[2])) };
+        // History-row brushes: a fixed four-color set, created once instead of
+        // per owner-draw row (every scroll tick repaints every visible row).
+        self.history_header_brush = unsafe { CreateSolidBrush(COLORREF(0x00141414)) };
+        self.history_selected_brush = unsafe { CreateSolidBrush(COLORREF(0x001D2B26)) };
+        self.history_row_even_brush = unsafe { CreateSolidBrush(COLORREF(0)) };
+        self.history_row_odd_brush = unsafe { CreateSolidBrush(COLORREF(0x000E0E0E)) };
 
         self.listbox = unsafe {
             CreateWindowExW(
@@ -1775,19 +1789,17 @@ impl MainWindowState {
         let selected = (item.itemState.0 & ODS_SELECTED.0) != 0;
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
 
-        let bg = if index == 0 {
-            COLORREF(0x00141414)
+        let brush = if index == 0 {
+            self.history_header_brush
         } else if selected {
-            COLORREF(0x001D2B26)
+            self.history_selected_brush
         } else if index.is_multiple_of(2) {
-            COLORREF(0x00000000)
+            self.history_row_even_brush
         } else {
-            COLORREF(0x000E0E0E)
+            self.history_row_odd_brush
         };
         unsafe {
-            let brush = CreateSolidBrush(bg);
             let _ = FillRect(hdc, &item.rcItem, brush);
-            let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
         }
 
         // Column layout: TIME | STATE | TITLE | ARTIST | ALBUM | SOURCE.
@@ -1885,6 +1897,10 @@ impl MainWindowState {
                 &self.settings_border_brush,
                 &self.settings_surface_brush,
                 &self.settings_hover_brush,
+                &self.history_header_brush,
+                &self.history_selected_brush,
+                &self.history_row_even_brush,
+                &self.history_row_odd_brush,
             ] {
                 if !brush.0.is_null() {
                     let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
