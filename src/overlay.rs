@@ -2824,6 +2824,31 @@ fn round_rect_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> 
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Returns the exact supersampled coverage for (x, y) when it can be proven
+/// without sampling, `None` otherwise. Interior: a pixel whose center is at
+/// least `max(radius, 0.75) + 0.35` from every edge is fully covered — every
+/// supersample sits in the straight-edge band of the SDF (clearing the corner
+/// squares by 0.35) and at least 0.75px inside it, so all four samples read
+/// coverage exactly 1.0. Exterior: a pixel whose center is at least 1.1px
+/// beyond any bounding-box edge has every supersample at least 0.75px outside
+/// the shape (the box contains the shape, and the corner arcs only pull the
+/// boundary inward), so all four samples read exactly 0.0. The bounds are
+/// deliberately conservative: a wrong guess here would be a visible hard edge
+/// or a thin unlit ring.
+fn round_rect_coverage_fast(x: f32, y: f32, width: f32, height: f32, radius: f32) -> Option<f32> {
+    let radius = radius.min(width / 2.0).min(height / 2.0);
+    let cx = x + 0.5;
+    let cy = y + 0.5;
+    let inset = radius.max(0.75) + 0.35;
+    if cx >= inset && cx <= width - inset && cy >= inset && cy <= height - inset {
+        return Some(1.0);
+    }
+    if cx <= -1.1 || cx >= width + 1.1 || cy <= -1.1 || cy >= height + 1.1 {
+        return Some(0.0);
+    }
+    None
+}
+
 /// 2×2 subpixel supersampled coverage of a rounded rectangle. Replaces the
 /// single-sample `round_rect_coverage` for the pill body to smooth the curved
 /// corners and straight edges, reducing stair-stepping on the anti-aliased
@@ -2831,7 +2856,13 @@ fn round_rect_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> 
 /// adds 0.5 internally for the pixel centre), so offsets of ±0.35 land on the
 /// four sub-pixel sample points at 0.15 and 0.85 within the pixel — wide
 /// enough to fully span the 1.5 px anti-alias band for the black pill edge.
+/// Pixels provably inside or outside the shape short-circuit through
+/// `round_rect_coverage_fast`, which returns bit-identical results to the
+/// full four-sample evaluation.
 fn round_rect_coverage_supersampled(x: f32, y: f32, width: f32, height: f32, radius: f32) -> f32 {
+    if let Some(coverage) = round_rect_coverage_fast(x, y, width, height, radius) {
+        return coverage;
+    }
     let cov = |dx: f32, dy: f32| round_rect_coverage(x + dx, y + dy, width, height, radius);
     (cov(-0.35, -0.35) + cov(0.35, -0.35) + cov(-0.35, 0.35) + cov(0.35, 0.35)) * 0.25
 }
@@ -2866,6 +2897,24 @@ fn draw_aura(
 
     for y in 0..buf_h {
         for x in 0..buf_w {
+            // Pixels farther than the margin from the pill's bounding box are
+            // certainly farther than the margin from the rounded pill itself
+            // (the box contains the pill), so they can never contribute —
+            // skip before evaluating the signed distance.
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let box_left = inset as f32;
+            let box_right = box_left + pill_w as f32;
+            let box_top = inset as f32;
+            let box_bottom = box_top + pill_h as f32;
+            let margin_f = margin as f32;
+            if px < box_left - margin_f
+                || px > box_right + margin_f
+                || py < box_top - margin_f
+                || py > box_bottom + margin_f
+            {
+                continue;
+            }
             let d = round_rect_signed_dist(
                 (x as f32) - inset as f32,
                 (y as f32) - inset as f32,
@@ -3263,6 +3312,58 @@ mod tests {
         assert!((edge - 0.5).abs() < 0.2, "expected ~0.5 on the arc, got {edge}");
         // Straight edge mid-pill: solid.
         assert_eq!(round_rect_coverage(0.5, 20.0, 100.0, 40.0, 16.0), 1.0);
+    }
+
+    #[test]
+    fn supersampled_fast_path_is_equivalent_to_full_sampling() {
+        // The interior/exterior shortcut must return bit-identical values to
+        // the full four-sample evaluation on every pixel it claims, across
+        // typical, clamped, and degenerate radii.
+        let cases: [(f32, f32, f32); 5] = [
+            (100.0, 40.0, 16.0),
+            (340.0, 110.0, 26.0),
+            (48.0, 48.0, 9.6),
+            (40.0, 40.0, 40.0), // radius clamped to half the size
+            (100.0, 40.0, 0.1), // degenerate near-zero radius
+        ];
+        let full = |x: f32, y: f32, w: f32, h: f32, r: f32| {
+            let cov = |dx: f32, dy: f32| round_rect_coverage(x + dx, y + dy, w, h, r);
+            (cov(-0.35, -0.35) + cov(0.35, -0.35) + cov(-0.35, 0.35) + cov(0.35, 0.35)) * 0.25
+        };
+        for (w, h, r) in cases {
+            for y in -8..(h as i32 + 8) {
+                for x in -8..(w as i32 + 8) {
+                    let xf = x as f32;
+                    let yf = y as f32;
+                    let expected = full(xf, yf, w, h, r);
+                    let actual = round_rect_coverage_supersampled(xf, yf, w, h, r);
+                    assert_eq!(
+                        actual, expected,
+                        "shortcut differs from full sampling at ({x}, {y}) in {w}x{h} r={r}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn supersampled_fast_path_claims_solid_interior_and_void_exterior() {
+        // The shortcut must claim exactly 1.0 for a pixel well inside the
+        // rect and exactly 0.0 for a pixel well outside it.
+        assert_eq!(round_rect_coverage_fast(30.0, 20.0, 100.0, 40.0, 16.0), Some(1.0));
+        assert_eq!(
+            round_rect_coverage_fast(30.0, 5.0, 100.0, 40.0, 16.0),
+            None,
+            "pixels near the straight edge still need sampling"
+        );
+        assert_eq!(round_rect_coverage_fast(-5.0, 20.0, 100.0, 40.0, 16.0), Some(0.0));
+        assert_eq!(round_rect_coverage_fast(105.0, 45.0, 100.0, 40.0, 16.0), Some(0.0));
+        assert_eq!(round_rect_coverage_fast(101.0, 20.0, 100.0, 40.0, 16.0), Some(0.0));
+        assert_eq!(
+            round_rect_coverage_fast(100.0, 20.0, 100.0, 40.0, 16.0),
+            None,
+            "the edge pixel itself carries the anti-aliased sliver"
+        );
     }
 
     #[test]
