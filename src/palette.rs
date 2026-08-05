@@ -53,7 +53,10 @@ struct Bucket {
 /// `ensure_art`.
 pub(crate) fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
     let shift = 8 - CHANNEL_BITS;
-    let mut buckets = [Bucket::default(); BUCKET_COUNT];
+    // Heap-allocated: 4096 ~32-byte buckets (~128 KiB) would be a large single
+    // stack frame on the UI thread's render path (under ensure_art), and the
+    // worker threads already run on deliberately small stacks.
+    let mut buckets = vec![Bucket::default(); BUCKET_COUNT];
     for px in rgba.chunks_exact(4) {
         let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
         if a < 32 {
@@ -78,7 +81,7 @@ pub(crate) fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
     // target-based scoring, not a global population sort.
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let max_count = candidates[0].0 as f32;
-    // The histogram is stack-allocated; trim the candidates heap so the
+    // The histogram is heap-allocated; trim the candidates heap so the
     // allocator gets clean pages back during candidate selection.
     candidates.shrink_to_fit();
 
