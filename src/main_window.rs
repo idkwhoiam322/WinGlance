@@ -823,14 +823,13 @@ impl MainWindowState {
         let Some(current) = &self.current else {
             return;
         };
-        // Skip a state row that duplicates the newest one (same track, same
-        // state). Session recreation re-reports "Playing" for the same song,
-        // which would otherwise flood the history with identical rows while
-        // the user never changed anything.
-        let is_duplicate = self.history.entries.front().is_some_and(|last| {
-            last.state == state && last.track.title == current.track.title && last.track.artist == current.track.artist
-        });
-        if is_duplicate {
+        // Skip a state row that duplicates the newest one for the same source
+        // (same track, same state). Session recreation re-reports "Playing"
+        // for the same song, which would otherwise flood the history with
+        // identical rows while the user never changed anything. Rejected
+        // sessions from other sources can interleave on top; the newest
+        // same-source row is the one to compare against, not just the front.
+        if duplicate_state_row(&self.history.entries, current, state) {
             return;
         }
         // Clone text-only: the artwork bytes (up to MBs) are stripped before
@@ -885,9 +884,11 @@ impl MainWindowState {
                 let entry = &mut self.history.entries[index];
                 entry.track = track.clone();
                 entry.track.artwork = None;
+                // Keep the row's original timestamp: only the metadata
+                // refreshed, and the tooltip formats from the same `at`.
                 let row = history_row(
                     &track,
-                    Local::now(),
+                    entry.at,
                     self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing),
                 );
                 let row = wide(&row);
@@ -2039,6 +2040,19 @@ impl MainWindowState {
     }
 }
 
+/// Whether a state row for `current` would duplicate the newest history row
+/// of the same source (same track, same state). Rejected sessions from other
+/// sources can sit on top of the row in question, so the comparison skips
+/// interleaved foreign rows instead of only checking the front.
+fn duplicate_state_row(entries: &VecDeque<HistoryEntry>, current: &CurrentActivity, state: PlaybackState) -> bool {
+    entries
+        .iter()
+        .find(|e| e.track.source_app == current.track.source_app)
+        .is_some_and(|last| {
+            last.state == state && last.track.title == current.track.title && last.track.artist == current.track.artist
+        })
+}
+
 fn history_row(track: &TrackInfo, at: DateTime<Local>, state: PlaybackState) -> String {
     let artist = if track.artist.trim().is_empty() {
         ""
@@ -2844,6 +2858,61 @@ mod tests {
         assert!(!entries[0].accepted);
         assert_eq!(entries[1].track.title, "Track A");
         assert!(entries[1].accepted);
+    }
+
+    fn current_activity(track: TrackInfo, state: PlaybackState) -> CurrentActivity {
+        CurrentActivity {
+            track,
+            state,
+            art: None,
+            art_fingerprint: None,
+            art_decode_failed: false,
+        }
+    }
+
+    fn history_entry(track: TrackInfo, state: PlaybackState) -> HistoryEntry {
+        HistoryEntry {
+            at: Local::now(),
+            at_label: String::new(),
+            track,
+            state,
+            accepted: true,
+        }
+    }
+
+    #[test]
+    fn state_row_dedup_skips_interleaved_foreign_rows() {
+        let current = current_activity(track("Song"), PlaybackState::Playing);
+
+        // Empty history: not a duplicate.
+        let history = History::new(10);
+        assert!(!duplicate_state_row(&history.entries, &current, PlaybackState::Playing));
+
+        // Same source, same track, same state on top: duplicate.
+        let mut history = History::new(10);
+        history.push(history_entry(track("Song"), PlaybackState::Playing));
+        assert!(duplicate_state_row(&history.entries, &current, PlaybackState::Playing));
+        // Same source, same track, different state: a real change, new row.
+        assert!(!duplicate_state_row(&history.entries, &current, PlaybackState::Paused));
+
+        // A rejected row from another source interleaves on top: the newest
+        // same-source row below it still dedups.
+        let mut other = track("Song");
+        other.source_app = "other-app".into();
+        history.push(history_entry(other.clone(), PlaybackState::Playing));
+        assert!(
+            duplicate_state_row(&history.entries, &current, PlaybackState::Playing),
+            "interleaved foreign rows must not defeat the dedup"
+        );
+
+        // Only a foreign row exists: nothing to dedup against.
+        let mut foreign_only = History::new(10);
+        foreign_only.push(history_entry(other, PlaybackState::Playing));
+        assert!(!duplicate_state_row(
+            &foreign_only.entries,
+            &current,
+            PlaybackState::Playing
+        ));
     }
 
     #[test]
