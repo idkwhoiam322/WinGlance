@@ -54,7 +54,8 @@ WinGlance/
   icons, deduplicates (content diff, session-recreation, artwork-change
   time-gate, per-source churn cool-down), and sends events down the channel.
 - **overlay.rs** — passive pill: `UpdateLayeredWindow`, DPI-aware position,
-  the expand/light/collapse state machine, the palette aura, vector playback
+  the expand/light/collapse state machine, the palette aura, the per-track
+  fill tint, the directional edge highlight, vector playback
   glyphs (play/pause/stop/music note), marquee rows, and hover-dismiss.
   `set_position`/`show_sample` are the only entry points other windows reach
   into.

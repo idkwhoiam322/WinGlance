@@ -28,8 +28,8 @@ close_to_tray = true
 # allowed_sources = ["spotify"]
 
 [appearance]
-# Translucent dark-slate pill background (alpha 235). Lower the alpha for more
-# translucency so the desktop shows through the glassy surface.
+# Opaque dark-slate pill background (alpha 255). Lower the alpha for
+# translucency.
 background_color = [18, 20, 28, 255]
 text_color = [255, 255, 255, 255]
 # Accent color used across the pill: playback symbols, the music note, the

@@ -39,7 +39,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 
 | Key                | Default       | Range    | Effect                                  |
 |--------------------|---------------|----------|-----------------------------------------|
-| `background_color` | `[18, 20, 28, 235]` | RGBA 0–255 | Glassy dark-slate pill background (alpha 235; lower for more translucency) |
+| `background_color` | `[18, 20, 28, 255]` | RGBA 0–255 | Opaque dark-slate pill background (alpha 255; lower for translucency) |
 | `text_color`       | `[255, 255, 255, 255]` | RGBA 0–255 | Title and state-label color |
 | `accent_color`     | `[240, 110, 155, 255]` | RGBA 0–255 | Playback symbols, music note, album-art rim; aura fallback when the artwork palette has no vibrant color |
 | `corner_radius`    | `26.0`     | 4–48    | Corner rounding in logical pixels       |
@@ -63,10 +63,16 @@ Beyond these knobs the pill derives its look from the playing track:
   — so moody portraits and bright white covers get their own tint
   instead of the accent default. The primary recolors the playback
   symbols, the clock icon and the music note; a muted variant tints the
-  artist and source-app rows. When the artwork yields no qualifying color,
-  the accent above is used.
+  artist and source-app rows; and the pill fill itself is tinted toward
+  the primary at 16% weight, so the background picks up a hint of the
+  cover's hue. When the artwork yields no qualifying color, the accent
+  above is used.
 - **Aura** — a soft C₁→C₂ glow around the pill boundary, brighter on the left
-  where the art sits. Intensity is hardcoded, not in the config.
+  where the art sits, fading exponentially over a ~6 px halo. Intensity is
+  hardcoded, not in the config.
+- **Edge highlight** — a subtle white stroke along the pill's own boundary,
+  brighter at the top-left than the bottom-right, so the pill reads as a
+  physical cut edge. Not configurable.
 - **App icon** — the source app's icon (from its AUMID) renders next to the
   source-app name.
 - **Album-art rim** — a thin accent stroke around the art square.
@@ -96,6 +102,7 @@ The tray menu mirrors the `[behavior]` toggles in real time:
 
 The shipped defaults produce a slim pill: up to 340 px wide, height derived
 from `art_size` (48 px) plus padding — about 110 px tall — anchored 8 px from
-the top of the work area, glassy dark-slate background with a pink aura, 48 px
+the top of the work area, opaque dark-slate background tinted per track with a
+pink aura, 48 px
 artwork with a palette-tinted glow and rim, and compact title/artist text with
 per-track accent colors. All of these can be widened or recolored here.

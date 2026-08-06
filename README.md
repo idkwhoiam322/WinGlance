@@ -1,7 +1,7 @@
 # WinGlance
 
 A passive, always-on-top media overlay for Windows 10/11. When the track or
-playback state changes, WinGlance shows a small glassy pill with the album art,
+playback state changes, WinGlance shows a small rounded pill with the album art,
 a palette-tinted glow, and the app that's playing — without ever stealing
 focus or intercepting clicks. Built for gaming and fullscreen use: it never
 interrupts and never needs interaction.
@@ -14,9 +14,10 @@ interrupts and never needs interaction.
   changes.
 - **Per-track theming** — two vibrant colors are extracted from the album art
   and drive the accent symbols, the artist/source text tint, the album-art
-  rim, and a soft C₁→C₂ **aura glow** around the pill, brighter on the
-  album-art side. No palette in the artwork? Falls back to the configured
-  accent.
+  rim, a subtle tint in the pill fill, and a soft C₁→C₂ **aura glow** around
+  the pill, brighter on the album-art side. A directional edge highlight
+  traces the pill's boundary. No palette in the artwork? Falls back to the
+  configured accent.
 - **Source-app icons** — the app's icon (from its Windows AUMID) renders
   next to the source name.
 - **Completely passive** — `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`: no focus

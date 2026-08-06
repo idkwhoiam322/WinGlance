@@ -130,8 +130,9 @@ Each frame is rendered into an in-memory premultiplied-BGRA buffer:
 
 1. `draw_pixels` resolves the artwork and decodes it once per unique cover
    (`ensure_art`, keyed by the artwork bytes), then draws — in order — the
-   palette aura ring in the DIB margin, the glassy rounded-rect body, the
-   album art with its accent glow and rim, and the vector playback glyph.
+   palette aura ring in the DIB margin, the opaque palette-tinted rounded-rect
+   body with its directional edge highlight, the album art with its accent
+   glow and rim, and the vector playback glyph.
 2. `draw_text_pixels` paints the title/artist/meta/source-app rows with GDI
    `DrawTextW` into a scratch DIB and composites them alpha-correctly; rows
    marquee-scroll only while their text overflows the visible band.
@@ -156,10 +157,15 @@ Two vibrant colors are extracted from the album art (a 4-bit-per-channel
 histogram over the decoded display buffer, guarded by saturation ≥ 0.25 and
 luminance 0.20–0.85, secondary ≥ 30° away in hue). The primary recolors the
 playback symbols, the clock icon and the music note; a muted pastel variant
-tints the artist and source-app rows. The aura is a soft C₁→C₂ glow drawn in
-the DIB margin around the pill, brighter on the album-art side, with peak
-opacity ~94% of the accent — the window is inflated by the aura margin so the
-glow extends into the desktop rather than being clipped.
+tints the artist and source-app rows; and a 16% blend of the primary tints the
+pill fill itself, so the opaque body picks up a hint of the cover's hue. The
+aura is a soft C₁→C₂ glow drawn in the DIB margin around the pill, brighter on
+the album-art side, with peak alpha ~140 at the pill boundary fading
+exponentially over a 6 logical-px halo — the window is inflated by the halo
+extent so the glow extends into the desktop rather than being clipped. A
+directional edge highlight (white, brighter at the top-left) traces the pill's
+own boundary, drawn as a supersampled coverage ring so the corners stay
+anti-aliased.
 
 ## Placement and resolution
 
