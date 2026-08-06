@@ -463,13 +463,24 @@ fn post_result(hwnd: HWND, cancelled: bool) {
         Box::into_raw(Box::new(selected)) as isize
     };
 
-    unsafe {
-        let _ = PostMessageW(
+    if unsafe {
+        PostMessageW(
             owner,
             PICKER_RESULT_MSG,
             WPARAM(if cancelled { 1 } else { 0 }),
             LPARAM(lparam),
-        );
+        )
+    }
+    .is_err()
+    {
+        // The owner window is gone (quitting via the tray while the picker is
+        // open): free the result box that can no longer be delivered.
+        warn!("posting the picker result failed; freeing the result payload");
+        if !cancelled {
+            unsafe {
+                drop(Box::from_raw(lparam as *mut Vec<String>));
+            }
+        }
     }
 }
 
