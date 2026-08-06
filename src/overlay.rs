@@ -339,12 +339,13 @@ pub(crate) fn set_duration(hwnd: HWND, duration_ms: u64) {
 impl OverlayState {
     fn new(config: Config, queue: EventQueue) -> Self {
         let position = OverlayPos::from_config(&config);
+        let enabled = config.behavior.notifications_enabled;
         Self {
             hwnd: HWND::default(),
             config,
             queue,
             pending: VecDeque::new(),
-            enabled: true,
+            enabled,
             content: None,
             last_track: None,
             phase: Phase::Hidden,

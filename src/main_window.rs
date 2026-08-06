@@ -521,6 +521,7 @@ impl MainWindowState {
     }
 
     fn new(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwnd: HWND, instance: HINSTANCE) -> Self {
+        let notifications_enabled = config.read().unwrap().behavior.notifications_enabled;
         Self {
             hwnd: HWND::default(),
             instance,
@@ -543,7 +544,7 @@ impl MainWindowState {
             history_selected_brush: HBRUSH::default(),
             history_row_even_brush: HBRUSH::default(),
             history_row_odd_brush: HBRUSH::default(),
-            notifications_enabled: true,
+            notifications_enabled,
             active_pane: Pane::Activity,
             settings_hover: None,
             tooltip_ctrl: HWND::default(),
@@ -2402,8 +2403,15 @@ fn show_tray_menu(state: &mut MainWindowState) {
             match command {
                 MENU_OPEN_ID => state.show_window(),
                 MENU_NOTIFY_ID => {
-                    state.notifications_enabled = !state.notifications_enabled;
-                    let _ = PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0));
+                    let new_value = !state.notifications_enabled;
+                    // Flip the overlay first; persist only when the toggle
+                    // reaches it, so the flag and the pill can never desync.
+                    if PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0)).is_err() {
+                        error!("posting the notifications toggle to the overlay failed");
+                    } else {
+                        state.notifications_enabled = new_value;
+                        state.mutate_config(|cfg| cfg.behavior.notifications_enabled = new_value);
+                    }
                 }
                 MENU_AUTOSTART_ID => {
                     let new_value = !state.cfg().behavior.start_on_login;
@@ -2600,8 +2608,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                             };
                             match id {
                                 SettingId::Notifications => {
-                                    state.notifications_enabled = !state.notifications_enabled;
-                                    let _ = PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0));
+                                    let new_value = !state.notifications_enabled;
+                                    // Flip the overlay first; persist only when
+                                    // the toggle reaches it, so the flag and
+                                    // the pill can never desync.
+                                    if unsafe { PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0)) }
+                                        .is_err()
+                                    {
+                                        error!("posting the notifications toggle to the overlay failed");
+                                    } else {
+                                        state.notifications_enabled = new_value;
+                                        state.mutate_config(|cfg| cfg.behavior.notifications_enabled = new_value);
+                                    }
                                     state.invalidate();
                                 }
                                 SettingId::StartOnLogin => {

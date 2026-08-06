@@ -55,6 +55,9 @@ pub enum HorizontalPosition {
 pub struct BehaviorConfig {
     pub enable_track_change: bool,
     pub enable_playback_state_change: bool,
+    /// Whether the pill shows notifications. Persisted so a toggle survives a
+    /// restart; the main window is the owner, the overlay mirrors it.
+    pub notifications_enabled: bool,
     pub debounce_ms: u64,
     pub start_on_login: bool,
     pub start_in_tray: bool,
@@ -106,6 +109,7 @@ impl Default for BehaviorConfig {
         Self {
             enable_track_change: true,
             enable_playback_state_change: true,
+            notifications_enabled: true,
             debounce_ms: 200,
             start_on_login: false,
             start_in_tray: true,
