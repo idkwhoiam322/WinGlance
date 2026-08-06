@@ -1301,6 +1301,45 @@ fn backing_upper_bound(config: &Config, dpi: u32) -> (i32, i32) {
     )
 }
 
+/// Creates a compatible DC with a top-down 32-bit DIB of the given size,
+/// releasing the DC when the DIB cannot be created. Callers select the bitmap
+/// into the DC and own both handles.
+fn create_dc_with_dib(width: i32, height: i32) -> Result<(HDC, HBITMAP, *mut c_void)> {
+    let hdc = unsafe { CreateCompatibleDC(None) };
+    if hdc.0.is_null() {
+        anyhow::bail!("CreateCompatibleDC failed");
+    }
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut c_void = null_mut();
+    let bitmap = match unsafe { CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &mut bits, None, 0) } {
+        Ok(bitmap) => bitmap,
+        Err(error) => {
+            unsafe {
+                let _ = DeleteDC(hdc);
+            }
+            return Err(error.into());
+        }
+    };
+    if bits.is_null() {
+        unsafe {
+            let _ = DeleteDC(hdc);
+        }
+        anyhow::bail!("CreateDIBSection returned no pixel buffer");
+    }
+    Ok((hdc, bitmap, bits))
+}
+
 /// Returns the cached DIB for the given size, creating (or replacing) it when
 /// the cache is too small. The backing buffer is allocated to the generous
 /// config bound, so during expand/collapse the requested size changes every
@@ -1327,30 +1366,7 @@ fn dib_for(state: &mut OverlayState, width: i32, height: i32) -> Result<(HDC, HB
     let (bound_w, bound_h) = backing_upper_bound(&state.config, state.last_dpi);
     let alloc_w = width.max(bound_w).max(1);
     let alloc_h = height.max(bound_h).max(1);
-    let info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: alloc_w,
-            biHeight: -alloc_h,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: 0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let hdc = unsafe { CreateCompatibleDC(None) };
-    if hdc.0.is_null() {
-        anyhow::bail!("CreateCompatibleDC failed");
-    }
-    let mut bits: *mut c_void = null_mut();
-    let bitmap = unsafe { CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &mut bits, None, 0) }?;
-    if bits.is_null() {
-        unsafe {
-            let _ = DeleteDC(hdc);
-        }
-        anyhow::bail!("CreateDIBSection returned no pixel buffer");
-    }
+    let (hdc, bitmap, bits) = create_dc_with_dib(alloc_w, alloc_h)?;
     let old_bitmap = unsafe { SelectObject(hdc, bitmap) };
     state.dib = Some(DibCache {
         hdc,
@@ -2576,30 +2592,7 @@ fn text_scratch_for(
     }
     let width = width.max(1);
     let height = height.max(1);
-    let hdc = unsafe { CreateCompatibleDC(None) };
-    if hdc.0.is_null() {
-        anyhow::bail!("CreateCompatibleDC failed");
-    }
-    let info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: 0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut bits: *mut c_void = null_mut();
-    let bitmap = unsafe { CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &mut bits, None, 0) }?;
-    if bits.is_null() {
-        unsafe {
-            let _ = DeleteDC(hdc);
-        }
-        anyhow::bail!("CreateDIBSection returned no pixel buffer");
-    }
+    let (hdc, bitmap, bits) = create_dc_with_dib(width, height)?;
     let old_bitmap = unsafe { SelectObject(hdc, bitmap) };
     *scratch = Some(TextScratch {
         hdc,
