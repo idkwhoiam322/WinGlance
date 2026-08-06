@@ -352,7 +352,6 @@ fn spawn_event_forwarder(
         .stack_size(256 * 1024)
         .spawn(move || {
             while let Ok(event) = receiver.recv() {
-                let mut posted = true;
                 if let Ok(mut queue) = main_queue.lock() {
                     queue.push_back(event.clone());
                 }
@@ -362,15 +361,22 @@ fn spawn_event_forwarder(
                 if unsafe { PostMessageW(HWND(main_raw as *mut c_void), MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }
                     .is_err()
                 {
-                    posted = false;
+                    warn!("posting the media event to the main window failed; dropping its queue copy");
+                    // The forwarder is the only pusher and the window drains
+                    // under the same lock, so pop_back removes exactly the
+                    // event posted above — or is a no-op when the window
+                    // already drained it, meaning it was delivered after all.
+                    if let Ok(mut queue) = main_queue.lock() {
+                        queue.pop_back();
+                    }
                 }
                 if unsafe { PostMessageW(HWND(overlay_raw as *mut c_void), MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }
                     .is_err()
                 {
-                    posted = false;
-                }
-                if !posted {
-                    break;
+                    warn!("posting the media event to the overlay failed; dropping its queue copy");
+                    if let Ok(mut queue) = overlay_queue.lock() {
+                        queue.pop_back();
+                    }
                 }
             }
         })
