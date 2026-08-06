@@ -43,9 +43,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX,
-    WM_DESTROY, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY,
-    WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
+    WM_NOTIFY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -555,10 +555,11 @@ impl MainWindowState {
         }
     }
 
-    fn create_children(&mut self) {
-        let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
+    /// Creates the history listbox font at the given scale, matching the
+    /// height the rows are laid out at. Recreated when the DPI changes.
+    fn make_listbox_font(scale: f32) -> HFONT {
         let font_name = wide("Segoe UI");
-        self.listbox_font = unsafe {
+        unsafe {
             CreateFontW(
                 -((13.0 * scale).round() as i32).max(1),
                 0,
@@ -575,7 +576,41 @@ impl MainWindowState {
                 DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
                 PCWSTR(font_name.as_ptr()),
             )
-        };
+        }
+    }
+
+    /// Reacts to the window moving to a monitor with a different DPI: the
+    /// listbox font, the row height and the tooltip geometry are frozen at
+    /// the creation DPI otherwise, leaving rows overlapping the header after
+    /// a cross-DPI move.
+    fn on_dpi_changed(&mut self, dpi: u32) {
+        unsafe {
+            if !self.listbox_font.0.is_null() {
+                let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.listbox_font.0));
+            }
+        }
+        let scale = dpi.max(96) as f32 / 96.0;
+        self.listbox_font = Self::make_listbox_font(scale);
+        if !self.listbox.0.is_null() {
+            unsafe {
+                let item_h = (18.0 * scale).round() as i32;
+                let _ = SendMessageW(self.listbox, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(item_h as isize));
+                let _ = SendMessageW(
+                    self.listbox,
+                    WM_SETFONT,
+                    WPARAM(self.listbox_font.0 as usize),
+                    LPARAM(1),
+                );
+            }
+        }
+        self.layout();
+        self.sync_tooltips();
+        self.invalidate();
+    }
+
+    fn create_children(&mut self) {
+        let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
+        self.listbox_font = Self::make_listbox_font(scale);
         self.gray_brush = unsafe { CreateSolidBrush(colorref(0x1E, 0x1E, 0x1E)) };
         let accent = self.cfg().appearance.accent_color;
         self.accent_brush = unsafe { CreateSolidBrush(colorref(accent[0], accent[1], accent[2])) };
@@ -2520,6 +2555,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_SIZE => {
             if !state_ptr.is_null() {
                 (*state_ptr).layout();
+            }
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            if !state_ptr.is_null() {
+                (*state_ptr).on_dpi_changed((wparam.0 >> 16) as u32);
             }
             LRESULT(0)
         }
