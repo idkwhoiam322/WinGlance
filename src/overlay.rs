@@ -1368,7 +1368,6 @@ fn draw_pixels(
     art_base: usize,
 ) -> Result<()> {
     let radius = state.config.appearance.corner_radius * scale;
-    let background = state.config.appearance.background_color;
     // Resolve the artwork that will be displayed and decode it (once per
     // unique cover) up front, so the aura palette below is ready and the
     // cover is never shown stale. Track pills carry the artwork directly;
@@ -1396,6 +1395,18 @@ fn draw_pixels(
         primary: state.config.appearance.accent_color,
         secondary: state.config.appearance.accent_color,
     });
+    // The pill fill picks up a hint of the cover's hue when a palette is
+    // available; palette-less pills (e.g. the sample) keep the configured
+    // fill exactly.
+    let effective_bg = if state.palette.is_some() {
+        tinted_fill(
+            state.config.appearance.background_color,
+            aura_palette.primary,
+            FILL_TINT_WEIGHT,
+        )
+    } else {
+        state.config.appearance.background_color
+    };
     draw_aura(
         pixels,
         width,
@@ -1424,13 +1435,13 @@ fn draw_pixels(
                 radius,
             );
             if coverage > 0.0 {
-                let alpha = (background[3] as f32 * coverage) as u32;
+                let alpha = (effective_bg[3] as f32 * coverage) as u32;
                 composite(
                     pixels,
                     width,
                     x,
                     y,
-                    [background[0], background[1], background[2]],
+                    [effective_bg[0], effective_bg[1], effective_bg[2]],
                     alpha,
                 );
             }
@@ -1941,6 +1952,24 @@ fn rounded_triangle_coverage(
     };
     let t = (signed_dist / 1.5 + 0.5).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Weight for blending the track palette's primary color into the pill
+/// fill. Kept low so the fill stays neutral-legible and only picks up a
+/// subtle hint of the cover's hue — not a solid color wash.
+const FILL_TINT_WEIGHT: f32 = 0.16;
+
+/// Blends `accent` into `base` at `weight`, keeping base's own alpha.
+/// Used to give the pill fill a subtle per-track hue instead of a fixed
+/// neutral fill.
+fn tinted_fill(base: [u8; 4], accent: [u8; 4], weight: f32) -> [u8; 4] {
+    let mix = |b: u8, a: u8| -> u8 { (b as f32 * (1.0 - weight) + a as f32 * weight).round() as u8 };
+    [
+        mix(base[0], accent[0]),
+        mix(base[1], accent[1]),
+        mix(base[2], accent[2]),
+        base[3],
+    ]
 }
 
 /// A softened version of the accent color: lifts each channel towards white
@@ -3477,6 +3506,22 @@ mod tests {
         // Inside the pill: no aura (covered by body fill).
         let inside = alpha_at(inset + 2, inset + pill_h / 2);
         assert_eq!(inside, 0, "inside the pill there must be no aura");
+    }
+
+    #[test]
+    fn fill_tint_mixes_toward_the_accent_and_keeps_alpha() {
+        let base = [160, 160, 180, 38];
+        let accent = [255, 0, 0, 255];
+        assert_eq!(
+            tinted_fill(base, accent, 0.0),
+            base,
+            "zero weight leaves the base untouched"
+        );
+        let full = tinted_fill(base, accent, 1.0);
+        assert_eq!([full[0], full[1], full[2]], [accent[0], accent[1], accent[2]]);
+        let half = tinted_fill(base, accent, 0.5);
+        assert_eq!(half, [208, 80, 90, 38], "weight 0.5 lands at the channel midpoint");
+        assert_eq!(half[3], base[3], "alpha must be preserved");
     }
 
     #[test]
