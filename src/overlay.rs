@@ -36,6 +36,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 const TIMER_DEBOUNCE: usize = 1;
+/// Window-timer ID used only when the timer-queue fallback is active.
+const ANIM_TIMER_ID: usize = 2;
 const LIGHT_DURATION: Duration = Duration::from_millis(120);
 /// Remaining time left on the current pill when something newer wants the
 /// screen: hovering over the pill or a queued update both cap the exit at
@@ -193,7 +195,10 @@ struct OverlayState {
     /// Per-row marquee state for the four track lines (title/subtitle/meta/app).
     scroll: [LineScroll; 4],
     /// High-resolution timer driving the pill animation.
+    /// Animation timer from the timer queue; when creation fails, a plain
+    /// window timer with `ANIM_TIMER_ID` drives the animation instead.
     anim_timer: HANDLE,
+    anim_timer_fallback: bool,
     /// Animation tick period in ms, matched to the monitor's refresh rate.
     /// Re-detected on every show; the timer is recreated only when it changes.
     tick_period: u32,
@@ -345,6 +350,7 @@ impl OverlayState {
             position,
             scroll: [LineScroll::default(); 4],
             anim_timer: HANDLE::default(),
+            anim_timer_fallback: false,
             tick_period: 16,
             decoded_art: None,
             decoded_art_source: None,
@@ -456,12 +462,12 @@ impl OverlayState {
     }
 
     fn ensure_anim_timer(&mut self) {
-        if !self.anim_timer.0.is_null() {
+        if !self.anim_timer.0.is_null() || self.anim_timer_fallback {
             return;
         }
         let mut handle = HANDLE::default();
-        unsafe {
-            let _ = CreateTimerQueueTimer(
+        let created = unsafe {
+            CreateTimerQueueTimer(
                 &mut handle,
                 None,
                 Some(animation_timer_proc),
@@ -469,9 +475,20 @@ impl OverlayState {
                 self.tick_period,
                 self.tick_period,
                 WT_EXECUTEDEFAULT,
-            );
+            )
+            .is_ok()
+        };
+        if created {
+            self.anim_timer = handle;
+            return;
         }
-        self.anim_timer = handle;
+        // Rare (handle exhaustion or a low-resource condition): without a
+        // timer the pill freezes at its first frame and never dismisses.
+        // Fall back to a plain window timer that drives the same tick.
+        error!("CreateTimerQueueTimer failed; falling back to SetTimer");
+        if unsafe { SetTimer(self.hwnd, ANIM_TIMER_ID, self.tick_period, None) } != 0 {
+            self.anim_timer_fallback = true;
+        }
     }
 
     /// Re-samples the monitor's refresh period and recreates the animation
@@ -501,6 +518,12 @@ impl OverlayState {
                 let _ = DeleteTimerQueueTimer(None, self.anim_timer, None);
             }
             self.anim_timer = HANDLE::default();
+        }
+        if self.anim_timer_fallback {
+            unsafe {
+                let _ = KillTimer(self.hwnd, ANIM_TIMER_ID);
+            }
+            self.anim_timer_fallback = false;
         }
     }
 
@@ -3196,6 +3219,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_TIMER if wparam.0 == TIMER_DEBOUNCE => {
             if !state_ptr.is_null() {
                 (*state_ptr).flush_pending();
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == ANIM_TIMER_ID => {
+            if !state_ptr.is_null() {
+                (*state_ptr).tick();
             }
             LRESULT(0)
         }
