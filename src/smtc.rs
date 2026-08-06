@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::events::{MediaEvent, PlaybackState, TrackInfo};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -125,6 +125,11 @@ struct ListenerState {
     /// Debounce deadline for pending dirty keys and session bursts.
     pending_deadline: Option<Instant>,
     /// Last time the periodic safety-net poll ran.
+    /// Last time the process heap was compacted. The worker and the UI
+    /// thread share that heap, and HeapCompact takes its lock, so the
+    /// compaction is throttled hard to keep UI-thread allocations
+    /// stall-free.
+    last_heap_compact: Instant,
     last_session_check: Instant,
     /// Session-creation counts per source app within a rolling window, for the
     /// churn cool-down.
@@ -232,6 +237,7 @@ impl ListenerState {
             dirty: HashSet::new(),
             sessions_pending: false,
             pending_deadline: None,
+            last_heap_compact: Instant::now(),
             last_session_check: Instant::now(),
             churn: HashMap::new(),
             churn_cooldown: HashMap::new(),
@@ -250,12 +256,17 @@ impl ListenerState {
             *self.heartbeat.lock().unwrap() = Instant::now();
             // The Windows heap keeps freed blocks (artwork decodes, thumbnail
             // bytes) in its free lists instead of returning them to the OS,
-            // so RSS climbs as songs change. Compacting on this ≤5s cadence
-            // releases that free space back to the OS. Cheap on a small heap
-            // and safe cross-thread (heap functions are serialized).
-            unsafe {
-                if let Ok(heap) = GetProcessHeap() {
-                    let _ = HeapCompact(heap, HEAP_FLAGS(0));
+            // so RSS climbs as songs change. Compacting on a 60s cadence
+            // releases that free space back to the OS. The worker and the UI
+            // thread share this heap and HeapCompact takes its lock, so a
+            // shorter cadence would stall UI-thread allocations on every
+            // compact.
+            if self.last_heap_compact.elapsed() >= Duration::from_secs(60) {
+                self.last_heap_compact = Instant::now();
+                unsafe {
+                    if let Ok(heap) = GetProcessHeap() {
+                        let _ = HeapCompact(heap, HEAP_FLAGS(0));
+                    }
                 }
             }
             let timeout = self
@@ -1328,8 +1339,16 @@ fn read_duration(session: &GlobalSystemMediaTransportControlsSession) -> Option<
 /// read completed. A retry cannot succeed, so fail fast instead of logging
 /// an anomaly. Mirrors WindowsMediaController's message-based suppression.
 fn is_session_gone(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}");
-    text.contains("0x800706BA") || text.contains("0x80070015")
+    // Compare the HRESULT codes of the windows error in the chain (raw when
+    // propagated with `?`, or wrapped as the source by read_thumbnail) —
+    // never the formatted error text.
+    const RPC_SERVER_UNAVAILABLE: u32 = 0x8007_06BA;
+    const DEVICE_NOT_READY: u32 = 0x8007_0015;
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<windows::core::Error>()
+            .is_some_and(|e| matches!(e.code().0 as u32, RPC_SERVER_UNAVAILABLE | DEVICE_NOT_READY))
+    })
 }
 
 fn read_thumbnail(
@@ -1337,32 +1356,31 @@ fn read_thumbnail(
 ) -> Result<Option<Vec<u8>>> {
     let reference = properties
         .Thumbnail()
-        .map_err(|e| anyhow!("Thumbnail failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
+        .map_err(|e| anyhow::Error::new(e).context("Thumbnail failed"))?;
     let stream = reference
         .OpenReadAsync()
-        .map_err(|e| anyhow!("OpenReadAsync failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?
+        .map_err(|e| anyhow::Error::new(e).context("OpenReadAsync failed"))?
         .get()
-        .map_err(|e| anyhow!("OpenReadAsync get failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
+        .map_err(|e| anyhow::Error::new(e).context("OpenReadAsync get failed"))?;
     let size = stream
         .Size()
-        .map_err(|e| anyhow!("Size failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
+        .map_err(|e| anyhow::Error::new(e).context("Size failed"))?;
     if size == 0 || !(1024..=8 * 1024 * 1024).contains(&size) || size > u32::MAX as u64 {
         return Ok(None);
     }
     let size = size as u32;
-    let buffer =
-        Buffer::Create(size).map_err(|e| anyhow!("Buffer::Create failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
+    let buffer = Buffer::Create(size).map_err(|e| anyhow::Error::new(e).context("Buffer::Create failed"))?;
     stream
         .ReadAsync(&buffer, size, InputStreamOptions::None)
-        .map_err(|e| anyhow!("ReadAsync failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?
+        .map_err(|e| anyhow::Error::new(e).context("ReadAsync failed"))?
         .get()
-        .map_err(|e| anyhow!("ReadAsync get failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
-    let reader = DataReader::FromBuffer(&buffer)
-        .map_err(|e| anyhow!("DataReader::FromBuffer failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
+        .map_err(|e| anyhow::Error::new(e).context("ReadAsync get failed"))?;
+    let reader =
+        DataReader::FromBuffer(&buffer).map_err(|e| anyhow::Error::new(e).context("DataReader::FromBuffer failed"))?;
     let mut data = vec![0u8; size as usize];
     reader
         .ReadBytes(&mut data)
-        .map_err(|e| anyhow!("ReadBytes failed: {e:?} (hr=0x{:08X})", e.code().0 as u32))?;
+        .map_err(|e| anyhow::Error::new(e).context("ReadBytes failed"))?;
     Ok(Some(data))
 }
 
@@ -1400,6 +1418,7 @@ fn debounce_duration(config: &Config) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     #[test]
     fn source_app_label_uses_a_readable_fallback() {
@@ -1634,6 +1653,11 @@ mod tests {
         assert!(is_session_gone(&rpc));
         assert!(is_session_gone(&device));
         assert!(!is_session_gone(&other));
+        // The thumbnail path wraps the same windows error as the chain
+        // source with context; the code must still match through it.
+        let wrapped =
+            anyhow::Error::new(windows::core::Error::from(HRESULT(0x8007_06BAu32 as i32))).context("Thumbnail failed");
+        assert!(is_session_gone(&wrapped));
     }
 
     #[test]
