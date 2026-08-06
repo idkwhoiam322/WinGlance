@@ -1448,6 +1448,10 @@ fn draw_pixels(
         }
     }
 
+    // Directional edge highlight: white stroke on the pill's own boundary,
+    // brighter along the top-left than the bottom-right.
+    draw_edge_stroke(pixels, width, inset, pill_w, pill_h, radius, scale);
+
     match content {
         MediaEvent::TrackChanged(_) => {
             let padding = (state.config.appearance.padding * scale).round() as usize;
@@ -1588,6 +1592,57 @@ fn draw_pixels(
         MediaEvent::SessionRejected { .. } => {}
     }
     Ok(())
+}
+
+/// Directional edge highlight traced on the pill's own boundary — a
+/// supersampled coverage ring (outer rounded-rect minus the same shape
+/// inset by the stroke width), at low alpha and biased brighter along
+/// the top-left than the bottom-right, to read as light catching a
+/// physical cut edge rather than a flat outline. Purely a boundary
+/// definition line; the aura glow (drawn earlier, underneath) is what
+/// carries color outside it.
+fn draw_edge_stroke(
+    pixels: &mut [u8],
+    width: usize,
+    inset: usize,
+    pill_w: usize,
+    pill_h: usize,
+    radius: f32,
+    scale: f32,
+) {
+    const STROKE_COLOR: [u8; 3] = [255, 255, 255];
+    const PEAK_ALPHA: f32 = 90.0;
+    const MIN_ALPHA: f32 = 30.0;
+    let stroke_w = (1.25 * scale).round().max(1.0);
+    // Ring coverage = outer rounded-rect coverage minus the same shape
+    // inset by stroke_w, both supersampled — the same technique the pill
+    // fill uses (round_rect_coverage_supersampled), reused here so the
+    // stroke gets correct anti-aliasing at the diagonal corners instead
+    // of the single-sample banding the old d-based edge ramp produced.
+    let inner_w = (pill_w as f32 - 2.0 * stroke_w).max(0.0);
+    let inner_h = (pill_h as f32 - 2.0 * stroke_w).max(0.0);
+    let inner_radius = (radius - stroke_w).max(0.0);
+    for y in 0..pill_h {
+        for x in 0..pill_w {
+            let px = x as f32;
+            let py = y as f32;
+            let outer = round_rect_coverage_supersampled(px, py, pill_w as f32, pill_h as f32, radius);
+            if outer <= 0.0 {
+                continue;
+            }
+            let inner = round_rect_coverage_supersampled(px - stroke_w, py - stroke_w, inner_w, inner_h, inner_radius);
+            let coverage = (outer - inner).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+            // Diagonal light bias: brightest at top-left (0,0), dimmest
+            // at bottom-right (pill_w, pill_h), normalized to [0, 1].
+            let t = ((x as f32 / pill_w.max(1) as f32) + (y as f32 / pill_h.max(1) as f32)) * 0.5;
+            let peak = PEAK_ALPHA - (PEAK_ALPHA - MIN_ALPHA) * t;
+            let alpha = (peak * coverage).round() as u32;
+            composite(pixels, width, inset + x, inset + y, STROKE_COLOR, alpha);
+        }
+    }
 }
 
 /// Draws the cached artwork bitmap into the tile region, bilinear-scaled from
