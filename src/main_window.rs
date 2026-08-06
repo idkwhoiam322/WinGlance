@@ -2368,9 +2368,13 @@ fn show_tray_menu(state: &mut MainWindowState) {
                 }
                 MENU_AUTOSTART_ID => {
                     let new_value = !state.cfg().behavior.start_on_login;
-                    state.mutate_config(|cfg| cfg.behavior.start_on_login = new_value);
-                    if let Err(error) = autostart::apply(state.cfg().behavior.start_on_login) {
+                    // Write the registry entry before committing the config
+                    // value: a failed write must not persist a state the
+                    // registry does not reflect.
+                    if let Err(error) = autostart::apply(new_value) {
                         error!("start-on-login update failed: {error:#}");
+                    } else {
+                        state.mutate_config(|cfg| cfg.behavior.start_on_login = new_value);
                     }
                 }
                 MENU_CLOSE_TRAY_ID => {
@@ -2558,9 +2562,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                 }
                                 SettingId::StartOnLogin => {
                                     let new_value = !state.cfg().behavior.start_on_login;
-                                    state.mutate_config(|cfg| cfg.behavior.start_on_login = new_value);
-                                    if let Err(error) = autostart::apply(state.cfg().behavior.start_on_login) {
+                                    // Write the registry entry before committing
+                                    // the config value: a failed write must not
+                                    // persist a state the registry does not
+                                    // reflect.
+                                    if let Err(error) = autostart::apply(new_value) {
                                         error!("start-on-login update failed: {error:#}");
+                                    } else {
+                                        state.mutate_config(|cfg| cfg.behavior.start_on_login = new_value);
                                     }
                                     state.invalidate();
                                 }
