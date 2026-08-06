@@ -209,6 +209,9 @@ struct OverlayState {
     /// the same song (same title+artist, different art) re-decodes instead of
     /// showing the stale image.
     decoded_art_source: Option<Arc<[u8]>>,
+    /// The art size `decoded_art` was decoded at, so a DPI move re-decodes at
+    /// the new resolution instead of serving the stale-size buffer.
+    decoded_art_size: usize,
     /// Dominant colors derived from `decoded_art` (recomputed only when the
     /// artwork re-decodes): the aura gradient and the accent recoloring read
     /// from here, so they always match the cover that is actually displayed.
@@ -354,6 +357,7 @@ impl OverlayState {
             tick_period: 16,
             decoded_art: None,
             decoded_art_source: None,
+            decoded_art_size: 0,
             palette: None,
             dib: None,
             frame_scratch: Vec::new(),
@@ -381,9 +385,12 @@ impl OverlayState {
 
     /// Decodes (once per artwork) and caches the artwork bitmap at the full
     /// art size, so animation frames never re-decode the JPEG/PNG. Keyed by
-    /// the artwork bytes themselves: the same song with a different cover
-    /// re-decodes, while unchanged art (session recreation, re-render) is
-    /// served from the cache. The palette is derived from the same decoded
+    /// the artwork bytes and the target size: a different cover re-decodes,
+    /// a DPI move re-decodes at the new resolution, and unchanged art
+    /// (session recreation, re-render) is served from the cache. A failed
+    /// decode is cached too — the source and size are recorded even when the
+    /// buffer stays `None` — so a corrupt cover is attempted once instead of
+    /// on every animation frame. The palette is derived from the same decoded
     /// buffer (~0.1ms, only when a re-decode happens), so no separate
     /// full-resolution decode is ever needed for color extraction.
     fn ensure_art(&mut self, artwork: Option<&Arc<[u8]>>, base_size: usize) {
@@ -392,11 +399,13 @@ impl OverlayState {
             (None, None) => true,
             _ => false,
         };
-        if self.decoded_art.is_none() || !same_art {
-            self.decoded_art = artwork.and_then(|a| decode_artwork(a, base_size));
-            self.decoded_art_source = artwork.cloned();
-            self.palette = self.decoded_art.as_deref().and_then(crate::palette::palette_from_rgba);
+        if same_art && self.decoded_art_size == base_size {
+            return;
         }
+        self.decoded_art = artwork.and_then(|a| decode_artwork(a, base_size));
+        self.decoded_art_source = artwork.cloned();
+        self.decoded_art_size = base_size;
+        self.palette = self.decoded_art.as_deref().and_then(crate::palette::palette_from_rgba);
     }
 
     /// Returns the Segoe UI (ANTIALIASED_QUALITY) HFONT for the given pixel
@@ -2808,7 +2817,7 @@ fn draw_icon_scaled(
     y: usize,
     dest_size: usize,
 ) {
-    if dest_size == 0 || icon_size == 0 || icon.is_empty() {
+    if dest_size == 0 || icon_size == 0 || icon.len() < icon_size * icon_size * 4 {
         return;
     }
     let src_stride = icon_size * 4;
@@ -3353,6 +3362,58 @@ mod tests {
         let mut dst = vec![0u8; 24];
         blit_packed_rows(&mut dst, 6, &src, 6, 4);
         assert_eq!(dst, src);
+    }
+
+    fn png_bytes(color: [u8; 3]) -> Arc<[u8]> {
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([color[0], color[1], color[2], 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("4x4 png should encode");
+        Arc::from(buf.into_inner())
+    }
+
+    #[test]
+    fn artwork_cache_is_keyed_by_bytes_and_size() {
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+        let red = png_bytes([200, 40, 40]);
+        let blue = png_bytes([40, 40, 200]);
+
+        state.ensure_art(Some(&red), 32);
+        assert_eq!(state.decoded_art.as_ref().map(Vec::len), Some(32 * 32 * 4));
+        let first = state.decoded_art.clone();
+
+        // Same bytes and size: served from the cache, not re-decoded.
+        state.ensure_art(Some(&red), 32);
+        assert_eq!(state.decoded_art, first);
+
+        // A DPI move changes the target size: re-decode at the new resolution.
+        state.ensure_art(Some(&red), 64);
+        assert_eq!(state.decoded_art.as_ref().map(Vec::len), Some(64 * 64 * 4));
+
+        // New bytes with the same size: re-decode from the new cover.
+        state.ensure_art(Some(&blue), 64);
+        assert_ne!(state.decoded_art, first);
+
+        // A simulated eviction (empty buffer) with an unchanged key is a
+        // no-op: a failed decode must not be re-attempted on every frame.
+        state.decoded_art = None;
+        state.ensure_art(Some(&blue), 64);
+        assert!(state.decoded_art.is_none(), "same key must not re-decode");
+
+        // A different size still forces a retry after a recorded failure.
+        state.ensure_art(Some(&blue), 48);
+        assert_eq!(state.decoded_art.as_ref().map(Vec::len), Some(48 * 48 * 4));
+    }
+
+    #[test]
+    fn draw_icon_scaled_rejects_a_short_icon_buffer() {
+        let mut pixels = vec![0u8; 40 * 40 * 4];
+        // An icon shorter than icon_size^2 * 4 must be a no-op, not an
+        // out-of-bounds read.
+        draw_icon_scaled(&mut pixels, 40, &[0u8; 10], 24, 0, 0, 24);
+        assert!(pixels.iter().all(|&b| b == 0));
     }
 
     #[test]

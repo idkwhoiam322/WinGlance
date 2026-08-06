@@ -403,6 +403,10 @@ struct CurrentActivity {
     /// FNV-1a of the artwork bytes this cache was decoded from, so a metadata
     /// refresh with unchanged artwork does not re-decode.
     art_fingerprint: Option<u64>,
+    /// A decode failure is cached: with this set, paint skips the retry until
+    /// the artwork bytes change, so a corrupt cover is attempted once instead
+    /// of on every repaint.
+    art_decode_failed: bool,
 }
 
 struct MainWindowState {
@@ -868,6 +872,7 @@ impl MainWindowState {
                 if current.art_fingerprint != art_fingerprint {
                     current.art = None;
                     current.art_fingerprint = art_fingerprint;
+                    current.art_decode_failed = false;
                 }
             }
             // Rejected-session rows can be pushed on top of the current
@@ -923,6 +928,7 @@ impl MainWindowState {
             // decode cost.
             art: None,
             art_fingerprint,
+            art_decode_failed: false,
         });
         self.invalidate();
     }
@@ -1051,6 +1057,7 @@ impl MainWindowState {
         // the first time the art is actually needed.
         if let Some(current) = &mut self.current
             && current.art.is_none()
+            && !current.art_decode_failed
             && current.art_fingerprint.is_some()
         {
             current.art = current
@@ -1058,6 +1065,7 @@ impl MainWindowState {
                 .artwork
                 .as_deref()
                 .and_then(|data| decode_artwork_pm(data, ART_DECODE as usize));
+            current.art_decode_failed = current.art.is_none();
         }
 
         if let Some(current) = &self.current {
