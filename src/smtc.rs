@@ -147,6 +147,14 @@ struct ListenerState {
     /// always sees a change. We compare title + artist + artwork-presence so
     /// that a genuine artwork gain still surfaces as an in-place refresh.
     last_track_per_source: HashMap<String, TrackInfo>,
+    /// Last playback state each source app reported, surviving session-key
+    /// changes. A recreated session (new key, default state) re-reports the
+    /// source's current playback; comparing it against this value tells the
+    /// session-recreation guard whether that report is noise (state unchanged)
+    /// or the user's real pause/play (state changed — YouTube Music recreates
+    /// its session when the transport buttons are used, so the fresh session's
+    /// first state can be the actual transition).
+    last_known_playback_per_source: HashMap<String, PlaybackState>,
     /// Cached app icons keyed by source_app label (derived from AUMID via
     /// `source_app_label`). Populated on first encounter of a source.
     icon_cache: HashMap<String, Option<Arc<[u8]>>>,
@@ -229,6 +237,7 @@ impl ListenerState {
             churn_cooldown: HashMap::new(),
             rejected_seen: HashSet::new(),
             last_track_per_source: HashMap::new(),
+            last_known_playback_per_source: HashMap::new(),
             icon_cache: HashMap::new(),
             last_emit_at: HashMap::new(),
             heartbeat,
@@ -385,15 +394,20 @@ impl ListenerState {
         // Playback is a normal diffable field: Stopped goes through the same
         // path as Playing/Paused and can produce a pill like any other real
         // transition. Transitional statuses leave the stored state untouched.
+        let mut known_playback = None;
         if playback != prev.playback
             && let Some(state) = playback
         {
+            // The last state this source reported, captured before this read
+            // overwrites it. The session-recreation guard below compares the
+            // fresh session's report against it: a state that actually changed
+            // is the user's own pause/play, not recreation noise.
+            let source = read_source_app(session);
+            known_playback = self.last_known_playback_per_source.get(&source).copied();
+            self.last_known_playback_per_source.insert(source.clone(), state);
             next.playback = Some(state);
-            info!(
-                "playback state changed | state={state:?} | source={}",
-                read_source_app(session)
-            );
-            events.push(MediaEvent::PlaybackStateChanged(state, read_source_app(session)));
+            info!("playback state changed | state={state:?} | source={source}");
+            events.push(MediaEvent::PlaybackStateChanged(state, source));
         }
 
         // Content is only diffed while the session is not stopped; a stopped
@@ -493,9 +507,18 @@ impl ListenerState {
                     // state (e.g. Paused while the user never touched anything)
                     // as if it were a real transition. When the track identifies
                     // the whole read as a session recreation, the paired
-                    // playback event is spurious too: drop it so a source that
-                    // re-creates its session while paused does not fire pills.
-                    if session_recreation && prev.source_app.is_empty() && prev.title.is_empty() {
+                    // playback event is usually spurious too: drop it so a
+                    // source that re-creates its session while paused does not
+                    // fire pills. The exception is a state that actually changed
+                    // since the source last reported it — YouTube Music
+                    // recreates its session when the user presses pause/play,
+                    // so the fresh session's first state can be the real
+                    // transition and must be shown.
+                    if session_recreation
+                        && prev.source_app.is_empty()
+                        && prev.title.is_empty()
+                        && spurious_recreated_playback(known_playback, playback)
+                    {
                         events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
                     }
                     if emit && !session_recreation {
@@ -689,6 +712,8 @@ impl ListenerState {
         // session: their cached track (with artwork bytes) and icon would
         // otherwise persist forever, growing with every AUMID variant seen.
         self.last_track_per_source.retain(|source, _| active.contains(source));
+        self.last_known_playback_per_source
+            .retain(|source, _| active.contains(source));
         self.icon_cache.retain(|source, _| active.contains(source));
         self.last_emit_at.retain(|source, _| active.contains(source));
     }
@@ -1001,6 +1026,20 @@ fn is_session_recreation(prev_track: &TrackInfo, merged: &TrackInfo, read_artwor
                 _ => false,
             }
         }
+}
+
+/// Whether a recreated session's first playback report is spurious noise
+/// rather than a real transition. A source recreating its session (new key,
+/// default state) re-reports its current playback state; when it matches the
+/// last state the source reported it is noise (the "Paused while the user
+/// never touched anything" case) and the paired TrackChanged, if any, already
+/// covers the pill. When it differs, the recreation was caused by the user's
+/// own pause/play and the event is the real transition. `None` — the source's
+/// first session, or a transitional status that produced no event — is
+/// treated as spurious, matching the historical behavior of dropping
+/// unconditionally.
+fn spurious_recreated_playback(known: Option<PlaybackState>, reported: Option<PlaybackState>) -> bool {
+    known.is_none() || known == reported
 }
 
 /// True if a session still needs a poll-driven artwork read: it has no artwork
@@ -1716,6 +1755,34 @@ mod tests {
     /// follows an emit that had art.
     fn old_is_session_recreation(prev: &TrackInfo, merged: &TrackInfo) -> bool {
         prev.title == merged.title && prev.artist == merged.artist && prev.artwork.is_some() == merged.artwork.is_some()
+    }
+
+    #[test]
+    fn recreated_session_playback_guard_keeps_real_state_changes() {
+        // Unknown source (first-ever session): treat as spurious, as before.
+        assert!(spurious_recreated_playback(None, Some(PlaybackState::Paused)));
+        assert!(spurious_recreated_playback(None, Some(PlaybackState::Playing)));
+        // State unchanged (recreation while paused/playing, user idle): noise.
+        assert!(spurious_recreated_playback(
+            Some(PlaybackState::Paused),
+            Some(PlaybackState::Paused)
+        ));
+        assert!(spurious_recreated_playback(
+            Some(PlaybackState::Playing),
+            Some(PlaybackState::Playing)
+        ));
+        // State actually changed: the recreation was the user's pause/play.
+        assert!(!spurious_recreated_playback(
+            Some(PlaybackState::Playing),
+            Some(PlaybackState::Paused)
+        ));
+        assert!(!spurious_recreated_playback(
+            Some(PlaybackState::Paused),
+            Some(PlaybackState::Playing)
+        ));
+        // Transitional status (no report) with a known state: nothing to
+        // drop — the retain is a no-op without a playback event anyway.
+        assert!(!spurious_recreated_playback(Some(PlaybackState::Paused), None));
     }
 
     #[test]
