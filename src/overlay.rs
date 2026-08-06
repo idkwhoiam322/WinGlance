@@ -256,7 +256,7 @@ struct OverlayState {
     /// when the window moves to another monitor or system scaling changes.
     last_dpi: u32,
     /// Physical-pixel inset from the buffer edge to the pill body, computed
-    /// each frame from `AURA_MARGIN_LOGICAL * dpi * shape`. The pill is
+    /// each frame from `AURA_HALO_LOGICAL * dpi * shape`. The pill is
     /// drawn at `(aura_inset, aura_inset)` so the aura fills the outer ring.
     aura_inset: i32,
 }
@@ -818,7 +818,7 @@ impl OverlayState {
         let (logical_width, logical_height) = content_size_of(&self.config, &content);
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
-        self.aura_inset = (AURA_MARGIN_LOGICAL * dpi * shape).round() as i32;
+        self.aura_inset = (AURA_HALO_LOGICAL * dpi * shape).round() as i32;
         let Some(position) = self.position(width, height) else {
             self.content = Some(content);
             return;
@@ -1275,8 +1275,8 @@ fn blit_packed_rows(dst: &mut [u8], dst_stride_bytes: usize, src: &[u8], row_byt
 /// Generous upper bound on the DIB backing buffer for the current config:
 /// the pill's logical size never exceeds `max_width` wide and the fitted
 /// height for the largest allowed art/font rows (both from
-/// `content_size_of`), inflated by the aura margin on every side, the ~3%
-/// ease-out-back shape overshoot mid-expand, and rounding. Allocating to
+/// `content_size_of`), inflated by the aura halo extent on every side, the
+/// ~3% ease-out-back shape overshoot mid-expand, and rounding. Allocating to
 /// this bound means animation frames reuse the buffer instead of recreating
 /// it every tick; a request that still exceeds it (e.g. config changed
 /// mid-run) just recreates once — the bound is an efficiency knob, never a
@@ -1288,10 +1288,11 @@ fn backing_upper_bound(config: &Config, dpi: u32) -> (i32, i32) {
     let max_text_h = 4.0 * appearance.font_size_title.max(appearance.font_size_artist) * ROW_HEIGHT;
     let max_h =
         (appearance.art_size as f32 + 2.0 * appearance.padding).max(max_text_h + 2.0 * appearance.padding + 8.0);
+    let aura_px = AURA_HALO_LOGICAL;
     let scale = dpi * 1.1;
     (
-        ((max_w + 2.0 * AURA_MARGIN_LOGICAL) * scale).ceil() as i32,
-        ((max_h + 2.0 * AURA_MARGIN_LOGICAL) * scale).ceil() as i32,
+        ((max_w + 2.0 * aura_px) * scale).ceil() as i32,
+        ((max_h + 2.0 * aura_px) * scale).ceil() as i32,
     )
 }
 
@@ -2867,15 +2868,22 @@ fn round_rect_coverage_supersampled(x: f32, y: f32, width: f32, height: f32, rad
 }
 
 /// Soft multi-color glow around the pill's boundary. The DIB is inflated by
-/// `AURA_MARGIN_LOGICAL` (scaled by DPI × shape) on every side so the halo
-/// can extend outside the pill into the desktop background.
+/// `AURA_HALO_LOGICAL` (scaled by DPI × shape) on every side so the halo can
+/// extend outside the pill into the desktop background.
 const AURA_MARGIN_LOGICAL: f32 = 10.0;
+/// Outer extent of the synthetic aura glow, in logical px per side. The
+/// falloff curve (see `AURA_DECAY`) is normalized by `AURA_MARGIN_LOGICAL`,
+/// so the glow's shape is independent of where it ends: shrinking the halo
+/// truncates the faint outer tail instead of re-shaping the visible part.
+const AURA_HALO_LOGICAL: f32 = 6.0;
 /// Peak opacity of the outer aura ring, at the pill boundary. Capped at ~140
 /// so the glow stays soft beneath the pill body's supersampled edge instead
 /// of producing a hard 0→255 step at the boundary.
 const AURA_PEAK_ALPHA: f32 = 140.0;
-/// Exponential decay constant: the aura's outer edge sits at
-/// exp(-AURA_DECAY) of the peak opacity.
+/// Exponential decay constant. The falloff is exp(-AURA_DECAY * d /
+/// (AURA_MARGIN_LOGICAL * scale)) per physical px, so the curve's per-px
+/// rate is fixed by these two constants and does not change when the halo
+/// extent shrinks.
 const AURA_DECAY: f32 = 3.0;
 
 #[allow(clippy::too_many_arguments)]
@@ -2892,7 +2900,7 @@ fn draw_aura(
 ) {
     let c1 = palette.primary;
     let c2 = palette.secondary;
-    let margin = (AURA_MARGIN_LOGICAL * scale).round().max(1.0) as usize;
+    let margin = (AURA_HALO_LOGICAL * scale).round().max(1.0) as usize;
 
     for y in 0..buf_h {
         for x in 0..buf_w {
@@ -2947,9 +2955,16 @@ fn draw_aura(
                 (c1[2] as f32 * (1.0 - t) + c2[2] as f32 * t).round() as u8,
             ];
 
-            // Exponential outer decay: alpha(d) = A_peak * inner_aa * e^(-decay * d / margin)
-            let falloff = (-d / margin as f32 * AURA_DECAY).exp();
-            let alpha = (AURA_PEAK_ALPHA * inner_aa * falloff).round().min(140.0) as u32;
+            // Exponential outer decay at a fixed per-logical-px rate (DPI and
+            // the expand/collapse shape are folded into `scale`). The margin
+            // guard above truncates the halo at its extent; the last px
+            // ramps linearly to 0 so the glow ends smoothly mid-curve
+            // instead of hitting a hard edge.
+            let falloff = (-d * AURA_DECAY / AURA_MARGIN_LOGICAL / scale).exp();
+            let edge = (margin as f32 - d).clamp(0.0, 1.0);
+            let alpha = (AURA_PEAK_ALPHA * inner_aa * falloff * edge)
+                .round()
+                .min(AURA_PEAK_ALPHA) as u32;
 
             if alpha > 0 {
                 composite(pixels, buf_w, x, y, rgb, alpha);
@@ -3452,10 +3467,13 @@ mod tests {
         // Just outside the pill boundary (d ≈ 1.5): visible.
         let near = alpha_at(inset + pill_w + 1, inset + pill_h / 2);
         assert!(near > 0, "outer glow must be visible just outside the pill");
-        // Farther out (d ≈ 5.5, within the 10px margin): still visible but weaker.
+        // Farther out (d ≈ 5.5, inside the 6px halo): still visible but weaker.
         let far = alpha_at(inset + pill_w + 5, inset + pill_h / 2);
         assert!(far > 0, "glow must extend beyond the pill edge");
         assert!(near > far, "glow must fade with distance from the pill");
+        // Beyond the halo extent: nothing.
+        let beyond = alpha_at(inset + pill_w + 7, inset + pill_h / 2);
+        assert_eq!(beyond, 0, "no glow beyond the halo extent");
         // Inside the pill: no aura (covered by body fill).
         let inside = alpha_at(inset + 2, inset + pill_h / 2);
         assert_eq!(inside, 0, "inside the pill there must be no aura");
