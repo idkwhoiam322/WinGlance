@@ -118,7 +118,7 @@ impl Default for BehaviorConfig {
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
-            background_color: [0x12, 0x14, 0x1C, 0xEB],
+            background_color: [0x12, 0x14, 0x1C, 0xFF],
             text_color: [0xFF, 0xFF, 0xFF, 0xFF],
             // Single hardcoded pink accent, used across the pill, the sidebar
             // highlights and the window title bar. Deliberately not derived
