@@ -1732,7 +1732,9 @@ impl MainWindowState {
                 if *id == SettingId::Duration {
                     let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
                     let seg = segments.iter().position(|s| x >= s.left && x < s.right);
-                    return Some((row_index, SettingSub::Seg(seg.unwrap_or(0))));
+                    // A click or hover in the gap right of the last segment is
+                    // not the first segment; the row stays highlighted.
+                    return Some((row_index, seg.map_or(SettingSub::None, SettingSub::Seg)));
                 }
                 if *id == SettingId::Position {
                     let parts = position_parts(rect, scale);
