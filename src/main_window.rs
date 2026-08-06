@@ -27,7 +27,7 @@ use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, Glo
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Controls::{
     DRAWITEMSTRUCT, NMHDR, NMTTDISPINFOW, ODS_SELECTED, TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_DELTOOLW,
-    TTM_SETMAXTIPWIDTH, TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX, WM_MOUSELEAVE,
+    TTM_SETMAXTIPWIDTH, TTM_SETTOOLINFOW, TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
@@ -37,15 +37,15 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, HWND_TOP, IDC_ARROW, IDI_APPLICATION,
-    IsWindowVisible, KillTimer, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMRECT, LB_GETTOPINDEX,
-    LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED,
-    LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX,
-    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
-    WM_NOTIFY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD,
-    WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    IsWindowVisible, KillTimer, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT,
+    LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT,
+    LBS_OWNERDRAWFIXED, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE,
+    WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASS_STYLES,
+    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -438,11 +438,10 @@ struct MainWindowState {
     settings_hover: Option<(usize, SettingSub)>,
     /// Native TOOLTIPS_CLASS control showing full history details on hover.
     tooltip_ctrl: HWND,
-    /// Number of tools currently registered in the native tooltip (for resync).
-    tooltip_count: usize,
-    /// Last synced (item count, top index) of the history listbox; the 1 Hz
-    /// tooltip timer skips the full rebuild while both are unchanged.
-    tooltip_sync: Option<(usize, usize)>,
+    /// Currently registered tool range [start, end) in the native tooltip:
+    /// the visible band of listbox rows. Unchanged (count, top, size) skips
+    /// the sync; a scroll only touches the rows that crossed the band.
+    tooltip_range: Option<(usize, usize)>,
     /// Set when an event batch changed the list; the tooltips are rebuilt once
     /// per batch instead of once per event.
     tooltips_dirty: bool,
@@ -548,8 +547,7 @@ impl MainWindowState {
             active_pane: Pane::Activity,
             settings_hover: None,
             tooltip_ctrl: HWND::default(),
-            tooltip_count: 0,
-            tooltip_sync: None,
+            tooltip_range: None,
             tooltips_dirty: false,
             logs_copied_at: None,
         }
@@ -704,10 +702,14 @@ impl MainWindowState {
 
     /// Rebuilds the per-item tool definitions so rects and row count match
     /// the listbox (rows are fixed-height, so scroll changes the mapping).
-    /// The 1 Hz timer calls this constantly, so a full rebuild (3N+1
+    /// The 1 Hz timer calls this constantly, so the full rebuild (3N+1
     /// SendMessageW) is skipped when the item count and scroll position are
-    /// unchanged since the last sync. While the window is hidden in the tray
-    /// there is nothing to sync, so the timer's two probe messages are
+    /// unchanged since the last sync. Only the *visible* band of rows is
+    /// registered (off-screen rows cannot be hovered): a scroll updates the
+    /// band's rects in place via TTM_NEWTOOLW and drops the rows that
+    /// scrolled out, so the per-tick message count is bounded by the visible
+    /// row count instead of the history size. While the window is hidden in
+    /// the tray there is nothing to sync, so the timer's probe messages are
     /// skipped entirely (the show path re-syncs on restore).
     fn sync_tooltips(&mut self) {
         if !unsafe { IsWindowVisible(self.hwnd).as_bool() } {
@@ -719,29 +721,37 @@ impl MainWindowState {
         unsafe {
             let count = SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
             let top = SendMessageW(self.listbox, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)).0 as usize;
-            if self.tooltip_sync == Some((count, top)) {
+            let mut client = RECT::default();
+            let _ = GetClientRect(self.listbox, &mut client);
+            let item_h = SendMessageW(self.listbox, LB_GETITEMHEIGHT, WPARAM(0), LPARAM(0)).0 as usize;
+            let visible = client.bottom as usize / item_h.max(1) + 1;
+            let end = (top + visible).min(count);
+            if self.tooltip_range == Some((top, end)) {
                 return;
             }
-            for index in 0..self.tooltip_count {
-                let mut tool = ToolInfo {
-                    cb_size: std::mem::size_of::<ToolInfo>() as u32,
-                    u_flags: 0,
-                    hwnd: self.listbox,
-                    u_id: index,
-                    rect: RECT::default(),
-                    hinst: HINSTANCE::default(),
-                    lpsz_text: std::ptr::null_mut(),
-                    l_param: 0,
-                    lp_reserved: std::ptr::null_mut(),
-                };
-                let _ = SendMessageW(
-                    self.tooltip_ctrl,
-                    TTM_DELTOOLW,
-                    WPARAM(0),
-                    LPARAM(&mut tool as *mut _ as isize),
-                );
+            let (old_start, old_end) = self.tooltip_range.unwrap_or((0, 0));
+            for index in old_start..old_end {
+                if index < top || index >= end {
+                    let mut tool = ToolInfo {
+                        cb_size: std::mem::size_of::<ToolInfo>() as u32,
+                        u_flags: 0,
+                        hwnd: self.listbox,
+                        u_id: index,
+                        rect: RECT::default(),
+                        hinst: HINSTANCE::default(),
+                        lpsz_text: std::ptr::null_mut(),
+                        l_param: 0,
+                        lp_reserved: std::ptr::null_mut(),
+                    };
+                    let _ = SendMessageW(
+                        self.tooltip_ctrl,
+                        TTM_DELTOOLW,
+                        WPARAM(0),
+                        LPARAM(&mut tool as *mut _ as isize),
+                    );
+                }
             }
-            for index in 0..count {
+            for index in top..end {
                 let mut rect = RECT::default();
                 let ok = SendMessageW(
                     self.listbox,
@@ -763,15 +773,21 @@ impl MainWindowState {
                     l_param: 0,
                     lp_reserved: std::ptr::null_mut(),
                 };
+                // Adds the tool, or updates the existing one's rect in place
+                // (the row's client position moved with the scroll).
+                let message = if index >= old_start && index < old_end {
+                    TTM_SETTOOLINFOW
+                } else {
+                    TTM_ADDTOOLW
+                };
                 let _ = SendMessageW(
                     self.tooltip_ctrl,
-                    TTM_ADDTOOLW,
+                    message,
                     WPARAM(0),
                     LPARAM(&mut tool as *mut _ as isize),
                 );
             }
-            self.tooltip_count = count;
-            self.tooltip_sync = Some((count, top));
+            self.tooltip_range = Some((top, end));
         }
     }
 
@@ -1982,16 +1998,28 @@ impl MainWindowState {
         }
     }
 
-    /// The client-space region the settings pane occupies (right of the
-    /// sidebar), repainted on hover changes.
-    fn settings_region(&self, client_w: i32, client_h: i32) -> RECT {
+    /// Invalidates only the settings rows that changed hover state
+    /// (pixel-identical to repainting the whole pane: every other row is
+    /// unchanged). The row rects come from the same layout the hover
+    /// hit-testing and the paint use.
+    fn invalidate_hover_rows(&self, client_w: i32, old: Option<(usize, SettingSub)>, new: Option<(usize, SettingSub)>) {
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let sidebar_w = (SIDEBAR_W * scale).round() as i32;
-        RECT {
-            left: sidebar_w,
-            top: 0,
-            right: client_w,
-            bottom: client_h,
+        let pad = (PAD * scale) as i32;
+        let items = self.settings_items(sidebar_w, client_w, pad, scale);
+        for (row, _) in [old, new].into_iter().flatten() {
+            // Row indices count rows only (headers are skipped), so walk the
+            // row items to find the rect at that ordinal.
+            let rect = items
+                .iter()
+                .filter_map(|i| match i {
+                    SettingsItem::Row { rect, .. } => Some(rect),
+                    _ => None,
+                })
+                .nth(row);
+            if let Some(rect) = rect {
+                self.invalidate_rect(rect);
+            }
         }
     }
 
@@ -2762,16 +2790,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                     let sidebar_w = (SIDEBAR_W * scale).round() as i32;
                     let pad = (PAD * scale) as i32;
-                    let (client_w, client_h) = client_size(hwnd);
+                    let (client_w, _client_h) = client_size(hwnd);
                     let hover = if x < sidebar_w {
                         None
                     } else {
                         state.settings_hover_at(x, y, sidebar_w, client_w, pad, scale)
                     };
                     if hover != state.settings_hover {
+                        let old = state.settings_hover;
                         state.settings_hover = hover;
-                        let region = state.settings_region(client_w, client_h);
-                        state.invalidate_rect(&region);
+                        state.invalidate_hover_rows(client_w, old, hover);
                     }
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -2780,11 +2808,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                         dwHoverTime: 0,
                     };
                     let _ = TrackMouseEvent(&mut tme);
-                } else if state.settings_hover.is_some() {
+                } else if let Some(old) = state.settings_hover {
                     state.settings_hover = None;
-                    let (client_w, client_h) = client_size(hwnd);
-                    let region = state.settings_region(client_w, client_h);
-                    state.invalidate_rect(&region);
+                    let (client_w, _client_h) = client_size(hwnd);
+                    state.invalidate_hover_rows(client_w, Some(old), None);
                 }
             }
             LRESULT(0)
@@ -2792,11 +2819,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_MOUSELEAVE => {
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
-                if state.settings_hover.is_some() {
+                if let Some(old) = state.settings_hover {
                     state.settings_hover = None;
-                    let (client_w, client_h) = client_size(hwnd);
-                    let region = state.settings_region(client_w, client_h);
-                    state.invalidate_rect(&region);
+                    let (client_w, _client_h) = client_size(hwnd);
+                    state.invalidate_hover_rows(client_w, Some(old), None);
                 }
             }
             LRESULT(0)
