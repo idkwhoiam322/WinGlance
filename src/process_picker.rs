@@ -78,9 +78,9 @@ fn close_btn_rect(client: &RECT) -> RECT {
     }
 }
 
-fn register_class(instance: HINSTANCE) {
+fn register_class(instance: HINSTANCE) -> bool {
     if CLASS_REGISTERED.get().is_some() {
-        return;
+        return true;
     }
     unsafe {
         let cursor = LoadCursorW(None, IDC_ARROW).unwrap();
@@ -94,8 +94,13 @@ fn register_class(instance: HINSTANCE) {
             hbrBackground: CreateSolidBrush(COLORREF(0x001E1E1E)),
             ..Default::default()
         };
-        let _ = RegisterClassExW(&class);
+        if RegisterClassExW(&class) == 0 {
+            let _ = DeleteObject(class.hbrBackground);
+            warn!("RegisterClassExW failed for the process picker window");
+            return false;
+        }
         let _ = CLASS_REGISTERED.set(());
+        true
     }
 }
 
@@ -293,7 +298,9 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
             Ok(h) => HINSTANCE(h.0),
             Err(_) => return false,
         };
-        register_class(instance);
+        if !register_class(instance) {
+            return false;
+        }
         close_existing();
 
         let item_count = list.len().min(MAX_VISIBLE);
@@ -342,7 +349,12 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
         let hwnd = match hwnd {
             Ok(hwnd) => hwnd,
             Err(_) => {
-                drop(Box::from_raw(state_ptr));
+                // The state box is owned by the window from WM_NCCREATE onward
+                // and freed in WM_NCDESTROY. If CreateWindowExW fails after
+                // WM_NCCREATE ran, the system tears the window down through
+                // WM_NCDESTROY first, so freeing the box here would double-free
+                // it; WM_NCCREATE-never-ran failures are prevented by the
+                // registration check just above.
                 return false;
             }
         };

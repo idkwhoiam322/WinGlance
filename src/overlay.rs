@@ -1144,7 +1144,12 @@ pub(crate) fn create_window(config: Config, queue: EventQueue) -> Result<HWND> {
     match hwnd {
         Ok(hwnd) => Ok(hwnd),
         Err(error) => {
-            unsafe { drop(Box::from_raw(state_ptr)) };
+            // The state box is owned by the window from WM_NCCREATE onward and
+            // freed in WM_NCDESTROY. If CreateWindowExW fails after WM_NCCREATE
+            // ran, the system tears the window down through WM_NCDESTROY first,
+            // so freeing the box here would double-free it. Freeing here only
+            // covers the WM_NCCREATE-never-ran case, which cannot happen
+            // because the class was just registered above.
             Err(error.into())
         }
     }
@@ -3168,8 +3173,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         let create = lparam.0 as *const CREATESTRUCTW;
         if !create.is_null() {
             let state = (*create).lpCreateParams as *mut OverlayState;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
-            (*state).hwnd = hwnd;
+            if !state.is_null() {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+                (*state).hwnd = hwnd;
+            }
         }
     }
 

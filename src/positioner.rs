@@ -1,5 +1,5 @@
 use crate::events::POSITION_MSG;
-use log::debug;
+use log::{debug, warn};
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -51,7 +51,9 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
             Err(_) => return false,
         };
         let class_name = wide(CLASS_NAME);
-        register_class(instance, &class_name);
+        if !register_class(instance, &class_name) {
+            return false;
+        }
 
         let state = Box::new(PositionerState {
             owner,
@@ -83,7 +85,12 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
                 true
             }
             Err(_) => {
-                drop(Box::from_raw(state_ptr));
+                // The state box is owned by the window from WM_NCCREATE onward
+                // and freed in WM_NCDESTROY. If CreateWindowExW fails after
+                // WM_NCCREATE ran, the system tears the window down through
+                // WM_NCDESTROY first, so freeing the box here would double-free
+                // it; WM_NCCREATE-never-ran failures are prevented by the
+                // registration check just above.
                 false
             }
         }
@@ -127,9 +134,9 @@ pub(crate) fn reset_position() {
     }
 }
 
-fn register_class(instance: HINSTANCE, class_name: &[u16]) {
+fn register_class(instance: HINSTANCE, class_name: &[u16]) -> bool {
     if CLASS_REGISTERED.get().is_some() {
-        return;
+        return true;
     }
     unsafe {
         let cursor = LoadCursorW(None, IDC_ARROW).unwrap();
@@ -143,8 +150,13 @@ fn register_class(instance: HINSTANCE, class_name: &[u16]) {
             hbrBackground: CreateSolidBrush(COLORREF(0x00121212)),
             ..Default::default()
         };
-        let _ = RegisterClassExW(&class);
+        if RegisterClassExW(&class) == 0 {
+            let _ = DeleteObject(class.hbrBackground);
+            warn!("RegisterClassExW failed for the positioner window");
+            return false;
+        }
         let _ = CLASS_REGISTERED.set(());
+        true
     }
 }
 
