@@ -236,8 +236,11 @@ fn is_already_running() -> bool {
 }
 
 fn main() -> Result<()> {
+    // Logging initializes before the config loads: a corrupted config.toml now
+    // falls back to defaults, and that fallback must be diagnosable through
+    // the log file.
+    logging::init_logging(&config::Config::default().logs_dir());
     let config = config::Config::load()?;
-    logging::init_logging(&config.logs_dir());
     install_crash_handler(&config.logs_dir());
     install_panic_hook(&config.logs_dir());
 

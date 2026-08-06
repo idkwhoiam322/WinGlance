@@ -1,3 +1,4 @@
+use log::warn;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -138,15 +139,45 @@ impl Default for AppearanceConfig {
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let config_path = Self::config_path()?;
-        let mut config = if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)?;
-            toml::from_str(&content)?
-        } else {
-            Config::default()
-        };
-        config.normalize();
         if !config_path.exists() {
+            let mut config = Config::default();
+            config.normalize();
             config.save()?;
+            return Ok(config);
+        }
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(content) => content,
+            Err(error) => {
+                warn!("config.toml could not be read ({error}); falling back to defaults");
+                return Self::default_config_saved();
+            }
+        };
+        match toml::from_str::<Config>(&content) {
+            Ok(mut config) => {
+                config.normalize();
+                Ok(config)
+            }
+            Err(error) => {
+                // A hand-edited or partially written config must not kill the
+                // app with no console and no dialog: fall back to defaults and
+                // keep the bad file for inspection under config.toml.bad.
+                warn!("config.toml is not valid TOML ({error}); falling back to defaults");
+                let backup = config_path.with_extension("toml.bad");
+                if let Err(rename_error) = std::fs::rename(&config_path, &backup) {
+                    warn!("keeping the bad config as {backup:?} failed: {rename_error}");
+                }
+                Self::default_config_saved()
+            }
+        }
+    }
+
+    /// Defaults in memory with a best-effort persist, so the next launch
+    /// starts from a healthy file while the bad one stays quarantined.
+    fn default_config_saved() -> anyhow::Result<Self> {
+        let mut config = Config::default();
+        config.normalize();
+        if let Err(error) = config.save() {
+            warn!("could not write a fresh config.toml: {error}");
         }
         Ok(config)
     }

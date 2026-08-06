@@ -510,7 +510,9 @@ impl MainWindowState {
     fn mutate_config(&mut self, mutate: impl FnOnce(&mut Config)) {
         let mut cfg = self.config.write().unwrap();
         mutate(&mut cfg);
-        let _ = cfg.save();
+        if let Err(error) = cfg.save() {
+            error!("saving config after a settings change failed: {error}");
+        }
     }
 
     fn new(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwnd: HWND, instance: HINSTANCE) -> Self {
