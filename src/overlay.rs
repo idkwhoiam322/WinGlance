@@ -172,6 +172,19 @@ struct TextScratch {
     height: i32,
 }
 
+/// Pre-rendered text pieces of the pill currently on screen, built once per
+/// content change so animation frames neither rebuild the meta line nor
+/// clone the cached TrackInfo. The draw path takes it out of the state and
+/// puts it back, keeping the `state` borrow exclusive.
+struct PillText {
+    title: String,
+    artist: String,
+    source_app: String,
+    app_icon: Option<Arc<[u8]>>,
+    meta_clock: bool,
+    meta: String,
+}
+
 struct OverlayState {
     hwnd: HWND,
     config: Config,
@@ -246,6 +259,9 @@ struct OverlayState {
     /// so that a later PlaybackStateChanged for that source can render the
     /// correct track info instead of the most-recently-shown app's track.
     track_cache: HashMap<String, TrackInfo>,
+    /// Pre-rendered text pieces of the pill currently on screen, resolved once
+    /// per content change (see `resolve_pill_text`).
+    pill_text: Option<PillText>,
     /// Scratch DC + DIB for GDI text rendering (cached across frames).
     text_scratch: Option<TextScratch>,
     /// Reusable UTF-16 scratch buffer for GDI text rendering, cleared and
@@ -366,6 +382,7 @@ impl OverlayState {
             last_reassert: None,
             current_source: None,
             track_cache: HashMap::new(),
+            pill_text: None,
             text_scratch: None,
             scratch_utf16: Vec::new(),
             font_cache: HashMap::new(),
@@ -699,6 +716,7 @@ impl OverlayState {
     /// refresh only changes the drawn rows, never the pill's dimensions.
     fn update_content(&mut self, event: MediaEvent) {
         self.content = Some(event);
+        self.resolve_pill_text();
         self.reset_scroll();
         if let Some(deadline) = self.dismiss_at {
             self.dismiss_at = Some(deadline.max(Instant::now() + update_min_duration(&self.config)));
@@ -714,6 +732,21 @@ impl OverlayState {
         self.render();
     }
 
+    /// Builds the render pieces for the pill content once, when the content
+    /// changes. The state-pill path resolves the cached track here too, so
+    /// animation frames draw from `pill_text` without a per-frame TrackInfo
+    /// clone or meta-line rebuild. `None` for a state pill whose source has
+    /// no cached track: the caller falls back to the source-name layout.
+    fn resolve_pill_text(&mut self) {
+        self.pill_text = match &self.content {
+            Some(MediaEvent::TrackChanged(track)) => Some(pill_text_from_track(track)),
+            Some(MediaEvent::PlaybackStateChanged(_, source)) if !source.is_empty() => {
+                self.track_cache.get(source).map(pill_text_from_track)
+            }
+            _ => None,
+        };
+    }
+
     fn show(&mut self, event: MediaEvent, full_animation: bool) {
         self.show_with_duration(event, full_animation, self.config.overlay.duration_ms.max(500));
     }
@@ -723,6 +756,7 @@ impl OverlayState {
             return;
         }
         self.content = Some(event);
+        self.resolve_pill_text();
         self.reset_scroll();
         let now = Instant::now();
         self.dismiss_at = Some(now + Duration::from_millis(duration_ms));
@@ -1079,6 +1113,7 @@ impl OverlayState {
             MediaEvent::TrackChanged,
         );
         self.content = Some(content);
+        self.resolve_pill_text();
         self.reset_scroll();
         let now = Instant::now();
         self.dismiss_at = Some(now + sample_duration(&self.config));
@@ -1510,142 +1545,112 @@ fn draw_pixels(
         MediaEvent::TrackChanged(_) => {
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
-            // Must match the mask radius draw_art_scaled uses for the art
-            // bitmap itself, not the pill's corner_radius — otherwise the
-            // halo/rim are rounder than the art beneath them and visibly
-            // don't hug its corners.
             let art_radius = art_size as f32 * 0.2;
             let art_x = inset + padding;
             let art_y = inset + pill_h.saturating_sub(art_size) / 2;
-            // Album art halo: subtle accent glow behind the art square.
-            if let Some(c) = state.palette.map(|p| p.primary) {
-                let halo_pad = (1.5 * scale).round() as usize;
-                let halo_size = art_size + halo_pad * 2;
-                let halo_x = art_x.saturating_sub(halo_pad);
-                let halo_y = art_y.saturating_sub(halo_pad);
-                let halo_radius = art_radius + halo_pad as f32;
-                for dy in 0..halo_size {
-                    for dx in 0..halo_size {
-                        let cov =
-                            round_rect_coverage(dx as f32, dy as f32, halo_size as f32, halo_size as f32, halo_radius);
-                        if cov > 0.0 {
-                            let alpha = (c[3] as f32 * 0.75 * cov) as u32;
-                            composite(pixels, width, halo_x + dx, halo_y + dy, [c[0], c[1], c[2]], alpha);
-                        }
-                    }
-                }
-            }
-            if let Some(art) = state.decoded_art.as_deref() {
-                draw_art_scaled(
-                    pixels,
-                    width,
-                    art,
-                    art_base,
-                    art_x,
-                    art_y,
-                    art_size,
-                    state.config.appearance.accent_color,
-                );
-            } else {
-                draw_placeholder(
-                    pixels,
-                    width,
-                    art_x,
-                    art_y,
-                    art_size,
-                    state.config.appearance.accent_color,
-                );
-            }
-            // Glowing rim: thin 1.5px accent stroke around the album art.
-            if let Some(c) = state.palette.map(|p| p.primary) {
-                let stroke_w = (1.5 * scale).round().max(1.0);
-                for dy in 0..art_size {
-                    for dx in 0..art_size {
-                        let d =
-                            round_rect_signed_dist(dx as f32, dy as f32, art_size as f32, art_size as f32, art_radius);
-                        if d.abs() < stroke_w {
-                            let edge = 1.0 - d.abs() / stroke_w;
-                            let alpha = (c[3] as f32 * 0.9 * edge) as u32;
-                            composite(pixels, width, art_x + dx, art_y + dy, [c[0], c[1], c[2]], alpha);
-                        }
-                    }
-                }
-            }
+            draw_art_tile(
+                pixels,
+                width,
+                state.palette,
+                state.config.appearance.accent_color,
+                art_base,
+                art_x,
+                art_y,
+                art_size,
+                art_radius,
+                state.decoded_art.as_deref(),
+                scale,
+            );
         }
         MediaEvent::PlaybackStateChanged(_, _) => {
             // State pills reuse the cached track's artwork for the source that
             // produced the state change, so a pause/play pill still shows the
             // right cover. Falls back to the accent placeholder when nothing
-            // has been cached for this source yet.
+            // has been cached for this source yet. The art size is clamped to
+            // the pill body: the state-pill layout reserves no extra rows.
             let padding = (state.config.appearance.padding * scale).round() as usize;
             let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
             let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
-            // Must match the mask radius draw_art_scaled uses for the art
-            // bitmap itself, not the pill's corner_radius — otherwise the
-            // halo/rim are rounder than the art beneath them and visibly
-            // don't hug its corners.
             let art_radius = art_size as f32 * 0.2;
             let art_x = inset + padding;
             let art_y = inset + pill_h.saturating_sub(art_size) / 2;
-            // Album art halo: subtle accent glow behind the art square.
-            if let Some(c) = state.palette.map(|p| p.primary) {
-                let halo_pad = (1.5 * scale).round() as usize;
-                let halo_size = art_size + halo_pad * 2;
-                let halo_x = art_x.saturating_sub(halo_pad);
-                let halo_y = art_y.saturating_sub(halo_pad);
-                let halo_radius = art_radius + halo_pad as f32;
-                for dy in 0..halo_size {
-                    for dx in 0..halo_size {
-                        let cov =
-                            round_rect_coverage(dx as f32, dy as f32, halo_size as f32, halo_size as f32, halo_radius);
-                        if cov > 0.0 {
-                            let alpha = (c[3] as f32 * 0.75 * cov) as u32;
-                            composite(pixels, width, halo_x + dx, halo_y + dy, [c[0], c[1], c[2]], alpha);
-                        }
-                    }
-                }
-            }
-            if let Some(art) = state.decoded_art.as_deref() {
-                draw_art_scaled(
-                    pixels,
-                    width,
-                    art,
-                    art_base,
-                    art_x,
-                    art_y,
-                    art_size,
-                    state.config.appearance.accent_color,
-                );
-            } else {
-                draw_placeholder(
-                    pixels,
-                    width,
-                    art_x,
-                    art_y,
-                    art_size,
-                    state.config.appearance.accent_color,
-                );
-            }
-            // Glowing rim: thin 1.5px accent stroke around the album art.
-            if let Some(c) = state.palette.map(|p| p.primary) {
-                let stroke_w = (1.5 * scale).round().max(1.0);
-                for dy in 0..art_size {
-                    for dx in 0..art_size {
-                        let d =
-                            round_rect_signed_dist(dx as f32, dy as f32, art_size as f32, art_size as f32, art_radius);
-                        if d.abs() < stroke_w {
-                            let edge = 1.0 - d.abs() / stroke_w;
-                            let alpha = (c[3] as f32 * 0.9 * edge) as u32;
-                            composite(pixels, width, art_x + dx, art_y + dy, [c[0], c[1], c[2]], alpha);
-                        }
-                    }
-                }
-            }
+            draw_art_tile(
+                pixels,
+                width,
+                state.palette,
+                state.config.appearance.accent_color,
+                art_base,
+                art_x,
+                art_y,
+                art_size,
+                art_radius,
+                state.decoded_art.as_deref(),
+                scale,
+            );
         }
         // Never rendered: SessionRejected is filtered out before enqueue.
         MediaEvent::SessionRejected { .. } => {}
     }
     Ok(())
+}
+
+/// Draws the art tile at (art_x, art_y): the accent halo behind the square,
+/// the cover (or the accent placeholder when no art decoded) and the glowing
+/// rim. Shared by the track- and state-pill arms, which differ only in the
+/// art-size clamp the caller applies. The mask radius must match the one
+/// `draw_art_scaled` uses for the art bitmap itself, not the pill's
+/// `corner_radius` — otherwise the halo/rim are rounder than the art beneath
+/// them and visibly don't hug its corners.
+#[allow(clippy::too_many_arguments)]
+fn draw_art_tile(
+    pixels: &mut [u8],
+    width: usize,
+    palette: Option<Palette>,
+    accent: [u8; 4],
+    art_base: usize,
+    art_x: usize,
+    art_y: usize,
+    art_size: usize,
+    art_radius: f32,
+    decoded_art: Option<&[u8]>,
+    scale: f32,
+) {
+    // Album art halo: subtle accent glow behind the art square.
+    if let Some(c) = palette.map(|p| p.primary) {
+        let halo_pad = (1.5 * scale).round() as usize;
+        let halo_size = art_size + halo_pad * 2;
+        let halo_x = art_x.saturating_sub(halo_pad);
+        let halo_y = art_y.saturating_sub(halo_pad);
+        let halo_radius = art_radius + halo_pad as f32;
+        for dy in 0..halo_size {
+            for dx in 0..halo_size {
+                let cov = round_rect_coverage(dx as f32, dy as f32, halo_size as f32, halo_size as f32, halo_radius);
+                if cov > 0.0 {
+                    let alpha = (c[3] as f32 * 0.75 * cov) as u32;
+                    composite(pixels, width, halo_x + dx, halo_y + dy, [c[0], c[1], c[2]], alpha);
+                }
+            }
+        }
+    }
+    if let Some(art) = decoded_art {
+        draw_art_scaled(pixels, width, art, art_base, art_x, art_y, art_size, accent);
+    } else {
+        draw_placeholder(pixels, width, art_x, art_y, art_size, accent);
+    }
+    // Glowing rim: thin 1.5px accent stroke around the album art.
+    if let Some(c) = palette.map(|p| p.primary) {
+        let stroke_w = (1.5 * scale).round().max(1.0);
+        for dy in 0..art_size {
+            for dx in 0..art_size {
+                let d = round_rect_signed_dist(dx as f32, dy as f32, art_size as f32, art_size as f32, art_radius);
+                if d.abs() < stroke_w {
+                    let edge = 1.0 - d.abs() / stroke_w;
+                    let alpha = (c[3] as f32 * 0.9 * edge) as u32;
+                    composite(pixels, width, art_x + dx, art_y + dy, [c[0], c[1], c[2]], alpha);
+                }
+            }
+        }
+    }
 }
 
 /// Directional edge highlight traced on the pill's own boundary — a
@@ -2104,7 +2109,7 @@ fn draw_pill_text_rows(
     pixels: &mut [u8],
     width: i32,
     scale: f32,
-    track: &TrackInfo,
+    pill: &PillText,
     playback: Option<PlaybackState>,
 ) {
     let inset = state.aura_inset;
@@ -2144,13 +2149,12 @@ fn draw_pill_text_rows(
     let (font_app, h_app) = state.font_for(rows[3].1 as i32, false);
     // Only rows that will actually be drawn take up vertical space: the rest
     // of the pill's constant height stays empty below the rows.
-    let (meta_clock, meta) = track.meta_line_for_overlay(true);
-    let artist_active = !track.artist.trim().is_empty();
+    let artist_active = !pill.artist.trim().is_empty();
     let active: [bool; 4] = [
         true,
         artist_active,
-        !meta.is_empty(),
-        !track.source_app.trim().is_empty(),
+        !pill.meta.is_empty(),
+        !pill.source_app.trim().is_empty(),
     ];
     let text_top = inset as f32 + pad * scale;
     let mut y = text_top;
@@ -2188,7 +2192,7 @@ fn draw_pill_text_rows(
         &mut state.scratch_utf16,
         pixels,
         width as usize,
-        &track.title,
+        &pill.title,
         &title_narrow,
         font_title,
         h_title,
@@ -2215,7 +2219,7 @@ fn draw_pill_text_rows(
             &mut state.scratch_utf16,
             pixels,
             width as usize,
-            &track.artist,
+            &pill.artist,
             &artist_rect,
             font_artist,
             h_artist,
@@ -2233,8 +2237,8 @@ fn draw_pill_text_rows(
             pixels,
             width,
             &meta_rect,
-            &meta,
-            meta_clock,
+            &pill.meta,
+            pill.meta_clock,
             font_meta,
             rows[2].1 as i32,
             h_meta,
@@ -2251,7 +2255,8 @@ fn draw_pill_text_rows(
             &mut state.scratch_utf16,
             pixels,
             width as usize,
-            track,
+            &pill.source_app,
+            pill.app_icon.as_ref(),
             &app_rect,
             font_app,
             h_app,
@@ -2262,6 +2267,19 @@ fn draw_pill_text_rows(
     }
 }
 
+/// Builds the render pieces for a track, computing the meta line once.
+fn pill_text_from_track(track: &TrackInfo) -> PillText {
+    let (meta_clock, meta) = track.meta_line_for_overlay(true);
+    PillText {
+        title: track.title.clone(),
+        artist: track.artist.clone(),
+        source_app: track.source_app.clone(),
+        app_icon: track.app_icon.clone(),
+        meta_clock,
+        meta,
+    }
+}
+
 /// Draws the pill's text rows into the same premultiplied pixel buffer as the
 /// shapes: glyph coverage from fontdue becomes alpha, so text alpha-composites
 /// exactly like every other element (GDI text cannot do this on a layered
@@ -2269,18 +2287,25 @@ fn draw_pill_text_rows(
 fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &MediaEvent, width: i32, scale: f32) {
     match content {
         MediaEvent::TrackChanged(track) => {
-            draw_pill_text_rows(state, pixels, width, scale, track, Some(PlaybackState::NowPlaying));
+            // The pill pieces were resolved when the content changed (see
+            // `resolve_pill_text`); take them out so drawing can borrow
+            // `state` mutably, then put them back for the next frame. The
+            // on-demand fallback keeps direct draw calls self-sufficient.
+            let pill = state.pill_text.take().unwrap_or_else(|| pill_text_from_track(track));
+            draw_pill_text_rows(state, pixels, width, scale, &pill, Some(PlaybackState::NowPlaying));
+            state.pill_text = Some(pill);
         }
         MediaEvent::PlaybackStateChanged(playback, source_app) => {
-            // Cached track: render the shared layout with the state symbol
-            // on the title row.
-            let cached = if source_app.is_empty() {
-                None
-            } else {
-                state.track_cache.get(source_app).cloned()
-            };
-            if let Some(track) = cached {
-                draw_pill_text_rows(state, pixels, width, scale, &track, Some(*playback));
+            let pill = state.pill_text.take().or_else(|| {
+                if source_app.is_empty() {
+                    None
+                } else {
+                    state.track_cache.get(source_app).map(pill_text_from_track)
+                }
+            });
+            if let Some(pill) = pill {
+                draw_pill_text_rows(state, pixels, width, scale, &pill, Some(*playback));
+                state.pill_text = Some(pill);
             } else {
                 // No cached track (the state change arrived before the first
                 // TrackChanged): fall back to the source name with an
@@ -2686,16 +2711,6 @@ pub(crate) fn cached_font(height: i32, bold: bool, quality: u32) -> HFONT {
     }
 }
 
-/// Creates the pill's Segoe UI font with grayscale antialiasing, cached across
-/// frames. ClearType subpixel rendering is unusable here: it paints colored
-/// fringes into the scratch DIB, and the text path derives glyph coverage from
-/// the RGB channels, so gray AA keeps the mask clean (see `draw_string` for
-/// the same call on the layered-window path).
-#[allow(dead_code)]
-fn create_pill_font(height: i32, bold: bool) -> HFONT {
-    cached_font(height, bold, ANTIALIASED_QUALITY.0 as u32)
-}
-
 /// Source-over composite of a premultiplied source (rgb already multiplied by
 /// alpha) onto the premultiplied pill buffer.
 fn composite_pm(pixels: &mut [u8], width: usize, x: usize, y: usize, rgb: [u8; 3], alpha: u32) {
@@ -2870,7 +2885,8 @@ fn draw_source_app_row(
     scratch_utf16: &mut Vec<u16>,
     pixels: &mut [u8],
     width: usize,
-    track: &TrackInfo,
+    source_app: &str,
+    app_icon: Option<&Arc<[u8]>>,
     rect: &RECT,
     font: HFONT,
     tm_height: i32,
@@ -2878,7 +2894,7 @@ fn draw_source_app_row(
     scale: f32,
     marquee: Option<&mut LineScroll>,
 ) {
-    if let Some(icon) = track.app_icon.as_deref() {
+    if let Some(icon) = app_icon {
         // The source bitmap is always 24x24; the destination size is the
         // 16px base scaled for DPI, clamped so it never overflows the band.
         let band_h = (rect.bottom - rect.top) as usize;
@@ -2895,7 +2911,7 @@ fn draw_source_app_row(
             scratch_utf16,
             pixels,
             width,
-            &track.source_app,
+            source_app,
             &text_rect,
             font,
             tm_height,
@@ -2909,7 +2925,7 @@ fn draw_source_app_row(
             scratch_utf16,
             pixels,
             width,
-            &track.source_app,
+            source_app,
             rect,
             font,
             tm_height,

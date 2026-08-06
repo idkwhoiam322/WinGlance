@@ -11,7 +11,7 @@ use chrono::{DateTime, Local};
 use log::{debug, error};
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DwmSetWindowAttribute};
@@ -2125,6 +2125,11 @@ fn history_row(track: &TrackInfo, at: DateTime<Local>, state: PlaybackState) -> 
     row
 }
 
+/// Last time a persistent StretchDIBits failure was logged, so a broken blit
+/// cannot flood the log at repaint rate: one line per 30 s of continuous
+/// failure instead.
+static LAST_STRETCH_LOG: Mutex<Option<Instant>> = Mutex::new(None);
+
 /// Blits the cached premultiplied BGRA artwork (decoded once at `base` size
 /// when the track changed) into the tile at `px` pixels — no per-paint
 /// decode or pixel conversion.
@@ -2159,7 +2164,11 @@ fn draw_art_pm(hdc: HDC, pm: &[u8], base: i32, px: i32, x: i32, y: i32) {
         )
     };
     if drawn == 0 {
-        error!("StretchDIBits failed while drawing artwork");
+        let mut last = LAST_STRETCH_LOG.lock().unwrap_or_else(|p| p.into_inner());
+        if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
+            *last = Some(Instant::now());
+            error!("StretchDIBits failed while drawing artwork");
+        }
     }
 }
 
