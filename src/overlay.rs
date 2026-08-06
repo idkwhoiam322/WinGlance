@@ -1027,21 +1027,24 @@ impl OverlayState {
 
     /// Shows a short-lived preview of the overlay at its current position, used by
     /// the tray "Show sample" command to preview placement without real media.
-    /// Reuses the last shown pill when one exists, so the preview shows real
-    /// content (and its palette/aura) instead of synthetic data; on a fresh
-    /// start it falls back to a track-change pill with sample data.
+    /// Shows the most recent real track (and its palette/aura) so the preview
+    /// looks like an actual notification; on a fresh start before any track
+    /// has been seen it falls back to a track-change pill with sample data.
     fn show_sample(&mut self) {
-        let content = self.content.clone().unwrap_or_else(|| {
-            let track = TrackInfo {
-                title: "Sample Track".into(),
-                artist: "Sample Artist".into(),
-                album: "Sample Album".into(),
-                source_app: "Example Player".into(),
-                duration_secs: Some(3 * 60 + 45),
-                ..Default::default()
-            };
-            MediaEvent::TrackChanged(track)
-        });
+        let content = self.last_track.clone().map_or_else(
+            || {
+                let track = TrackInfo {
+                    title: "Sample Track".into(),
+                    artist: "Sample Artist".into(),
+                    album: "Sample Album".into(),
+                    source_app: "Example Player".into(),
+                    duration_secs: Some(3 * 60 + 45),
+                    ..Default::default()
+                };
+                MediaEvent::TrackChanged(track)
+            },
+            MediaEvent::TrackChanged,
+        );
         self.content = Some(content);
         self.reset_scroll();
         let now = Instant::now();
