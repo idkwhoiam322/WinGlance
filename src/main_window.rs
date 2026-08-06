@@ -2465,11 +2465,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if !state_ptr.is_null() {
                 (*state_ptr).create_children();
             }
-            // Color the window title bar with the pill's pink accent so the
+            // Color the window title bar with the configured accent so the
             // app reads as one theme. Applied here, after the frame is
             // realized, rather than right after CreateWindowExW. COLORREF is
             // 0x00BBGGRR, hence the swapped red/blue channels.
-            let color = COLORREF(0x009F_6CE0);
+            let accent = if state_ptr.is_null() {
+                [240, 110, 155, 255]
+            } else {
+                (*state_ptr).cfg().appearance.accent_color
+            };
+            let color = COLORREF(((accent[2] as u32) << 16) | ((accent[1] as u32) << 8) | accent[0] as u32);
             let result = unsafe {
                 DwmSetWindowAttribute(
                     hwnd,
