@@ -1083,6 +1083,7 @@ impl OverlayState {
         if raw_dpi != 0 && raw_dpi != self.last_dpi {
             self.last_dpi = raw_dpi;
             self.flush_fonts();
+            flush_global_fonts();
         }
         let dpi = raw_dpi.max(96) as f32 / 96.0;
         let (logical_width, logical_height) = content_size_of(&self.config, &content);
@@ -3078,12 +3079,14 @@ type FontKey = (i32, bool, u32);
 /// qualities), so caching them for the process lifetime replaces thousands of
 /// CreateFontW/DeleteObject pairs per second with hash lookups. Handles are
 /// stored as `usize`: HFONT is a raw pointer and not Send, but GDI font
-/// handles are process-global and every use here is on the UI thread.
+/// handles are process-global and every use here is on the UI thread. The
+/// cache is drained (handles deleted) when the DPI changes — a font sized for
+/// one scale is stale at another — see `flush_global_fonts`.
 static FONT_CACHE: OnceLock<Mutex<HashMap<FontKey, usize>>> = OnceLock::new();
 
 /// Returns the cached Segoe UI font for (height, bold, quality), creating it
-/// on first use. The returned handle must never be deleted (it stays valid
-/// until process exit).
+/// on first use. The returned handle must not be retained: it stays valid
+/// until a DPI change flushes the cache.
 pub(crate) fn cached_font(height: i32, bold: bool, quality: u32) -> HFONT {
     let cache = FONT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache.lock().unwrap_or_else(|poisoned| {
@@ -3116,6 +3119,24 @@ pub(crate) fn cached_font(height: i32, bold: bool, quality: u32) -> HFONT {
         guard.insert((height, bold, quality), font.0 as usize);
     }
     font
+}
+
+/// Deletes every font in the process-wide cache. Called when the DPI changes,
+/// together with the per-window flush: fonts created for the old scale are
+/// stale GDI objects and must not outlive the scale they were sized for.
+fn flush_global_fonts() {
+    let Some(cache) = FONT_CACHE.get() else {
+        return;
+    };
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| {
+        warn!("font cache lock was poisoned; recovering");
+        poisoned.into_inner()
+    });
+    for (_, raw) in guard.drain() {
+        unsafe {
+            let _ = DeleteObject(HFONT(raw as *mut std::ffi::c_void));
+        }
+    }
 }
 
 /// Source-over composite of a premultiplied source (rgb already multiplied by
