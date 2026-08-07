@@ -1,8 +1,9 @@
 use log::warn;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub overlay: OverlayConfig,
@@ -13,6 +14,24 @@ pub struct Config {
     /// settings change never silently deletes unknown fields from disk.
     #[serde(flatten)]
     pub unknown: toml::Table,
+    /// Whether `save()` may write config.toml. False only when the existing
+    /// file was invalid AND could not be preserved under a backup name: the
+    /// user's file must never be overwritten with defaults, so settings apply
+    /// in memory for that run and nothing is persisted. Never serialized.
+    #[serde(skip)]
+    pub persistable: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            overlay: OverlayConfig::default(),
+            behavior: BehaviorConfig::default(),
+            appearance: AppearanceConfig::default(),
+            unknown: toml::Table::new(),
+            persistable: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,22 +173,11 @@ impl Config {
             Err(error) => {
                 // An unreadable config (bad encoding such as UTF-16, transient
                 // I/O error) must never be replaced with defaults: that would
-                // destroy the user's file. Quarantine it like the
-                // invalid-TOML path below; only when even the rename fails do
-                // we run on defaults for this launch without touching the file.
-                warn!("config.toml could not be read ({error}); quarantining it and falling back to defaults");
-                let backup = config_path.with_extension("toml.bad");
-                return match std::fs::rename(&config_path, &backup) {
-                    Ok(()) => Self::default_config_saved(),
-                    Err(rename_error) => {
-                        warn!(
-                            "keeping the unreadable config as {backup:?} failed: {rename_error}; defaults apply for this run only"
-                        );
-                        let mut config = Config::default();
-                        config.normalize();
-                        Ok(config)
-                    }
-                };
+                // destroy the user's file. Preserve it under a unique backup
+                // name when possible; otherwise defaults apply in memory for
+                // this run and persistence is disabled.
+                warn!("config.toml could not be read ({error}); recovering");
+                return Self::recover_invalid_config(&config_path, "unreadable");
             }
         };
         match toml::from_str::<Config>(&content) {
@@ -179,30 +187,73 @@ impl Config {
             }
             Err(error) => {
                 // A hand-edited or partially written config must not kill the
-                // app with no console and no dialog: fall back to defaults and
-                // keep the bad file for inspection under config.toml.bad.
-                warn!("config.toml is not valid TOML ({error}); falling back to defaults");
-                let backup = config_path.with_extension("toml.bad");
-                if let Err(rename_error) = std::fs::rename(&config_path, &backup) {
-                    warn!("keeping the bad config as {backup:?} failed: {rename_error}");
-                }
-                Self::default_config_saved()
+                // app with no console and no dialog, and must never be
+                // overwritten with defaults. Preserve it under a unique backup
+                // name when possible; otherwise defaults apply in memory for
+                // this run and persistence is disabled.
+                warn!("config.toml is not valid TOML ({error}); recovering");
+                Self::recover_invalid_config(&config_path, "invalid")
             }
         }
     }
 
-    /// Defaults in memory with a best-effort persist, so the next launch
-    /// starts from a healthy file while the bad one stays quarantined.
-    fn default_config_saved() -> anyhow::Result<Self> {
-        let mut config = Config::default();
-        config.normalize();
-        if let Err(error) = config.save() {
-            warn!("could not write a fresh config.toml: {error}");
+    /// Preserves an unreadable or invalid config under a unique backup name
+    /// so a fresh default file can take its place without losing the user's
+    /// data. When even the rename fails, the file stays untouched and
+    /// `persistable` is cleared so `save()` can never overwrite it.
+    fn recover_invalid_config(config_path: &Path, reason: &str) -> anyhow::Result<Self> {
+        let backup = Self::unique_backup_path(config_path);
+        match std::fs::rename(config_path, &backup) {
+            Ok(()) => {
+                warn!("preserved the {reason} config as {backup:?}; writing a fresh default");
+                let mut config = Config::default();
+                config.normalize();
+                if let Err(error) = config.save() {
+                    warn!("could not write a fresh config.toml: {error}");
+                }
+                Ok(config)
+            }
+            Err(rename_error) => {
+                warn!(
+                    "could not preserve the {reason} config ({rename_error}); defaults apply for this run only, persistence disabled"
+                );
+                let mut config = Config::default();
+                config.normalize();
+                config.persistable = false;
+                Ok(config)
+            }
         }
-        Ok(config)
+    }
+
+    /// A backup path that does not exist yet, so repeated recoveries never
+    /// overwrite an earlier backup.
+    fn unique_backup_path(config_path: &Path) -> PathBuf {
+        let dir = config_path.parent().unwrap_or(Path::new("."));
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for i in 0..100 {
+            let name = if i == 0 {
+                format!("config.toml.bad-{stamp}")
+            } else {
+                format!("config.toml.bad-{stamp}-{i}")
+            };
+            let candidate = dir.join(name);
+            if !candidate.exists() {
+                return candidate;
+            }
+        }
+        dir.join(format!("config.toml.bad-{stamp}-final"))
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
+        if !self.persistable {
+            warn!(
+                "config.toml is not persistable this run (its invalid content could not be preserved); settings apply until the app exits"
+            );
+            return Ok(());
+        }
         let config_path = Self::config_path()?;
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
