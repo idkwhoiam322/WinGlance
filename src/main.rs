@@ -558,13 +558,17 @@ fn spawn_event_forwarder(
                     HWND(main_raw as *mut c_void),
                     "main window",
                 );
-                push_and_wake(
-                    &overlay_queue,
-                    &overlay_wake,
-                    event,
-                    HWND(overlay_raw as *mut c_void),
-                    "overlay",
-                );
+                // Rejected sessions are history-only: the overlay never renders
+                // them, so they must not wake the pill or occupy its queue.
+                if !matches!(event, MediaEvent::SessionRejected { .. }) {
+                    push_and_wake(
+                        &overlay_queue,
+                        &overlay_wake,
+                        event,
+                        HWND(overlay_raw as *mut c_void),
+                        "overlay",
+                    );
+                }
             }
         })
         .expect("event forwarder thread should start")
