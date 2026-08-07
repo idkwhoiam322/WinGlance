@@ -35,7 +35,8 @@ WinGlance/
     ├── palette.rs          Vibrant-color quantizer for the accent/aura
     ├── main_window.rs      Maximized tracking window + tray icon/menu
     ├── autostart.rs        HKCU Run-key start-on-login sync
-    └── positioner.rs       Draggable sample window for custom placement
+    ├── positioner.rs       Draggable sample window for custom placement
+    └── process_picker.rs   Owner-drawn app-picker popup for the allow-list
 ```
 
 ## Module responsibilities
@@ -60,8 +61,10 @@ WinGlance/
   `set_position`/`show_sample` are the only entry points other windows reach
   into.
 - **icon.rs** — resolves a source app's icon from its AUMID through the shell
-  (`SHCreateItemFromParsingName` + `IShellItemImageFactory`), run on the SMTC
-  worker with a per-source cache and RAII COM lifetime.
+  (`SHCreateItemFromParsingName` + `IShellItemImageFactory`), cached per
+  source. The shell calls run on a short-lived helper thread with its own COM
+  apartment, time-boxed to 1.5 s so a hung shell extension cannot stall the
+  SMTC worker.
 - **palette.rs** — the two-color quantizer (4-bit histogram, saturation/
   luminance guard, ≥ 30° hue separation) that feeds the accents and the aura.
 - **main_window.rs** — the tracking window (current activity + history) and the
@@ -71,6 +74,11 @@ WinGlance/
 - **positioner.rs** — the in-app floating sample used to drag-place the pill; it
   writes `position_x`/`position_y` back to `config.toml` and calls
   `overlay::set_position`.
+- **process_picker.rs** — the owner-drawn "Allowed apps" popup opened from the
+  Settings pane: lists running processes and open SMTC session sources,
+  pre-checks the allow-list, and posts the confirmed patterns back to the main
+  window via `PICKER_RESULT_MSG` (which applies them to
+  `behavior.allowed_sources`).
 
 ## Build and verify
 

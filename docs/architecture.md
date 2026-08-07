@@ -191,6 +191,31 @@ opens `src/positioner.rs`, a draggable sample that writes `position_x`/`position
 to `config.toml` and nudges the live overlay via `overlay::set_position` (which
 calls `reposition()` without a full redraw).
 
+## Main window: panes and the process picker
+
+The main window (`src/main_window.rs`) is a maximized tracker with a sidebar
+switching between two panes:
+
+- **Now Playing** — the current activity (art, state, title/artist/album,
+  meta) and the per-session history listbox (newest first, capped at 400
+  rows). A native `TOOLTIPS_CLASSW` control shows full row details on hover,
+  synced to the visible row band on a 1 Hz timer while the window is visible.
+- **Settings** — cards mirroring the tray menu and `[behavior]`/`[overlay]`
+  config: notifications toggle, duration presets, start-on-login, close-to-
+  tray, allowed apps, position anchors + Reset/Adjust, "Show sample", and the
+  "Copy logs" button. The main window is the single writer of the in-memory
+  config (see the guardrail in `AGENTS.md`); every change goes through
+  `mutate_config` and is persisted.
+
+The **process picker** (`src/process_picker.rs`, ~900 lines) is an
+owner-drawn popup opened from the Settings "Allowed apps" card. It lists
+visible windows' processes (one Toolhelp snapshot + one `EnumWindows` pass)
+plus every open SMTC session source, pre-checks the current allow-list with
+the same normalization the worker uses, and posts the confirmed patterns back
+to the main window via `PICKER_RESULT_MSG`, which applies them to
+`behavior.allowed_sources` — so allow-list changes apply to the live worker
+without a restart.
+
 ## Configuration
 
 `Config::load()` reads `%APPDATA%\WinGlance\WinGlance\data\config.toml`, falls back

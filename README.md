@@ -37,8 +37,10 @@ interrupts and never needs interaction.
 
 Download `WinGlance.exe` from the latest [release](../../releases), run it, and
 it sits in the tray. It starts silently (no window); the pill appears when
-media plays. Double-click the tray icon for the tracking window with a
-per-source history.
+media plays. Double-click the tray icon for the tracking window: it shows the
+current activity and a per-source history on the **Now Playing** pane, plus a
+**Settings** pane mirroring the tray menu (notifications, duration,
+start-on-login, close-to-tray, allowed apps, position, logs).
 
 ### Tray menu
 
