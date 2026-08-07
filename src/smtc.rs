@@ -873,7 +873,13 @@ impl ListenerState {
     /// is exhausted.
     fn retry_artwork(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<()> {
         let key = session_key(session);
-        if !self.should_follow_session(session) || !should_poll_artwork(self.states.get(&key)) {
+        // The source may have entered the churn cool-down (or been filtered
+        // out) since this session was subscribed; the retry must not emit
+        // events for it any more than the normal refresh path would.
+        if !self.should_follow_session(session)
+            || !self.session_source_allowed(session)
+            || !should_poll_artwork(self.states.get(&key))
+        {
             return Ok(());
         }
         let read = match read_track_info(session, true) {
