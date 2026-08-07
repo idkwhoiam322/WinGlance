@@ -1,9 +1,7 @@
 use crate::autostart;
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo};
-use crate::overlay::{
-    EventQueue, OverlayPos, decode_artwork_pm, draw_string, set_duration, set_position, show_sample, wide,
-};
+use crate::overlay::{EventQueue, OverlayPos, draw_string, set_duration, set_position, show_sample, wide};
 use crate::process_picker;
 use crate::process_picker::PICKER_RESULT_MSG;
 use anyhow::{Context, Result};
@@ -76,10 +74,9 @@ const LISTBOX_ID: usize = 2;
 /// listbox as UTF-16 row strings, so the cap directly sizes the app's
 /// baseline memory (~1 KB per row across both copies).
 const HISTORY_CAP: usize = 400;
-/// Artwork decode size in pixels (1.33× the 96 logical tile, so the cached
-/// bitmap stays crisp up to ~133% DPI; below that it is only ever
-/// downscaled at paint). 128²×4 = 64 KB, versus 147 KB at 192².
-const ART_DECODE: u32 = 128;
+/// The artwork is decoded on the SMTC worker at `events::ARTWORK_DECODE`; the
+/// main window only ever copies those pixels and blits them at the same size.
+const ART_DECODE: u32 = crate::events::ARTWORK_DECODE;
 /// Timer used to clear the "Copied" feedback on the Copy logs button.
 const TIMER_LOGS_ID: usize = 101;
 /// Timer used to keep the native history tooltip's item rects in sync (scroll).
@@ -1323,18 +1320,15 @@ impl MainWindowState {
         let accent_color = self.cfg().appearance.accent_color;
         let text_color = self.cfg().appearance.text_color;
 
-        // Decode lazily here: the window starts hidden, so the first paint is
-        // the first time the art is actually needed.
+        // The SMTC worker already decoded the artwork once at event time (see
+        // smtc.rs `with_decoded_art`); the UI thread only ever copies the
+        // cached pixels, never decodes an image.
         if let Some(current) = &mut self.current
             && current.art.is_none()
             && !current.art_decode_failed
             && current.art_fingerprint.is_some()
         {
-            current.art = current
-                .track
-                .artwork
-                .as_deref()
-                .and_then(|data| decode_artwork_pm(data, ART_DECODE as usize));
+            current.art = current.track.decoded_art.as_deref().map(|pm| pm.to_vec());
             current.art_decode_failed = current.art.is_none();
             if current.art.is_none() {
                 free_art_blit(&mut current.art_blit);
@@ -3194,6 +3188,7 @@ mod tests {
             album_artist: String::new(),
             subtitle: String::new(),
             artwork: None,
+            decoded_art: None,
             app_icon: None,
             source_app: "Spotify".into(),
             duration_secs: None,

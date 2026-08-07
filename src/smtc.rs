@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::events::{MediaEvent, PlaybackState, TrackInfo};
+use crate::events::{ARTWORK_DECODE, MediaEvent, PlaybackState, TrackInfo, decode_artwork_pm};
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -621,7 +621,8 @@ impl ListenerState {
                     if emit && !session_recreation {
                         let label = track_label(&merged);
                         info!("track changed | {label}");
-                        events.push(MediaEvent::TrackChanged(merged.clone()));
+                        let emitted = with_decoded_art(merged.clone());
+                        events.push(MediaEvent::TrackChanged(emitted));
                         self.last_track_per_source
                             .insert(merged.source_app.clone(), merged.clone());
                         self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
@@ -911,7 +912,7 @@ impl ListenerState {
             info!("track changed | {label}");
             self.last_track_per_source
                 .insert(merged.source_app.clone(), merged.clone());
-            self.emit(MediaEvent::TrackChanged(merged.clone()));
+            self.emit(MediaEvent::TrackChanged(with_decoded_art(merged.clone())));
             if let Some(state) = self.states.get_mut(&key) {
                 state.deferred_at = None;
             }
@@ -1240,6 +1241,7 @@ fn merge_track(prev: &LogicalState, read: &TrackInfo, read_artwork: bool) -> Tra
         album_artist: inherit(&read.album_artist, &prev.album_artist),
         subtitle: inherit(&read.subtitle, &prev.subtitle),
         artwork: if read_artwork { read.artwork.clone() } else { None },
+        decoded_art: None,
         app_icon: read.app_icon.clone(),
         source_app: read.source_app.clone(),
         duration_secs: if same_identity {
@@ -1305,6 +1307,19 @@ fn emit_track(prev: &LogicalState, merged: &TrackInfo, read_artwork: bool) -> (b
 /// should be emitted anyway, artwork or not.
 fn defer_expired(deferred_at: Option<Instant>) -> bool {
     deferred_at.is_some_and(|t| t.elapsed() >= ARTWORK_TIMEOUT)
+}
+
+/// Attaches the worker's fixed-size artwork decode to a track about to be
+/// emitted. Called only on the emit paths (never on poll/merge reads), so the
+/// image decode runs once per actually-emitted track — on the worker thread,
+/// never on a window's UI thread.
+fn with_decoded_art(mut track: TrackInfo) -> TrackInfo {
+    track.decoded_art = track
+        .artwork
+        .as_deref()
+        .and_then(|bytes| decode_artwork_pm(bytes, ARTWORK_DECODE as usize))
+        .map(Arc::from);
+    track
 }
 
 /// Whether a fresh-session read returned no real metadata — the title is just
@@ -1469,6 +1484,7 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_art
         album_artist,
         subtitle,
         artwork,
+        decoded_art: None,
         app_icon: None,
         source_app,
         duration_secs,

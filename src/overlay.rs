@@ -2,7 +2,6 @@ use crate::config::{Config, HorizontalPosition, VerticalPosition};
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo};
 use crate::palette::Palette;
 use anyhow::{Context, Result};
-use image::imageops::FilterType;
 use log::{debug, error, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -265,15 +264,14 @@ struct OverlayState {
     /// Re-detected on every show; the timer is recreated only when it changes.
     tick_period: u32,
     /// Cached decoded artwork for the current track (RGBA8 at the full art
-    /// size), so animation frames never re-decode the JPEG/PNG.
+    /// size), so animation frames never re-decode or re-convert the cover.
     decoded_art: Option<Vec<u8>>,
-    /// The artwork bytes that produced `decoded_art`, so a cover change for
-    /// the same song (same title+artist, different art) re-decodes instead of
-    /// showing the stale image.
+    /// The worker's decoded pixels (premultiplied BGRA) that produced
+    /// `decoded_art`, so a cover change for the same song (same title+artist,
+    /// different art) re-converts instead of showing the stale image. Also
+    /// records failed decodes (None source key) so a corrupt cover is
+    /// attempted once instead of on every animation frame.
     decoded_art_source: Option<Arc<[u8]>>,
-    /// The art size `decoded_art` was decoded at, so a DPI move re-decodes at
-    /// the new resolution instead of serving the stale-size buffer.
-    decoded_art_size: usize,
     /// Dominant colors derived from `decoded_art` (recomputed only when the
     /// artwork re-decodes): the aura gradient and the accent recoloring read
     /// from here, so they always match the cover that is actually displayed.
@@ -437,7 +435,6 @@ impl OverlayState {
             tick_period: 16,
             decoded_art: None,
             decoded_art_source: None,
-            decoded_art_size: 0,
             palette: None,
             dib: None,
             frame_scratch: Vec::new(),
@@ -467,28 +464,27 @@ impl OverlayState {
         }
     }
 
-    /// Decodes (once per artwork) and caches the artwork bitmap at the full
-    /// art size, so animation frames never re-decode the JPEG/PNG. Keyed by
-    /// the artwork bytes and the target size: a different cover re-decodes,
-    /// a DPI move re-decodes at the new resolution, and unchanged art
+    /// Converts (once per artwork) the worker's premultiplied BGRA decode into
+    /// the overlay's straight RGBA buffer at the full art size, so animation
+    /// frames never re-decode or re-convert the JPEG/PNG. Keyed by the decoded
+    /// pixels: a different cover (new Arc/bytes) re-converts, unchanged art
     /// (session recreation, re-render) is served from the cache. A failed
-    /// decode is cached too — the source and size are recorded even when the
-    /// buffer stays `None` — so a corrupt cover is attempted once instead of
-    /// on every animation frame. The palette is derived from the same decoded
-    /// buffer (~0.1ms, only when a re-decode happens), so no separate
+    /// decode is cached too — the source is recorded even when the buffer
+    /// stays `None` — so a corrupt cover is attempted once instead of on every
+    /// animation frame. The palette is derived from the same converted buffer
+    /// (~0.1ms, only when a conversion happens), so no separate
     /// full-resolution decode is ever needed for color extraction.
-    fn ensure_art(&mut self, artwork: Option<&Arc<[u8]>>, base_size: usize) {
-        let same_art = match (&self.decoded_art_source, artwork) {
+    fn ensure_art(&mut self, decoded: Option<&Arc<[u8]>>) {
+        let same_art = match (&self.decoded_art_source, decoded) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref(),
             (None, None) => true,
             _ => false,
         };
-        if same_art && self.decoded_art_size == base_size {
+        if same_art {
             return;
         }
-        self.decoded_art = artwork.and_then(|a| decode_artwork(a, base_size));
-        self.decoded_art_source = artwork.cloned();
-        self.decoded_art_size = base_size;
+        self.decoded_art = decoded.and_then(|arc| pm_bgra_to_rgba(arc));
+        self.decoded_art_source = decoded.cloned();
         self.palette = self.decoded_art.as_deref().and_then(crate::palette::palette_from_rgba);
     }
 
@@ -1094,8 +1090,7 @@ impl OverlayState {
             self.content = Some(content);
             return;
         };
-        let art_base = (self.config.appearance.art_size as f32 * dpi).round() as usize;
-        let result = render_layered(self, &content, width, height, dpi * shape, art_base, alpha, position);
+        let result = render_layered(self, &content, width, height, dpi * shape, alpha, position);
         self.content = Some(content);
         if let Err(error) = result {
             error!("rendering overlay: {error:#}");
@@ -1444,7 +1439,6 @@ fn render_layered(
     width: i32,
     height: i32,
     scale: f32,
-    art_base: usize,
     alpha: u8,
     position: POINT,
 ) -> Result<()> {
@@ -1480,7 +1474,6 @@ fn render_layered(
         buf_w as usize,
         buf_h as usize,
         scale,
-        art_base,
     )?;
     draw_text_pixels(state, &mut scratch[..needed], content, buf_w, scale);
     // A single oversized metadata string (huge title/album) can inflate the
@@ -1697,25 +1690,24 @@ fn draw_pixels(
     width: usize,
     height: usize,
     scale: f32,
-    art_base: usize,
 ) -> Result<()> {
     let radius = state.config.appearance.corner_radius * scale;
-    // Resolve the artwork that will be displayed and decode it (once per
+    // Resolve the artwork that will be displayed and convert it (once per
     // unique cover) up front, so the aura palette below is ready and the
-    // cover is never shown stale. Track pills carry the artwork directly;
-    // state pills reuse the cached track's for the source.
-    let artwork: Option<Arc<[u8]>> = match content {
-        MediaEvent::TrackChanged(track) => track.artwork.clone(),
+    // cover is never shown stale. Track pills carry the worker's decode
+    // directly; state pills reuse the cached track's for the source.
+    let decoded: Option<Arc<[u8]>> = match content {
+        MediaEvent::TrackChanged(track) => track.decoded_art.clone(),
         MediaEvent::PlaybackStateChanged(_, source_app) => {
             if source_app.is_empty() {
                 None
             } else {
-                state.track_cache.get(source_app).and_then(|t| t.artwork.clone())
+                state.track_cache.get(source_app).and_then(|t| t.decoded_art.clone())
             }
         }
         MediaEvent::SessionRejected { .. } => None,
     };
-    state.ensure_art(artwork.as_ref(), art_base);
+    state.ensure_art(decoded.as_ref());
     let inset = state.aura_inset as usize;
     let pill_w = width.saturating_sub(inset * 2);
     let pill_h = height.saturating_sub(inset * 2);
@@ -1796,7 +1788,6 @@ fn draw_pixels(
                 width,
                 state.palette,
                 state.config.appearance.accent_color,
-                art_base,
                 art_x,
                 art_y,
                 art_size,
@@ -1822,7 +1813,6 @@ fn draw_pixels(
                 width,
                 state.palette,
                 state.config.appearance.accent_color,
-                art_base,
                 art_x,
                 art_y,
                 art_size,
@@ -1850,7 +1840,6 @@ fn draw_art_tile(
     width: usize,
     palette: Option<Palette>,
     accent: [u8; 4],
-    art_base: usize,
     art_x: usize,
     art_y: usize,
     art_size: usize,
@@ -1876,7 +1865,7 @@ fn draw_art_tile(
         }
     }
     if let Some(art) = decoded_art {
-        draw_art_scaled(pixels, width, art, art_base, art_x, art_y, art_size, accent);
+        draw_art_scaled(pixels, width, art, art_x, art_y, art_size, accent);
     } else {
         draw_placeholder(pixels, width, art_x, art_y, art_size, accent);
     }
@@ -1951,17 +1940,10 @@ fn draw_edge_stroke(
 /// the cached base size to the current (animation-scaled) size, with the
 /// rounded-corner mask. Falls back to the accent placeholder on decode errors.
 #[allow(clippy::too_many_arguments)]
-fn draw_art_scaled(
-    pixels: &mut [u8],
-    width: usize,
-    art: &[u8],
-    base: usize,
-    x: usize,
-    y: usize,
-    size: usize,
-    accent: [u8; 4],
-) {
-    if size == 0 || base == 0 || art.len() < base * base * 4 {
+fn draw_art_scaled(pixels: &mut [u8], width: usize, art: &[u8], x: usize, y: usize, size: usize, accent: [u8; 4]) {
+    let base = (art.len() / 4) as f64;
+    let base = base.sqrt() as usize;
+    if size == 0 || base == 0 || base * base * 4 != art.len() {
         draw_placeholder(pixels, width, x, y, size, accent);
         return;
     }
@@ -3183,49 +3165,26 @@ pub(crate) fn draw_string(
     }
 }
 
-/// Artwork only ever displays at ~200px, so refusing anything larger than
-/// this defeats decompression bombs (a header can claim huge dimensions
-/// while the compressed payload is tiny) without affecting real album art.
-/// 2048² bounds the transient decode to ~16 MB RGBA on the UI thread; real
-/// covers are ≤1024² anyway.
-const ART_MAX_DIM: u32 = 2048;
-
-/// Decodes artwork bytes with a hard cap on source dimensions. The `image`
-/// crate's dimension limits are strict, so an oversized image fails here
-/// instead of allocating a huge buffer.
-fn decode_limited(data: &[u8]) -> Option<image::DynamicImage> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
-        .with_guessed_format()
-        .ok()?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(ART_MAX_DIM);
-    limits.max_image_height = Some(ART_MAX_DIM);
-    reader.limits(limits);
-    reader.decode().ok()
-}
-
-pub(crate) fn decode_artwork(data: &[u8], size: usize) -> Option<Vec<u8>> {
-    let image = decode_limited(data)?.to_rgba8();
-    let image = image::imageops::resize(&image, size as u32, size as u32, FilterType::Triangle);
-    Some(image.into_raw())
-}
-
-/// Decodes artwork directly into the premultiplied BGRA layout that
-/// StretchDIBits consumes (top-down 32bpp DIB), so the main window can draw
-/// the cached bitmap with a single blit instead of re-converting per paint.
-pub(crate) fn decode_artwork_pm(data: &[u8], size: usize) -> Option<Vec<u8>> {
-    let image = decode_limited(data)?.to_rgba8();
-    let image = image::imageops::resize(&image, size as u32, size as u32, FilterType::Triangle);
-    let raw = image.into_raw();
-    let mut pm = Vec::with_capacity(raw.len());
-    for px in raw.chunks_exact(4) {
-        let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
-        pm.push((b * a / 255) as u8);
-        pm.push((g * a / 255) as u8);
-        pm.push((r * a / 255) as u8);
-        pm.push(a as u8);
+/// Converts the worker's premultiplied BGRA artwork (fixed `ARTWORK_DECODE`²)
+/// into the straight RGBA buffer the overlay composites and palettizes from.
+/// Runs once per cover change, keyed by the decoded pixels in `ensure_art`.
+/// The result is always a perfect square; `draw_art_scaled` derives the side
+/// from the buffer length.
+fn pm_bgra_to_rgba(pm: &[u8]) -> Option<Vec<u8>> {
+    let mut rgba = Vec::with_capacity(pm.len());
+    for px in pm.chunks_exact(4) {
+        let (b, g, r, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
+        if a == 0 {
+            rgba.extend_from_slice(&[0, 0, 0, 0]);
+            continue;
+        }
+        // Un-premultiply: straight channel = premultiplied × 255 / alpha.
+        rgba.push((r * 255 / a) as u8);
+        rgba.push((g * 255 / a) as u8);
+        rgba.push((b * 255 / a) as u8);
+        rgba.push(a as u8);
     }
-    Some(pm)
+    Some(rgba)
 }
 
 /// Source-over composite of a premultiplied source (rgb, alpha) onto the
@@ -3742,6 +3701,7 @@ pub(crate) fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::ARTWORK_DECODE;
 
     #[test]
     fn frame_scratch_is_cleared_when_it_grows() {
@@ -3834,47 +3794,58 @@ mod tests {
         assert_eq!(dst, src);
     }
 
-    fn png_bytes(color: [u8; 3]) -> Arc<[u8]> {
-        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([color[0], color[1], color[2], 255]));
-        let mut buf = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(img)
-            .write_to(&mut buf, image::ImageFormat::Png)
-            .expect("4x4 png should encode");
-        Arc::from(buf.into_inner())
+    /// A solid-color artwork buffer in the worker's format: premultiplied
+    /// BGRA at `ARTWORK_DECODE`² (the fixed decode size; the overlay no
+    /// longer controls resolution).
+    fn pm_art(color: [u8; 3]) -> Arc<[u8]> {
+        let (b, g, r) = (color[2], color[1], color[0]);
+        let px = [b, g, r, 255];
+        Arc::from(px.repeat(ARTWORK_DECODE as usize * ARTWORK_DECODE as usize))
     }
 
     #[test]
-    fn artwork_cache_is_keyed_by_bytes_and_size() {
+    fn artwork_cache_is_keyed_by_decoded_pixels() {
         let config = Config::default();
         let mut state = OverlayState::new(config, EventQueue::default());
-        let red = png_bytes([200, 40, 40]);
-        let blue = png_bytes([40, 40, 200]);
+        let red = pm_art([200, 40, 40]);
+        let blue = pm_art([40, 40, 200]);
 
-        state.ensure_art(Some(&red), 32);
-        assert_eq!(state.decoded_art.as_ref().map(Vec::len), Some(32 * 32 * 4));
+        state.ensure_art(Some(&red));
+        assert_eq!(
+            state.decoded_art.as_ref().map(Vec::len),
+            Some(ARTWORK_DECODE as usize * ARTWORK_DECODE as usize * 4)
+        );
         let first = state.decoded_art.clone();
 
-        // Same bytes and size: served from the cache, not re-decoded.
-        state.ensure_art(Some(&red), 32);
+        // Same pixels (equal bytes, different Arc): served from the cache,
+        // not converted again.
+        state.ensure_art(Some(&red));
         assert_eq!(state.decoded_art, first);
 
-        // A DPI move changes the target size: re-decode at the new resolution.
-        state.ensure_art(Some(&red), 64);
-        assert_eq!(state.decoded_art.as_ref().map(Vec::len), Some(64 * 64 * 4));
-
-        // New bytes with the same size: re-decode from the new cover.
-        state.ensure_art(Some(&blue), 64);
+        // New pixels: converted again.
+        state.ensure_art(Some(&blue));
         assert_ne!(state.decoded_art, first);
 
         // A simulated eviction (empty buffer) with an unchanged key is a
         // no-op: a failed decode must not be re-attempted on every frame.
         state.decoded_art = None;
-        state.ensure_art(Some(&blue), 64);
-        assert!(state.decoded_art.is_none(), "same key must not re-decode");
+        state.ensure_art(Some(&blue));
+        assert!(state.decoded_art.is_none(), "same key must not re-convert");
 
-        // A different size still forces a retry after a recorded failure.
-        state.ensure_art(Some(&blue), 48);
-        assert_eq!(state.decoded_art.as_ref().map(Vec::len), Some(48 * 48 * 4));
+        // A missing decode (corrupt art) is cached as a failure: the same
+        // `None` key again is a no-op and never re-attempts conversion.
+        state.ensure_art(None);
+        state.decoded_art = Some(vec![0u8; 4]);
+        state.ensure_art(None);
+        assert_eq!(
+            state.decoded_art.as_deref(),
+            Some(&[0u8, 0, 0, 0][..]),
+            "None key must be a no-op"
+        );
+
+        // A new cover after a recorded failure still converts.
+        state.ensure_art(Some(&blue));
+        assert_ne!(state.decoded_art.as_ref().map(Vec::len), Some(4));
     }
 
     #[test]

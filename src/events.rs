@@ -25,8 +25,14 @@ pub struct TrackInfo {
     pub subtitle: String,
     /// Raw artwork bytes (JPEG/PNG) behind an Arc: events are cloned into two
     /// window queues, and history clones get stripped, so the byte copy would
-    /// be pure waste on every track change.
+    /// be pure waste on every track change. Also the identity used for
+    /// same-media comparisons and cache keying.
     pub artwork: Option<Arc<[u8]>>,
+    /// The artwork decoded once by the SMTC worker at `ARTWORK_DECODE`² into
+    /// premultiplied BGRA (the layout AlphaBlend/StretchDIBits consume), so
+    /// neither window ever runs the image decode on its UI thread. The raw
+    /// bytes stay attached (above) for identity and fingerprinting.
+    pub decoded_art: Option<Arc<[u8]>>,
     /// App icon (premultiplied BGRA pixel data) extracted from the source's
     /// AUMID via the shell, cached per-app and shared across track clones.
     pub app_icon: Option<Arc<[u8]>>,
@@ -139,6 +145,53 @@ pub enum MediaEvent {
         state: PlaybackState,
         accepted: bool,
     },
+}
+
+/// Fixed size the SMTC worker decodes album art to (one dimension, square).
+/// Both windows display art at ≤ ~200 px (overlay) / ~128 px (tile), so 256
+/// covers every DPI with margin; shipping one canonical decode avoids each
+/// window decoding the same JPEG/PNG on its own UI thread.
+pub const ARTWORK_DECODE: u32 = 256;
+
+/// Artwork only ever displays at ~200px, so refusing anything larger than
+/// this defeats decompression bombs (a header can claim huge dimensions
+/// while the compressed payload is tiny) without affecting real album art.
+/// 2048² bounds the transient decode to ~16 MB RGBA; real covers are ≤1024²
+/// anyway. The cap runs on the SMTC worker (decode happens there, once per
+/// emitted track).
+const ART_MAX_DIM: u32 = 2048;
+
+/// Decodes artwork bytes with a hard cap on source dimensions. The `image`
+/// crate's dimension limits are strict, so an oversized image fails here
+/// instead of allocating a huge buffer.
+fn decode_limited(data: &[u8]) -> Option<image::DynamicImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(ART_MAX_DIM);
+    limits.max_image_height = Some(ART_MAX_DIM);
+    reader.limits(limits);
+    reader.decode().ok()
+}
+
+/// Decodes artwork directly into the premultiplied BGRA layout that
+/// StretchDIBits/AlphaBlend consume (top-down 32bpp DIB), so windows can
+/// draw the cached bitmap with a single blit instead of re-converting per
+/// paint. Runs on the SMTC worker thread, never on a UI thread.
+pub(crate) fn decode_artwork_pm(data: &[u8], size: usize) -> Option<Vec<u8>> {
+    let image = decode_limited(data)?.to_rgba8();
+    let image = image::imageops::resize(&image, size as u32, size as u32, image::imageops::FilterType::Triangle);
+    let raw = image.into_raw();
+    let mut pm = Vec::with_capacity(raw.len());
+    for px in raw.chunks_exact(4) {
+        let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
+        pm.push((b * a / 255) as u8);
+        pm.push((g * a / 255) as u8);
+        pm.push((r * a / 255) as u8);
+        pm.push(a as u8);
+    }
+    Some(pm)
 }
 
 #[cfg(test)]
