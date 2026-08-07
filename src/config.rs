@@ -142,7 +142,12 @@ impl Default for BehaviorConfig {
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
-            background_color: [0x12, 0x14, 0x1C, 0xFF],
+            // Near-opaque fill (235 = ~92%): text, album art and symbols
+            // composite fully opaque over it, so only the body lets a hint of
+            // the backdrop through. Keep the alpha at ~224 (88%) or above —
+            // below that the accent-colored meta text drops under WCAG AA
+            // 4.5:1 over bright backdrops.
+            background_color: [0x12, 0x14, 0x1C, 0xEB],
             text_color: [0xFF, 0xFF, 0xFF, 0xFF],
             // Single hardcoded pink accent, used across the pill, the sidebar
             // highlights and the window title bar. Deliberately not derived

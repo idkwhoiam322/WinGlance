@@ -31,9 +31,12 @@ close_to_tray = true
 # allowed_sources = ["spotify"]
 
 [appearance]
-# Opaque dark-slate pill background (alpha 255). Lower the alpha for
-# translucency.
-background_color = [18, 20, 28, 255]
+# Near-opaque dark-slate pill background (alpha 235 = ~92%): text, album art
+# and symbols stay fully opaque over it, so only the body lets a hint of the
+# backdrop through. Lower the alpha for more translucency; keep it at ~224
+# (88%) or above so the accent-colored meta text keeps its contrast over
+# bright backdrops.
+background_color = [18, 20, 28, 235]
 text_color = [255, 255, 255, 255]
 # Accent color used across the pill: playback symbols, the music note, the
 # album-art rim, and the aura fallback when the artwork yields no vibrant

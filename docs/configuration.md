@@ -40,7 +40,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 
 | Key                | Default       | Range    | Effect                                  |
 |--------------------|---------------|----------|-----------------------------------------|
-| `background_color` | `[18, 20, 28, 255]` | RGBA 0–255 | Opaque dark-slate pill background (alpha 255; lower for translucency) |
+| `background_color` | `[18, 20, 28, 235]` | RGBA 0–255 | Near-opaque dark-slate pill background (alpha 235 ≈ 92%; lower for more translucency) |
 | `text_color`       | `[255, 255, 255, 255]` | RGBA 0–255 | Title and state-label color |
 | `accent_color`     | `[240, 110, 155, 255]` | RGBA 0–255 | Playback symbols, music note, album-art rim; aura fallback when the artwork palette has no vibrant color |
 | `corner_radius`    | `26.0`     | 4–48    | Corner rounding in logical pixels       |
@@ -50,7 +50,9 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `font_size_artist` | `13.0`     | 8–28    | Artist (or source app) font size        |
 
 Colors are `[R, G, B, A]` with 0–255 components. The alpha channel is used
-for compositing; a value below 255 makes the pill slightly translucent.
+for compositing; the default (235, ~92%) keeps the pill near-opaque while
+letting a hint of the backdrop through. Text, album art and symbols stay
+fully opaque regardless of the body alpha.
 
 ## Per-track theming (not configurable)
 
@@ -105,7 +107,7 @@ The tray menu mirrors the `[behavior]` toggles in real time:
 
 The shipped defaults produce a slim pill: up to 340 px wide, height derived
 from `art_size` (48 px) plus padding — about 110 px tall — anchored 8 px from
-the top of the work area, opaque dark-slate background tinted per track with a
+the top of the work area, near-opaque dark-slate background tinted per track with a
 pink aura, 48 px
 artwork with a palette-tinted glow and rim, and compact title/artist text with
 per-track accent colors. All of these can be widened or recolored here.
