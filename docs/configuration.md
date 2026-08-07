@@ -56,8 +56,9 @@ for compositing; a value below 255 makes the pill slightly translucent.
 
 Beyond these knobs the pill derives its look from the playing track:
 
-- **Palette** — two vibrant colors extracted from the album art (on first
-  decode, in the UI thread): a 4-bit-per-channel histogram, filtered through
+- **Palette** — two vibrant colors extracted from the album art (from the
+  worker's decoded buffer, computed once per cover in the UI thread): a
+  4-bit-per-channel histogram, filtered through
   a four-tier guard chain — vibrant scoring, strict guard (saturation ≥ 0.25,
   luminance 0.20–0.85), a relaxed fallback for dark covers (S ≥ 0.10,
   L ≥ 0.10),   and a monochrome tier for B&W and high-key covers (any pixel with Y ≥ 0.18)

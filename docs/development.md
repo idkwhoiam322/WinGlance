@@ -72,8 +72,9 @@ WinGlance/
   Position submenu, and Quit.
 - **autostart.rs** — reads/writes the `HKCU ...\Run` entry for start-on-login.
 - **positioner.rs** — the in-app floating sample used to drag-place the pill; it
-  writes `position_x`/`position_y` back to `config.toml` and calls
-  `overlay::set_position`.
+  posts the chosen `position_x`/`position_y` to the main window via
+  `POSITION_MSG` (the main window owns the config, applies, and persists), and
+  the overlay is nudged via `overlay::set_position`.
 - **process_picker.rs** — the owner-drawn "Allowed apps" popup opened from the
   Settings pane: lists running processes and open SMTC session sources,
   pre-checks the allow-list, and posts the confirmed patterns back to the main

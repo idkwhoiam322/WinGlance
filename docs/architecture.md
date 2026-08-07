@@ -61,11 +61,12 @@ SystemMediaTransportControls            create_window x2 (pill + main)
   two window queues and pokes the UI thread with `PostMessageW`. It exists so
   the UI thread stays responsive even if several SMTC callbacks fire at once.
 - The UI thread owns all Win32 windows, the queue, and GDI surfaces. SMTC
-  reads (metadata + artwork bytes) and app-icon extraction (COM shell calls)
-  run on the worker; image *decoding* happens on the UI thread in
-  `ensure_art`, once per unique cover, cached for the animation frames.
-  The palette is derived from that same decoded buffer (~0.1 ms), so no
-  separate full-resolution decode is ever needed.
+  reads (metadata + artwork bytes), app-icon extraction (COM shell calls),
+  and image *decoding* (into a fixed `ARTWORK_DECODE`² = 256² premultiplied
+  BGRA buffer, once per unique cover) all run on the worker. The UI thread
+  only converts that buffer to RGBA in `ensure_art` (~0.1 ms, cached for
+  the animation frames); the palette is derived from that same converted
+  buffer, so no separate full-resolution decode is ever needed.
 
 ## SMTC session selection
 
@@ -132,8 +133,9 @@ shows the last track.
 
 Each frame is rendered into an in-memory premultiplied-BGRA buffer:
 
-1. `draw_pixels` resolves the artwork and decodes it once per unique cover
-   (`ensure_art`, keyed by the artwork bytes), then draws — in order — the
+1. `draw_pixels` resolves the artwork and converts the worker's decoded
+   premultiplied-BGRA buffer once per unique cover (`ensure_art`, keyed by
+   the decoded pixels), then draws — in order — the
    palette aura ring in the DIB margin, the opaque palette-tinted rounded-rect
    body with its directional edge highlight, the album art with its accent
    glow and rim, and the vector playback glyph.
@@ -187,9 +189,11 @@ anti-aliased.
 Because the 16 ms `WM_TIMER` recomputes geometry each tick while the pill is
 shown, a monitor removal or resolution change moves the pill back onto the new
 work area on the next frame. The tray **Position → Adjust position…** command
-opens `src/positioner.rs`, a draggable sample that writes `position_x`/`position_y`
-to `config.toml` and nudges the live overlay via `overlay::set_position` (which
-calls `reposition()` without a full redraw).
+opens `src/positioner.rs`, a draggable sample that posts the chosen
+`position_x`/`position_y` to the main window via `POSITION_MSG`; the main
+window — the single owner of the config — applies and persists them, and
+nudges the live overlay via `overlay::set_position` (which calls
+`reposition()` without a full redraw).
 
 ## Main window: panes and the process picker
 
