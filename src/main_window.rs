@@ -453,13 +453,11 @@ impl History {
 struct CurrentActivity {
     track: TrackInfo,
     state: PlaybackState,
-    /// Decoded artwork: premultiplied BGRA at ART_DECODE×ART_DECODE, cached
-    /// so paint is a single AlphaBlend (no decode or conversion per paint).
-    /// Filled lazily on the first paint that needs it.
-    art: Option<Vec<u8>>,
     /// Cached GDI source for AlphaBlend of the decoded artwork: a memory DC
     /// with the premultiplied pixels in a DIB section, built once per decode
-    /// so repaints blend without per-paint DC/DIB allocation.
+    /// so repaints blend without per-paint DC/DIB allocation. Built directly
+    /// from `track.decoded_art` (the worker's premultiplied BGRA) on the
+    /// first paint that needs it — no intermediate byte copy is kept.
     art_blit: Option<ArtBlit>,
     /// FNV-1a of the artwork bytes this cache was decoded from, so a metadata
     /// refresh with unchanged artwork does not re-decode.
@@ -1138,7 +1136,6 @@ impl MainWindowState {
                 // re-reporting the same cover must not re-decode, so only bump
                 // the fingerprint and drop the cached bitmap when bytes changed.
                 if current.art_fingerprint != art_fingerprint {
-                    current.art = None;
                     free_art_blit(&mut current.art_blit);
                     current.art_fingerprint = art_fingerprint;
                     current.art_decode_failed = false;
@@ -1198,10 +1195,9 @@ impl MainWindowState {
         self.current = Some(CurrentActivity {
             track,
             state,
-            // Art is decoded lazily on first paint; the window starts hidden
-            // (start_in_tray), so a track that never gets looked at pays no
-            // decode cost.
-            art: None,
+            // The blit is built lazily on first paint; the window starts
+            // hidden (start_in_tray), so a track that never gets looked at
+            // pays no GDI cost.
             art_blit: None,
             art_fingerprint,
             art_decode_failed: false,
@@ -1319,25 +1315,22 @@ impl MainWindowState {
         // smtc.rs `with_decoded_art`); the UI thread only ever copies the
         // cached pixels, never decodes an image.
         if let Some(current) = &mut self.current
-            && current.art.is_none()
+            && current.art_blit.is_none()
             && !current.art_decode_failed
             && current.art_fingerprint.is_some()
         {
-            current.art = current.track.decoded_art.as_deref().map(|pm| pm.to_vec());
-            current.art_decode_failed = current.art.is_none();
-            if current.art.is_none() {
-                free_art_blit(&mut current.art_blit);
-            }
-        }
-        // Build the cached AlphaBlend source once per decode; repaints then
-        // blend without per-paint DC/DIB allocation.
-        if let Some(current) = &mut self.current
-            && current.art.is_some()
-            && current.art_blit.is_none()
-        {
-            current.art_blit = build_art_blit(current.art.as_deref().unwrap_or_default(), ART_DECODE as i32);
-            if current.art_blit.is_none() {
-                log_art_blit_failure();
+            match current.track.decoded_art.as_deref() {
+                Some(pm) => {
+                    current.art_blit = build_art_blit(pm, ART_DECODE as i32);
+                    if current.art_blit.is_none() {
+                        log_art_blit_failure();
+                    }
+                }
+                // No decoded pixels (the worker's decode failed): cache the
+                // miss so paint does not retry until the artwork bytes change.
+                None => {
+                    current.art_decode_failed = true;
+                }
             }
         }
 
@@ -3250,7 +3243,6 @@ mod tests {
         CurrentActivity {
             track,
             state,
-            art: None,
             art_blit: None,
             art_fingerprint: None,
             art_decode_failed: false,
