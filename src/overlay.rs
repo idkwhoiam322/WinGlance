@@ -92,7 +92,10 @@ fn refresh_period_ms() -> u32 {
             None
         } else {
             let mut info = MONITORINFOEXW::default();
-            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            // cbSize must cover the extended structure (with szDevice), or
+            // Windows may not populate the device name and the refresh-rate
+            // fallback below silently degrades to 16 ms.
+            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
             GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool().then(|| {
                 let mut devmode = std::mem::zeroed::<DEVMODEW>();
                 devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
