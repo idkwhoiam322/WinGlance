@@ -12,7 +12,7 @@ use log::{debug, error};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DwmSetWindowAttribute};
@@ -42,11 +42,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, KillTimer, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT,
     LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT,
     LBS_OWNERDRAWFIXED, LoadCursorW, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE,
-    WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER,
+    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE,
+    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER,
     WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
     WS_VSCROLL,
 };
@@ -2488,6 +2488,15 @@ fn install_tray_icon(hwnd: HWND) -> Result<()> {
     Ok(())
 }
 
+/// The `TaskbarCreated` message, registered once. Windows broadcasts it after
+/// Explorer (re)starts; the tray icon must be re-added then or it stays gone
+/// until the app restarts.
+fn taskbar_created_msg() -> u32 {
+    *TASKBAR_CREATED_MSG.get_or_init(|| unsafe { RegisterWindowMessageW(PCWSTR(wide("TaskbarCreated").as_ptr())) })
+}
+
+static TASKBAR_CREATED_MSG: OnceLock<u32> = OnceLock::new();
+
 fn remove_tray_icon(hwnd: HWND) {
     if let Ok(data) = tray_data(hwnd) {
         unsafe {
@@ -2767,6 +2776,14 @@ fn show_tray_menu(state: &mut MainWindowState) {
 
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Explorer (re)started and rebuilt the notification area: re-add the
+    // tray icon, which Explorer's restart wiped.
+    if message == taskbar_created_msg() {
+        if let Err(error) = install_tray_icon(hwnd) {
+            error!("re-adding the tray icon after an Explorer restart failed: {error}");
+        }
+        return LRESULT(0);
+    }
     if message == WM_NCCREATE {
         let create = lparam.0 as *const CREATESTRUCTW;
         if !create.is_null() {
