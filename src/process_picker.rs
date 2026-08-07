@@ -300,12 +300,21 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
 
 pub(crate) fn close_existing() {
     let Some(m) = OPEN_PICKER.get() else { return };
-    if let Ok(guard) = m.lock()
-        && let Some(hwnd_val) = *guard
-        && hwnd_val != 0
-    {
+    // Copy the handle out and release the guard before DestroyWindow: the
+    // destruction messages (WM_DESTROY) lock OPEN_PICKER again, and holding
+    // the mutex across DestroyWindow would deadlock the UI thread.
+    let hwnd = {
+        let Ok(guard) = m.lock() else {
+            return;
+        };
+        match *guard {
+            Some(hwnd_val) if hwnd_val != 0 => Some(HWND(hwnd_val as *mut std::ffi::c_void)),
+            _ => None,
+        }
+    };
+    if let Some(hwnd) = hwnd {
         unsafe {
-            let _ = DestroyWindow(HWND(hwnd_val as *mut std::ffi::c_void));
+            let _ = DestroyWindow(hwnd);
         }
     }
 }

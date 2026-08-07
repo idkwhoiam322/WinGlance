@@ -118,16 +118,23 @@ pub(crate) fn close_existing() {
     let Some(m) = OPEN_POSITIONER.get() else {
         return;
     };
-    let Ok(guard) = m.lock() else {
-        return;
+    // Copy the handle out and release the guard before DestroyWindow: the
+    // destruction messages (WM_NCDESTROY) lock OPEN_POSITIONER again, and
+    // holding the mutex across DestroyWindow would deadlock the UI thread.
+    let hwnd = {
+        let Ok(guard) = m.lock() else {
+            return;
+        };
+        let (hwnd, _) = *guard;
+        if hwnd == 0 {
+            return;
+        }
+        Some(HWND(hwnd as *mut std::ffi::c_void))
     };
-    let (hwnd, _) = *guard;
-    if hwnd == 0 {
-        return;
-    }
-    let hwnd = HWND(hwnd as *mut std::ffi::c_void);
-    unsafe {
-        let _ = DestroyWindow(hwnd);
+    if let Some(hwnd) = hwnd {
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
     }
 }
 
