@@ -204,7 +204,9 @@ struct OverlayState {
     queue: EventQueue,
     /// Notifications waiting to be shown, in arrival order. Distinct events
     /// from different sources show one after another instead of clobbering
-    /// each other; the pill on screen is never replaced early.
+    /// each other; the pill on screen is never replaced early. A newer event
+    /// for a source already waiting supersedes the older one, so a burst of
+    /// same-source events (play/pause spam) collapses to the latest.
     pending: VecDeque<MediaEvent>,
     enabled: bool,
     content: Option<MediaEvent>,
@@ -627,7 +629,7 @@ impl OverlayState {
                         self.current_source = Some(track.source_app.clone());
                         self.last_track = Some(track.clone());
                         self.cache_track(&track);
-                        self.update_content(MediaEvent::TrackChanged(track));
+                        self.update_content(MediaEvent::TrackChanged(track), update_min_duration(&self.config));
                     } else {
                         self.enqueue(MediaEvent::TrackChanged(track));
                     }
@@ -636,33 +638,58 @@ impl OverlayState {
                     if self.config.behavior.enable_playback_state_change =>
                 {
                     // Suppress a PlaybackStateChanged pill when:
+                    //  - A TrackChanged for the same source is in this batch
+                    //    (see the pre-scan above: the state pill would render
+                    //    the source's previously cached track) or already
+                    //    queued (a TrackChanged pill is about to show; a
+                    //    redundant PlaybackStateChanged would flash the same
+                    //    info).
+                    //  - The pill on screen is the source's track pill: the
+                    //    song announcement is still visible, so the state flip
+                    //    adds nothing.
                     //  - It is Playing AND the same source's TrackChanged was
                     //    recently shown (prevents the "replaying" pill after
                     //    session recreation, or when a browser video triggers
                     //    YTM to re-report "Playing").
-                    //  - A TrackChanged for the same source is queued (a
-                    //    TrackChanged pill is about to show; a redundant
-                    //    PlaybackStateChanged would flash the same info).
-                    //  - A TrackChanged for the same source is in this batch
-                    //    (see the pre-scan above: the state pill would render
-                    //    the source's previously cached track).
                     // Paused/Stopped pass through when they are a new state
                     // from a source that is NOT currently shown.
-                    let is_redundant = (matches!(state, PlaybackState::Playing)
-                        && self.current_source.as_deref() == Some(source_app.as_str()))
+                    let track_wins = track_sources.iter().any(|s| s == &source_app)
                         || self
                             .pending
                             .iter()
-                            .any(|e| matches!(e, MediaEvent::TrackChanged(t) if t.source_app == source_app))
-                        || track_sources.iter().any(|s| s == &source_app);
-                    if is_redundant {
+                            .any(|e| matches!(e, MediaEvent::TrackChanged(t) if t.source_app == source_app));
+                    let track_pill_shown = matches!(
+                        self.content.as_ref(),
+                        Some(MediaEvent::TrackChanged(t)) if t.source_app == source_app
+                    );
+                    if track_wins || track_pill_shown {
                         debug!(
                             "playback state pill suppressed | reason=track shown for same source | source={source_app}"
                         );
                         continue;
                     }
-                    let event = MediaEvent::PlaybackStateChanged(state, source_app);
-                    self.enqueue(event);
+                    // A new state from a source whose state pill is on screen
+                    // updates it in place (play/pause spam): the pill shows
+                    // the latest state and gets the full duration again from
+                    // the last change, instead of queueing one pill per
+                    // toggle.
+                    let state_pill_shown = matches!(
+                        self.content.as_ref(),
+                        Some(MediaEvent::PlaybackStateChanged(_, shown_source)) if shown_source == &source_app
+                    );
+                    if state_pill_shown {
+                        let event = MediaEvent::PlaybackStateChanged(state, source_app);
+                        let full = Duration::from_millis(self.config.overlay.duration_ms.max(500));
+                        self.update_content(event, full);
+                        continue;
+                    }
+                    let replaying = matches!(state, PlaybackState::Playing)
+                        && self.current_source.as_deref() == Some(source_app.as_str());
+                    if replaying {
+                        debug!("playback state pill suppressed | reason=replaying same source | source={source_app}");
+                        continue;
+                    }
+                    self.enqueue(MediaEvent::PlaybackStateChanged(state, source_app));
                 }
                 MediaEvent::TrackChanged(_) | MediaEvent::PlaybackStateChanged(_, _) => {}
                 // Rejected sessions are history-only: never shown as a pill.
@@ -712,31 +739,55 @@ impl OverlayState {
 
     /// Adds a notification to the pending queue. At the cap, the oldest unshown
     /// queued event is dropped in favor of the incoming one; the pill currently
-    /// on screen is never pulled. A metadata refresh for a track already
-    /// waiting in the queue replaces it instead of showing the song twice.
+    /// on screen is never pulled. A newer event for a source already waiting
+    /// supersedes the older one — the queue holds at most one event per source —
+    /// so a burst of same-source events (play/pause spam, fast skipping)
+    /// collapses to the latest. A metadata refresh for a track already waiting
+    /// in the queue merges into it instead of showing the song twice.
     fn enqueue(&mut self, event: MediaEvent) {
-        // A metadata refresh for a track already waiting in the queue (artwork
-        // or album arriving late) merges into that entry instead of queueing a
-        // duplicate. Checking only the back of the queue is not enough: other
-        // sources' events can interleave between the track and its refresh.
-        // The merge follows the same `same_media` identity rule as the
-        // shown-pill update path, so a cover swap for the same title+artist
-        // (video vs audio version) queues a fresh pill rather than silently
-        // replacing the queued one.
-        if let MediaEvent::TrackChanged(incoming) = &event {
-            for queued in self.pending.iter_mut() {
-                if let MediaEvent::TrackChanged(queued) = queued
-                    && queued.same_media(incoming)
-                {
-                    if !incoming.album.trim().is_empty() {
-                        queued.album = incoming.album.clone();
+        match &event {
+            // A newer track from the same source supersedes the queued one:
+            // skipping songs quickly shows only the last one. A metadata
+            // refresh for the same media (artwork or album arriving late)
+            // merges into that entry instead of queueing a duplicate; the
+            // merge follows the same `same_media` identity rule as the
+            // shown-pill update path, so a cover swap for the same
+            // title+artist (video vs audio version) replaces the queued pill
+            // with the latest version rather than keeping the stale cover.
+            MediaEvent::TrackChanged(incoming) => {
+                for queued in self.pending.iter_mut() {
+                    if let MediaEvent::TrackChanged(queued) = queued
+                        && queued.source_app == incoming.source_app
+                    {
+                        if queued.same_media(incoming) {
+                            if !incoming.album.trim().is_empty() {
+                                queued.album = incoming.album.clone();
+                            }
+                            if incoming.artwork.is_some() {
+                                queued.artwork = incoming.artwork.clone();
+                            }
+                        } else {
+                            *queued = incoming.clone();
+                        }
+                        return;
                     }
-                    if incoming.artwork.is_some() {
-                        queued.artwork = incoming.artwork.clone();
-                    }
-                    return;
                 }
             }
+            // A newer playback state from the same source supersedes the
+            // queued one: play/pause spam shows only the final state.
+            MediaEvent::PlaybackStateChanged(_, source_app) => {
+                for queued in self.pending.iter_mut() {
+                    if let MediaEvent::PlaybackStateChanged(_, queued_source) = queued
+                        && queued_source == source_app
+                    {
+                        *queued = event.clone();
+                        return;
+                    }
+                }
+            }
+            // Never queued (receive_events skips it); defensive for
+            // exhaustiveness.
+            MediaEvent::SessionRejected { .. } => {}
         }
         if self.pending.len() >= PENDING_CAP {
             self.pending.pop_front();
@@ -781,16 +832,19 @@ impl OverlayState {
         self.show_next();
     }
 
-    /// Refreshes the shown content in place (metadata-only change): keeps the
-    /// current animation phase, extends the visible time, and re-renders. The
-    /// pill's size is constant — every row band is always reserved — so a
-    /// refresh only changes the drawn rows, never the pill's dimensions.
-    fn update_content(&mut self, event: MediaEvent) {
+    /// Refreshes the shown content in place: keeps the current animation
+    /// phase, extends the dismiss deadline to at least `now + min_visible`
+    /// (a metadata refresh grants a short extension, a real content change —
+    /// a state flip — grants the full configured duration again), and
+    /// re-renders. The pill's size is constant — every row band is always
+    /// reserved — so a refresh only changes the drawn rows, never the pill's
+    /// dimensions.
+    fn update_content(&mut self, event: MediaEvent, min_visible: Duration) {
         self.content = Some(event);
         self.resolve_pill_text();
         self.reset_scroll();
         if let Some(deadline) = self.dismiss_at {
-            self.dismiss_at = Some(deadline.max(Instant::now() + update_min_duration(&self.config)));
+            self.dismiss_at = Some(deadline.max(Instant::now() + min_visible));
         }
         // A refresh that lands during the collapse (e.g. artwork arriving as
         // the pill fades) would otherwise be cut short: the collapse keeps its
@@ -3626,6 +3680,184 @@ mod tests {
         assert!(matches!(
             state.pending.front(),
             Some(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, source)) if source == "youtube-music"
+        ));
+    }
+
+    #[test]
+    fn same_source_state_toggle_updates_the_shown_state_pill_in_place() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.content = Some(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "youtube-music".into(),
+        ));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() + Duration::from_millis(1500));
+
+        state.queue.lock().unwrap().push_back(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Playing,
+            "youtube-music".into(),
+        ));
+        state.receive_events();
+
+        assert!(
+            state.pending.is_empty(),
+            "a same-source toggle must not queue a second pill"
+        );
+        assert!(matches!(
+            state.content.as_ref(),
+            Some(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, source))
+                if source == "youtube-music"
+        ));
+        let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
+        assert!(
+            remaining >= Duration::from_millis(2900),
+            "the pill must get the full configured duration again, got {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn play_pause_spam_collapses_to_the_latest_state_on_the_shown_pill() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.content = Some(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "youtube-music".into(),
+        ));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() + Duration::from_millis(3000));
+
+        {
+            let mut queue = state.queue.lock().unwrap();
+            queue.push_back(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Playing,
+                "youtube-music".into(),
+            ));
+            queue.push_back(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Paused,
+                "youtube-music".into(),
+            ));
+            queue.push_back(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Playing,
+                "youtube-music".into(),
+            ));
+        }
+        state.receive_events();
+
+        assert!(
+            state.pending.is_empty(),
+            "the whole burst must update in place, not queue"
+        );
+        assert!(matches!(
+            state.content.as_ref(),
+            Some(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, source))
+                if source == "youtube-music"
+        ));
+    }
+
+    #[test]
+    fn same_source_state_event_suppressed_while_the_track_pill_is_shown() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.content = Some(MediaEvent::TrackChanged(track_for("youtube-music", "Song", "Artist")));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() + Duration::from_secs(3));
+
+        state.queue.lock().unwrap().push_back(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "youtube-music".into(),
+        ));
+        state.receive_events();
+
+        assert!(
+            state.pending.is_empty(),
+            "a state flip adds nothing while the source's track pill is still visible"
+        );
+        assert!(matches!(state.content.as_ref(), Some(MediaEvent::TrackChanged(_))));
+    }
+
+    #[test]
+    fn same_source_state_toggle_during_collapse_brings_the_pill_back() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.content = Some(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "youtube-music".into(),
+        ));
+        state.phase = Phase::Collapsing(Instant::now() - Duration::from_millis(10));
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+
+        state.queue.lock().unwrap().push_back(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Playing,
+            "youtube-music".into(),
+        ));
+        state.receive_events();
+
+        assert!(
+            matches!(state.phase, Phase::Shown),
+            "the toggle must rescue the collapsing pill"
+        );
+    }
+
+    #[test]
+    fn enqueue_keeps_only_the_newest_track_for_a_source() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.enqueue(MediaEvent::TrackChanged(track_for("youtube-music", "Song A", "Artist")));
+        state.enqueue(MediaEvent::TrackChanged(track_for("youtube-music", "Song B", "Artist")));
+        assert_eq!(state.pending.len(), 1, "a newer track must supersede the queued one");
+        assert!(matches!(
+            state.pending.front(),
+            Some(MediaEvent::TrackChanged(t)) if t.title == "Song B"
+        ));
+    }
+
+    #[test]
+    fn enqueue_merges_metadata_into_the_queued_track_for_same_media() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.enqueue(MediaEvent::TrackChanged(track_for("youtube-music", "Song", "Artist")));
+        let mut refreshed = track_for("youtube-music", "Song", "Artist");
+        refreshed.artwork = Some(Arc::new([1u8, 2, 3]));
+        state.enqueue(MediaEvent::TrackChanged(refreshed));
+        assert_eq!(state.pending.len(), 1, "a same-media refresh must merge, not queue");
+        assert!(matches!(
+            state.pending.front(),
+            Some(MediaEvent::TrackChanged(t)) if t.artwork.is_some()
+        ));
+    }
+
+    #[test]
+    fn enqueue_keeps_only_the_newest_state_for_a_source() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.enqueue(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "youtube-music".into(),
+        ));
+        state.enqueue(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Playing,
+            "youtube-music".into(),
+        ));
+        state.enqueue(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "youtube-music".into(),
+        ));
+        assert_eq!(state.pending.len(), 1, "a newer state must supersede the queued one");
+        assert!(matches!(
+            state.pending.front(),
+            Some(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, source))
+                if source == "youtube-music"
+        ));
+    }
+
+    #[test]
+    fn enqueue_keeps_events_from_distinct_sources() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.enqueue(MediaEvent::TrackChanged(track_for("youtube-music", "Song A", "Artist")));
+        state.enqueue(MediaEvent::TrackChanged(track_for("spotify", "Song B", "Artist")));
+        state.enqueue(MediaEvent::TrackChanged(track_for("youtube-music", "Song C", "Artist")));
+        assert_eq!(state.pending.len(), 2, "distinct sources still queue separately");
+        assert!(matches!(
+            state.pending.front(),
+            Some(MediaEvent::TrackChanged(t)) if t.title == "Song C"
+        ));
+        assert!(matches!(
+            state.pending.back(),
+            Some(MediaEvent::TrackChanged(t)) if t.title == "Song B"
         ));
     }
 
