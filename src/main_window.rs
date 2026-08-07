@@ -511,6 +511,10 @@ struct MainWindowState {
     tooltips_dirty: bool,
     /// Timestamp of the last "Copy logs" press, for the "Copied" feedback.
     logs_copied_at: Option<Instant>,
+    /// Shared slot for the process picker's confirmed allow-list patterns. The
+    /// picker writes the result here and posts a bare `PICKER_RESULT_MSG`; no
+    /// pointer ever crosses the message boundary.
+    picker_result: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 /// Set when this window's WM_NCCREATE claims the state box handed over in
@@ -644,6 +648,7 @@ impl MainWindowState {
             tooltip_range: None,
             tooltips_dirty: false,
             logs_copied_at: None,
+            picker_result: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2849,8 +2854,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     state.copy_logs();
                                 }
                                 SettingId::AllowedApps => {
-                                    if !process_picker::open(hwnd, &control_rect, &state.cfg().behavior.allowed_sources)
-                                    {
+                                    if !process_picker::open(
+                                        hwnd,
+                                        &control_rect,
+                                        &state.cfg().behavior.allowed_sources,
+                                        state.picker_result.clone(),
+                                    ) {
                                         debug!("process picker failed to open");
                                     }
                                 }
@@ -2944,16 +2953,19 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             LRESULT(0)
         }
         PICKER_RESULT_MSG => {
-            // Confirmed results carry a heap-allocated Vec<String> in lparam
-            // that must be reclaimed even when the window is being destroyed
-            // (state_ptr null) — the Box::from_raw must live outside the
-            // state_ptr guard or the allocation leaks on teardown. When the
-            // window is still alive, the patterns are applied to config.
-            if lparam.0 != 0 {
-                let patterns = unsafe { Box::from_raw(lparam.0 as *mut Vec<String>) };
-                if !state_ptr.is_null() {
-                    let state = &mut *state_ptr;
-                    let patterns = *patterns;
+            // The picker writes its confirmed patterns into the shared result
+            // slot (never into the message itself) and posts this bare
+            // message. Taking the slot is safe even when the message was
+            // posted by a foreign process: it can only deliver values this
+            // process's own picker produced.
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                let patterns = state
+                    .picker_result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if let Some(patterns) = patterns {
                     state.mutate_config(|cfg| cfg.behavior.allowed_sources = patterns);
                     state.invalidate();
                 }

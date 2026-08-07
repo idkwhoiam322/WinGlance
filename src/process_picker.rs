@@ -2,7 +2,7 @@ use crate::overlay::wide;
 use log::warn;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, COLORREF, CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -69,6 +69,10 @@ struct PickerState {
     header_brush: HBRUSH,
     close_brush: HBRUSH,
     close_hover_brush: HBRUSH,
+    /// Shared slot for the confirmed allow-list patterns. The picker writes
+    /// the result here and posts a bare `PICKER_RESULT_MSG`; the main window
+    /// reads the slot. No pointers ever cross the message boundary.
+    result: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 static OPEN_PICKER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
@@ -306,7 +310,12 @@ pub(crate) fn close_existing() {
     }
 }
 
-pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool {
+pub(crate) fn open(
+    owner: HWND,
+    trigger_rect: &RECT,
+    current: &[String],
+    result: Arc<Mutex<Option<Vec<String>>>>,
+) -> bool {
     let list = merge_smtc_sources(enumerate_app_processes());
     if list.is_empty() {
         warn!("no app processes or SMTC sessions found for picker");
@@ -358,6 +367,7 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
             header_brush: HBRUSH::default(),
             close_brush: HBRUSH::default(),
             close_hover_brush: HBRUSH::default(),
+            result,
         });
         let state_ptr = Box::into_raw(state);
         PICKER_STATE_CLAIMED.store(false, Ordering::SeqCst);
@@ -514,31 +524,20 @@ fn post_result(hwnd: HWND, cancelled: bool) {
     let state = unsafe { &*state_ptr };
     let owner = unsafe { GetParent(hwnd).unwrap_or_default() };
 
-    let lparam = if cancelled {
-        0
-    } else {
-        let selected = read_checked(hwnd, state.listbox);
-        Box::into_raw(Box::new(selected)) as isize
-    };
-
-    if unsafe {
-        PostMessageW(
-            owner,
-            PICKER_RESULT_MSG,
-            WPARAM(if cancelled { 1 } else { 0 }),
-            LPARAM(lparam),
-        )
+    // The selected patterns travel through the shared result slot, never as a
+    // pointer in the message. The main window takes the slot on
+    // PICKER_RESULT_MSG; if the post fails the slot is simply never read and
+    // the next picker open overwrites it.
+    if let Ok(mut slot) = state.result.lock() {
+        *slot = if cancelled {
+            None
+        } else {
+            Some(read_checked(hwnd, state.listbox))
+        };
     }
-    .is_err()
-    {
-        // The owner window is gone (quitting via the tray while the picker is
-        // open): free the result box that can no longer be delivered.
-        warn!("posting the picker result failed; freeing the result payload");
-        if !cancelled {
-            unsafe {
-                drop(Box::from_raw(lparam as *mut Vec<String>));
-            }
-        }
+
+    if unsafe { PostMessageW(owner, PICKER_RESULT_MSG, WPARAM(0), LPARAM(0)) }.is_err() {
+        warn!("posting the picker result failed");
     }
 }
 
