@@ -152,8 +152,24 @@ impl Config {
         let content = match std::fs::read_to_string(&config_path) {
             Ok(content) => content,
             Err(error) => {
-                warn!("config.toml could not be read ({error}); falling back to defaults");
-                return Self::default_config_saved();
+                // An unreadable config (bad encoding such as UTF-16, transient
+                // I/O error) must never be replaced with defaults: that would
+                // destroy the user's file. Quarantine it like the
+                // invalid-TOML path below; only when even the rename fails do
+                // we run on defaults for this launch without touching the file.
+                warn!("config.toml could not be read ({error}); quarantining it and falling back to defaults");
+                let backup = config_path.with_extension("toml.bad");
+                return match std::fs::rename(&config_path, &backup) {
+                    Ok(()) => Self::default_config_saved(),
+                    Err(rename_error) => {
+                        warn!(
+                            "keeping the unreadable config as {backup:?} failed: {rename_error}; defaults apply for this run only"
+                        );
+                        let mut config = Config::default();
+                        config.normalize();
+                        Ok(config)
+                    }
+                };
             }
         };
         match toml::from_str::<Config>(&content) {
