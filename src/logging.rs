@@ -69,7 +69,10 @@ impl Log for FileLogger {
             && let Some(files) = files.as_mut()
         {
             let _ = files.live.write_all(line.as_bytes());
-            let _ = files.live.flush();
+            // No per-line flush: the OS page cache keeps the write durable
+            // across a process crash, which is what the log is for. Flushing
+            // every Debug line would stall the SMTC worker under churn; only
+            // a power loss can lose the last few lines.
             files.written += line.len() as u64;
             if files.written >= LIVE_LOG_CAP {
                 // Start the log fresh instead of growing without bound; the
