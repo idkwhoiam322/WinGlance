@@ -1346,11 +1346,7 @@ fn render_layered(
 
     let needed = buf_w as usize * buf_h as usize * 4;
     let mut scratch = std::mem::take(&mut state.frame_scratch);
-    if scratch.len() < needed {
-        scratch.resize(needed, 0);
-    } else {
-        scratch[..needed].fill(0);
-    }
+    clear_frame_scratch(&mut scratch, needed);
     draw_pixels(
         state,
         &mut scratch[..needed],
@@ -1410,6 +1406,17 @@ fn render_layered(
         );
     }
     result.context("UpdateLayeredWindow")
+}
+
+/// Grows the reusable frame buffer when needed and clears the entire region
+/// that this frame will present. `Vec::resize` preserves existing elements, so
+/// clearing only in the no-growth branch leaves old animation pixels behind
+/// while the pill expands.
+fn clear_frame_scratch(scratch: &mut Vec<u8>, needed: usize) {
+    if scratch.len() < needed {
+        scratch.resize(needed, 0);
+    }
+    scratch[..needed].fill(0);
 }
 
 /// Copies `rows` rows of `row_bytes` each from a tightly-packed `src` buffer
@@ -3408,6 +3415,15 @@ pub(crate) fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_scratch_is_cleared_when_it_grows() {
+        let mut scratch = vec![0xA5; 4];
+
+        clear_frame_scratch(&mut scratch, 8);
+
+        assert_eq!(scratch, vec![0; 8]);
+    }
 
     /// This is the test that would have caught the original stride bug: it
     /// constructs a destination buffer *larger* than the packed source (an
