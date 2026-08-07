@@ -64,9 +64,11 @@ struct PickerState {
     /// heights and hit-testing are scaled by it so the picker matches the
     /// DPI-correct main window on high-DPI displays.
     scale: f32,
-    /// Fixed GDI objects for the picker's own chrome (header text + fills),
-    /// created once per open and freed at teardown so paints create nothing.
+    /// Fixed GDI objects for the picker's own chrome (header text + fills,
+    /// listbox rows), created once per open and freed at teardown so paints
+    /// create nothing.
     header_font: HFONT,
+    list_font: HFONT,
     header_brush: HBRUSH,
     close_brush: HBRUSH,
     close_hover_brush: HBRUSH,
@@ -371,6 +373,7 @@ pub(crate) fn open(
             last_click_time: None,
             scale: 1.0,
             header_font: HFONT::default(),
+            list_font: HFONT::default(),
             header_brush: HBRUSH::default(),
             close_brush: HBRUSH::default(),
             close_hover_brush: HBRUSH::default(),
@@ -435,6 +438,26 @@ pub(crate) fn open(
             0x00,
             PCWSTR(wide("Segoe UI Semibold").as_ptr()),
         );
+        // Listbox font: same Segoe UI metrics the global cache used (13 px,
+        // regular weight, quality 0x02) but owned by the picker. The global
+        // cache flushes its handles on DPI change, which would leave the
+        // listbox with a dangling HFONT.
+        state_ref.list_font = CreateFontW(
+            -((13.0 * scale).round() as i32).max(1),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            0x01,
+            0,
+            0,
+            0x02,
+            0x00,
+            PCWSTR(wide("Segoe UI").as_ptr()),
+        );
         state_ref.header_brush = CreateSolidBrush(COLORREF(0x002D2D2D));
         state_ref.close_brush = CreateSolidBrush(COLORREF(0x00333333));
         state_ref.close_hover_brush = CreateSolidBrush(COLORREF(0x00404040));
@@ -498,8 +521,7 @@ pub(crate) fn open(
 
             let row_h = (ROW_HEIGHT as f32 * scale).round() as i32;
             let _ = SendMessageW(lb, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(row_h as isize));
-            // Cached font: reused across opens and never leaked.
-            let font = crate::overlay::cached_font((13.0 * scale).round() as i32, false, 0x02);
+            let font = state_ref.list_font;
             let _ = SendMessageW(lb, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
 
             for (i, entry) in state_ref.list.iter().enumerate() {
@@ -961,6 +983,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 let _ = unsafe { DeleteObject(state.header_font) };
+                let _ = unsafe { DeleteObject(state.list_font) };
                 let _ = unsafe { DeleteObject(state.header_brush) };
                 let _ = unsafe { DeleteObject(state.close_brush) };
                 let _ = unsafe { DeleteObject(state.close_hover_brush) };
