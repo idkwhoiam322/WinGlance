@@ -465,7 +465,17 @@ pub(crate) fn open(
             None,
         );
 
-        if let Ok(lb) = lb {
+        let lb = match lb {
+            Ok(lb) => lb,
+            Err(_) => {
+                // Without the listbox the popup cannot show anything usable;
+                // tear it down instead of leaving a dead frame on screen.
+                warn!("creating the picker listbox failed; closing the picker");
+                let _ = DestroyWindow(hwnd);
+                return false;
+            }
+        };
+        {
             let state_ref = &mut *state_ptr;
             state_ref.listbox = lb;
             state_ref.scale = scale;
