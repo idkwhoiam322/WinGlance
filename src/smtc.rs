@@ -253,7 +253,7 @@ impl ListenerState {
     fn event_loop(&mut self, signal_rx: Receiver<Signal>) -> Result<()> {
         let session_check_interval = Duration::from_secs(2);
         loop {
-            *self.heartbeat.lock().unwrap() = Instant::now();
+            *self.heartbeat.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
             // The Windows heap keeps freed blocks (artwork decodes, thumbnail
             // bytes) in its free lists instead of returning them to the OS,
             // so RSS climbs as songs change. Compacting on a 60s cadence
@@ -652,7 +652,11 @@ impl ListenerState {
                 "SMTC session {} | key={key} | source={} | allowed_sources={:?}",
                 if allowed { "accepted" } else { "rejected" },
                 read_source_app(session),
-                self.config.read().unwrap().behavior.allowed_sources
+                self.config
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .behavior
+                    .allowed_sources
             );
             if !allowed {
                 // Log rejected sessions once per appearance so the history
@@ -850,7 +854,13 @@ impl ListenerState {
         if self.source_on_cooldown(&label) {
             return false;
         }
-        let allowed = self.config.read().unwrap().behavior.allowed_sources.clone();
+        let allowed = self
+            .config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .behavior
+            .allowed_sources
+            .clone();
         if allowed.is_empty() {
             return true;
         }
@@ -962,7 +972,7 @@ impl ListenerState {
     }
 
     fn schedule_flush(&mut self) {
-        let deadline = Instant::now() + debounce_duration(&self.config.read().unwrap());
+        let deadline = Instant::now() + debounce_duration(&self.config.read().unwrap_or_else(|p| p.into_inner()));
         self.pending_deadline = Some(self.pending_deadline.map_or(deadline, |d| d.min(deadline)));
     }
 }

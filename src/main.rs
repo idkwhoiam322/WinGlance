@@ -309,7 +309,9 @@ fn main() -> Result<()> {
                     if worker_started.elapsed() > Duration::from_secs(120) {
                         consecutive_restarts = 0;
                     }
-                    let last = *supervisor_heartbeat.lock().unwrap();
+                    let last = *supervisor_heartbeat
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if last.elapsed() > Duration::from_secs(30) {
                         stalled = true;
                         break;

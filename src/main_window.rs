@@ -566,7 +566,12 @@ pub fn create_window(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwn
     };
 
     unsafe {
-        if config.read().unwrap().behavior.start_in_tray {
+        if config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .behavior
+            .start_in_tray
+        {
             let _ = ShowWindow(hwnd, SW_HIDE);
         } else {
             let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
@@ -583,13 +588,15 @@ pub fn create_window(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwn
 
 impl MainWindowState {
     fn cfg(&self) -> std::sync::RwLockReadGuard<'_, Config> {
-        self.config.read().unwrap()
+        self.config.read().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Mutates the config under a single write-lock scope, then persists it.
     /// Never call `self.cfg()` (a read lock) from inside `mutate`.
     fn mutate_config(&mut self, mutate: impl FnOnce(&mut Config)) {
-        let mut cfg = self.config.write().unwrap();
+        // A poisoned lock still yields the (possibly stale) config; recovering
+        // beats panicking on the UI thread for the rest of the run.
+        let mut cfg = self.config.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         mutate(&mut cfg);
         if let Err(error) = cfg.save() {
             error!("saving config after a settings change failed: {error}");
@@ -597,7 +604,11 @@ impl MainWindowState {
     }
 
     fn new(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwnd: HWND, instance: HINSTANCE) -> Self {
-        let notifications_enabled = config.read().unwrap().behavior.notifications_enabled;
+        let notifications_enabled = config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .behavior
+            .notifications_enabled;
         Self {
             hwnd: HWND::default(),
             instance,

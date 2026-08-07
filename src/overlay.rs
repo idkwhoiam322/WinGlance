@@ -3,7 +3,7 @@ use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, Trac
 use crate::palette::Palette;
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
-use log::{debug, error};
+use log::{debug, error, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -2767,36 +2767,36 @@ static FONT_CACHE: OnceLock<Mutex<HashMap<FontKey, usize>>> = OnceLock::new();
 /// until process exit).
 pub(crate) fn cached_font(height: i32, bold: bool, quality: u32) -> HFONT {
     let cache = FONT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = cache.lock() {
-        if let Some(font) = guard.get(&(height, bold, quality)) {
-            return HFONT(*font as *mut std::ffi::c_void);
-        }
-        let font_name = wide("Segoe UI");
-        let font = unsafe {
-            CreateFontW(
-                -height.max(1),
-                0,
-                0,
-                0,
-                if bold { 600 } else { 400 },
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET.0 as u32,
-                OUT_DEFAULT_PRECIS.0 as u32,
-                CLIP_DEFAULT_PRECIS.0 as u32,
-                quality,
-                DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
-                PCWSTR(font_name.as_ptr()),
-            )
-        };
-        if !font.0.is_null() {
-            guard.insert((height, bold, quality), font.0 as usize);
-        }
-        font
-    } else {
-        HFONT::default()
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| {
+        warn!("font cache lock was poisoned; recovering");
+        poisoned.into_inner()
+    });
+    if let Some(font) = guard.get(&(height, bold, quality)) {
+        return HFONT(*font as *mut std::ffi::c_void);
     }
+    let font_name = wide("Segoe UI");
+    let font = unsafe {
+        CreateFontW(
+            -height.max(1),
+            0,
+            0,
+            0,
+            if bold { 600 } else { 400 },
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_DEFAULT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            quality,
+            DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+            PCWSTR(font_name.as_ptr()),
+        )
+    };
+    if !font.0.is_null() {
+        guard.insert((height, bold, quality), font.0 as usize);
+    }
+    font
 }
 
 /// Source-over composite of a premultiplied source (rgb already multiplied by
