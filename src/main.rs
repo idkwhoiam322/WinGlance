@@ -11,6 +11,7 @@ mod palette;
 mod positioner;
 mod process_picker;
 mod smtc;
+mod winutil;
 
 use crate::config::Config;
 use anyhow::Result;
