@@ -7,6 +7,7 @@ use log::{debug, error};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::BOOLEAN;
@@ -1199,6 +1200,13 @@ pub(crate) fn show_sample(hwnd: HWND) {
     }
 }
 
+/// Set when this window's WM_NCCREATE claims the state box handed over in
+/// `lpCreateParams`, so a failed CreateWindowExW can tell whether the box was
+/// taken by the system (and freed in WM_NCDESTROY) or still belongs to the
+/// caller. Window creation is single-threaded on the UI thread, so a plain
+/// atomic flag per window class is race-free.
+static OVERLAY_STATE_CLAIMED: AtomicBool = AtomicBool::new(false);
+
 /// Creates the passive WinGlance overlay window. It owns no message loop: the caller
 /// runs the loop and destroys the window at exit.
 pub(crate) fn create_window(config: Config, queue: EventQueue) -> Result<HWND> {
@@ -1209,6 +1217,7 @@ pub(crate) fn create_window(config: Config, queue: EventQueue) -> Result<HWND> {
 
     let state = Box::new(OverlayState::new(config, queue));
     let state_ptr = Box::into_raw(state);
+    OVERLAY_STATE_CLAIMED.store(false, Ordering::SeqCst);
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
@@ -1229,11 +1238,17 @@ pub(crate) fn create_window(config: Config, queue: EventQueue) -> Result<HWND> {
         Ok(hwnd) => Ok(hwnd),
         Err(error) => {
             // The state box is owned by the window from WM_NCCREATE onward and
-            // freed in WM_NCDESTROY. If CreateWindowExW fails after WM_NCCREATE
-            // ran, the system tears the window down through WM_NCDESTROY first,
-            // so freeing the box here would double-free it. Freeing here only
-            // covers the WM_NCCREATE-never-ran case, which cannot happen
-            // because the class was just registered above.
+            // freed in WM_NCDESTROY. WM_NCCREATE flips OVERLAY_STATE_CLAIMED
+            // when it takes the box; if it never ran (a creation failure before
+            // the window object existed), the box still belongs to us and must
+            // be freed here — otherwise it leaks. When WM_NCCREATE did run,
+            // the system tears the window down through WM_NCDESTROY first, so
+            // freeing the box here would double-free it.
+            if !OVERLAY_STATE_CLAIMED.load(Ordering::SeqCst) {
+                unsafe {
+                    drop(Box::from_raw(state_ptr));
+                }
+            }
             Err(error.into())
         }
     }
@@ -3234,6 +3249,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if !state.is_null() {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
                 (*state).hwnd = hwnd;
+                OVERLAY_STATE_CLAIMED.store(true, Ordering::SeqCst);
             }
         }
     }

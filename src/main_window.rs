@@ -11,6 +11,7 @@ use chrono::{DateTime, Local};
 use log::{debug, error};
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -501,6 +502,13 @@ struct MainWindowState {
     logs_copied_at: Option<Instant>,
 }
 
+/// Set when this window's WM_NCCREATE claims the state box handed over in
+/// `lpCreateParams`, so a failed CreateWindowExW can tell whether the box was
+/// taken by the system (and freed in WM_NCDESTROY) or still belongs to the
+/// caller. Window creation is single-threaded on the UI thread, so a plain
+/// atomic flag per window class is race-free.
+static MAIN_STATE_CLAIMED: AtomicBool = AtomicBool::new(false);
+
 /// Creates the main window: a maximized tracker with current activity,
 /// per-session history, and a tray icon. The caller runs the message loop.
 pub fn create_window(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwnd: HWND) -> Result<HWND> {
@@ -511,6 +519,7 @@ pub fn create_window(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwn
 
     let state = Box::new(MainWindowState::new(config.clone(), queue, overlay_hwnd, instance));
     let state_ptr = Box::into_raw(state);
+    MAIN_STATE_CLAIMED.store(false, Ordering::SeqCst);
     let hwnd = unsafe {
         CreateWindowExW(
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
@@ -531,11 +540,17 @@ pub fn create_window(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwn
         Ok(hwnd) => hwnd,
         Err(error) => {
             // The state box is owned by the window from WM_NCCREATE onward and
-            // freed in WM_NCDESTROY. If CreateWindowExW fails after WM_NCCREATE
-            // ran, the system tears the window down through WM_NCDESTROY first,
-            // so freeing the box here would double-free it. Freeing here only
-            // covers the WM_NCCREATE-never-ran case, which cannot happen
-            // because the class was just registered above.
+            // freed in WM_NCDESTROY. WM_NCCREATE flips MAIN_STATE_CLAIMED when
+            // it takes the box; if it never ran (a creation failure before the
+            // window object existed), the box still belongs to us and must be
+            // freed here — otherwise it leaks. When WM_NCCREATE did run, the
+            // system tears the window down through WM_NCDESTROY first, so
+            // freeing the box here would double-free it.
+            if !MAIN_STATE_CLAIMED.load(Ordering::SeqCst) {
+                unsafe {
+                    drop(Box::from_raw(state_ptr));
+                }
+            }
             return Err(error.into());
         }
     };
@@ -2542,6 +2557,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if !state.is_null() {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
                 (*state).hwnd = hwnd;
+                MAIN_STATE_CLAIMED.store(true, Ordering::SeqCst);
             }
         }
     }

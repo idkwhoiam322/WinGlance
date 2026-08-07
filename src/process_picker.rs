@@ -1,6 +1,7 @@
 use crate::overlay::wide;
 use log::warn;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, COLORREF, CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -61,6 +62,13 @@ struct PickerState {
 }
 
 static OPEN_PICKER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
+
+/// Set when this window's WM_NCCREATE claims the state box handed over in
+/// `lpCreateParams`, so a failed CreateWindowExW can tell whether the box was
+/// taken by the system (and freed in WM_NCDESTROY) or still belongs to the
+/// caller. Reset before each open; window creation is single-threaded on the
+/// UI thread, so a plain atomic flag is race-free.
+static PICKER_STATE_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Guards class registration: registering twice would leak the class brush.
 static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -330,6 +338,7 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
             last_click_time: None,
         });
         let state_ptr = Box::into_raw(state);
+        PICKER_STATE_CLAIMED.store(false, Ordering::SeqCst);
 
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -350,11 +359,12 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
             Ok(hwnd) => hwnd,
             Err(_) => {
                 // The state box is owned by the window from WM_NCCREATE onward
-                // and freed in WM_NCDESTROY. If CreateWindowExW fails after
-                // WM_NCCREATE ran, the system tears the window down through
-                // WM_NCDESTROY first, so freeing the box here would double-free
-                // it; WM_NCCREATE-never-ran failures are prevented by the
-                // registration check just above.
+                // and freed in WM_NCDESTROY. WM_NCCREATE flips
+                // PICKER_STATE_CLAIMED when it takes the box; if it never ran,
+                // the box still belongs to us and must be freed here.
+                if !PICKER_STATE_CLAIMED.load(Ordering::SeqCst) {
+                    drop(Box::from_raw(state_ptr));
+                }
                 return false;
             }
         };
@@ -595,6 +605,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if !create.is_null() {
                 let state = (*create).lpCreateParams as *mut PickerState;
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+                PICKER_STATE_CLAIMED.store(true, Ordering::SeqCst);
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }

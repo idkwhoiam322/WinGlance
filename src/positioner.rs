@@ -1,5 +1,6 @@
 use crate::events::POSITION_MSG;
 use log::{debug, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -42,6 +43,13 @@ struct PositionerState {
     drag_offset: POINT,
 }
 
+/// Set when this window's WM_NCCREATE claims the state box handed over in
+/// `lpCreateParams`, so a failed CreateWindowExW can tell whether the box was
+/// taken by the system (and freed in WM_NCDESTROY) or still belongs to the
+/// caller. Reset before each open; window creation is single-threaded on the
+/// UI thread, so a plain atomic flag is race-free.
+static POSITIONER_STATE_CLAIMED: AtomicBool = AtomicBool::new(false);
+
 /// Opens a floating sample notification that the user can drag to set WinGlance's
 /// placement. The window stays open until the user clicks X or presses Escape.
 pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
@@ -54,6 +62,7 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
         if !register_class(instance, &class_name) {
             return false;
         }
+        close_existing();
 
         let state = Box::new(PositionerState {
             owner,
@@ -62,6 +71,7 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
             drag_offset: POINT::default(),
         });
         let state_ptr = Box::into_raw(state);
+        POSITIONER_STATE_CLAIMED.store(false, Ordering::SeqCst);
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             PCWSTR(class_name.as_ptr()),
@@ -86,14 +96,34 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
             }
             Err(_) => {
                 // The state box is owned by the window from WM_NCCREATE onward
-                // and freed in WM_NCDESTROY. If CreateWindowExW fails after
-                // WM_NCCREATE ran, the system tears the window down through
-                // WM_NCDESTROY first, so freeing the box here would double-free
-                // it; WM_NCCREATE-never-ran failures are prevented by the
-                // registration check just above.
+                // and freed in WM_NCDESTROY. WM_NCCREATE flips
+                // POSITIONER_STATE_CLAIMED when it takes the box; if it never
+                // ran, the box still belongs to us and must be freed here.
+                if !POSITIONER_STATE_CLAIMED.load(Ordering::SeqCst) {
+                    drop(Box::from_raw(state_ptr));
+                }
                 false
             }
         }
+    }
+}
+
+/// Closes an already-open positioner window, so opening a second one cannot
+/// stack two draggable samples. No-op when none is open.
+pub(crate) fn close_existing() {
+    let Some(m) = OPEN_POSITIONER.get() else {
+        return;
+    };
+    let Ok(guard) = m.lock() else {
+        return;
+    };
+    let (hwnd, _) = *guard;
+    if hwnd == 0 {
+        return;
+    }
+    let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+    unsafe {
+        let _ = DestroyWindow(hwnd);
     }
 }
 
@@ -234,6 +264,7 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
             if !create.is_null() {
                 let state = (*create).lpCreateParams as *mut PositionerState;
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+                POSITIONER_STATE_CLAIMED.store(true, Ordering::SeqCst);
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
