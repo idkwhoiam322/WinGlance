@@ -40,6 +40,10 @@ struct PositionerState {
     overlay: HWND,
     dragging: bool,
     drag_offset: POINT,
+    /// Last position committed to the main window (logical coords), so a
+    /// release that did not move the pill — a click without a drag, or a
+    /// drag back to the same spot — skips the redundant post.
+    last_commit: Option<(i32, i32)>,
     /// Fixed paint objects, created at open and freed at teardown so the
     /// paint path creates nothing per repaint.
     bg_brush: HBRUSH,
@@ -73,6 +77,7 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
             overlay,
             dragging: false,
             drag_offset: POINT::default(),
+            last_commit: None,
             bg_brush: CreateSolidBrush(COLORREF(0x00121212)),
             x_brush: CreateSolidBrush(COLORREF(0x333333)),
             pen: CreatePen(PS_SOLID, 2, COLORREF(0x999999)),
@@ -231,6 +236,12 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
     let log_x = (phys_x as f32 / scale).round() as i32;
     let log_y = (phys_y as f32 / scale).round() as i32;
 
+    // Skip when the release did not move the pill: a click without a drag
+    // (or a drag back to the same spot) must not re-persist the config and
+    // re-nudge the overlay.
+    if state.last_commit == Some((log_x, log_y)) {
+        return;
+    }
     if let Err(error) = unsafe {
         PostMessageW(
             state.owner,
@@ -240,6 +251,8 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
         )
     } {
         debug!("positioner PostMessageW failed: {error}");
+    } else {
+        state.last_commit = Some((log_x, log_y));
     }
 }
 
