@@ -1039,14 +1039,18 @@ impl ListenerState {
             GlobalSystemMediaTransportControlsSession,
             MediaPropertiesChangedEventArgs,
         > = TypedEventHandler::new(move |_, _| {
-            let _ = properties_tx.try_send(Signal::MediaProperties(properties_session.clone()));
+            if let Err(e) = properties_tx.try_send(Signal::MediaProperties(properties_session.clone())) {
+                debug!("signal dropped | kind=MediaProperties | {e:?}");
+            }
             Ok(())
         });
         let playback_handler: TypedEventHandler<
             GlobalSystemMediaTransportControlsSession,
             PlaybackInfoChangedEventArgs,
         > = TypedEventHandler::new(move |_, _| {
-            let _ = playback_tx.try_send(Signal::PlaybackInfo(playback_session.clone()));
+            if let Err(e) = playback_tx.try_send(Signal::PlaybackInfo(playback_session.clone())) {
+                debug!("signal dropped | kind=PlaybackInfo | {e:?}");
+            }
             Ok(())
         });
 
@@ -1112,8 +1116,8 @@ impl ListenerState {
     /// worker that stalled and was replaced must not keep producing events
     /// after its successor took over.
     fn emit(&self, event: MediaEvent) {
-        if self.is_current_generation() {
-            let _ = self.output.send(event);
+        if self.is_current_generation() && self.output.send(event).is_err() {
+            debug!("signal dropped | kind=MediaEvent | reason=closed");
         }
     }
 
@@ -1379,7 +1383,9 @@ fn register_sessions_handler(
 ) -> Result<EventRegistrationToken> {
     let handler: TypedEventHandler<GlobalSystemMediaTransportControlsSessionManager, SessionsChangedEventArgs> =
         TypedEventHandler::new(move |_, _| {
-            let _ = signal_tx.try_send(Signal::Sessions);
+            if let Err(e) = signal_tx.try_send(Signal::Sessions) {
+                debug!("signal dropped | kind=Sessions | {e:?}");
+            }
             Ok(())
         });
     Ok(manager.SessionsChanged(&handler)?)
@@ -1395,7 +1401,9 @@ fn register_current_session_handler(
 ) -> Result<EventRegistrationToken> {
     let handler: TypedEventHandler<GlobalSystemMediaTransportControlsSessionManager, CurrentSessionChangedEventArgs> =
         TypedEventHandler::new(move |_, _| {
-            let _ = signal_tx.try_send(Signal::Sessions);
+            if let Err(e) = signal_tx.try_send(Signal::Sessions) {
+                debug!("signal dropped | kind=Sessions | {e:?}");
+            }
             Ok(())
         });
     Ok(manager.CurrentSessionChanged(&handler)?)
