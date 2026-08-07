@@ -72,6 +72,10 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
         });
         let state_ptr = Box::into_raw(state);
         POSITIONER_STATE_CLAIMED.store(false, Ordering::SeqCst);
+        // The positioner sits on the owner's monitor: create it at the owner's
+        // DPI so the sample box and its close button are sized like the rest
+        // of the UI on high-DPI displays.
+        let scale = GetDpiForWindow(owner).max(96) as f32 / 96.0;
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             PCWSTR(class_name.as_ptr()),
@@ -79,8 +83,8 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
             WS_POPUP | WS_VISIBLE,
             0,
             0,
-            WIDTH,
-            HEIGHT,
+            (WIDTH as f32 * scale).round() as i32,
+            (HEIGHT as f32 * scale).round() as i32,
             owner,
             None,
             instance,
@@ -200,13 +204,9 @@ fn monitor_work_area(hwnd: HWND) -> RECT {
     }
 }
 
-/// Snaps a value to the nearest edge if within SNAP_THRESHOLD.
-fn snap(val: i32, edge: i32) -> i32 {
-    if (val - edge).abs() <= SNAP_THRESHOLD {
-        edge
-    } else {
-        val
-    }
+/// Snaps a value to the nearest edge if within `threshold` physical pixels.
+fn snap(val: i32, edge: i32, threshold: i32) -> i32 {
+    if (val - edge).abs() <= threshold { edge } else { val }
 }
 
 /// Persists the positioner window's current screen position as absolute overlay
@@ -224,14 +224,20 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
     let sample_w = (WIDTH as f32 * scale).round() as i32;
     let sample_h = (HEIGHT as f32 * scale).round() as i32;
 
-    // Snap to edges and center
+    // Snap to edges and center; the threshold is a logical-pixel distance,
+    // scaled to this monitor so the snap feels the same at any DPI.
+    let snap_threshold = (SNAP_THRESHOLD as f32 * scale).round() as i32;
     let mut phys_x = rect.left;
     let mut phys_y = rect.top;
-    phys_x = snap(phys_x, work.left);
-    phys_x = snap(phys_x, work.right - sample_w);
-    phys_x = snap(phys_x, work.left + (work.right - work.left - sample_w) / 2);
-    phys_y = snap(phys_y, work.top);
-    phys_y = snap(phys_y, work.bottom - sample_h);
+    phys_x = snap(phys_x, work.left, snap_threshold);
+    phys_x = snap(phys_x, work.right - sample_w, snap_threshold);
+    phys_x = snap(
+        phys_x,
+        work.left + (work.right - work.left - sample_w) / 2,
+        snap_threshold,
+    );
+    phys_y = snap(phys_y, work.top, snap_threshold);
+    phys_y = snap(phys_y, work.bottom - sample_h, snap_threshold);
     phys_x = phys_x.clamp(work.left, (work.right - sample_w).max(work.left));
     phys_y = phys_y.clamp(work.top, (work.bottom - sample_h).max(work.top));
 
@@ -251,8 +257,14 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
 }
 
 /// Returns true if the click point (in client coords) is on the X button area.
-fn hit_close_button(cx: i32, cy: i32) -> bool {
-    (WIDTH - CLOSE_BTN_W - 6..=WIDTH - 6).contains(&cx) && (6..=6 + CLOSE_BTN_H).contains(&cy)
+/// The button geometry is scaled by the window's DPI.
+fn hit_close_button(hwnd: HWND, cx: i32, cy: i32) -> bool {
+    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+    let w = (CLOSE_BTN_W as f32 * scale).round() as i32;
+    let h = (CLOSE_BTN_H as f32 * scale).round() as i32;
+    let width = (WIDTH as f32 * scale).round() as i32;
+    let pad = (6.0 * scale).round() as i32;
+    (width - w - pad..=width - pad).contains(&cx) && (pad..=pad + h).contains(&cy)
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -272,7 +284,7 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
             if !state_ptr.is_null() {
                 let cx = (lparam.0 & 0xFFFF) as i32;
                 let cy = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                if hit_close_button(cx, cy) {
+                if hit_close_button(hwnd, cx, cy) {
                     let _ = DestroyWindow(hwnd);
                     return LRESULT(0);
                 }
@@ -330,12 +342,18 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
             let hdc: HDC = BeginPaint(hwnd, &mut paint);
             if !hdc.0.is_null() {
                 unsafe {
+                    let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+                    let width = (WIDTH as f32 * scale).round() as i32;
+                    let height = (HEIGHT as f32 * scale).round() as i32;
+                    let close_w = (CLOSE_BTN_W as f32 * scale).round() as i32;
+                    let close_h = (CLOSE_BTN_H as f32 * scale).round() as i32;
+                    let pad = (6.0 * scale).round() as i32;
                     let brush: HBRUSH = CreateSolidBrush(COLORREF(0x00121212));
                     let whole = RECT {
                         left: 0,
                         top: 0,
-                        right: WIDTH,
-                        bottom: HEIGHT,
+                        right: width,
+                        bottom: height,
                     };
                     let _ = FillRect(hdc, &whole, brush);
 
@@ -343,8 +361,8 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
                     let mut text_rect = RECT {
                         left: 12,
                         top: 0,
-                        right: WIDTH - CLOSE_BTN_W - 16,
-                        bottom: HEIGHT,
+                        right: width - close_w - 16,
+                        bottom: height,
                     };
                     let _ = SetBkMode(hdc, TRANSPARENT);
                     let _ = SetTextColor(hdc, COLORREF(0xCCCCCC));
@@ -355,17 +373,17 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
                     // unlike a glyph drawn with the default window font)
                     let x_brush = CreateSolidBrush(COLORREF(0x333333));
                     let x_rect = RECT {
-                        left: WIDTH - CLOSE_BTN_W - 6,
-                        top: 6,
-                        right: WIDTH - 6,
-                        bottom: 6 + CLOSE_BTN_H,
+                        left: width - close_w - pad,
+                        top: pad,
+                        right: width - pad,
+                        bottom: pad + close_h,
                     };
                     let _ = FillRect(hdc, &x_rect, x_brush);
                     let _ = DeleteObject(HGDIOBJ(x_brush.0));
 
                     let pen = CreatePen(PS_SOLID, 2, COLORREF(0x999999));
                     let old_pen = SelectObject(hdc, pen);
-                    let inset = 8;
+                    let inset = (8.0 * scale).round() as i32;
                     let _ = MoveToEx(hdc, x_rect.left + inset, x_rect.top + inset, None);
                     let _ = LineTo(hdc, x_rect.right - inset, x_rect.bottom - inset);
                     let _ = MoveToEx(hdc, x_rect.right - inset, x_rect.top + inset, None);

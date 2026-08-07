@@ -59,6 +59,10 @@ struct PickerState {
     close_hover: bool,
     last_click_item: Option<usize>,
     last_click_time: Option<Instant>,
+    /// DPI scale of the picker window at open time; all geometry, row
+    /// heights and hit-testing are scaled by it so the picker matches the
+    /// DPI-correct main window on high-DPI displays.
+    scale: f32,
 }
 
 static OPEN_PICKER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
@@ -77,12 +81,14 @@ fn get_open_picker() -> &'static Mutex<Option<isize>> {
     OPEN_PICKER.get_or_init(|| Mutex::new(None))
 }
 
-fn close_btn_rect(client: &RECT) -> RECT {
+fn close_btn_rect(client: &RECT, scale: f32) -> RECT {
+    let size = (CLOSE_BTN_SIZE as f32 * scale).round() as i32;
+    let pad = (4.0 * scale).round() as i32;
     RECT {
-        left: client.right - CLOSE_BTN_SIZE - 4,
-        top: 4,
-        right: client.right - 4,
-        bottom: 4 + CLOSE_BTN_SIZE,
+        left: client.right - size - pad,
+        top: pad,
+        right: client.right - pad,
+        bottom: pad + size,
     }
 }
 
@@ -312,7 +318,12 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
         close_existing();
 
         let item_count = list.len().min(MAX_VISIBLE);
-        let height = HEADER_H + item_count as i32 * ROW_HEIGHT + 10;
+        // The picker is positioned over the owner's control: create it at the
+        // owner's DPI, then re-read the window's own DPI once it exists (they
+        // agree in practice) so every geometry and hit-test below uses the
+        // authoritative scale.
+        let owner_scale = GetDpiForWindow(owner).max(96) as f32 / 96.0;
+        let height = ((HEADER_H + item_count as i32 * ROW_HEIGHT + 10) as f32 * owner_scale).round() as i32;
 
         // Pre-check with the same normalization the SMTC worker applies to
         // allow-list patterns, so a stored "youtube music" matches the
@@ -336,6 +347,7 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
             close_hover: false,
             last_click_item: None,
             last_click_time: None,
+            scale: 1.0,
         });
         let state_ptr = Box::into_raw(state);
         PICKER_STATE_CLAIMED.store(false, Ordering::SeqCst);
@@ -347,7 +359,7 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
             WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN,
             trigger_rect.left,
             trigger_rect.bottom + 4,
-            WIDTH,
+            (WIDTH as f32 * owner_scale).round() as i32,
             height,
             owner,
             None,
@@ -373,15 +385,16 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
             *guard = Some(hwnd.0 as isize);
         }
 
-        let scale = GetDpiForWindow(owner).max(96) as f32 / 96.0;
+        let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
         let phys_w = (WIDTH as f32 * scale).round() as i32;
+        let phys_h = ((HEADER_H + item_count as i32 * ROW_HEIGHT + 10) as f32 * scale).round() as i32;
         let _ = SetWindowPos(
             hwnd,
             HWND_TOPMOST,
             trigger_rect.left,
             trigger_rect.bottom + (4.0 * scale) as i32,
             phys_w,
-            height,
+            phys_h,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
 
@@ -396,9 +409,9 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
                 | WS_BORDER
                 | WINDOW_STYLE((LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT) as u32),
             0,
-            HEADER_H,
+            (HEADER_H as f32 * scale).round() as i32,
             phys_w,
-            item_count as i32 * ROW_HEIGHT,
+            ((item_count as i32 * ROW_HEIGHT) as f32 * scale).round() as i32,
             hwnd,
             None,
             instance,
@@ -408,6 +421,7 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
         if let Ok(lb) = lb {
             let state_ref = &mut *state_ptr;
             state_ref.listbox = lb;
+            state_ref.scale = scale;
 
             // Route mouse and keyboard messages from the listbox child through
             // our own subclass proc; DefSubclassProc forwards every message we
@@ -418,7 +432,8 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
             // on WM_NCDESTROY.
             let _ = SetWindowSubclass(lb, Some(listbox_proc), LISTBOX_SUBCLASS_ID, hwnd.0 as usize);
 
-            let _ = SendMessageW(lb, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(ROW_HEIGHT as isize));
+            let row_h = (ROW_HEIGHT as f32 * scale).round() as i32;
+            let _ = SendMessageW(lb, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(row_h as isize));
             // Cached font: reused across opens and never leaked.
             let font = crate::overlay::cached_font((13.0 * scale).round() as i32, false, 0x02);
             let _ = SendMessageW(lb, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
@@ -497,7 +512,8 @@ fn post_result(hwnd: HWND, cancelled: bool) {
 fn hit_test_close(hwnd: HWND, x: i32, y: i32) -> bool {
     let mut client = RECT::default();
     let _ = unsafe { GetClientRect(hwnd, &mut client) };
-    let r = close_btn_rect(&client);
+    let scale = unsafe { GetDpiForWindow(hwnd).max(96) as f32 / 96.0 };
+    let r = close_btn_rect(&client, scale);
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
 
@@ -529,7 +545,11 @@ unsafe extern "system" fn listbox_proc(
             let state_ptr = unsafe { GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut PickerState };
             if !state_ptr.is_null() {
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                let item_idx = y / ROW_HEIGHT;
+                // The row height is DPI-scaled like the listbox item height,
+                // so hit-testing matches the rendered rows on any display.
+                let scale = unsafe { (*state_ptr).scale };
+                let row_h = (ROW_HEIGHT as f32 * scale).round() as i32;
+                let item_idx = y / row_h.max(1);
                 let count = unsafe { SendMessageW(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as i32;
                 if item_idx >= 0 && item_idx < count {
                     let i = item_idx as usize;
@@ -614,6 +634,17 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
 
+            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+            let scale = if state_ptr.is_null() {
+                unsafe { GetDpiForWindow(hwnd).max(96) as f32 / 96.0 }
+            } else {
+                unsafe { (*state_ptr).scale }
+            };
+            let header_h = (HEADER_H as f32 * scale).round() as i32;
+            let close_size = (CLOSE_BTN_SIZE as f32 * scale).round() as i32;
+            let pad6 = (6.0 * scale) as i32;
+            let pad12 = (12.0 * scale) as i32;
+
             let mut client = RECT::default();
             let _ = unsafe { GetClientRect(hwnd, &mut client) };
 
@@ -625,7 +656,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                         left: client.left,
                         top: client.top,
                         right: client.right,
-                        bottom: client.top + HEADER_H,
+                        bottom: client.top + header_h,
                     },
                     header_brush,
                 )
@@ -634,7 +665,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
 
             let font = unsafe {
                 CreateFontW(
-                    -14,
+                    -((14.0 * scale).round() as i32),
                     0,
                     0,
                     0,
@@ -659,18 +690,17 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     hdc,
                     &mut title,
                     &mut RECT {
-                        left: client.left + 12,
-                        top: client.top + 6,
-                        right: client.right - 12 - CLOSE_BTN_SIZE,
-                        bottom: client.top + HEADER_H - 6,
+                        left: client.left + pad12,
+                        top: client.top + pad6,
+                        right: client.right - pad12 - close_size,
+                        bottom: client.top + header_h - pad6,
                     },
                     DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
                 )
             };
 
             // Draw close button (X)
-            let btn = close_btn_rect(&client);
-            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+            let btn = close_btn_rect(&client, scale);
             let hover = !state_ptr.is_null() && unsafe { (*state_ptr).close_hover };
             let btn_brush = unsafe { CreateSolidBrush(COLORREF(if hover { 0x00404040 } else { 0x00333333 })) };
             let _ = unsafe { FillRect(hdc, &btn, btn_brush) };
@@ -710,6 +740,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             let state = unsafe { &*state_ptr };
             let entry = &state.list[draw.itemID as usize];
+            let scale = state.scale;
             unsafe {
                 // Background: highlight selected items.
                 let bg = COLORREF(if draw.itemState.0 & ODS_SELECTED.0 != 0 {
@@ -723,11 +754,13 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
 
                 // Checkbox square on the left.
                 let mid = (draw.rcItem.top + draw.rcItem.bottom) / 2;
+                let cb_size = (CB_SIZE as f32 * scale).round() as i32;
+                let pad6 = (6.0 * scale) as i32;
                 let mut cb = RECT {
-                    left: draw.rcItem.left + 6,
-                    top: mid - CB_SIZE / 2,
-                    right: draw.rcItem.left + 6 + CB_SIZE,
-                    bottom: mid - CB_SIZE / 2 + CB_SIZE,
+                    left: draw.rcItem.left + pad6,
+                    top: mid - cb_size / 2,
+                    right: draw.rcItem.left + pad6 + cb_size,
+                    bottom: mid - cb_size / 2 + cb_size,
                 };
                 let _ = DrawEdge(draw.hDC, &mut cb, BDR_SUNKENOUTER, BF_RECT);
                 if draw.itemData == BST_CHECKED {
@@ -755,8 +788,8 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     draw.hDC,
                     &mut name,
                     &mut RECT {
-                        left: draw.rcItem.left + 24,
-                        right: draw.rcItem.right - 4,
+                        left: draw.rcItem.left + (24.0 * scale) as i32,
+                        right: draw.rcItem.right - (4.0 * scale) as i32,
                         top: draw.rcItem.top,
                         bottom: draw.rcItem.bottom,
                     },
@@ -779,7 +812,8 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 unsafe {
                     let mut client = RECT::default();
                     let _ = GetClientRect(hwnd, &mut client);
-                    let btn = close_btn_rect(&client);
+                    let scale = (*state_ptr).scale;
+                    let btn = close_btn_rect(&client, scale);
                     let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, Some(&btn), false);
                 };
                 // Change cursor
