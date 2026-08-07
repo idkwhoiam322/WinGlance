@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
     DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteObject, EndPaint, FF_DONTCARE, FillRect, GetStockObject,
-    HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, SetBkColor, SetTextColor,
+    HBRUSH, HDC, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, SetBkColor, SetTextColor,
     StretchDIBits,
 };
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
@@ -213,6 +213,12 @@ fn row_split(rect: &RECT, scale: f32) -> RowSplit {
     }
 }
 
+/// Whether two rects overlap in area. Used to skip repainting rows that the
+/// invalid region does not cover.
+fn rects_intersect(a: &RECT, b: &RECT) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
 /// The overlay position as a display string: "Custom (x, y)" for a dragged
 /// placement, otherwise "top-center" style. Shared by the Activity pane and
 /// the settings value so the wording cannot drift.
@@ -305,6 +311,18 @@ struct SettingsBrushes {
     border: HBRUSH,
     surface: HBRUSH,
     hover: HBRUSH,
+    accent: HBRUSH,
+    /// Accent blended toward the surface at 28%, the fill of active segments.
+    accent_soft: HBRUSH,
+    /// Accent blended toward the surface at 55%, the fill of approximate
+    /// (non-exact) duration presets.
+    near: HBRUSH,
+    /// Accent blended toward the surface at 45%, the hovered Adjust fill.
+    adjust_hover: HBRUSH,
+    /// Flat dark fill of idle outline buttons.
+    small_fill: HBRUSH,
+    /// Accent-blended hover fill of outline buttons.
+    small_hover: HBRUSH,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -314,23 +332,11 @@ fn draw_segment_button(
     label: &str,
     active: bool,
     hovered: bool,
-    accent: [u8; 4],
-    accent_soft: [u8; 4],
     scale: f32,
     brushes: SettingsBrushes,
 ) {
-    if active {
-        let b = unsafe { CreateSolidBrush(colorref(accent[0], accent[1], accent[2])) };
-        unsafe {
-            let _ = FillRect(hdc, rect, b);
-        }
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(b.0));
-        }
-    } else {
-        unsafe {
-            let _ = FillRect(hdc, rect, brushes.border);
-        }
+    unsafe {
+        let _ = FillRect(hdc, rect, if active { brushes.accent } else { brushes.border });
     }
     let inner = RECT {
         left: rect.left + 1,
@@ -338,18 +344,15 @@ fn draw_segment_button(
         right: rect.right - 1,
         bottom: rect.bottom - 1,
     };
-    if active {
-        let f = unsafe { CreateSolidBrush(colorref(accent_soft[0], accent_soft[1], accent_soft[2])) };
-        unsafe {
-            let _ = FillRect(hdc, &inner, f);
-        }
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(f.0));
-        }
-    } else {
-        unsafe {
-            let _ = FillRect(hdc, &inner, if hovered { brushes.hover } else { brushes.surface });
-        }
+    unsafe {
+        let fill = if active {
+            brushes.accent_soft
+        } else if hovered {
+            brushes.hover
+        } else {
+            brushes.surface
+        };
+        let _ = FillRect(hdc, &inner, fill);
     }
     let mut t = inner;
     let tc = if active { SETTINGS_TEXT } else { SETTINGS_MUTED };
@@ -357,13 +360,17 @@ fn draw_segment_button(
 }
 
 /// Draws an outline button (accent border, dark fill, accent label).
-fn draw_small_button(hdc: HDC, rect: &RECT, label: &str, accent: [u8; 4], hovered: bool, scale: f32) {
-    let b = unsafe { CreateSolidBrush(colorref(accent[0], accent[1], accent[2])) };
+fn draw_small_button(
+    hdc: HDC,
+    rect: &RECT,
+    label: &str,
+    accent: [u8; 4],
+    hovered: bool,
+    scale: f32,
+    brushes: SettingsBrushes,
+) {
     unsafe {
-        let _ = FillRect(hdc, rect, b);
-    }
-    unsafe {
-        let _ = DeleteObject(HGDIOBJ(b.0));
+        let _ = FillRect(hdc, rect, brushes.accent);
     }
     let inner = RECT {
         left: rect.left + 1,
@@ -371,17 +378,16 @@ fn draw_small_button(hdc: HDC, rect: &RECT, label: &str, accent: [u8; 4], hovere
         right: rect.right - 1,
         bottom: rect.bottom - 1,
     };
-    let fill = if hovered {
-        mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], 0.35)
-    } else {
-        [0x12, 0x12, 0x12, 0xFF]
-    };
-    let f = unsafe { CreateSolidBrush(colorref(fill[0], fill[1], fill[2])) };
     unsafe {
-        let _ = FillRect(hdc, &inner, f);
-    }
-    unsafe {
-        let _ = DeleteObject(HGDIOBJ(f.0));
+        let _ = FillRect(
+            hdc,
+            &inner,
+            if hovered {
+                brushes.small_hover
+            } else {
+                brushes.small_fill
+            },
+        );
     }
     let mut t = inner;
     draw_string(hdc, label, &mut t, (10.0 * scale) as i32, accent, true, true);
@@ -481,6 +487,11 @@ struct MainWindowState {
     settings_border_brush: HBRUSH,
     settings_surface_brush: HBRUSH,
     settings_hover_brush: HBRUSH,
+    settings_accent_soft_brush: HBRUSH,
+    settings_near_brush: HBRUSH,
+    settings_adjust_hover_brush: HBRUSH,
+    settings_small_fill_brush: HBRUSH,
+    settings_small_hover_brush: HBRUSH,
     history_header_brush: HBRUSH,
     history_selected_brush: HBRUSH,
     history_row_even_brush: HBRUSH,
@@ -606,6 +617,11 @@ impl MainWindowState {
             settings_border_brush: HBRUSH::default(),
             settings_surface_brush: HBRUSH::default(),
             settings_hover_brush: HBRUSH::default(),
+            settings_accent_soft_brush: HBRUSH::default(),
+            settings_near_brush: HBRUSH::default(),
+            settings_adjust_hover_brush: HBRUSH::default(),
+            settings_small_fill_brush: HBRUSH::default(),
+            settings_small_hover_brush: HBRUSH::default(),
             history_header_brush: HBRUSH::default(),
             history_selected_brush: HBRUSH::default(),
             history_row_even_brush: HBRUSH::default(),
@@ -690,6 +706,19 @@ impl MainWindowState {
             unsafe { CreateSolidBrush(colorref(SETTINGS_SURFACE[0], SETTINGS_SURFACE[1], SETTINGS_SURFACE[2])) };
         self.settings_hover_brush =
             unsafe { CreateSolidBrush(colorref(SETTINGS_HOVER[0], SETTINGS_HOVER[1], SETTINGS_HOVER[2])) };
+        // Accent-derived control brushes: every settings-paint fill is a fixed
+        // color per process (the accent cannot change at runtime), so the
+        // segment/button paints reuse these instead of creating ~20 transient
+        // brushes per repaint. `accent_brush` above supplies the accent border.
+        let soft = |weight: f32| -> HBRUSH {
+            let c = mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], weight);
+            unsafe { CreateSolidBrush(colorref(c[0], c[1], c[2])) }
+        };
+        self.settings_accent_soft_brush = soft(0.28);
+        self.settings_near_brush = soft(0.55);
+        self.settings_adjust_hover_brush = soft(0.45);
+        self.settings_small_fill_brush = unsafe { CreateSolidBrush(COLORREF(0x00121212)) };
+        self.settings_small_hover_brush = soft(0.35);
         // History-row brushes: a fixed four-color set, created once instead of
         // per owner-draw row (every scroll tick repaints every visible row).
         self.history_header_brush = unsafe { CreateSolidBrush(COLORREF(0x00141414)) };
@@ -1137,10 +1166,12 @@ impl MainWindowState {
             );
         }
 
-        // Draw content based on active pane
+        // Draw content based on active pane. The settings pane skips rows that
+        // do not intersect the invalid region, so hover repaints only touch the
+        // rows that changed instead of the whole maximized window.
         match self.active_pane {
             Pane::Activity => self.paint_activity(hdc, content_left, client_w, client_h, scale, pad),
-            Pane::Settings => self.paint_settings(hdc, content_left, client_w, client_h, scale, pad),
+            Pane::Settings => self.paint_settings(hdc, content_left, client_w, client_h, scale, pad, &paint.rcPaint),
         }
 
         unsafe {
@@ -1478,12 +1509,21 @@ impl MainWindowState {
         items
     }
 
-    fn paint_settings(&self, hdc: HDC, content_left: i32, client_w: i32, _client_h: i32, scale: f32, pad: i32) {
+    #[allow(clippy::too_many_arguments)]
+    fn paint_settings(
+        &self,
+        hdc: HDC,
+        content_left: i32,
+        client_w: i32,
+        _client_h: i32,
+        scale: f32,
+        pad: i32,
+        invalid: &RECT,
+    ) {
         // Read the config once per paint instead of ~10 lock acquisitions,
         // and snapshot the hover/flag state so the row loop stays pure.
         let cfg = self.cfg();
         let accent = cfg.appearance.accent_color;
-        let accent_soft = mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], 0.28);
         let notifications_enabled = self.notifications_enabled;
         let settings_hover = self.settings_hover;
         let duration_ms = cfg.overlay.duration_ms;
@@ -1499,23 +1539,41 @@ impl MainWindowState {
             right: client_w - pad,
             bottom: pad + (24.0 * scale) as i32,
         };
-        draw_string(hdc, "SETTINGS", &mut hdr, (13.0 * scale) as i32, accent, true, false);
+        if rects_intersect(invalid, &hdr) {
+            draw_string(hdc, "SETTINGS", &mut hdr, (13.0 * scale) as i32, accent, true, false);
+        }
 
         let items = self.settings_items(content_left, client_w, pad, scale);
         let brushes = SettingsBrushes {
             border: self.settings_border_brush,
             surface: self.settings_surface_brush,
             hover: self.settings_hover_brush,
+            accent: self.accent_brush,
+            accent_soft: self.settings_accent_soft_brush,
+            near: self.settings_near_brush,
+            adjust_hover: self.settings_adjust_hover_brush,
+            small_fill: self.settings_small_fill_brush,
+            small_hover: self.settings_small_hover_brush,
         };
         let mut row_index = 0usize;
         for item in &items {
             match item {
                 SettingsItem::Header { text, rect } => {
-                    let mut hr = *rect;
-                    draw_string(hdc, text, &mut hr, (9.0 * scale) as i32, SETTINGS_FAINT, true, false);
+                    if rects_intersect(invalid, rect) {
+                        let mut hr = *rect;
+                        draw_string(hdc, text, &mut hr, (9.0 * scale) as i32, SETTINGS_FAINT, true, false);
+                    }
                 }
                 SettingsItem::Row { id, rect } => {
-                    let hovered_row = settings_hover.is_some_and(|(r, _)| r == row_index);
+                    // Row ordinals count rows only (headers are skipped), and
+                    // must stay in sync with settings_hover_at even when the
+                    // row is skipped for repainting.
+                    let current_row = row_index;
+                    row_index += 1;
+                    if !rects_intersect(invalid, rect) {
+                        continue;
+                    }
+                    let hovered_row = settings_hover.is_some_and(|(r, _)| r == current_row);
                     let split = row_split(rect, scale);
                     let label_rect = split.label;
                     let control_rect = split.control;
@@ -1623,18 +1681,13 @@ impl MainWindowState {
                             for (i, seg) in segments.iter().enumerate() {
                                 let active = duration_ms == values[i];
                                 let near = !exact && i == nearest;
-                                let seg_hovered = settings_hover == Some((row_index, SettingSub::Seg(i)));
-                                let border = if active || near {
-                                    colorref(accent[0], accent[1], accent[2])
-                                } else {
-                                    colorref(SETTINGS_BORDER[0], SETTINGS_BORDER[1], SETTINGS_BORDER[2])
-                                };
-                                let b = unsafe { CreateSolidBrush(border) };
+                                let seg_hovered = settings_hover == Some((current_row, SettingSub::Seg(i)));
                                 unsafe {
-                                    let _ = FillRect(hdc, seg, b);
-                                }
-                                unsafe {
-                                    let _ = DeleteObject(HGDIOBJ(b.0));
+                                    let _ = FillRect(
+                                        hdc,
+                                        seg,
+                                        if active || near { brushes.accent } else { brushes.border },
+                                    );
                                 }
                                 let s_inner = RECT {
                                     left: seg.left + 1,
@@ -1642,23 +1695,20 @@ impl MainWindowState {
                                     right: seg.right - 1,
                                     bottom: seg.bottom - 1,
                                 };
+                                // Approximate preset: dimmer accent fill than
+                                // the exact match, so "saved but not exact" is
+                                // visible.
                                 let fill = if active {
-                                    accent_soft
+                                    brushes.accent_soft
                                 } else if near {
-                                    // Approximate preset: dimmer accent fill than the
-                                    // exact match, so "saved but not exact" is visible.
-                                    mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], 0.55)
+                                    brushes.near
                                 } else if seg_hovered {
-                                    SETTINGS_HOVER
+                                    brushes.hover
                                 } else {
-                                    SETTINGS_SURFACE
+                                    brushes.surface
                                 };
-                                let f = unsafe { CreateSolidBrush(colorref(fill[0], fill[1], fill[2])) };
                                 unsafe {
-                                    let _ = FillRect(hdc, &s_inner, f);
-                                }
-                                unsafe {
-                                    let _ = DeleteObject(HGDIOBJ(f.0));
+                                    let _ = FillRect(hdc, &s_inner, fill);
                                 }
                                 let mut t = s_inner;
                                 let tc = if active || near { SETTINGS_TEXT } else { SETTINGS_MUTED };
@@ -1696,38 +1746,26 @@ impl MainWindowState {
                                 false,
                                 false,
                             );
-                            let reset_hovered = settings_hover == Some((row_index, SettingSub::Reset));
-                            draw_small_button(hdc, &parts.reset, "Reset", accent, reset_hovered, scale);
+                            let reset_hovered = settings_hover == Some((current_row, SettingSub::Reset));
+                            draw_small_button(hdc, &parts.reset, "Reset", accent, reset_hovered, scale, brushes);
 
                             // Anchor segments + Adjust button row
                             for (i, seg) in parts.anchors.iter().enumerate() {
                                 let active = active_anchor == Some(i);
-                                let seg_hovered = settings_hover == Some((row_index, SettingSub::Anchor(i)));
-                                draw_segment_button(
+                                let seg_hovered = settings_hover == Some((current_row, SettingSub::Anchor(i)));
+                                draw_segment_button(hdc, seg, ANCHOR_LABELS[i], active, seg_hovered, scale, brushes);
+                            }
+                            let adjust_hovered = settings_hover == Some((current_row, SettingSub::Adjust));
+                            unsafe {
+                                let _ = FillRect(
                                     hdc,
-                                    seg,
-                                    ANCHOR_LABELS[i],
-                                    active,
-                                    seg_hovered,
-                                    accent,
-                                    accent_soft,
-                                    scale,
-                                    brushes,
+                                    &parts.adjust,
+                                    if adjust_hovered {
+                                        brushes.adjust_hover
+                                    } else {
+                                        brushes.accent_soft
+                                    },
                                 );
-                            }
-                            let adjust_hovered = settings_hover == Some((row_index, SettingSub::Adjust));
-                            let adjust_fill = if adjust_hovered {
-                                mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], 0.45)
-                            } else {
-                                accent_soft
-                            };
-                            let b =
-                                unsafe { CreateSolidBrush(colorref(adjust_fill[0], adjust_fill[1], adjust_fill[2])) };
-                            unsafe {
-                                let _ = FillRect(hdc, &parts.adjust, b);
-                            }
-                            unsafe {
-                                let _ = DeleteObject(HGDIOBJ(b.0));
                             }
                             let mut bt = parts.adjust;
                             draw_string(hdc, "Adjust…", &mut bt, (10.0 * scale) as i32, accent, true, true);
@@ -1739,8 +1777,16 @@ impl MainWindowState {
                                 right: control_rect.right,
                                 bottom: control_rect.bottom,
                             };
-                            let hovered = self.settings_hover == Some((row_index, SettingSub::None));
-                            draw_small_button(hdc, &btn_rect, "Preview the notification", accent, hovered, scale);
+                            let hovered = self.settings_hover == Some((current_row, SettingSub::None));
+                            draw_small_button(
+                                hdc,
+                                &btn_rect,
+                                "Preview the notification",
+                                accent,
+                                hovered,
+                                scale,
+                                brushes,
+                            );
                         }
                         SettingId::CopyLogs => {
                             let btn_rect = RECT {
@@ -1749,7 +1795,7 @@ impl MainWindowState {
                                 right: control_rect.right,
                                 bottom: control_rect.bottom,
                             };
-                            let hovered = self.settings_hover == Some((row_index, SettingSub::None));
+                            let hovered = self.settings_hover == Some((current_row, SettingSub::None));
                             let copied = self
                                 .logs_copied_at
                                 .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
@@ -1760,10 +1806,10 @@ impl MainWindowState {
                                 accent,
                                 hovered,
                                 scale,
+                                brushes,
                             );
                         }
                     }
-                    row_index += 1;
                 }
             }
         }
@@ -1983,6 +2029,11 @@ impl MainWindowState {
                 &self.history_selected_brush,
                 &self.history_row_even_brush,
                 &self.history_row_odd_brush,
+                &self.settings_accent_soft_brush,
+                &self.settings_near_brush,
+                &self.settings_adjust_hover_brush,
+                &self.settings_small_fill_brush,
+                &self.settings_small_hover_brush,
             ] {
                 if !brush.0.is_null() {
                     let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
