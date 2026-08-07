@@ -572,19 +572,23 @@ fn spawn_event_forwarder(
 /// Pushes one event into a window's queue and posts `MEDIA_EVENT_MSG` only
 /// when no wake message is already in flight (`wake` was clear). On a failed
 /// post the flag is cleared and the event removed, so the next push retries
-/// instead of waiting on a message that never arrived.
+/// instead of waiting on a message that never arrived. On a poisoned queue
+/// the event is dropped and the wake flag is left untouched.
 fn push_and_wake(queue: &EventQueue, wake: &AtomicBool, event: MediaEvent, hwnd: HWND, name: &str) {
-    if let Ok(mut q) = queue.lock() {
-        q.push_back(event);
-    }
+    // A poisoned queue is unusable, so the event cannot be delivered. Do not
+    // arm the wake flag: the window would drain nothing and the flag would
+    // stay set until the next successful push.
+    let Ok(mut q) = queue.lock() else {
+        warn!("the {name} event queue is poisoned; dropping the event");
+        return;
+    };
+    q.push_back(event);
     if !wake.swap(true, Ordering::SeqCst)
         && unsafe { PostMessageW(hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
     {
         warn!("posting the media event to the {name} failed; dropping its queue copy");
         wake.store(false, Ordering::SeqCst);
-        if let Ok(mut q) = queue.lock() {
-            q.pop_back();
-        }
+        q.pop_back();
     }
 }
 
