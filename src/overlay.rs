@@ -167,6 +167,31 @@ struct LineScroll {
     scrolling: bool,
 }
 
+/// Bundles the scroll state of one line with the cached raster of that line,
+/// so the scrolling draw can pass both to the text rasterizer together.
+struct MarqueeCtx<'a> {
+    scroll: &'a mut LineScroll,
+    strip: &'a mut Option<MarqueeStrip>,
+}
+
+/// The overflowing line rasterized once at its natural width, premultiplied
+/// with the row's color. While the line scrolls, every animation tick samples
+/// the visible window from this strip (two contiguous runs) instead of
+/// re-running GDI text rendering (ExtTextOutW + GdiFlush) at animation
+/// cadence. Keyed by everything that affects the raster, so a content, size,
+/// font, or color change rebuilds it and everything else is a pure memcpy.
+struct MarqueeStrip {
+    value: String,
+    rw: i32,
+    rh: i32,
+    font: HFONT,
+    font_height: i32,
+    color: [u8; 4],
+    centered: bool,
+    text_w: i32,
+    pixels: Vec<u8>,
+}
+
 /// Hold time before an overflowing line starts scrolling.
 const MARQUEE_HOLD: Duration = Duration::from_millis(600);
 /// Horizontal gap between the end of the text and its repeated copy.
@@ -229,6 +254,8 @@ struct OverlayState {
     position: OverlayPos,
     /// Per-row marquee state for the four track lines (title/subtitle/meta/app).
     scroll: [LineScroll; 4],
+    /// Per-row cached marquee rasters (parallel to `scroll`), see `MarqueeStrip`.
+    marquee_strips: [Option<MarqueeStrip>; 4],
     /// High-resolution timer driving the pill animation.
     /// Animation timer from the timer queue; when creation fails, a plain
     /// window timer with `ANIM_TIMER_ID` drives the animation instead.
@@ -404,6 +431,7 @@ impl OverlayState {
             hover_dismiss_at: None,
             position,
             scroll: [LineScroll::default(); 4],
+            marquee_strips: [None, None, None, None],
             anim_timer: HANDLE::default(),
             anim_timer_fallback: false,
             tick_period: 16,
@@ -2413,7 +2441,10 @@ fn draw_pill_text_rows(
         h_title,
         text_color,
         false,
-        Some(&mut state.scroll[0]),
+        Some(MarqueeCtx {
+            scroll: &mut state.scroll[0],
+            strip: &mut state.marquee_strips[0],
+        }),
     );
     if let Some(playback) = playback {
         draw_symbol_pixels(
@@ -2440,7 +2471,10 @@ fn draw_pill_text_rows(
             h_artist,
             muted_accent(accent),
             false,
-            Some(&mut state.scroll[1]),
+            Some(MarqueeCtx {
+                scroll: &mut state.scroll[1],
+                strip: &mut state.marquee_strips[1],
+            }),
         );
     }
 
@@ -2460,7 +2494,10 @@ fn draw_pill_text_rows(
             accent,
             accent,
             scale,
-            Some(&mut state.scroll[2]),
+            Some(MarqueeCtx {
+                scroll: &mut state.scroll[2],
+                strip: &mut state.marquee_strips[2],
+            }),
         );
     }
     if active[3] {
@@ -2477,7 +2514,10 @@ fn draw_pill_text_rows(
             h_app,
             muted,
             scale,
-            Some(&mut state.scroll[3]),
+            Some(MarqueeCtx {
+                scroll: &mut state.scroll[3],
+                strip: &mut state.marquee_strips[3],
+            }),
         );
     }
 }
@@ -2631,7 +2671,7 @@ fn draw_meta_line_pixels(
     color: [u8; 4],
     accent: [u8; 4],
     scale: f32,
-    marquee: Option<&mut LineScroll>,
+    marquee: Option<MarqueeCtx<'_>>,
 ) {
     if !clock {
         draw_text_line_pixels(
@@ -2692,7 +2732,7 @@ fn draw_text_line_pixels(
     font_height: i32,
     color: [u8; 4],
     centered: bool,
-    marquee: Option<&mut LineScroll>,
+    marquee: Option<MarqueeCtx<'_>>,
 ) {
     if value.is_empty() || rect.right <= rect.left || rect.bottom <= rect.top {
         return;
@@ -2737,7 +2777,7 @@ fn draw_text_line_pixels(
             right: rw,
             bottom: rh,
         };
-        if let Some(scroll) = marquee {
+        if let Some(ctx) = marquee {
             let mut measured = RECT::default();
             let _ = DrawTextW(
                 hdc,
@@ -2751,12 +2791,12 @@ fn draw_text_line_pixels(
             // skips repainting. The threshold is the draw rect itself (the
             // symbol- or icon-narrowed width) — text that is cut off by the
             // badge must scroll rather than sit truncated.
-            let was_scrolling = scroll.scrolling;
-            scroll.scrolling = text_w > rw;
-            if scroll.scrolling && !was_scrolling {
+            let was_scrolling = ctx.scroll.scrolling;
+            ctx.scroll.scrolling = text_w > rw;
+            if ctx.scroll.scrolling && !was_scrolling {
                 debug!("marquee overflow | text_w={text_w} | draw_w={rw} | title={value}");
             }
-            let hold_elapsed = scroll.started_at.map(|t| t.elapsed()).unwrap_or_default();
+            let hold_elapsed = ctx.scroll.started_at.map(|t| t.elapsed()).unwrap_or_default();
             if text_w <= rw {
                 // Text fits: render once statically (no scrolling needed).
                 let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
@@ -2765,39 +2805,30 @@ fn draw_text_line_pixels(
                 // the text is readable ("…") instead of hard-clipped at the edge.
                 let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
             } else {
-                // Scrolling active: draw two copies offset by the marquee delta.
+                // Scrolling active: sample the cached marquee strip instead of
+                // re-running GDI text rendering at animation cadence. Returns
+                // early because the strip composite below replaces the general
+                // glyph composite at the end of this function.
                 let total = text_w + MARQUEE_GAP as i32;
-                let off = (scroll.offset % total as f32) as i32;
-                let clip = RECT {
-                    left: 0,
-                    top: 0,
-                    right: rw,
-                    bottom: rh,
-                };
-                let x1 = -off;
-                let _ = ExtTextOutW(
-                    hdc,
-                    x1,
+                let off = (ctx.scroll.offset % total as f32) as i32;
+                build_marquee_strip(
+                    ctx.strip,
+                    text_scratch,
+                    scratch_utf16,
+                    value,
+                    rw,
+                    rh,
+                    font,
+                    font_height,
+                    color,
+                    centered,
                     y,
-                    ETO_CLIPPED,
-                    Some(&clip),
-                    PCWSTR(scratch_utf16.as_ptr()),
-                    scratch_utf16.len() as u32,
-                    None,
+                    text_w,
                 );
-                let x2 = x1 + total;
-                if x2 < rw {
-                    let _ = ExtTextOutW(
-                        hdc,
-                        x2,
-                        y,
-                        ETO_CLIPPED,
-                        Some(&clip),
-                        PCWSTR(scratch_utf16.as_ptr()),
-                        scratch_utf16.len() as u32,
-                        None,
-                    );
+                if let Some(strip) = ctx.strip.as_ref() {
+                    composite_marquee_strip(pixels, width, rect, strip, off, total);
                 }
+                return;
             }
         } else {
             let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
@@ -2817,9 +2848,179 @@ fn draw_text_line_pixels(
     // `composite_pm`. Drawing the final color via SetTextColor instead would
     // make GDI pre-dim the scratch, and reading that dimmed value as coverage
     // would render gray text at ~brightness² opacity.
-    let sw = sw as usize;
-    let rw = rw as usize;
-    let rh = rh as usize;
+    composite_glyphs(
+        pixels,
+        width,
+        rect.left,
+        rect.top,
+        bits,
+        sw as usize,
+        rw as usize,
+        rh as usize,
+        color,
+    );
+}
+
+/// Rasterizes the scrolling line once at its natural width and caches it,
+/// premultiplied with the row's color. A cache hit (same text, rect, font,
+/// color) is a no-op; a miss re-runs the GDI text draw into the scratch —
+/// which may grow from the row's width to the text's width — and premultiplies
+/// the coverage into the strip. On any GDI failure the strip is dropped so a
+/// stale raster can never be shown for different content.
+#[allow(clippy::too_many_arguments)]
+fn build_marquee_strip(
+    strip: &mut Option<MarqueeStrip>,
+    text_scratch: &mut Option<TextScratch>,
+    scratch_utf16: &mut Vec<u16>,
+    value: &str,
+    rw: i32,
+    rh: i32,
+    font: HFONT,
+    font_height: i32,
+    color: [u8; 4],
+    centered: bool,
+    y: i32,
+    text_w: i32,
+) {
+    let cache_hit = matches!(
+        strip,
+        Some(cached)
+            if cached.value == value
+                && cached.rw == rw
+                && cached.rh == rh
+                && cached.font.0 == font.0
+                && cached.font_height == font_height
+                && cached.color == color
+                && cached.centered == centered
+                && cached.text_w == text_w
+    );
+    if cache_hit {
+        return;
+    }
+    let Ok((hdc, bits, sw, sh)) = text_scratch_for(text_scratch, text_w, rh) else {
+        *strip = None;
+        return;
+    };
+    // The scratch DIB may be wider than the visible band after this grow; the
+    // full buffer must be clean because the strip build reads every pixel of
+    // it below (stale pixels from a previous wider row would composite in).
+    unsafe {
+        std::ptr::write_bytes(bits.cast::<u8>(), 0, (sw * sh * 4) as usize);
+    }
+    if font.0.is_null() {
+        *strip = None;
+        return;
+    }
+    scratch_utf16.clear();
+    scratch_utf16.extend(value.encode_utf16());
+    unsafe {
+        let old_font = SelectObject(hdc, font);
+        SetBkMode(hdc, TRANSPARENT);
+        // Draw in pure white so the scratch RGB channels hold exactly the glyph
+        // coverage; the requested text color is applied when premultiplying.
+        SetTextColor(hdc, COLORREF(0x00FFFFFF));
+        let clip = RECT {
+            left: 0,
+            top: 0,
+            right: text_w,
+            bottom: rh,
+        };
+        let _ = ExtTextOutW(
+            hdc,
+            0,
+            y,
+            ETO_CLIPPED,
+            Some(&clip),
+            PCWSTR(scratch_utf16.as_ptr()),
+            scratch_utf16.len() as u32,
+            None,
+        );
+        // CreateDIBSection's documented contract: GDI must finish any drawing
+        // into the DIB before the application reads the bit values directly.
+        let _ = GdiFlush();
+        let _ = SelectObject(hdc, old_font);
+    }
+    let mut pixels = vec![0u8; text_w as usize * rh as usize * 4];
+    composite_glyphs(
+        &mut pixels,
+        text_w as usize,
+        0,
+        0,
+        bits,
+        sw as usize,
+        text_w as usize,
+        rh as usize,
+        color,
+    );
+    *strip = Some(MarqueeStrip {
+        value: value.to_owned(),
+        rw,
+        rh,
+        font,
+        font_height,
+        color,
+        centered,
+        text_w,
+        pixels,
+    });
+}
+
+/// Samples the visible window of the scrolling marquee from the cached strip
+/// and composites it into the frame, replicating the old two-copy GDI draw:
+/// copy 1 of the loop covers [x1, x1+text_w), copy 2 covers
+/// [x1+total, x1+total+text_w) with x1 = -off. Pixels between the copies are
+/// background and stay untouched. The strip holds premultiplied pixels, so
+/// the composite is the same source-over math as `composite_pm`.
+fn composite_marquee_strip(pixels: &mut [u8], width: usize, rect: &RECT, strip: &MarqueeStrip, off: i32, total: i32) {
+    let rw = (rect.right - rect.left) as usize;
+    let rh = (rect.bottom - rect.top) as usize;
+    let tw = strip.text_w as usize;
+    let x1 = -off;
+    let x1_end = x1 + strip.text_w;
+    let x2 = x1 + total;
+    let x2_end = x2 + strip.text_w;
+    for dy in 0..rh {
+        let src_row = &strip.pixels[dy * tw * 4..(dy + 1) * tw * 4];
+        let dst_row = &mut pixels[((rect.top as usize + dy) * width + rect.left as usize) * 4..];
+        for x in 0..rw as i32 {
+            let sx = if x >= x1 && x < x1_end {
+                x - x1
+            } else if x >= x2 && x < x2_end {
+                x - x2
+            } else {
+                continue;
+            };
+            let sp = sx as usize * 4;
+            let alpha = src_row[sp + 3] as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let inv = 255 - alpha;
+            let dp = x as usize * 4;
+            dst_row[dp] = (src_row[sp] as u32 + dst_row[dp] as u32 * inv / 255) as u8;
+            dst_row[dp + 1] = (src_row[sp + 1] as u32 + dst_row[dp + 1] as u32 * inv / 255) as u8;
+            dst_row[dp + 2] = (src_row[sp + 2] as u32 + dst_row[dp + 2] as u32 * inv / 255) as u8;
+            dst_row[dp + 3] = (alpha + dst_row[dp + 3] as u32 * inv / 255) as u8;
+        }
+    }
+}
+
+/// Premultiplies the glyph coverage in the scratch DIB (white-on-black, stride
+/// `sw` pixels per row) into `dest` at (left, top) with `color`, skipping
+/// fully transparent pixels. Shared by the per-frame text composite and the
+/// marquee-strip build.
+#[allow(clippy::too_many_arguments)]
+fn composite_glyphs(
+    dest: &mut [u8],
+    dest_width: usize,
+    left: i32,
+    top: i32,
+    bits: *mut c_void,
+    sw: usize,
+    rw: usize,
+    rh: usize,
+    color: [u8; 4],
+) {
     for y in 0..rh {
         for x in 0..rw {
             let p = unsafe { bits.cast::<u8>().add((y * sw + x) * 4) };
@@ -2835,10 +3036,10 @@ fn draw_text_line_pixels(
                 continue;
             }
             composite_pm(
-                pixels,
-                width,
-                (rect.left + x as i32) as usize,
-                (rect.top + y as i32) as usize,
+                dest,
+                dest_width,
+                (left + x as i32) as usize,
+                (top + y as i32) as usize,
                 [
                     (color[0] as u32 * alpha / 255) as u8,
                     (color[1] as u32 * alpha / 255) as u8,
@@ -3115,7 +3316,7 @@ fn draw_source_app_row(
     tm_height: i32,
     color: [u8; 4],
     scale: f32,
-    marquee: Option<&mut LineScroll>,
+    marquee: Option<MarqueeCtx<'_>>,
 ) {
     if let Some(icon) = app_icon {
         // The source bitmap is always 24x24; the destination size is the
@@ -4356,6 +4557,8 @@ mod tests {
         };
         let config = Config::default();
         let mut state = OverlayState::new(config, EventQueue::default());
+        let mut scroll = LineScroll::default();
+        let mut strip = None;
         let (font, h) = state.font_for(12, false);
         draw_text_line_pixels(
             &mut state.text_scratch,
@@ -4368,7 +4571,10 @@ mod tests {
             h,
             [255, 255, 255, 255],
             false,
-            Some(&mut LineScroll::default()),
+            Some(MarqueeCtx {
+                scroll: &mut scroll,
+                strip: &mut strip,
+            }),
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 100, "expected glyph pixels with marquee state, got {lit}");
@@ -4388,6 +4594,7 @@ mod tests {
         let config = Config::default();
         let mut state = OverlayState::new(config, EventQueue::default());
         let mut scroll = LineScroll::default();
+        let mut strip = None;
         let (font, h) = state.font_for(12, false);
         draw_text_line_pixels(
             &mut state.text_scratch,
@@ -4400,12 +4607,181 @@ mod tests {
             h,
             [255, 255, 255, 255],
             false,
-            Some(&mut scroll),
+            Some(MarqueeCtx {
+                scroll: &mut scroll,
+                strip: &mut strip,
+            }),
         );
         assert!(
             scroll.scrolling,
             "a title wider than the visible band must be marked as scrolling"
         );
+    }
+
+    #[test]
+    fn marquee_strip_is_built_once_and_reused_across_ticks() {
+        // The scrolling branch must rasterize the overflowing line into the
+        // strip on the first tick, then serve later ticks from the cache: the
+        // strip pixels must not change when nothing that affects the raster
+        // changed (this is the property that removes ExtTextOutW from the
+        // per-tick path).
+        let mut pixels = vec![0u8; 200 * 40 * 4];
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 80, // narrow, forces overflow
+            bottom: 40,
+        };
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+        let mut scroll = LineScroll {
+            // Past the static hold so the draw takes the scrolling branch.
+            started_at: Some(Instant::now() - MARQUEE_HOLD - Duration::from_millis(100)),
+            ..LineScroll::default()
+        };
+        let mut strip = None;
+        let (font, h) = state.font_for(12, false);
+        let value = "Feel It (Official Music Video)";
+        draw_text_line_pixels(
+            &mut state.text_scratch,
+            &mut state.scratch_utf16,
+            &mut pixels,
+            200,
+            value,
+            &rect,
+            font,
+            h,
+            [255, 255, 255, 255],
+            false,
+            Some(MarqueeCtx {
+                scroll: &mut scroll,
+                strip: &mut strip,
+            }),
+        );
+        let built = strip.as_ref().expect("scrolling line must build a strip");
+        assert!(built.text_w > 80, "strip must carry the full text width");
+        assert_eq!(built.rw, 80, "strip must remember the visible band width");
+        let first_pixels = built.pixels.clone();
+
+        // Second tick with identical content/size/font/color: cache hit.
+        draw_text_line_pixels(
+            &mut state.text_scratch,
+            &mut state.scratch_utf16,
+            &mut pixels,
+            200,
+            value,
+            &rect,
+            font,
+            h,
+            [255, 255, 255, 255],
+            false,
+            Some(MarqueeCtx {
+                scroll: &mut scroll,
+                strip: &mut strip,
+            }),
+        );
+        assert_eq!(
+            strip.as_ref().unwrap().pixels,
+            first_pixels,
+            "unchanged content must not re-rasterize the strip"
+        );
+    }
+
+    #[test]
+    fn marquee_strip_rebuilds_when_the_content_changes() {
+        // The strip is keyed by its raster inputs; a new value must invalidate
+        // it so the old glyphs never scroll for the new text.
+        let mut pixels = vec![0u8; 200 * 40 * 4];
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 80,
+            bottom: 40,
+        };
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+        let mut scroll = LineScroll {
+            started_at: Some(Instant::now() - MARQUEE_HOLD - Duration::from_millis(100)),
+            ..LineScroll::default()
+        };
+        let mut strip = None;
+        let (font, h) = state.font_for(12, false);
+        let first = "Feel It (Official Music Video)";
+        let second = "A Different Song Name That Also Overflows";
+        draw_text_line_pixels(
+            &mut state.text_scratch,
+            &mut state.scratch_utf16,
+            &mut pixels,
+            200,
+            first,
+            &rect,
+            font,
+            h,
+            [255, 255, 255, 255],
+            false,
+            Some(MarqueeCtx {
+                scroll: &mut scroll,
+                strip: &mut strip,
+            }),
+        );
+        assert_eq!(strip.as_ref().unwrap().value, first);
+        draw_text_line_pixels(
+            &mut state.text_scratch,
+            &mut state.scratch_utf16,
+            &mut pixels,
+            200,
+            second,
+            &rect,
+            font,
+            h,
+            [255, 255, 255, 255],
+            false,
+            Some(MarqueeCtx {
+                scroll: &mut scroll,
+                strip: &mut strip,
+            }),
+        );
+        assert_eq!(
+            strip.as_ref().unwrap().value,
+            second,
+            "a new text value must rebuild the strip"
+        );
+    }
+
+    #[test]
+    fn marquee_strip_composites_both_copies_inside_the_window() {
+        // The visible window of a scrolling line is two contiguous runs of the
+        // strip (the tail from -off and the head after one total period).
+        // Everything between the copies stays background.
+        let strip = MarqueeStrip {
+            value: "x".into(),
+            rw: 40,
+            rh: 20,
+            font: HFONT(std::ptr::null_mut()),
+            font_height: 10,
+            color: [0, 0, 255, 255],
+            centered: false,
+            text_w: 10,
+            pixels: [255u8, 0, 0, 255].repeat(10 * 20), // solid premultiplied blue (BGRA)
+        };
+        let mut pixels = vec![0u8; 40 * 20 * 4];
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 40,
+            bottom: 20,
+        };
+        composite_marquee_strip(&mut pixels, 40, &rect, &strip, 2, 30);
+        for (i, p) in pixels.chunks(4).enumerate() {
+            let x = i % 40;
+            let in_tail = (0..8).contains(&x); // x1 = -2, x1 + text_w = 8
+            let in_head = (28..38).contains(&x); // x2 = 28, x2 + text_w = 38
+            if in_tail || in_head {
+                assert_eq!(p, &[255, 0, 0, 255], "strip pixels must land at x={x} (row {})", i / 40);
+            } else {
+                assert_eq!(p, &[0, 0, 0, 0], "background must stay clear at x={x}");
+            }
+        }
     }
 
     #[test]
