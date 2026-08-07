@@ -1435,9 +1435,10 @@ fn render_layered(
     // tightly-packed scratch buffer at the *requested* size instead — the
     // stride `draw_pixels`/`draw_text_pixels` have always assumed — and
     // blit the result into the real DIB at its real stride right before the
-    // GDI call. The scratch buffer is grown but never shrunk across frames,
-    // so after warm-up this performs no per-frame heap allocation, matching
-    // the existing `text_scratch` buffer's pattern elsewhere in this file.
+    // GDI call. The scratch buffer is grown across frames (and shrunk back
+    // below only when an oversized frame inflates it), so after warm-up this
+    // performs no per-frame heap allocation, matching the existing
+    // `text_scratch` buffer's pattern elsewhere in this file.
     let (hdc, _bitmap, bits) = dib_for(state, buf_w, buf_h)?;
     let alloc_w = state.dib.as_ref().map(|dib| dib.width).unwrap_or(buf_w) as usize;
     let alloc_h = state.dib.as_ref().map(|dib| dib.height).unwrap_or(buf_h) as usize;
@@ -1461,6 +1462,10 @@ fn render_layered(
     if state.scratch_utf16.capacity() > 8192 {
         state.scratch_utf16.shrink_to(4096);
     }
+    // A single oversized frame (wide max_width on a high-DPI monitor) can
+    // inflate the packed frame scratch the same way; shrink it back so the
+    // capacity does not stay bloated for the rest of the run.
+    shrink_frame_scratch(&mut scratch, needed);
     state.frame_scratch = scratch;
 
     // Blit the packed frame into the real DIB, row by row, at the DIB's real
@@ -1521,6 +1526,18 @@ fn clear_frame_scratch(scratch: &mut Vec<u8>, needed: usize) {
         scratch.resize(needed, 0);
     }
     scratch[..needed].fill(0);
+}
+
+/// Shrinks the packed frame scratch back when an oversized frame has inflated
+/// it far beyond any real pill size. The buffer is grown on demand across
+/// frames (no per-frame allocation after warm-up); this releases capacity only
+/// when the needed size has dropped to half the allocated capacity, so the
+/// normal expand/collapse animation never reallocates. Pure and GDI-free so it
+/// can be unit tested directly.
+fn shrink_frame_scratch(scratch: &mut Vec<u8>, needed: usize) {
+    if scratch.capacity() > needed * 2 {
+        scratch.shrink_to(needed);
+    }
 }
 
 /// Copies `rows` rows of `row_bytes` each from a tightly-packed `src` buffer
@@ -3542,6 +3559,25 @@ mod tests {
         clear_frame_scratch(&mut scratch, 8);
 
         assert_eq!(scratch, vec![0; 8]);
+    }
+
+    #[test]
+    fn frame_scratch_is_shrunk_back_only_when_it_drops_to_half_capacity() {
+        // Models production: `clear_frame_scratch` keeps len == needed while
+        // an oversized frame has inflated the capacity far beyond it.
+        let mut scratch = Vec::with_capacity(512 * 1024);
+        scratch.resize(128 * 1024, 0);
+
+        shrink_frame_scratch(&mut scratch, 128 * 1024);
+
+        assert_eq!(scratch.capacity(), 128 * 1024);
+
+        // A mild reduction keeps the capacity (hysteresis), so the normal
+        // expand/collapse animation never reallocates.
+        let mut mild = Vec::with_capacity(512 * 1024);
+        mild.resize(300 * 1024, 0);
+        shrink_frame_scratch(&mut mild, 300 * 1024);
+        assert_eq!(mild.capacity(), 512 * 1024);
     }
 
     /// This is the test that would have caught the original stride bug: it
