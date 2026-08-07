@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, COLORREF, CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BDR_SUNKENOUTER, BF_RECT, BeginPaint, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect, HBRUSH, HFONT,
-    InvalidateRect, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
+    HBRUSH, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, SelectObject,
+    SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -324,6 +325,27 @@ pub(crate) fn open(
         // authoritative scale.
         let owner_scale = GetDpiForWindow(owner).max(96) as f32 / 96.0;
         let height = ((HEADER_H + item_count as i32 * ROW_HEIGHT + 10) as f32 * owner_scale).round() as i32;
+        let width = (WIDTH as f32 * owner_scale).round() as i32;
+
+        // Clamp the popup to the owner monitor's work area: the trigger
+        // control can sit near the bottom edge, where an unclamped
+        // `trigger_rect.bottom + 4` would push the popup under the taskbar
+        // or off-screen. Prefer below the control, flip above when that
+        // would overflow, then clamp into the work area.
+        let (mut x, mut y) = (trigger_rect.left, trigger_rect.bottom + 4);
+        let monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let work = info.rcWork;
+            if y + height > work.bottom {
+                y = (trigger_rect.top - 4 - height).max(work.top);
+            }
+            x = x.clamp(work.left, (work.right - width).max(work.left));
+            y = y.clamp(work.top, (work.bottom - height).max(work.top));
+        }
 
         // Pre-check with the same normalization the SMTC worker applies to
         // allow-list patterns, so a stored "youtube music" matches the
@@ -364,9 +386,9 @@ pub(crate) fn open(
             PCWSTR(wide(CLASS_NAME).as_ptr()),
             PCWSTR(wide("Select apps").as_ptr()),
             WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN,
-            trigger_rect.left,
-            trigger_rect.bottom + 4,
-            (WIDTH as f32 * owner_scale).round() as i32,
+            x,
+            y,
+            width,
             height,
             owner,
             None,
