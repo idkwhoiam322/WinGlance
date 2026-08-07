@@ -575,9 +575,29 @@ impl ListenerState {
                             (None, None) => false,
                         };
                         if art_changed {
-                            emit = true;
-                            let label = track_label(&merged);
-                            debug!("track emit forced | reason=artwork-changed | {label}");
+                            // The user's real pause/play is already in the batch:
+                            // YouTube Music re-encodes its thumbnail when it
+                            // recreates the session on pause, so the same cover
+                            // can re-read with different bytes. Forcing a
+                            // TrackChanged here would make the batch rule below
+                            // drop the state event, and the pill would show the
+                            // track layout instead of the pause. Absorb the
+                            // refresh instead: record the new bytes as the
+                            // source's last emitted track so a later read dedups
+                            // against them, and let the state event carry the
+                            // pill. A later genuine cover swap still re-reads
+                            // differently and emits normally.
+                            if artwork_refresh_absorbed(&events, &merged) {
+                                self.last_track_per_source
+                                    .insert(merged.source_app.clone(), merged.clone());
+                                self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
+                                let label = track_label(&merged);
+                                debug!("artwork refresh absorbed | reason=state-change-in-batch | {label}");
+                            } else {
+                                emit = true;
+                                let label = track_label(&merged);
+                                debug!("track emit forced | reason=artwork-changed | {label}");
+                            }
                         }
                     }
                     // Per-source session-recreation dedup: a source that
@@ -691,7 +711,10 @@ impl ListenerState {
         // from the previous session during a session switch — is redundant,
         // and showing both would flash two pills for one transition. The
         // TrackChanged alone is enough; the state the pill shows is implied by
-        // the fresh track.
+        // the fresh track. Same-track artwork refreshes never reach this
+        // rule: the artwork-changed force absorbs them when the state event
+        // is in the batch, so a pause cannot be swallowed by a re-read of the
+        // same cover (see `artwork_refresh_absorbed`).
         if events.iter().any(|e| matches!(e, MediaEvent::TrackChanged(_))) {
             events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
         }
@@ -1218,6 +1241,23 @@ fn retry_should_emit(merged: &TrackInfo, last_track: Option<&TrackInfo>) -> bool
         && !last_track.is_some_and(|cached| {
             cached.title == merged.title && cached.artist == merged.artist && cached.artwork.is_some()
         })
+}
+
+/// Whether an artwork-changed TrackChanged for a same-title+artist track must
+/// be absorbed instead of emitted: a real playback state event for the same
+/// source is already in the batch. The refresh is not new content — emitting
+/// it would make the batch rule drop the user's pause/play and the pill would
+/// show the track layout instead of the state (observed with YouTube Music,
+/// which re-encodes its thumbnail when the session is recreated on pause:
+/// same cover, different bytes). The caller records the refresh as the
+/// source's last emitted track so a later read dedups against the new bytes.
+/// Absent artwork is never absorbed: the artwork-timeout first pill and the
+/// artwork-lost path must keep their existing behavior.
+fn artwork_refresh_absorbed(events: &[MediaEvent], merged: &TrackInfo) -> bool {
+    merged.artwork.is_some()
+        && events
+            .iter()
+            .any(|e| matches!(e, MediaEvent::PlaybackStateChanged(_, source) if source == &merged.source_app))
 }
 
 /// Merges a fresh read into the stored state. Within the same title/artist
@@ -2080,5 +2120,45 @@ mod tests {
             ..TrackInfo::default()
         };
         assert!(retry_should_emit(&other, Some(&with_art)));
+    }
+
+    #[test]
+    fn artwork_refresh_absorbed_when_a_state_event_is_in_the_batch() {
+        let with_art = TrackInfo {
+            title: "Battle Symphony".into(),
+            artist: "Linkin Park".into(),
+            source_app: "youtube-music".into(),
+            artwork: Some(Arc::from(vec![1])),
+            ..TrackInfo::default()
+        };
+        // The observed pause case: Paused for the same source is in the batch
+        // when the artwork-changed force would fire → absorb.
+        let paused = vec![MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "youtube-music".into(),
+        )];
+        assert!(artwork_refresh_absorbed(&paused, &with_art));
+
+        // Playing for the same source absorbs too (play after a cover swap).
+        let playing = vec![MediaEvent::PlaybackStateChanged(
+            PlaybackState::Playing,
+            "youtube-music".into(),
+        )];
+        assert!(artwork_refresh_absorbed(&playing, &with_art));
+
+        // No state event in the batch → a genuine cover swap still emits.
+        assert!(!artwork_refresh_absorbed(&[], &with_art));
+
+        // A state event from another source does not absorb this refresh.
+        let other_source = vec![MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "spotify".into(),
+        )];
+        assert!(!artwork_refresh_absorbed(&other_source, &with_art));
+
+        // Artwork absent is never absorbed: the artwork-timeout first pill
+        // and the artwork-lost path keep their existing behavior.
+        let no_art = track("Battle Symphony", "Linkin Park");
+        assert!(!artwork_refresh_absorbed(&paused, &no_art));
     }
 }
