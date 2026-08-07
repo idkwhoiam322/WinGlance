@@ -280,10 +280,17 @@ fn main() -> Result<()> {
         .name("WinGlance-smtc".to_string())
         .stack_size(256 * 1024)
         .spawn(move || {
+            // Consecutive worker failures (stall or exit) back off: a
+            // permanently broken SMTC worker must not restart (and re-log)
+            // every few seconds forever, and each stalled restart leaks the
+            // hung thread plus its COM registrations, so the leak rate needs
+            // a bound. A worker that runs for two minutes resets the counter.
+            let mut consecutive_restarts: u32 = 0;
             loop {
                 let worker_heartbeat = supervisor_heartbeat.clone();
                 let event_tx_worker = event_tx.clone();
                 let listener_config_worker = listener_config.clone();
+                let worker_started = Instant::now();
                 let worker = thread::Builder::new()
                     .name("WinGlance-smtc-worker".to_string())
                     .stack_size(1024 * 1024)
@@ -299,6 +306,9 @@ fn main() -> Result<()> {
                 let mut stalled = false;
                 while !worker.is_finished() {
                     std::thread::sleep(Duration::from_secs(2));
+                    if worker_started.elapsed() > Duration::from_secs(120) {
+                        consecutive_restarts = 0;
+                    }
                     let last = *supervisor_heartbeat.lock().unwrap();
                     if last.elapsed() > Duration::from_secs(30) {
                         stalled = true;
@@ -307,8 +317,10 @@ fn main() -> Result<()> {
                 }
                 if stalled {
                     // Do not join: the worker may be blocked inside COM forever.
-                    error!("SMTC worker stalled; restarting it");
-                    std::thread::sleep(Duration::from_secs(5));
+                    consecutive_restarts += 1;
+                    let delay = worker_restart_delay(consecutive_restarts);
+                    error!("SMTC worker stalled; restarting it in {}s", delay.as_secs());
+                    std::thread::sleep(delay);
                     continue;
                 }
                 match worker.join() {
@@ -319,8 +331,10 @@ fn main() -> Result<()> {
                     }
                 }
                 // The worker exited on its own (an error or a panic): restart it.
-                warn!("SMTC worker exited; restarting it");
-                std::thread::sleep(Duration::from_secs(5));
+                consecutive_restarts += 1;
+                let delay = worker_restart_delay(consecutive_restarts);
+                warn!("SMTC worker exited; restarting it in {}s", delay.as_secs());
+                std::thread::sleep(delay);
             }
         })?;
 
@@ -338,6 +352,17 @@ fn main() -> Result<()> {
         let _ = DestroyWindow(main_hwnd);
     }
     message_result
+}
+
+/// Restart delay after `consecutive` SMTC worker failures: quick retries at
+/// first, then a slow cadence so a permanently broken worker does not restart
+/// (and leak a thread plus its COM registrations) every few seconds forever.
+fn worker_restart_delay(consecutive: u32) -> Duration {
+    if consecutive >= 3 {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(5)
+    }
 }
 
 /// Drains SMTC events into each window's queue and wakes both windows.

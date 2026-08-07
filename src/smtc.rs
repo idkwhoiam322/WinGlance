@@ -272,10 +272,11 @@ impl ListenerState {
             let timeout = self
                 .pending_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or(Duration::from_secs(5))
-                // Wake at least every 5s so the heartbeat stays fresh even
-                // when nothing is pending.
-                .min(Duration::from_secs(5));
+                // Wake at least every 2 s when nothing is pending, so the
+                // heartbeat stays fresh and the periodic safety-net poll below
+                // keeps its documented cadence.
+                .unwrap_or(session_check_interval)
+                .min(session_check_interval);
 
             match signal_rx.recv_timeout(timeout) {
                 Ok(signal) => self.handle_signal(signal)?,
@@ -733,6 +734,9 @@ impl ListenerState {
             .retain(|source, _| active.contains(source));
         self.icon_cache.retain(|source, _| active.contains(source));
         self.last_emit_at.retain(|source, _| active.contains(source));
+        // Churn counts for departed sources are worthless and would otherwise
+        // accumulate one deque per distinct source ever seen.
+        self.churn.retain(|source, _| active.contains(source));
     }
 
     /// YouTube Music and similar browser clients can leave several sessions
