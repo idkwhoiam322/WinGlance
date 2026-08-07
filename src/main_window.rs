@@ -1046,12 +1046,14 @@ impl MainWindowState {
         }
     }
 
-    /// Appends a history row and syncs the listbox + tooltips. Artwork and the
-    /// app icon are stripped before storing — the history is text-only, and
-    /// the raw image bytes would be pure waste across hundreds of rows.
+    /// Appends a history row and syncs the listbox + tooltips. Artwork, the
+    /// app icon and the decoded cover buffer are stripped before storing —
+    /// the history is text-only, and the image bytes would be pure waste
+    /// across hundreds of rows.
     fn push_history(&mut self, mut track: TrackInfo, state: PlaybackState, accepted: bool) {
         track.artwork = None;
         track.app_icon = None;
+        track.decoded_art = None;
         let at = Local::now();
         let at_label = at.format("%H:%M:%S").to_string();
         let row = history_row(&track, at, state);
