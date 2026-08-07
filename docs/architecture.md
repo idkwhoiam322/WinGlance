@@ -13,11 +13,14 @@ the top of the screen when the track or the playback state changes.
   runs on a dedicated worker thread. The Windows UI runs on the UI thread with a
   classic `GetMessageW` loop. They communicate only through an `mpsc` channel and
   `PostMessageW`.
-- **Two windows, one queue.** There is a borderless "WinGlance" pill overlay window
+- **Two windows, two queues.** There is a borderless "WinGlance" pill overlay window
   and a maximized "tracking" window; both register a `WM_MEDIA_EVENT` handler.
-  A single forwarder thread drains the SMTC `mpsc` receiver into a shared
-  `Arc<Mutex<VecDeque<MediaEvent>>` and pokes **both** windows with
-  `PostMessageW`, so each can render from the same event stream without owning SMTC.
+  A single forwarder thread drains the SMTC `mpsc` receiver into two window-owned
+  queues (`Arc<Mutex<VecDeque<MediaEvent>>>`, one per window) and pokes **both**
+  windows with `PostMessageW`, so each can render from the same event stream
+  without owning SMTC. Two queues are required: a single shared queue would let
+  one window's drain consume events the other still needs — each window owns and
+  drains its own copy.
 - **Passive pill.** The overlay never takes focus, never appears in
   Alt-Tab, never intercepts mouse clicks, and stays on top of the active
   monitor's work area.
@@ -38,11 +41,12 @@ SystemMediaTransportControls            create_window x2 (pill + main)
   │
   │  events → mpsc channel ─────────► forwarder thread
   │                                       │
-  │                                       ├──► queue (Arc<Mutex<VecDeque>>)
-  │                                       │       ├──► both windows read it
-  │                                       │       └──► PostMessageW(WM_MEDIA_EVENT) to BOTH
-  │                                       │       └──► PostMessageW(WM_TOGGLE) to overlay only
-  │                                       └──► shared queue + both HWNDs
+  │                                       ├──► main queue (Arc<Mutex<VecDeque>>)
+  │                                       │       └──► main window drains it
+  │                                       ├──► overlay queue (Arc<Mutex<VecDeque>>)
+  │                                       │       └──► overlay drains it
+  │                                       ├──► PostMessageW(WM_MEDIA_EVENT) to BOTH
+  │                                       └──► PostMessageW(WM_TOGGLE) to overlay only
   │
   │  WM_MEDIA_EVENT → receive_events()  (pill + main)
   │  WM_TIMER (debounce) → flush_pending()  (pill)
@@ -53,8 +57,8 @@ SystemMediaTransportControls            create_window x2 (pill + main)
 - The SMTC worker owns all COM state for its lifetime and initializes COM as
   MTA. Async WinRT calls block on `IAsyncOperation::get()`; blocking the
   worker is acceptable because no other code shares that thread.
-- The event forwarder is a thin thread that drains the `mpsc` receiver into a
-  `Mutex<VecDeque>` and pokes the UI thread with `PostMessageW`. It exists so
+- The event forwarder is a thin thread that drains the `mpsc` receiver into the
+  two window queues and pokes the UI thread with `PostMessageW`. It exists so
   the UI thread stays responsive even if several SMTC callbacks fire at once.
 - The UI thread owns all Win32 windows, the queue, and GDI surfaces. SMTC
   reads (metadata + artwork bytes) and app-icon extraction (COM shell calls)
@@ -146,10 +150,12 @@ be clicked through to, activated, or tabbed to.
 
 Animation is a simple three-phase ease-out: expanding (grow + fade in), light
 (short fade for playback-state changes), collapsing (shrink + fade out),
-driven by a high-resolution timer matched to the monitor's refresh rate. The
-pill repaints only while animating or marquee-scrolling; a static pill does no
-per-frame drawing. Hovering the cursor over the pill, or queueing a newer
-notification, caps the remaining display time at 500 ms.
+driven by a high-resolution timer matched to the monitor's refresh rate while
+the pill animates or a text line scrolls. A fully static pill drops to a
+coarse 250 ms tick — the dismiss countdown and hover polling do not need frame
+rate — and the pill repaints only while animating or marquee-scrolling; a
+static pill does no per-frame drawing. Hovering the cursor over the pill, or
+queueing a newer notification, caps the remaining display time at 500 ms.
 
 ## Palette and aura
 

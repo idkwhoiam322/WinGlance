@@ -407,7 +407,6 @@ fn segment_rects(rect: &RECT, count: usize, gap: i32) -> Vec<RECT> {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct HistoryEntry {
     at: DateTime<Local>,
     /// Pre-formatted HH:MM:SS time, so the listbox paint never re-formats

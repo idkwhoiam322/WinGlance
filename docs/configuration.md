@@ -29,6 +29,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 |---------------------------------|---------|--------|-----------------------------------------|
 | `enable_track_change`           | `true`  | bool   | Show the pill when the track changes    |
 | `enable_playback_state_change`  | `true`  | bool   | Show a small state pill on play/pause   |
+| `notifications_enabled`         | `true`  | bool   | Master switch for pill notifications; mirrors the tray "Toggle notifications" item and is persisted so the toggle survives a restart |
 | `debounce_ms`                   | `200`   | 150–250 | Coalescing window for bursty SMTC events |
 | `start_in_tray`                 | `true`  | bool   | Start silently: no window, only the tray icon + pill |
 | `start_on_login`                | `false` | bool   | Register a Windows startup entry to launch WinGlance at logon |

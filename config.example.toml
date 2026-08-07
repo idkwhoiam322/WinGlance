@@ -1,6 +1,6 @@
 [overlay]
 duration_ms = 3000
-animation_ms = 200
+animation_ms = 280
 # Vertical edge: "top" | "bottom".
 vertical = "top"
 # Horizontal placement: "left" | "center" | "right".
@@ -16,6 +16,9 @@ max_width = 340
 [behavior]
 enable_track_change = true
 enable_playback_state_change = true
+# Master switch for pill notifications, mirroring the tray
+# "Toggle notifications" item; persisted so the toggle survives a restart.
+notifications_enabled = true
 debounce_ms = 200
 # Launch quietly to the system tray: no window pops up, just the WinGlance + tray icon.
 start_in_tray = true
