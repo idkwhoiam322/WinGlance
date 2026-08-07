@@ -36,16 +36,16 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HMENU, HWND_TOP, IDI_APPLICATION, IsWindowVisible,
-    KillTimer, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT, LB_GETTOPINDEX,
-    LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED,
-    LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterWindowMessageW,
-    SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY,
-    WM_DPICHANGED, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY,
-    WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HICON, HMENU, HWND_TOP, IDI_APPLICATION,
+    IsWindowVisible, KillTimer, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT,
+    LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT,
+    LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage,
+    RegisterWindowMessageW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX,
+    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
+    WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WS_CHILD, WS_CLIPCHILDREN,
+    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -2501,9 +2501,24 @@ fn register_main_class(instance: HINSTANCE, class_name: &[u16]) -> Result<()> {
 
 static REGISTERED: OnceLock<()> = OnceLock::new();
 
+/// The shared system application icon, loaded once and reused for every tray
+/// (re)add. `LoadIconW(None, IDI_APPLICATION)` returns a system-owned handle
+/// that must never be destroyed, so a single load serves the initial add and
+/// every `TaskbarCreated` re-add after an Explorer restart. The handle is
+/// stored as a raw value: `HICON` is not `Send`/`Sync`.
+static TRAY_ICON: OnceLock<isize> = OnceLock::new();
+
+fn tray_icon() -> HICON {
+    let raw = *TRAY_ICON.get_or_init(|| {
+        unsafe { LoadIconW(None, IDI_APPLICATION) }
+            .expect("the system application icon should always load")
+            .0 as isize
+    });
+    HICON(raw as *mut c_void)
+}
+
 fn install_tray_icon(hwnd: HWND) -> Result<()> {
-    let data = tray_data(hwnd)?;
-    if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
+    if !unsafe { Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)) }.as_bool() {
         anyhow::bail!("Shell_NotifyIconW(NIM_ADD) failed");
     }
     Ok(())
@@ -2519,28 +2534,25 @@ fn taskbar_created_msg() -> u32 {
 static TASKBAR_CREATED_MSG: OnceLock<u32> = OnceLock::new();
 
 fn remove_tray_icon(hwnd: HWND) {
-    if let Ok(data) = tray_data(hwnd) {
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
-        }
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
     }
 }
 
-fn tray_data(hwnd: HWND) -> Result<NOTIFYICONDATAW> {
-    let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }?;
+fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
     let mut data = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: TRAY_ID,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: WM_TRAY,
-        hIcon: icon,
+        hIcon: tray_icon(),
         ..Default::default()
     };
     let tip = wide("WinGlance media overlay");
     let count = tip.len().min(data.szTip.len());
     data.szTip[..count].copy_from_slice(&tip[..count]);
-    Ok(data)
+    data
 }
 
 fn show_tray_menu(state: &mut MainWindowState) {
