@@ -719,12 +719,14 @@ impl OverlayState {
         // or album arriving late) merges into that entry instead of queueing a
         // duplicate. Checking only the back of the queue is not enough: other
         // sources' events can interleave between the track and its refresh.
+        // The merge follows the same `same_media` identity rule as the
+        // shown-pill update path, so a cover swap for the same title+artist
+        // (video vs audio version) queues a fresh pill rather than silently
+        // replacing the queued one.
         if let MediaEvent::TrackChanged(incoming) = &event {
             for queued in self.pending.iter_mut() {
                 if let MediaEvent::TrackChanged(queued) = queued
-                    && queued.title == incoming.title
-                    && queued.artist == incoming.artist
-                    && queued.source_app == incoming.source_app
+                    && queued.same_media(incoming)
                 {
                     if !incoming.album.trim().is_empty() {
                         queued.album = incoming.album.clone();
