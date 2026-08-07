@@ -21,14 +21,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWLP_USERDATA,
-    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IDC_ARROW,
-    IsIconic, IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT, LB_GETTOPINDEX, LB_SETCURSEL,
+    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic,
+    IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT, LB_GETTOPINDEX, LB_SETCURSEL,
     LB_SETITEMDATA, LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW,
-    PostMessageW, RegisterClassExW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DRAWITEM,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WNDCLASS_STYLES,
-    WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
-    WS_VSCROLL,
+    PostMessageW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WS_BORDER, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -108,29 +107,15 @@ fn close_btn_rect(client: &RECT, scale: f32) -> RECT {
 }
 
 fn register_class(instance: HINSTANCE) -> bool {
-    if CLASS_REGISTERED.get().is_some() {
-        return true;
-    }
-    unsafe {
-        let cursor = LoadCursorW(None, IDC_ARROW).unwrap();
-        let class = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: WNDCLASS_STYLES(0),
-            lpfnWndProc: Some(picker_proc),
-            hInstance: instance,
-            hCursor: cursor,
-            lpszClassName: PCWSTR(wide(CLASS_NAME).as_ptr()),
-            hbrBackground: CreateSolidBrush(COLORREF(0x001E1E1E)),
-            ..Default::default()
-        };
-        if RegisterClassExW(&class) == 0 {
-            let _ = DeleteObject(class.hbrBackground);
-            warn!("RegisterClassExW failed for the process picker window");
-            return false;
-        }
-        let _ = CLASS_REGISTERED.set(());
-        true
-    }
+    crate::winutil::register_class_once(
+        &CLASS_REGISTERED,
+        instance,
+        &wide(CLASS_NAME),
+        Some(picker_proc),
+        || Some(unsafe { CreateSolidBrush(COLORREF(0x001E1E1E)) }),
+        "the process picker window",
+    )
+    .is_ok()
 }
 
 /// RAII guard for the Toolhelp process snapshot handle. The kernel handle

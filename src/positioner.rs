@@ -1,5 +1,5 @@
 use crate::events::POSITION_MSG;
-use log::{debug, warn};
+use log::debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -13,10 +13,9 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetCursorPos, GetWindowLongPtrW,
-    GetWindowRect, HWND_TOPMOST, IDC_ARROW, LoadCursorW, PostMessageW, RegisterClassExW, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASS_STYLES,
-    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    GetWindowRect, HWND_TOPMOST, PostMessageW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
@@ -171,29 +170,15 @@ pub(crate) fn reset_position() {
 }
 
 fn register_class(instance: HINSTANCE, class_name: &[u16]) -> bool {
-    if CLASS_REGISTERED.get().is_some() {
-        return true;
-    }
-    unsafe {
-        let cursor = LoadCursorW(None, IDC_ARROW).unwrap();
-        let class = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: WNDCLASS_STYLES(0),
-            lpfnWndProc: Some(positioner_proc),
-            hInstance: instance,
-            hCursor: cursor,
-            lpszClassName: PCWSTR(class_name.as_ptr()),
-            hbrBackground: CreateSolidBrush(COLORREF(0x00121212)),
-            ..Default::default()
-        };
-        if RegisterClassExW(&class) == 0 {
-            let _ = DeleteObject(class.hbrBackground);
-            warn!("RegisterClassExW failed for the positioner window");
-            return false;
-        }
-        let _ = CLASS_REGISTERED.set(());
-        true
-    }
+    crate::winutil::register_class_once(
+        &CLASS_REGISTERED,
+        instance,
+        class_name,
+        Some(positioner_proc),
+        || Some(unsafe { CreateSolidBrush(COLORREF(0x00121212)) }),
+        "the positioner window",
+    )
+    .is_ok()
 }
 
 fn monitor_work_area(hwnd: HWND) -> RECT {

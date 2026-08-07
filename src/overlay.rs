@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DEVMODEW, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER,
     DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, ENUM_CURRENT_SETTINGS,
     ETO_CLIPPED, EnumDisplaySettingsW, ExtTextOutW, FF_DONTCARE, GdiFlush, GetMonitorInfoW, GetTextMetricsW, HBITMAP,
-    HBRUSH, HDC, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW,
+    HDC, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW,
     MonitorFromWindow, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
     ValidateRect,
 };
@@ -29,12 +29,11 @@ use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueT
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetCursorPos, GetForegroundWindow,
-    GetWindowLongPtrW, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW, MA_NOACTIVATE,
-    MSG, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA, WM_APP, WM_DESTROY, WM_MOUSEACTIVATE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASS_STYLES, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    GetWindowLongPtrW, HTTRANSPARENT, HWND_TOPMOST, IsWindowVisible, KillTimer, MA_NOACTIVATE, MSG, PM_REMOVE,
+    PeekMessageW, PostMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    ULW_ALPHA, WM_APP, WM_DESTROY, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -3412,26 +3411,17 @@ fn draw_placeholder(pixels: &mut [u8], width: usize, x: usize, y: usize, size: u
 }
 
 fn register_window_class(instance: HINSTANCE, class_name: &[u16]) -> Result<()> {
-    let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }?;
-    let class = WNDCLASSEXW {
-        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        style: WNDCLASS_STYLES(0),
-        lpfnWndProc: Some(window_proc),
-        cbClsExtra: 0,
-        cbWndExtra: 0,
-        hInstance: instance,
-        hIcon: Default::default(),
-        hCursor: cursor,
-        hbrBackground: HBRUSH::default(),
-        lpszMenuName: PCWSTR::null(),
-        lpszClassName: PCWSTR(class_name.as_ptr()),
-        hIconSm: Default::default(),
-    };
-    if unsafe { RegisterClassExW(&class) } == 0 {
-        anyhow::bail!("RegisterClassExW failed");
-    }
-    Ok(())
+    Ok(crate::winutil::register_class_once(
+        &REGISTERED,
+        instance,
+        class_name,
+        Some(window_proc),
+        || None,
+        "the overlay window",
+    )?)
 }
+
+static REGISTERED: OnceLock<()> = OnceLock::new();
 
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
