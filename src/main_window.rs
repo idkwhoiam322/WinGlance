@@ -922,8 +922,15 @@ impl MainWindowState {
         for event in batch {
             match event {
                 MediaEvent::TrackChanged(track) => self.add_track(track),
-                MediaEvent::PlaybackStateChanged(state, _source_app) => {
-                    if let Some(current) = &mut self.current {
+                MediaEvent::PlaybackStateChanged(state, source_app) => {
+                    // A state event only applies to the activity it belongs
+                    // to: the worker tracks sources independently, so a
+                    // playback change from another app must not rewrite the
+                    // currently displayed track's state or push a history row
+                    // under it.
+                    if let Some(current) = &mut self.current
+                        && current.track.source_app == source_app
+                    {
                         current.state = state;
                         self.add_state_change(state);
                         self.invalidate();
@@ -1021,11 +1028,11 @@ impl MainWindowState {
         let art_fingerprint = track.artwork.as_deref().map(fingerprint);
         // Metadata refresh for the same song (album/artwork arriving late): update
         // the current activity and the last history row in place instead of
-        // appending a duplicate entry.
-        let is_update = self
-            .current
-            .as_ref()
-            .is_some_and(|c| c.track.title == track.title && c.track.artist == track.artist);
+        // appending a duplicate entry. The source must match too — two apps
+        // playing the same title+artist are different media.
+        let is_update = self.current.as_ref().is_some_and(|c| {
+            c.track.source_app == track.source_app && c.track.title == track.title && c.track.artist == track.artist
+        });
 
         if is_update {
             if let Some(current) = &mut self.current {
