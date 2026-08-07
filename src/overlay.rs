@@ -148,11 +148,18 @@ enum Phase {
 const PENDING_CAP: usize = 4;
 
 /// Upper bound on the per-source track cache. Each entry holds the last
-/// track's artwork bytes (up to several MB), and the worker evicts its own
-/// source-level caches when sessions close — the overlay has no session
-/// knowledge, so a simple LRU keeps long-idle sources from accumulating
-/// covers that will never be shown again.
-const TRACK_CACHE_CAP: usize = 16;
+/// track's decoded cover (256 KB) plus raw artwork bytes, and the worker
+/// evicts its own source-level caches when sessions close — the overlay has
+/// no session knowledge, so an LRU + idle timeout keeps long-idle sources
+/// from accumulating covers that will never be shown again.
+const TRACK_CACHE_CAP: usize = 5;
+
+/// Entries untouched for this long are evicted at the next insert. Eviction
+/// is lazy (sweep inside `cache_track`), so an expired entry remains
+/// readable until new data arrives: a state pill is never robbed of the
+/// cached track by the timeout alone. Time-bounds what the cap cannot: a
+/// source that played once and never returns still drops out after this.
+const TRACK_CACHE_TTL: Duration = Duration::from_secs(600);
 
 /// Per-line marquee state for the pill's text rows. The offset advances on the
 /// 16ms animation tick; a short hold before the first movement reads better.
@@ -313,9 +320,10 @@ struct OverlayState {
     /// Per-source track cache: the last TrackChanged shown for each source app,
     /// so that a later PlaybackStateChanged for that source can render the
     /// correct track info instead of the most-recently-shown app's track.
-    /// LRU-ordered (see `TRACK_CACHE_CAP`), so a source that stops playing
-    /// eventually drops out instead of holding its artwork bytes forever.
-    track_cache: HashMap<String, TrackInfo>,
+    /// LRU-ordered and time-bounded (see `TRACK_CACHE_CAP`/`TRACK_CACHE_TTL`),
+    /// so a source that stops playing eventually drops out instead of holding
+    /// its artwork bytes forever. The `Instant` is the last insert time.
+    track_cache: HashMap<String, (TrackInfo, Instant)>,
     /// Recency order of `track_cache` keys (front = oldest). Kept in sync by
     /// `cache_track`.
     track_cache_order: VecDeque<String>,
@@ -789,12 +797,25 @@ impl OverlayState {
             self.track_cache_order.remove(pos);
         }
         self.track_cache_order.push_back(source.clone());
-        while self.track_cache_order.len() > TRACK_CACHE_CAP {
-            if let Some(oldest) = self.track_cache_order.pop_front() {
-                self.track_cache.remove(&oldest);
+        let now = Instant::now();
+        // Insert first so the sweep below sees the fresh entry: a brand-new
+        // source must never look like an expired cache miss.
+        self.track_cache.insert(source, (track.clone(), now));
+        // Lazy sweep: expire idle entries first, then enforce the cap. Only
+        // runs here (on insert), so an expired entry is still readable by a
+        // pill that arrives before the next insert — the timeout never
+        // degrades a pill on its own.
+        while let Some(front) = self.track_cache_order.front().cloned() {
+            let expired = self
+                .track_cache
+                .get(&front)
+                .is_none_or(|(_, last_used)| now.duration_since(*last_used) > TRACK_CACHE_TTL);
+            if self.track_cache_order.len() <= TRACK_CACHE_CAP && !expired {
+                break;
             }
+            self.track_cache_order.pop_front();
+            self.track_cache.remove(&front);
         }
-        self.track_cache.insert(source, track.clone());
     }
 
     /// Adds a notification to the pending queue. At the cap, the oldest unshown
@@ -925,9 +946,10 @@ impl OverlayState {
     fn resolve_pill_text(&mut self) {
         self.pill_text = match &self.content {
             Some(MediaEvent::TrackChanged(track)) => Some(pill_text_from_track(track)),
-            Some(MediaEvent::PlaybackStateChanged(_, source)) if !source.is_empty() => {
-                self.track_cache.get(source).map(pill_text_from_track)
-            }
+            Some(MediaEvent::PlaybackStateChanged(_, source)) if !source.is_empty() => self
+                .track_cache
+                .get(source)
+                .map(|(track, _)| pill_text_from_track(track)),
             _ => None,
         };
     }
@@ -1706,7 +1728,10 @@ fn draw_pixels(
             if source_app.is_empty() {
                 None
             } else {
-                state.track_cache.get(source_app).and_then(|t| t.decoded_art.clone())
+                state
+                    .track_cache
+                    .get(source_app)
+                    .and_then(|(t, _)| t.decoded_art.clone())
             }
         }
         MediaEvent::SessionRejected { .. } => None,
@@ -2541,7 +2566,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 if source_app.is_empty() {
                     None
                 } else {
-                    state.track_cache.get(source_app).map(pill_text_from_track)
+                    state.track_cache.get(source_app).map(|(t, _)| pill_text_from_track(t))
                 }
             });
             if let Some(pill) = pill {
@@ -3919,6 +3944,32 @@ mod tests {
     }
 
     #[test]
+    fn track_cache_expires_sources_idle_beyond_the_ttl() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.track_cache.insert(
+            "stale".into(),
+            (
+                track_for("stale", "Old", "Song"),
+                Instant::now() - TRACK_CACHE_TTL - Duration::from_secs(1),
+            ),
+        );
+        state.track_cache_order.push_back("stale".into());
+        // Lazy eviction: nothing sweeps between inserts, so an expired entry
+        // stays readable for a state pill that arrives before the next one.
+        assert!(
+            state.track_cache.contains_key("stale"),
+            "expired entries are readable until the next insert"
+        );
+        state.cache_track(&track_for("fresh", "New", "Song"));
+        assert!(
+            !state.track_cache.contains_key("stale"),
+            "an entry idle past the TTL must be evicted at the next insert"
+        );
+        assert!(state.track_cache.contains_key("fresh"));
+        assert_eq!(state.track_cache.len(), 1);
+    }
+
+    #[test]
     fn state_pill_suppressed_when_track_change_follows_in_the_same_batch() {
         let config = Config::default();
         let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
@@ -3927,7 +3978,7 @@ mod tests {
         // suppression the state pill would render it stale.
         state.track_cache.insert(
             "youtube-music".into(),
-            track_for("youtube-music", "Old Song", "Old Artist"),
+            (track_for("youtube-music", "Old Song", "Old Artist"), Instant::now()),
         );
 
         queue.lock().unwrap().push_back(MediaEvent::PlaybackStateChanged(
@@ -3953,9 +4004,10 @@ mod tests {
         let config = Config::default();
         let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
         let mut state = OverlayState::new(config, queue.clone());
-        state
-            .track_cache
-            .insert("youtube-music".into(), track_for("youtube-music", "Song", "Artist"));
+        state.track_cache.insert(
+            "youtube-music".into(),
+            (track_for("youtube-music", "Song", "Artist"), Instant::now()),
+        );
 
         queue.lock().unwrap().push_back(MediaEvent::PlaybackStateChanged(
             PlaybackState::Paused,
