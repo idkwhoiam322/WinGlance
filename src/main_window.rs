@@ -45,8 +45,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE,
     WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASS_STYLES,
-    WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER,
+    WNDCLASS_STYLES, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -2541,6 +2542,10 @@ fn show_tray_menu(state: &mut MainWindowState) {
 
         let mut point = POINT::default();
         if GetCursorPos(&mut point).is_ok() {
+            // The owner must be the foreground window before TrackPopupMenu,
+            // or the menu will not disappear when the user clicks away from
+            // it or presses Esc (documented Shell_NotifyIcon requirement).
+            let _ = SetForegroundWindow(state.hwnd);
             let command = TrackPopupMenu(
                 menu,
                 TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
@@ -2616,6 +2621,9 @@ fn show_tray_menu(state: &mut MainWindowState) {
                 _ => {}
             }
         }
+        // After the modal menu loop, flush the queue with a no-op message so
+        // the popup fully tears down when it was dismissed by clicking away.
+        let _ = PostMessageW(state.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menu);
     }
 }
