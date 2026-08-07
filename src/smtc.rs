@@ -556,6 +556,12 @@ impl ListenerState {
                             && !is_placeholder_read(&prev, &merged)
                             && merged.artwork.is_none()
                         {
+                            // The paired playback event (already queued above)
+                            // would reach the overlay before the deferred
+                            // track and render a state pill with the source's
+                            // *previous* track. Hold it back: the deferred
+                            // track carries the change.
+                            events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
                             next.deferred_at = Some(Instant::now());
                             let label = track_label(&merged);
                             debug!("track emit deferred | reason=awaiting-artwork | {label}");

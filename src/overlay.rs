@@ -561,6 +561,18 @@ impl OverlayState {
                 batch.push(event);
             }
         }
+        // A PlaybackStateChanged that races a TrackChanged for the same
+        // source in the same batch is redundant: the state pill would render
+        // the source's *previously cached* track, and the track pill that
+        // follows in the same batch carries the change. The worker emits
+        // state-then-track per read, so the pairing is always ordered.
+        let track_sources: Vec<String> = batch
+            .iter()
+            .filter_map(|e| match e {
+                MediaEvent::TrackChanged(t) => Some(t.source_app.clone()),
+                _ => None,
+            })
+            .collect();
         for event in batch {
             if !self.enabled {
                 continue;
@@ -597,6 +609,9 @@ impl OverlayState {
                     //  - A TrackChanged for the same source is queued (a
                     //    TrackChanged pill is about to show; a redundant
                     //    PlaybackStateChanged would flash the same info).
+                    //  - A TrackChanged for the same source is in this batch
+                    //    (see the pre-scan above: the state pill would render
+                    //    the source's previously cached track).
                     // Paused/Stopped pass through when they are a new state
                     // from a source that is NOT currently shown.
                     let is_redundant = (matches!(state, PlaybackState::Playing)
@@ -604,7 +619,8 @@ impl OverlayState {
                         || self
                             .pending
                             .iter()
-                            .any(|e| matches!(e, MediaEvent::TrackChanged(t) if t.source_app == source_app));
+                            .any(|e| matches!(e, MediaEvent::TrackChanged(t) if t.source_app == source_app))
+                        || track_sources.iter().any(|s| s == &source_app);
                     if is_redundant {
                         debug!(
                             "playback state pill suppressed | reason=track shown for same source | source={source_app}"
@@ -3431,6 +3447,67 @@ mod tests {
         // out-of-bounds read.
         draw_icon_scaled(&mut pixels, 40, &[0u8; 10], 24, 0, 0, 24);
         assert!(pixels.iter().all(|&b| b == 0));
+    }
+
+    fn track_for(source: &str, title: &str, artist: &str) -> TrackInfo {
+        TrackInfo {
+            title: title.into(),
+            artist: artist.into(),
+            source_app: source.into(),
+            ..TrackInfo::default()
+        }
+    }
+
+    #[test]
+    fn state_pill_suppressed_when_track_change_follows_in_the_same_batch() {
+        let config = Config::default();
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut state = OverlayState::new(config, queue.clone());
+        // Prime the source's track cache with the previous song: without the
+        // suppression the state pill would render it stale.
+        state.track_cache.insert(
+            "youtube-music".into(),
+            track_for("youtube-music", "Old Song", "Old Artist"),
+        );
+
+        queue.lock().unwrap().push_back(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Playing,
+            "youtube-music".into(),
+        ));
+        queue.lock().unwrap().push_back(MediaEvent::TrackChanged(track_for(
+            "youtube-music",
+            "New Song",
+            "New Artist",
+        )));
+        state.receive_events();
+
+        assert_eq!(state.pending.len(), 1, "only the track pill should be queued");
+        assert!(
+            matches!(state.pending.front(), Some(MediaEvent::TrackChanged(t)) if t.title == "New Song"),
+            "the queued event must be the new track"
+        );
+    }
+
+    #[test]
+    fn state_pill_still_shown_without_a_track_change_in_the_batch() {
+        let config = Config::default();
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut state = OverlayState::new(config, queue.clone());
+        state
+            .track_cache
+            .insert("youtube-music".into(), track_for("youtube-music", "Song", "Artist"));
+
+        queue.lock().unwrap().push_back(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "youtube-music".into(),
+        ));
+        state.receive_events();
+
+        assert_eq!(state.pending.len(), 1, "a state change alone still queues a pill");
+        assert!(matches!(
+            state.pending.front(),
+            Some(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, source)) if source == "youtube-music"
+        ));
     }
 
     #[test]
