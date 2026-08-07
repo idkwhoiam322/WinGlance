@@ -186,10 +186,62 @@ struct PositionParts {
     adjust: RECT,
 }
 
-fn position_parts(rect: &RECT, scale: f32) -> PositionParts {
+/// The label/control split of a settings row: the label takes the first 42%
+/// of the row, the control the remainder, both inset from the row edges.
+/// Paint, hit-test, click and `position_parts` all derive the same rects.
+struct RowSplit {
+    label: RECT,
+    control: RECT,
+}
+
+fn row_split(rect: &RECT, scale: f32) -> RowSplit {
     let label_w = (((rect.right - rect.left) as f32) * 0.42) as i32;
-    let control_left = rect.left + label_w + (10.0 * scale) as i32;
-    let control_right = rect.right - (10.0 * scale) as i32;
+    RowSplit {
+        label: RECT {
+            left: rect.left + (12.0 * scale) as i32,
+            top: rect.top,
+            right: rect.left + label_w,
+            bottom: rect.bottom,
+        },
+        control: RECT {
+            left: rect.left + label_w + (10.0 * scale) as i32,
+            top: rect.top,
+            right: rect.right - (10.0 * scale) as i32,
+            bottom: rect.bottom,
+        },
+    }
+}
+
+/// The overlay position as a display string: "Custom (x, y)" for a dragged
+/// placement, otherwise "top-center" style. Shared by the Activity pane and
+/// the settings value so the wording cannot drift.
+fn position_label(config: &Config) -> String {
+    if config.overlay.position_x.is_some() {
+        format!(
+            "Custom ({}, {})",
+            config.overlay.position_x.unwrap_or(0),
+            config.overlay.position_y.unwrap_or(0)
+        )
+    } else {
+        format!(
+            "{}-{}",
+            match config.overlay.vertical {
+                VerticalPosition::Top => "top",
+                VerticalPosition::Bottom => "bottom",
+            },
+            match config.overlay.horizontal {
+                HorizontalPosition::Left => "left",
+                HorizontalPosition::Center => "center",
+                HorizontalPosition::Right => "right",
+            }
+        )
+    }
+}
+
+fn position_parts(rect: &RECT, scale: f32) -> PositionParts {
+    let control = row_split(rect, scale).control;
+    let control_left = control.left;
+    let control_right = control.right;
     let row1_h = (30.0 * scale) as i32;
     let gap = (6.0 * scale) as i32;
     let reset_w = (64.0 * scale) as i32;
@@ -1299,26 +1351,7 @@ impl MainWindowState {
         );
 
         let pos_y = history_rect.bottom + (4.0 * scale) as i32;
-        let pos_label = if self.cfg().overlay.position_x.is_some() {
-            format!(
-                "Position: custom ({}, {})",
-                self.cfg().overlay.position_x.unwrap_or(0),
-                self.cfg().overlay.position_y.unwrap_or(0)
-            )
-        } else {
-            format!(
-                "Position: {}-{}",
-                match self.cfg().overlay.vertical {
-                    VerticalPosition::Top => "top",
-                    VerticalPosition::Bottom => "bottom",
-                },
-                match self.cfg().overlay.horizontal {
-                    HorizontalPosition::Left => "left",
-                    HorizontalPosition::Center => "center",
-                    HorizontalPosition::Right => "right",
-                }
-            )
-        };
+        let pos_label = format!("Position: {}", position_label(&self.cfg()));
         let mut pos_rect = RECT {
             left: content_left + pad,
             top: pos_y,
@@ -1443,7 +1476,7 @@ impl MainWindowState {
         let close_to_tray = cfg.behavior.close_to_tray;
         let allowed_sources = cfg.behavior.allowed_sources.join(", ");
         let custom_position = cfg.overlay.position_x.is_some();
-        let position_label = self.position_label();
+        let position_label = position_label(&cfg);
 
         let mut hdr = RECT {
             left: content_left + pad,
@@ -1468,20 +1501,9 @@ impl MainWindowState {
                 }
                 SettingsItem::Row { id, rect } => {
                     let hovered_row = settings_hover.is_some_and(|(r, _)| r == row_index);
-                    let label_w = (((rect.right - rect.left) as f32) * 0.42) as i32;
-                    let label_rect = RECT {
-                        left: rect.left + (12.0 * scale) as i32,
-                        top: rect.top,
-                        right: rect.left + label_w,
-                        bottom: rect.bottom,
-                    };
-                    let control_left = rect.left + label_w + (10.0 * scale) as i32;
-                    let control_rect = RECT {
-                        left: control_left,
-                        top: rect.top,
-                        right: rect.right - (10.0 * scale) as i32,
-                        bottom: rect.bottom,
-                    };
+                    let split = row_split(rect, scale);
+                    let label_rect = split.label;
+                    let control_rect = split.control;
 
                     // Card: border + surface fill (+ hover tint)
                     unsafe {
@@ -1732,29 +1754,6 @@ impl MainWindowState {
         }
     }
 
-    fn position_label(&self) -> String {
-        if self.cfg().overlay.position_x.is_some() {
-            format!(
-                "Custom ({}, {})",
-                self.cfg().overlay.position_x.unwrap_or(0),
-                self.cfg().overlay.position_y.unwrap_or(0)
-            )
-        } else {
-            format!(
-                "{}-{}",
-                match self.cfg().overlay.vertical {
-                    VerticalPosition::Top => "top",
-                    VerticalPosition::Bottom => "bottom",
-                },
-                match self.cfg().overlay.horizontal {
-                    HorizontalPosition::Left => "left",
-                    HorizontalPosition::Center => "center",
-                    HorizontalPosition::Right => "right",
-                }
-            )
-        }
-    }
-
     /// Computes which settings control is under a client-space point, for hover
     /// highlighting. Returns (row index, segment index) where segment is None for
     /// whole-row controls and Some(i) for the i-th duration segment.
@@ -1774,14 +1773,7 @@ impl MainWindowState {
                 && y >= rect.top
                 && y < rect.bottom
             {
-                let label_w = (((rect.right - rect.left) as f32) * 0.42) as i32;
-                let control_left = rect.left + label_w + (10.0 * scale) as i32;
-                let control_rect = RECT {
-                    left: control_left,
-                    top: rect.top,
-                    right: rect.right - (10.0 * scale) as i32,
-                    bottom: rect.bottom,
-                };
+                let control_rect = row_split(rect, scale).control;
                 if *id == SettingId::Duration {
                     let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
                     let seg = segments.iter().position(|s| x >= s.left && x < s.right);
@@ -2676,14 +2668,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                             && y >= rect.top
                             && y < rect.bottom
                         {
-                            let label_w = (((rect.right - rect.left) as f32) * 0.42) as i32;
-                            let control_left = rect.left + label_w + (10.0 * scale) as i32;
-                            let control_rect = RECT {
-                                left: control_left,
-                                top: rect.top,
-                                right: rect.right - (10.0 * scale) as i32,
-                                bottom: rect.bottom,
-                            };
+                            let control_rect = row_split(rect, scale).control;
                             match id {
                                 SettingId::Notifications => {
                                     let new_value = !state.notifications_enabled;
