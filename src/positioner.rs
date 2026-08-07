@@ -5,8 +5,8 @@ use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreatePen, CreateSolidBrush, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetMonitorInfoW, HBRUSH, HDC, HGDIOBJ, LineTo, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
-    MoveToEx, PAINTSTRUCT, PS_SOLID, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    FillRect, GetMonitorInfoW, HBRUSH, HDC, HGDIOBJ, HPEN, LineTo, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromWindow, MoveToEx, PAINTSTRUCT, PS_SOLID, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -41,6 +41,11 @@ struct PositionerState {
     overlay: HWND,
     dragging: bool,
     drag_offset: POINT,
+    /// Fixed paint objects, created at open and freed at teardown so the
+    /// paint path creates nothing per repaint.
+    bg_brush: HBRUSH,
+    x_brush: HBRUSH,
+    pen: HPEN,
 }
 
 /// Set when this window's WM_NCCREATE claims the state box handed over in
@@ -69,6 +74,9 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
             overlay,
             dragging: false,
             drag_offset: POINT::default(),
+            bg_brush: CreateSolidBrush(COLORREF(0x00121212)),
+            x_brush: CreateSolidBrush(COLORREF(0x333333)),
+            pen: CreatePen(PS_SOLID, 2, COLORREF(0x999999)),
         });
         let state_ptr = Box::into_raw(state);
         POSITIONER_STATE_CLAIMED.store(false, Ordering::SeqCst);
@@ -102,9 +110,16 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
                 // The state box is owned by the window from WM_NCCREATE onward
                 // and freed in WM_NCDESTROY. WM_NCCREATE flips
                 // POSITIONER_STATE_CLAIMED when it takes the box; if it never
-                // ran, the box still belongs to us and must be freed here.
+                // ran, the box still belongs to us and must be freed here —
+                // including its fixed GDI objects.
                 if !POSITIONER_STATE_CLAIMED.load(Ordering::SeqCst) {
-                    drop(Box::from_raw(state_ptr));
+                    let state = Box::from_raw(state_ptr);
+                    unsafe {
+                        let _ = DeleteObject(HGDIOBJ(state.bg_brush.0));
+                        let _ = DeleteObject(HGDIOBJ(state.x_brush.0));
+                        let _ = DeleteObject(HGDIOBJ(state.pen.0));
+                    }
+                    drop(state);
                 }
                 false
             }
@@ -347,7 +362,8 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             let hdc: HDC = BeginPaint(hwnd, &mut paint);
-            if !hdc.0.is_null() {
+            if !hdc.0.is_null() && !state_ptr.is_null() {
+                let state = &*state_ptr;
                 unsafe {
                     let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
                     let width = (WIDTH as f32 * scale).round() as i32;
@@ -355,14 +371,13 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
                     let close_w = (CLOSE_BTN_W as f32 * scale).round() as i32;
                     let close_h = (CLOSE_BTN_H as f32 * scale).round() as i32;
                     let pad = (6.0 * scale).round() as i32;
-                    let brush: HBRUSH = CreateSolidBrush(COLORREF(0x00121212));
                     let whole = RECT {
                         left: 0,
                         top: 0,
                         right: width,
                         bottom: height,
                     };
-                    let _ = FillRect(hdc, &whole, brush);
+                    let _ = FillRect(hdc, &whole, state.bg_brush);
 
                     // Draw instruction text
                     let mut text_rect = RECT {
@@ -376,29 +391,24 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
                     let mut text = wide("Drag to place the WinGlance");
                     let _ = DrawTextW(hdc, &mut text, &mut text_rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
-                    // Draw X button (cross lines — always perfectly centered,
-                    // unlike a glyph drawn with the default window font)
-                    let x_brush = CreateSolidBrush(COLORREF(0x333333));
+                    // Draw X button (cross lines — always perfectly
+                    // centered, unlike a glyph drawn with the default
+                    // window font)
                     let x_rect = RECT {
                         left: width - close_w - pad,
                         top: pad,
                         right: width - pad,
                         bottom: pad + close_h,
                     };
-                    let _ = FillRect(hdc, &x_rect, x_brush);
-                    let _ = DeleteObject(HGDIOBJ(x_brush.0));
+                    let _ = FillRect(hdc, &x_rect, state.x_brush);
 
-                    let pen = CreatePen(PS_SOLID, 2, COLORREF(0x999999));
-                    let old_pen = SelectObject(hdc, pen);
+                    let old_pen = SelectObject(hdc, state.pen);
                     let inset = (8.0 * scale).round() as i32;
                     let _ = MoveToEx(hdc, x_rect.left + inset, x_rect.top + inset, None);
                     let _ = LineTo(hdc, x_rect.right - inset, x_rect.bottom - inset);
                     let _ = MoveToEx(hdc, x_rect.right - inset, x_rect.top + inset, None);
                     let _ = LineTo(hdc, x_rect.left + inset, x_rect.bottom - inset);
                     SelectObject(hdc, old_pen);
-                    let _ = DeleteObject(HGDIOBJ(pen.0));
-
-                    let _ = DeleteObject(HGDIOBJ(brush.0));
                 }
             }
             let _ = EndPaint(hwnd, &paint);
@@ -410,6 +420,12 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
         }
         WM_NCDESTROY => {
             if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(state.bg_brush.0));
+                    let _ = DeleteObject(HGDIOBJ(state.x_brush.0));
+                    let _ = DeleteObject(HGDIOBJ(state.pen.0));
+                }
                 drop(Box::from_raw(state_ptr));
             }
             if let Some(m) = OPEN_POSITIONER.get()

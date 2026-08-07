@@ -540,6 +540,10 @@ struct MainWindowState {
     /// picker writes the result here and posts a bare `PICKER_RESULT_MSG`; no
     /// pointer ever crosses the message boundary.
     picker_result: Arc<Mutex<Option<Vec<String>>>>,
+    /// Wake flag for the event queue: `true` while a `MEDIA_EVENT_MSG` is in
+    /// flight. The forwarder and this window only post when the flag was
+    /// clear, so an event burst collapses into one wake message per drain.
+    wake: Arc<AtomicBool>,
 }
 
 /// Set when this window's WM_NCCREATE claims the state box handed over in
@@ -551,13 +555,19 @@ static MAIN_STATE_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Creates the main window: a maximized tracker with current activity,
 /// per-session history, and a tray icon. The caller runs the message loop.
-pub fn create_window(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwnd: HWND) -> Result<HWND> {
+pub fn create_window(
+    config: Arc<RwLock<Config>>,
+    queue: EventQueue,
+    overlay_hwnd: HWND,
+    wake: Arc<AtomicBool>,
+) -> Result<HWND> {
     let module = unsafe { GetModuleHandleW(None) }.context("getting the process module")?;
     let instance: HINSTANCE = module.into();
     let class_name = wide("WinGlanceMainWindow");
     register_main_class(instance, &class_name)?;
 
-    let state = Box::new(MainWindowState::new(config.clone(), queue, overlay_hwnd, instance));
+    let mut state = Box::new(MainWindowState::new(config.clone(), queue, overlay_hwnd, instance));
+    state.wake = wake;
     let state_ptr = Box::into_raw(state);
     MAIN_STATE_CLAIMED.store(false, Ordering::SeqCst);
     let hwnd = unsafe {
@@ -605,6 +615,12 @@ pub fn create_window(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwn
             let _ = ShowWindow(hwnd, SW_HIDE);
         } else {
             let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+            // The tooltip timer is normally started by show_window(); this
+            // visible-at-start path bypasses it, so start it and sync once
+            // here (the window is already shown, so sync_tooltips can run).
+            let _ = SetTimer(hwnd, TIMER_TOOLTIPS_ID, 1000, None);
+            let state_ref = &mut *state_ptr;
+            state_ref.sync_tooltips();
         }
     }
     if let Err(error) = install_tray_icon(hwnd) {
@@ -674,6 +690,7 @@ impl MainWindowState {
             tooltips_dirty: false,
             logs_copied_at: None,
             picker_result: Arc::new(Mutex::new(None)),
+            wake: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -831,9 +848,28 @@ impl MainWindowState {
         if !self.tooltip_ctrl.0.is_null() {
             unsafe {
                 let _ = SendMessageW(self.tooltip_ctrl, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM(600));
-                let _ = SetTimer(self.hwnd, TIMER_TOOLTIPS_ID, 1000, None);
             }
             self.sync_tooltips();
+        }
+    }
+
+    /// Shows or hides the pane-owned child windows (history listbox and its
+    /// tooltip) to match the active pane. Called on pane switches and on
+    /// window show/hide — not from WM_PAINT, which would call ShowWindow on
+    /// every repaint.
+    fn apply_pane(&self) {
+        unsafe {
+            let _ = ShowWindow(
+                self.listbox,
+                if self.active_pane == Pane::Activity {
+                    SW_SHOW
+                } else {
+                    SW_HIDE
+                },
+            );
+            if self.active_pane != Pane::Activity {
+                let _ = ShowWindow(self.tooltip_ctrl, SW_HIDE);
+            }
         }
     }
 
@@ -938,11 +974,12 @@ impl MainWindowState {
     }
 
     fn receive_events(&mut self) {
+        // Clear the wake flag before draining; an event pushed while we drain
+        // re-arms it (and possibly posts), so nothing stays stuck.
+        self.wake.store(false, Ordering::Relaxed);
         let mut batch = Vec::new();
         if let Ok(mut queue) = self.queue.lock() {
-            while let Some(event) = queue.pop_front() {
-                batch.push(event);
-            }
+            batch.extend(queue.drain(..));
         }
         for event in batch {
             match event {
@@ -976,13 +1013,23 @@ impl MainWindowState {
             self.tooltips_dirty = false;
             self.sync_tooltips();
         }
+        // Events that arrived while we were draining need a wake-up: re-arm
+        // and post only if no wake message is already in flight.
+        let more = self.queue.lock().map(|q| !q.is_empty()).unwrap_or(false);
+        if more
+            && !self.wake.swap(true, Ordering::SeqCst)
+            && unsafe { PostMessageW(self.hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
+        {
+            self.wake.store(false, Ordering::SeqCst);
+        }
     }
 
-    /// Appends a history row and syncs the listbox + tooltips. Artwork is
-    /// stripped before storing — the history is text-only, and the raw image
-    /// bytes would be pure waste across hundreds of rows.
+    /// Appends a history row and syncs the listbox + tooltips. Artwork and the
+    /// app icon are stripped before storing — the history is text-only, and
+    /// the raw image bytes would be pure waste across hundreds of rows.
     fn push_history(&mut self, mut track: TrackInfo, state: PlaybackState, accepted: bool) {
         track.artwork = None;
+        track.app_icon = None;
         let at = Local::now();
         let at_label = at.format("%H:%M:%S").to_string();
         let row = history_row(&track, at, state);
@@ -1029,10 +1076,11 @@ impl MainWindowState {
         if duplicate_state_row(&self.history.entries, current, state) {
             return;
         }
-        // Clone text-only: the artwork bytes (up to MBs) are stripped before
-        // the clone so they are never copied just to be discarded.
+        // Clone text-only: the artwork and icon bytes (up to MBs) are stripped
+        // before the clone so they are never copied just to be discarded.
         let mut track = current.track.clone();
         track.artwork = None;
+        track.app_icon = None;
         self.push_history(track, state, true);
     }
 
@@ -1138,22 +1186,6 @@ impl MainWindowState {
         let hdc = unsafe { BeginPaint(self.hwnd, &mut paint) };
         if hdc.0.is_null() {
             return;
-        }
-        // The history listbox belongs to the Activity pane only.
-        unsafe {
-            let _ = ShowWindow(
-                self.listbox,
-                if self.active_pane == Pane::Activity {
-                    SW_SHOW
-                } else {
-                    SW_HIDE
-                },
-            );
-        }
-        if self.active_pane != Pane::Activity {
-            unsafe {
-                let _ = ShowWindow(self.tooltip_ctrl, SW_HIDE);
-            }
         }
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let (client_w, client_h) = client_size(self.hwnd);
@@ -1965,6 +1997,10 @@ impl MainWindowState {
         unsafe {
             if self.cfg().behavior.close_to_tray {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
+                // The tooltip sync timer only runs while the window is
+                // visible; stop it so a tray-hidden window stops waking the
+                // UI thread once a second.
+                let _ = KillTimer(self.hwnd, TIMER_TOOLTIPS_ID);
             } else {
                 let _ = DestroyWindow(self.hwnd);
             }
@@ -2167,7 +2203,13 @@ impl MainWindowState {
                 );
             }
         }
-        // The window was hidden, so the 1 Hz timer skipped its syncs; rebuild
+        self.apply_pane();
+        // The tooltip timer only runs while the window is visible (see
+        // install_tooltip and on_close), so it must be (re)started here.
+        unsafe {
+            let _ = SetTimer(self.hwnd, TIMER_TOOLTIPS_ID, 1000, None);
+        }
+        // The window was hidden, so the timer skipped its syncs; rebuild
         // the tool definitions now so hover works immediately on restore.
         self.sync_tooltips();
     }
@@ -2842,6 +2884,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     } else if y >= item1_y && y < item1_y + item_h {
                         state.active_pane = Pane::Settings;
                     }
+                    state.apply_pane();
                     state.invalidate();
                 } else if state.active_pane == Pane::Activity {
                     // Check position area click in Activity pane

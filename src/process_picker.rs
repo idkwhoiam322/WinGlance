@@ -69,6 +69,10 @@ struct PickerState {
     header_brush: HBRUSH,
     close_brush: HBRUSH,
     close_hover_brush: HBRUSH,
+    /// Owner-draw row background brushes, created once per open instead of
+    /// per painted row (every scroll tick repaints the visible rows).
+    row_brush: HBRUSH,
+    row_selected_brush: HBRUSH,
     /// Shared slot for the confirmed allow-list patterns. The picker writes
     /// the result here and posts a bare `PICKER_RESULT_MSG`; the main window
     /// reads the slot. No pointers ever cross the message boundary.
@@ -376,6 +380,8 @@ pub(crate) fn open(
             header_brush: HBRUSH::default(),
             close_brush: HBRUSH::default(),
             close_hover_brush: HBRUSH::default(),
+            row_brush: HBRUSH::default(),
+            row_selected_brush: HBRUSH::default(),
             result,
         });
         let state_ptr = Box::into_raw(state);
@@ -438,6 +444,8 @@ pub(crate) fn open(
         state_ref.header_brush = CreateSolidBrush(COLORREF(0x002D2D2D));
         state_ref.close_brush = CreateSolidBrush(COLORREF(0x00333333));
         state_ref.close_hover_brush = CreateSolidBrush(COLORREF(0x00404040));
+        state_ref.row_brush = CreateSolidBrush(COLORREF(0x001E1E1E));
+        state_ref.row_selected_brush = CreateSolidBrush(COLORREF(0x003D3D3D));
         let phys_w = (WIDTH as f32 * scale).round() as i32;
         let phys_h = ((HEADER_H + item_count as i32 * ROW_HEIGHT + 10) as f32 * scale).round() as i32;
         let _ = SetWindowPos(
@@ -812,15 +820,15 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             let entry = &state.list[draw.itemID as usize];
             let scale = state.scale;
             unsafe {
-                // Background: highlight selected items.
-                let bg = COLORREF(if draw.itemState.0 & ODS_SELECTED.0 != 0 {
-                    0x003D3D3D
+                // Background: highlight selected items. Brushes are cached on
+                // the state; every scroll tick repaints the visible rows, so
+                // per-row CreateSolidBrush/DeleteObject would churn GDI.
+                let bg_brush = if draw.itemState.0 & ODS_SELECTED.0 != 0 {
+                    state.row_selected_brush
                 } else {
-                    0x001E1E1E
-                });
-                let bg_brush = CreateSolidBrush(bg);
+                    state.row_brush
+                };
                 FillRect(draw.hDC, &draw.rcItem, bg_brush);
-                let _ = DeleteObject(bg_brush);
 
                 // Checkbox square on the left.
                 let mid = (draw.rcItem.top + draw.rcItem.bottom) / 2;
@@ -949,6 +957,8 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 let _ = unsafe { DeleteObject(state.header_brush) };
                 let _ = unsafe { DeleteObject(state.close_brush) };
                 let _ = unsafe { DeleteObject(state.close_hover_brush) };
+                let _ = unsafe { DeleteObject(state.row_brush) };
+                let _ = unsafe { DeleteObject(state.row_selected_brush) };
                 drop(Box::from_raw(state_ptr));
             }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);

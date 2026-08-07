@@ -431,14 +431,23 @@ fn main() -> Result<()> {
 
     let main_queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
     let overlay_queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
-    let overlay_hwnd = overlay::create_window(config.clone(), overlay_queue.clone())?;
-    let main_hwnd = main_window::create_window(shared_config.clone(), main_queue.clone(), overlay_hwnd)?;
+    let main_wake: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let overlay_wake: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let overlay_hwnd = overlay::create_window(config.clone(), overlay_queue.clone(), overlay_wake.clone())?;
+    let main_hwnd = main_window::create_window(
+        shared_config.clone(),
+        main_queue.clone(),
+        overlay_hwnd,
+        main_wake.clone(),
+    )?;
 
     let forwarder_handle = spawn_event_forwarder(
         main_hwnd,
         overlay_hwnd,
         main_queue,
         overlay_queue,
+        main_wake,
+        overlay_wake,
         event_rx,
         forwarder_shutdown,
     );
@@ -490,15 +499,22 @@ fn worker_restart_delay(consecutive: u32) -> Duration {
 
 /// Drains SMTC events into each window's queue and wakes both windows.
 /// Returns the thread handle so main can join it before destroying the
-/// windows. The loop exits within ~200ms of `shutdown` being set.
+/// windows. The loop exits within ~200ms of `shutdown` being set. At most one
+/// wake message per window is in flight at a time: the `wake` flags make an
+/// event burst collapse into a single `MEDIA_EVENT_MSG` per drain.
+#[allow(clippy::too_many_arguments)]
 fn spawn_event_forwarder(
     main_hwnd: HWND,
     overlay_hwnd: HWND,
     main_queue: EventQueue,
     overlay_queue: EventQueue,
+    main_wake: Arc<AtomicBool>,
+    overlay_wake: Arc<AtomicBool>,
     receiver: mpsc::Receiver<MediaEvent>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
+    // HWND is not Send; the raw handle value is all the forwarder needs to
+    // post with.
     let main_raw = main_hwnd.0 as isize;
     let overlay_raw = overlay_hwnd.0 as isize;
     thread::Builder::new()
@@ -511,35 +527,42 @@ fn spawn_event_forwarder(
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
-                if let Ok(mut queue) = main_queue.lock() {
-                    queue.push_back(event.clone());
-                }
-                if let Ok(mut queue) = overlay_queue.lock() {
-                    queue.push_back(event);
-                }
-                if unsafe { PostMessageW(HWND(main_raw as *mut c_void), MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }
-                    .is_err()
-                {
-                    warn!("posting the media event to the main window failed; dropping its queue copy");
-                    // The forwarder is the only pusher and the window drains
-                    // under the same lock, so pop_back removes exactly the
-                    // event posted above — or is a no-op when the window
-                    // already drained it, meaning it was delivered after all.
-                    if let Ok(mut queue) = main_queue.lock() {
-                        queue.pop_back();
-                    }
-                }
-                if unsafe { PostMessageW(HWND(overlay_raw as *mut c_void), MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }
-                    .is_err()
-                {
-                    warn!("posting the media event to the overlay failed; dropping its queue copy");
-                    if let Ok(mut queue) = overlay_queue.lock() {
-                        queue.pop_back();
-                    }
-                }
+                push_and_wake(
+                    &main_queue,
+                    &main_wake,
+                    event.clone(),
+                    HWND(main_raw as *mut c_void),
+                    "main window",
+                );
+                push_and_wake(
+                    &overlay_queue,
+                    &overlay_wake,
+                    event,
+                    HWND(overlay_raw as *mut c_void),
+                    "overlay",
+                );
             }
         })
         .expect("event forwarder thread should start")
+}
+
+/// Pushes one event into a window's queue and posts `MEDIA_EVENT_MSG` only
+/// when no wake message is already in flight (`wake` was clear). On a failed
+/// post the flag is cleared and the event removed, so the next push retries
+/// instead of waiting on a message that never arrived.
+fn push_and_wake(queue: &EventQueue, wake: &AtomicBool, event: MediaEvent, hwnd: HWND, name: &str) {
+    if let Ok(mut q) = queue.lock() {
+        q.push_back(event);
+    }
+    if !wake.swap(true, Ordering::SeqCst)
+        && unsafe { PostMessageW(hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
+    {
+        warn!("posting the media event to the {name} failed; dropping its queue copy");
+        wake.store(false, Ordering::SeqCst);
+        if let Ok(mut q) = queue.lock() {
+            q.pop_back();
+        }
+    }
 }
 
 fn message_loop() -> Result<()> {

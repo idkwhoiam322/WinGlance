@@ -271,6 +271,14 @@ struct OverlayState {
     /// shown (static), the re-assert is throttled to 1 Hz instead of running
     /// on every 4 ms tick.
     last_reassert: Option<Instant>,
+    /// Cached monitor refresh period (ms), re-sampled at most once per
+    /// second. `sync_anim_timer` runs on every animation tick; the underlying
+    /// DWM/display-mode queries are far more expensive than the tick itself.
+    period_cache: Option<(Instant, u32)>,
+    /// Wake flag for the event queue: `true` while a `MEDIA_EVENT_MSG` is in
+    /// flight. The forwarder and this window only post when the flag was
+    /// clear, so an event burst collapses into one wake message per drain.
+    wake: Arc<AtomicBool>,
     /// Source app of the last TrackChanged shown, used as the label fallback
     /// in state pills for current-session playback states so the pill always
     /// names the app that owns the media — never another app's last track.
@@ -405,6 +413,8 @@ impl OverlayState {
             frame_scratch: Vec::new(),
             last_tick: Instant::now(),
             last_reassert: None,
+            period_cache: None,
+            wake: Arc::new(AtomicBool::new(false)),
             current_source: None,
             track_cache: HashMap::new(),
             track_cache_order: VecDeque::new(),
@@ -555,8 +565,19 @@ impl OverlayState {
     fn sync_anim_timer(&mut self) {
         let animating = !matches!(self.phase, Phase::Shown);
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
+        let now = Instant::now();
         let period = if animating || marquee_active {
-            refresh_period_ms()
+            // The monitor queries behind `refresh_period_ms` (DWM timing,
+            // display-mode enumeration) are not free to run every tick; a
+            // 1-second cache is far fresher than any real rate change.
+            match self.period_cache {
+                Some((cached_at, cached)) if now.duration_since(cached_at) < Duration::from_secs(1) => cached,
+                _ => {
+                    let fresh = refresh_period_ms();
+                    self.period_cache = Some((now, fresh));
+                    fresh
+                }
+            }
         } else {
             STATIC_TICK_MS
         };
@@ -596,11 +617,12 @@ impl OverlayState {
     }
 
     fn receive_events(&mut self) {
+        // Clear the wake flag before draining; an event pushed while we drain
+        // re-arms it (and possibly posts), so nothing stays stuck.
+        self.wake.store(false, Ordering::Relaxed);
         let mut batch = Vec::new();
         if let Ok(mut queue) = self.queue.lock() {
-            while let Some(event) = queue.pop_front() {
-                batch.push(event);
-            }
+            batch.extend(queue.drain(..));
         }
         // A PlaybackStateChanged that races a TrackChanged for the same
         // source in the same batch is redundant: the state pill would render
@@ -720,6 +742,17 @@ impl OverlayState {
                     None,
                 );
             }
+        }
+        // Events that arrived while we were draining need a wake-up: re-arm
+        // and post only if no wake message is already in flight.
+        let more = self.queue.lock().map(|q| !q.is_empty()).unwrap_or(false);
+        if more
+            && !self.wake.swap(true, Ordering::SeqCst)
+            && unsafe { PostMessageW(self.hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
+        {
+            // The message queue is full; clear the flag so the forwarder's
+            // next push reposts instead of waiting on a lost message.
+            self.wake.store(false, Ordering::SeqCst);
         }
     }
 
@@ -1036,11 +1069,6 @@ impl OverlayState {
         self.content = Some(content);
         if let Err(error) = result {
             error!("rendering overlay: {error:#}");
-        } else {
-            debug!(
-                "pill rendered | {width}x{height} at ({}, {}) | alpha={alpha}",
-                position.x, position.y
-            );
         }
     }
 
@@ -1333,13 +1361,14 @@ static OVERLAY_STATE_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Creates the passive WinGlance overlay window. It owns no message loop: the caller
 /// runs the loop and destroys the window at exit.
-pub(crate) fn create_window(config: Config, queue: EventQueue) -> Result<HWND> {
+pub(crate) fn create_window(config: Config, queue: EventQueue, wake: Arc<AtomicBool>) -> Result<HWND> {
     let module = unsafe { GetModuleHandleW(None) }.context("getting the process module")?;
     let instance: HINSTANCE = module.into();
     let class_name = wide("WinGlanceOverlayWindow");
     register_window_class(instance, &class_name)?;
 
-    let state = Box::new(OverlayState::new(config, queue));
+    let mut state = Box::new(OverlayState::new(config, queue));
+    state.wake = wake;
     let state_ptr = Box::into_raw(state);
     OVERLAY_STATE_CLAIMED.store(false, Ordering::SeqCst);
     let hwnd = unsafe {
@@ -1423,6 +1452,12 @@ fn render_layered(
         art_base,
     )?;
     draw_text_pixels(state, &mut scratch[..needed], content, buf_w, scale);
+    // A single oversized metadata string (huge title/album) can inflate the
+    // retained UTF-16 scratch far beyond any real row; shrink it back so the
+    // capacity does not stay bloated for the rest of the run.
+    if state.scratch_utf16.capacity() > 8192 {
+        state.scratch_utf16.shrink_to(4096);
+    }
     state.frame_scratch = scratch;
 
     // Blit the packed frame into the real DIB, row by row, at the DIB's real
