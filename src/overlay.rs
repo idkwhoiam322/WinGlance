@@ -1,5 +1,5 @@
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
-use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo};
+use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo, artwork_same};
 use crate::palette::Palette;
 use anyhow::{Context, Result};
 use log::{debug, error, warn};
@@ -475,11 +475,7 @@ impl OverlayState {
     /// (~0.1ms, only when a conversion happens), so no separate
     /// full-resolution decode is ever needed for color extraction.
     fn ensure_art(&mut self, decoded: Option<&Arc<[u8]>>) {
-        let same_art = match (&self.decoded_art_source, decoded) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref(),
-            (None, None) => true,
-            _ => false,
-        };
+        let same_art = artwork_same(self.decoded_art_source.as_deref(), decoded.map(|d| d.as_ref()));
         if same_art {
             return;
         }

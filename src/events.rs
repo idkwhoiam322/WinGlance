@@ -47,6 +47,20 @@ pub struct TrackInfo {
     pub genre: Option<String>,
 }
 
+/// Whether two artwork buffers denote the same cover: the same allocation
+/// (shared Arc clones) or byte-identical contents. Strict about presence —
+/// art gained or lost on one side is a different identity, which is what
+/// lets a recreated session with a genuinely new cover escape dedup. Shared
+/// by `same_media` and the overlay's art cache so every site compares
+/// covers identically.
+pub fn artwork_same(a: Option<&[u8]>, b: Option<&[u8]>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => std::ptr::eq(a.as_ptr(), b.as_ptr()) || a == b,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 impl TrackInfo {
     /// Compact secondary info line: album (or subtitle/album-artist fallback) ·
     /// duration · track n/c · genre. Only the parts the app actually provided
@@ -109,7 +123,7 @@ impl TrackInfo {
             && self.title == other.title
             && self.artist == other.artist
             && match (&self.artwork, &other.artwork) {
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref(),
+                (Some(_), Some(_)) => artwork_same(self.artwork.as_deref(), other.artwork.as_deref()),
                 (None, Some(_)) | (Some(_), None) => true,
                 (None, None) => {
                     self.duration_secs == other.duration_secs
