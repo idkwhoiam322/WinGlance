@@ -9,7 +9,7 @@ use crate::process_picker::PICKER_RESULT_MSG;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use log::{debug, error};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -540,6 +540,13 @@ struct MainWindowState {
     /// picker writes the result here and posts a bare `PICKER_RESULT_MSG`; no
     /// pointer ever crosses the message boundary.
     picker_result: Arc<Mutex<Option<Vec<String>>>>,
+    /// Last playback state each source app reported, so a new track from a
+    /// source starts with its own state instead of inheriting the previous
+    /// activity's (which may belong to another app).
+    source_states: HashMap<String, PlaybackState>,
+    /// Insertion order of `source_states` keys, so the map can be capped by
+    /// forgetting the oldest sources first.
+    source_order: VecDeque<String>,
     /// Wake flag for the event queue: `true` while a `MEDIA_EVENT_MSG` is in
     /// flight. The forwarder and this window only post when the flag was
     /// clear, so an event burst collapses into one wake message per drain.
@@ -632,6 +639,12 @@ pub fn create_window(
     Ok(hwnd)
 }
 
+/// Upper bound on the remembered per-source playback states. A system that
+/// churns through many SMTC sources (apps that recreate their session on
+/// every launch) must not grow the map without bound; beyond it the oldest
+/// sources are forgotten and fall back to the default `Playing` state.
+const SOURCE_STATES_CAP: usize = 64;
+
 impl MainWindowState {
     fn cfg(&self) -> std::sync::RwLockReadGuard<'_, Config> {
         self.config.read().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -690,6 +703,8 @@ impl MainWindowState {
             tooltips_dirty: false,
             logs_copied_at: None,
             picker_result: Arc::new(Mutex::new(None)),
+            source_states: HashMap::new(),
+            source_order: VecDeque::new(),
             wake: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -973,6 +988,23 @@ impl MainWindowState {
         self.history.entries.get(row - 1).map(entry_detail)
     }
 
+    /// Records a source's playback state, capping the remembered set so a
+    /// system that churns through many apps cannot grow it without bound.
+    /// Forgetting the oldest source only falls back to the default state for
+    /// its next track; it never drops user data.
+    fn remember_source_state(&mut self, source: String, state: PlaybackState) {
+        if !self.source_states.contains_key(&source) {
+            self.source_order.push_back(source.clone());
+        }
+        self.source_states.insert(source, state);
+        while self.source_order.len() > SOURCE_STATES_CAP {
+            let Some(oldest) = self.source_order.pop_front() else {
+                break;
+            };
+            self.source_states.remove(&oldest);
+        }
+    }
+
     fn receive_events(&mut self) {
         // Clear the wake flag before draining; an event pushed while we drain
         // re-arms it (and possibly posts), so nothing stays stuck.
@@ -985,11 +1017,12 @@ impl MainWindowState {
             match event {
                 MediaEvent::TrackChanged(track) => self.add_track(track),
                 MediaEvent::PlaybackStateChanged(state, source_app) => {
-                    // A state event only applies to the activity it belongs
-                    // to: the worker tracks sources independently, so a
-                    // playback change from another app must not rewrite the
-                    // currently displayed track's state or push a history row
-                    // under it.
+                    // Remember the state per source so a later track from the
+                    // same source starts with the right state. The event only
+                    // applies to the activity it belongs to: a playback change
+                    // from another app must not rewrite the currently
+                    // displayed track's state or push a history row under it.
+                    self.remember_source_state(source_app.clone(), state);
                     if let Some(current) = &mut self.current
                         && current.track.source_app == source_app
                     {
@@ -1158,18 +1191,22 @@ impl MainWindowState {
             return;
         }
 
-        let state = self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing);
+        // The new activity starts with the source's own last reported state
+        // (the worker suppresses the paired playback event when it emits a
+        // TrackChanged, so inheriting the previous activity's state could
+        // show another app's Playing/Paused/Stopped).
+        let state = self
+            .source_states
+            .get(&track.source_app)
+            .copied()
+            .unwrap_or(PlaybackState::Playing);
         // History row is text-only: strip the artwork bytes before the clone.
         let mut history_track = track.clone();
         history_track.artwork = None;
         self.push_history(history_track, state, true);
         self.current = Some(CurrentActivity {
             track,
-            state: self
-                .current
-                .as_ref()
-                .map(|current| current.state)
-                .unwrap_or(PlaybackState::Playing),
+            state,
             // Art is decoded lazily on first paint; the window starts hidden
             // (start_in_tray), so a track that never gets looked at pays no
             // decode cost.
