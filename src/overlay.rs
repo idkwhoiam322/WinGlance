@@ -44,6 +44,11 @@ const LIGHT_DURATION: Duration = Duration::from_millis(120);
 /// screen: hovering over the pill or a queued update both cap the exit at
 /// this, so the user never waits out the full duration to see a change.
 const EARLY_EXIT_MS: u64 = 500;
+/// Tick period while the pill is fully static (no animation, no marquee
+/// scrolling). The dismiss countdown and hover polling do not need frame
+/// rate; the refresh-rate timer is restored the moment the pill animates or
+/// a line scrolls.
+const STATIC_TICK_MS: u32 = 250;
 
 /// Posted by the high-resolution animation timer to drive pill frames.
 const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
@@ -135,6 +140,13 @@ enum Phase {
 /// colliding within milliseconds is already an edge case, so the cap is not
 /// worth tuning.
 const PENDING_CAP: usize = 4;
+
+/// Upper bound on the per-source track cache. Each entry holds the last
+/// track's artwork bytes (up to several MB), and the worker evicts its own
+/// source-level caches when sessions close — the overlay has no session
+/// knowledge, so a simple LRU keeps long-idle sources from accumulating
+/// covers that will never be shown again.
+const TRACK_CACHE_CAP: usize = 16;
 
 /// Per-line marquee state for the pill's text rows. The offset advances on the
 /// 16ms animation tick; a short hold before the first movement reads better.
@@ -259,7 +271,12 @@ struct OverlayState {
     /// Per-source track cache: the last TrackChanged shown for each source app,
     /// so that a later PlaybackStateChanged for that source can render the
     /// correct track info instead of the most-recently-shown app's track.
+    /// LRU-ordered (see `TRACK_CACHE_CAP`), so a source that stops playing
+    /// eventually drops out instead of holding its artwork bytes forever.
     track_cache: HashMap<String, TrackInfo>,
+    /// Recency order of `track_cache` keys (front = oldest). Kept in sync by
+    /// `cache_track`.
+    track_cache_order: VecDeque<String>,
     /// Pre-rendered text pieces of the pill currently on screen, resolved once
     /// per content change (see `resolve_pill_text`).
     pill_text: Option<PillText>,
@@ -383,6 +400,7 @@ impl OverlayState {
             last_reassert: None,
             current_source: None,
             track_cache: HashMap::new(),
+            track_cache_order: VecDeque::new(),
             pill_text: None,
             text_scratch: None,
             scratch_utf16: Vec::new(),
@@ -523,12 +541,27 @@ impl OverlayState {
     /// timer when it changed (display switched, DPI changed, VRR kicked in).
     /// The tick cadence only affects how many frames the UI thread gets asked
     /// to paint; the easing is time-based, so motion is identical either way.
+    /// While the pill is fully static (no animation, no marquee line) the
+    /// timer drops to `STATIC_TICK_MS`: the dismiss countdown and hover
+    /// polling do not need frame rate, so a shown pill stops waking the UI
+    /// thread at monitor refresh rate.
     fn sync_anim_timer(&mut self) {
-        let period = refresh_period_ms();
+        let animating = !matches!(self.phase, Phase::Shown);
+        let marquee_active = self.scroll.iter().any(|line| line.scrolling);
+        let period = if animating || marquee_active {
+            refresh_period_ms()
+        } else {
+            STATIC_TICK_MS
+        };
         if period != self.tick_period {
             debug!(
-                "animation tick {period}ms = {} Hz (refresh-rate matched)",
-                1000 / period.max(1)
+                "animation tick {period}ms = {} Hz ({})",
+                1000 / period.max(1),
+                if animating || marquee_active {
+                    "refresh-rate matched"
+                } else {
+                    "static"
+                }
             );
             self.tick_period = period;
             self.delete_anim_timer();
@@ -593,7 +626,7 @@ impl OverlayState {
                     if is_update {
                         self.current_source = Some(track.source_app.clone());
                         self.last_track = Some(track.clone());
-                        self.track_cache.insert(track.source_app.clone(), track.clone());
+                        self.cache_track(&track);
                         self.update_content(MediaEvent::TrackChanged(track));
                     } else {
                         self.enqueue(MediaEvent::TrackChanged(track));
@@ -658,6 +691,25 @@ impl OverlayState {
         }
     }
 
+    /// Caches the last shown track for a source, moving the source to the
+    /// back of the recency order and evicting the oldest entry when the cap
+    /// is exceeded. A state pill for an evicted source falls back to the
+    /// source-name layout — the accepted degradation for a source that has
+    /// not played in a long time.
+    fn cache_track(&mut self, track: &TrackInfo) {
+        let source = track.source_app.clone();
+        if let Some(pos) = self.track_cache_order.iter().position(|s| *s == source) {
+            self.track_cache_order.remove(pos);
+        }
+        self.track_cache_order.push_back(source.clone());
+        while self.track_cache_order.len() > TRACK_CACHE_CAP {
+            if let Some(oldest) = self.track_cache_order.pop_front() {
+                self.track_cache.remove(&oldest);
+            }
+        }
+        self.track_cache.insert(source, track.clone());
+    }
+
     /// Adds a notification to the pending queue. At the cap, the oldest unshown
     /// queued event is dropped in favor of the incoming one; the pill currently
     /// on screen is never pulled. A metadata refresh for a track already
@@ -701,7 +753,7 @@ impl OverlayState {
             MediaEvent::TrackChanged(track) => {
                 self.current_source = Some(track.source_app.clone());
                 self.last_track = Some(track.clone());
-                self.track_cache.insert(track.source_app.clone(), track.clone());
+                self.cache_track(&track);
                 self.show(MediaEvent::TrackChanged(track), true);
             }
             MediaEvent::PlaybackStateChanged(state, source_app) => {
@@ -886,6 +938,10 @@ impl OverlayState {
         if animating || marquee_active {
             self.render();
         }
+        // Re-sync the timer to the phase: a static pill drops to the coarse
+        // tick, a phase transition or a marquee line starting restores the
+        // refresh-rate cadence.
+        self.sync_anim_timer();
     }
 
     fn render(&mut self) {
@@ -1341,7 +1397,6 @@ fn render_layered(
         )
     };
     unsafe {
-        let _ = ShowWindow(state.hwnd, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(
             state.hwnd,
             HWND_TOPMOST,
@@ -2795,7 +2850,9 @@ pub(crate) fn draw_string(
 /// Artwork only ever displays at ~200px, so refusing anything larger than
 /// this defeats decompression bombs (a header can claim huge dimensions
 /// while the compressed payload is tiny) without affecting real album art.
-const ART_MAX_DIM: u32 = 4096;
+/// 2048² bounds the transient decode to ~16 MB RGBA on the UI thread; real
+/// covers are ≤1024² anyway.
+const ART_MAX_DIM: u32 = 2048;
 
 /// Decodes artwork bytes with a hard cap on source dimensions. The `image`
 /// crate's dimension limits are strict, so an oversized image fails here
@@ -3472,6 +3529,34 @@ mod tests {
             source_app: source.into(),
             ..TrackInfo::default()
         }
+    }
+
+    #[test]
+    fn track_cache_evicts_the_oldest_source_at_the_cap() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        for i in 0..(TRACK_CACHE_CAP + 2) {
+            state.cache_track(&track_for(&format!("source-{i}"), "Song", "Artist"));
+        }
+        assert_eq!(state.track_cache.len(), TRACK_CACHE_CAP);
+        assert!(
+            !state.track_cache.contains_key("source-0"),
+            "the two oldest sources must be evicted"
+        );
+        assert!(
+            state
+                .track_cache
+                .contains_key(&format!("source-{}", TRACK_CACHE_CAP + 1)),
+            "the newest source stays"
+        );
+        // Re-caching an existing source refreshes its recency: it survives
+        // the evictions that follow.
+        state.cache_track(&track_for("source-1", "Song", "Artist"));
+        state.cache_track(&track_for("source-new", "Song", "Artist"));
+        assert!(
+            state.track_cache.contains_key("source-1"),
+            "a re-cached source must not be evicted"
+        );
+        assert_eq!(state.track_cache.len(), TRACK_CACHE_CAP);
     }
 
     #[test]
