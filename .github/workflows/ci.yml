@@ -12,14 +12,18 @@ on:
         required: false
         default: "none"
 
+# Check jobs run untrusted pull-request code and must not carry write
+# credentials; tag creation is isolated in its own write-permission job below.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   check:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -41,13 +45,33 @@ jobs:
       - uses: taiki-e/install-action@cargo-deny
       - name: cargo-deny
         run: cargo deny check
+
+  # Isolated from the check job: only workflow_dispatch runs (which the repo
+  # owner triggers) may create tags, and they get a write token for exactly
+  # that step — PR code never runs here.
+  release-tag:
+    if: github.event_name == 'workflow_dispatch' && inputs.release != 'none'
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - name: Create release tag
-        if: github.event_name == 'workflow_dispatch' && inputs.release != 'none'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_INPUT: ${{ inputs.release }}
         run: |
-          if ("${{ inputs.release }}" -eq "auto") {
+          # The input travels through the environment, never into the script
+          # text, and is validated before use: a crafted workflow_dispatch
+          # input must not be able to inject PowerShell into a write-capable
+          # job.
+          $release = $env:RELEASE_INPUT
+          if ($release -eq "auto") {
             git fetch --tags --force
             $latest = git tag --sort=-v:refname |
               Where-Object { $_ -match '^v\d+\.\d+\.\d+$' } |
@@ -58,8 +82,11 @@ jobs:
             } else {
               $tag = "v0.1.0"
             }
+          } elseif ($release -match '^v\d+\.\d+\.\d+$') {
+            $tag = $release
           } else {
-            $tag = "${{ inputs.release }}"
+            Write-Error "invalid release input '$release': expected 'auto' or a vN.N.N tag"
+            exit 1
           }
           Write-Host "Creating release tag $tag at $env:GITHUB_SHA"
           gh api -X POST repos/${{ github.repository }}/git/refs -f ref="refs/tags/$tag" -f sha=$env:GITHUB_SHA

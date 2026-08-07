@@ -37,3 +37,10 @@ skip-tree = [
 [advisories]
 ignore = []
 
+# Only the crates.io registry may supply dependencies: a future git or
+# alternate-registry dependency must be reviewed and allow-listed explicitly
+# instead of silently entering the tree.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
