@@ -2414,59 +2414,70 @@ fn show_tray_menu(state: &mut MainWindowState) {
             PCWSTR(wide("Close window to tray").as_ptr()),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        // Position submenu
+        let Ok(position_menu) = CreatePopupMenu() else {
+            let _ = DestroyMenu(menu);
+            return;
+        };
         let _ = AppendMenuW(
-            menu,
+            position_menu,
             MF_STRING,
             MENU_POSITION_TOP_LEFT,
-            PCWSTR(wide("Position: top-left").as_ptr()),
+            PCWSTR(wide("top-left").as_ptr()),
         );
         let _ = AppendMenuW(
-            menu,
+            position_menu,
             MF_STRING,
             MENU_POSITION_TOP_CENTER,
-            PCWSTR(wide("Position: top-center").as_ptr()),
+            PCWSTR(wide("top-center").as_ptr()),
         );
         let _ = AppendMenuW(
-            menu,
+            position_menu,
             MF_STRING,
             MENU_POSITION_TOP_RIGHT,
-            PCWSTR(wide("Position: top-right").as_ptr()),
+            PCWSTR(wide("top-right").as_ptr()),
         );
         let _ = AppendMenuW(
-            menu,
+            position_menu,
             MF_STRING,
             MENU_POSITION_BOTTOM_LEFT,
-            PCWSTR(wide("Position: bottom-left").as_ptr()),
+            PCWSTR(wide("bottom-left").as_ptr()),
         );
         let _ = AppendMenuW(
-            menu,
+            position_menu,
             MF_STRING,
             MENU_POSITION_BOTTOM_CENTER,
-            PCWSTR(wide("Position: bottom-center").as_ptr()),
+            PCWSTR(wide("bottom-center").as_ptr()),
         );
         let _ = AppendMenuW(
-            menu,
+            position_menu,
             MF_STRING,
             MENU_POSITION_BOTTOM_RIGHT,
-            PCWSTR(wide("Position: bottom-right").as_ptr()),
+            PCWSTR(wide("bottom-right").as_ptr()),
         );
         let _ = AppendMenuW(
-            menu,
+            position_menu,
             MF_STRING,
             MENU_POSITION_CUSTOM,
             PCWSTR(wide("Adjust position…").as_ptr()),
         );
         let _ = AppendMenuW(
-            menu,
+            position_menu,
             MF_STRING,
             MENU_POSITION_SAMPLE,
             PCWSTR(wide("Show sample").as_ptr()),
         );
         let _ = AppendMenuW(
-            menu,
+            position_menu,
             MF_STRING,
             MENU_POSITION_RESET,
             PCWSTR(wide("Reset position").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            position_menu.0 as usize,
+            PCWSTR(wide("Position").as_ptr()),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         // Duration submenu
