@@ -28,8 +28,8 @@ use windows::Win32::Foundation::{
     WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_ALWAYS, WriteFile,
+    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_WRITE_DATA, GetFileSize, OPEN_ALWAYS, SetEndOfFile, SetFilePointer, WriteFile,
 };
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
@@ -171,7 +171,7 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(path.as_ptr()),
-                FILE_APPEND_DATA.0,
+                FILE_APPEND_DATA.0 | FILE_WRITE_DATA.0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 None,
                 OPEN_ALWAYS,
@@ -180,6 +180,14 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
             )
         };
         if let Ok(handle) = handle {
+            // Keep crash.log bounded even on the allocation-free handler path:
+            // a crash loop must not grow it without limit.
+            unsafe {
+                if GetFileSize(handle, None) > CRASH_LOG_CAP as u32 {
+                    let _ = SetFilePointer(handle, 0, None, FILE_BEGIN);
+                    let _ = SetEndOfFile(handle);
+                }
+            }
             let mut written: u32 = 0;
             let _ = unsafe { WriteFile(handle, Some(&buf[..pos]), Some(&mut written as *mut _), None) };
             let _ = unsafe { CloseHandle(handle) };
@@ -203,7 +211,8 @@ fn install_crash_handler(logs_dir: &Path) {
 /// Writes Rust panics to crash.log. A panic in a window-proc unwinds across
 /// the extern "C" boundary, which aborts the process silently (no access
 /// violation, so the vectored handler never fires) — without this hook a
-/// panic looks like the app "stopped running randomly".
+/// panic looks like the app "stopped running randomly". The file is capped so
+/// a crash loop cannot grow it without bound.
 fn install_panic_hook(logs_dir: &Path) {
     let dir = logs_dir.to_path_buf();
     std::panic::set_hook(Box::new(move |info| {
@@ -216,17 +225,31 @@ fn install_panic_hook(logs_dir: &Path) {
         };
         let location = info.location().map(|l| l.to_string()).unwrap_or_default();
         let message = format!("PANIC {payload} at {location}\n");
+        let path = dir.join("crash.log");
         let _ = std::fs::create_dir_all(&dir);
+        if std::fs::metadata(&path)
+            .map(|m| m.len() > CRASH_LOG_CAP)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path);
+        }
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.join("crash.log"))
+            .open(&path)
             .and_then(|mut f| {
                 use std::io::Write;
                 f.write_all(message.as_bytes())
             });
     }));
 }
+
+/// Upper bound on `crash.log` before the next panic truncates it.
+const CRASH_LOG_CAP: u64 = 1024 * 1024;
 
 /// Acquires the single-instance mutex for the process lifetime. Returns the
 /// handle while the caller holds it, or `None` when another instance already
@@ -291,7 +314,7 @@ fn main() -> Result<()> {
                         f.write_all(format!("could not acquire the single-instance mutex: {error:#}\n").as_bytes())
                     });
             }
-            return Err(error.into());
+            return Err(error);
         }
     };
 

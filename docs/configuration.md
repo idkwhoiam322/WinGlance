@@ -81,8 +81,9 @@ Beyond these knobs the pill derives its look from the playing track:
 ## Logging
 
 Logging has no configuration. A single `log-Live.log` file in
-`<data_dir>\logs` captures the current run and is truncated at startup; no
-history is retained.
+`<data_dir>\logs` captures the current run; it is truncated at startup and
+capped at 1 MiB during the run (a churn-heavy session cannot grow the file
+without bound). No history is retained.
 
 ## [main window] and the system tray
 

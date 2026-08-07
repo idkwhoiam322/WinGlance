@@ -269,6 +269,7 @@ impl SmtcListener {
 }
 
 impl ListenerState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         manager: GlobalSystemMediaTransportControlsSessionManager,
         config: Arc<RwLock<Config>>,

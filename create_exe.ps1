@@ -128,6 +128,14 @@ try {
     cargo check --all-targets --locked $cargoJobsFlag
     if ($LASTEXITCODE -ne 0) { Fail "cargo check --all-targets failed (exit code $LASTEXITCODE)" }
 
+    Write-Step "Linting all targets"
+    cargo clippy --all-targets --locked $cargoJobsFlag -- -D warnings
+    if ($LASTEXITCODE -ne 0) { Fail "Clippy failed (exit code $LASTEXITCODE). Fix the warnings and retry." }
+
+    Write-Step "Running tests"
+    cargo test --locked $cargoJobsFlag
+    if ($LASTEXITCODE -ne 0) { Fail "Tests failed (exit code $LASTEXITCODE). Fix the failures and retry." }
+
     $profileFlag = if ($Release) { "--release" } else { "" }
     Write-Step "Building WinGlance.exe $profileFlag"
     cargo build $profileFlag --locked $cargoJobsFlag

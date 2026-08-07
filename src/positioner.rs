@@ -114,11 +114,9 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
                 // including its fixed GDI objects.
                 if !POSITIONER_STATE_CLAIMED.load(Ordering::SeqCst) {
                     let state = Box::from_raw(state_ptr);
-                    unsafe {
-                        let _ = DeleteObject(HGDIOBJ(state.bg_brush.0));
-                        let _ = DeleteObject(HGDIOBJ(state.x_brush.0));
-                        let _ = DeleteObject(HGDIOBJ(state.pen.0));
-                    }
+                    let _ = DeleteObject(HGDIOBJ(state.bg_brush.0));
+                    let _ = DeleteObject(HGDIOBJ(state.x_brush.0));
+                    let _ = DeleteObject(HGDIOBJ(state.pen.0));
                     drop(state);
                 }
                 false

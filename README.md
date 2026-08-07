@@ -63,7 +63,8 @@ fonts. Hand-edits apply after a restart; tray-menu changes apply immediately.
 See [`docs/configuration.md`](docs/configuration.md) for the full reference.
 
 Logs: `%APPDATA%\WinGlance\WinGlance\data\logs\log-Live.log` (current run, truncated
-at startup) — useful for answering "why did/didn't a notification fire".
+at startup and capped at 1 MiB during a run) — useful for answering "why
+did/didn't a notification fire".
 
 ## Building from source
 

@@ -93,11 +93,12 @@ cargo deny check
 .\create_exe.ps1 -Release -Start
 ```
 
-The default build is `.\create_exe.ps1 -Release -Start`: it formats, checks,
-builds the optimized `WinGlance.exe`, audits, and relaunches it into the tray
-(silent — the app runs in the background by default). Useful flags: `-NoRestart`
-leaves the previous instance stopped, `-SkipAudit` skips advisory/dependency
-checks, `-NoThrottle` uses all CPU cores.
+The default build is `.\create_exe.ps1 -Release -Start`: it formats, lints
+(all targets), tests, builds the optimized `WinGlance.exe`, audits, and
+relaunches it into the tray (silent — the app runs in the background by
+default). Useful flags: `-NoRestart` leaves the previous instance stopped,
+`-SkipAudit` skips advisory/dependency checks, `-NoThrottle` uses all CPU
+cores.
 
 ## Self-contained distribution
 
