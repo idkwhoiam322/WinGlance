@@ -19,6 +19,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -320,6 +321,18 @@ fn main() -> Result<()> {
     let listener_config = shared_config.clone();
     let heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
     let supervisor_heartbeat = heartbeat.clone();
+    // Set once the message loop returns; the supervisor and the event
+    // forwarder exit promptly so main can join them before destroying the
+    // windows (a forwarder still posting after teardown would risk reaching a
+    // reused HWND).
+    let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let supervisor_shutdown = shutdown.clone();
+    let forwarder_shutdown = shutdown.clone();
+    // Worker generation counter: each spawned worker gets the next value, so
+    // a worker that stalled and was replaced stops emitting events and stops
+    // updating the shared heartbeat the moment its successor takes over.
+    let generation: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let supervisor_generation = generation.clone();
     // Supervisor: runs the SMTC worker and restarts it when it stalls (a WinRT
     // call can hang under heavy session churn, which would otherwise silently
     // stop all events and pills). The hung worker thread is leaked; a fresh
@@ -327,7 +340,7 @@ fn main() -> Result<()> {
     // stacks (Rust defaults to 2 MB reserve each) — the supervisor and the
     // event forwarder only sleep and forward, and the worker's WinRT calls
     // stay well under 1 MB.
-    thread::Builder::new()
+    let supervisor_handle = thread::Builder::new()
         .name("WinGlance-smtc".to_string())
         .stack_size(256 * 1024)
         .spawn(move || {
@@ -338,7 +351,19 @@ fn main() -> Result<()> {
             // a bound. A worker that runs for two minutes resets the counter.
             let mut consecutive_restarts: u32 = 0;
             loop {
+                if supervisor_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                if consecutive_restarts >= MAX_WORKER_RESTARTS {
+                    error!(
+                        "SMTC worker failed {MAX_WORKER_RESTARTS} times in a row; giving up until the process restarts"
+                    );
+                    break;
+                }
                 let worker_heartbeat = supervisor_heartbeat.clone();
+                let worker_generation = supervisor_generation.clone();
+                let worker_shutdown = supervisor_shutdown.clone();
+                let my_generation = supervisor_generation.fetch_add(1, Ordering::SeqCst) + 1;
                 let event_tx_worker = event_tx.clone();
                 let listener_config_worker = listener_config.clone();
                 let worker_started = Instant::now();
@@ -346,17 +371,27 @@ fn main() -> Result<()> {
                     .name("WinGlance-smtc-worker".to_string())
                     .stack_size(1024 * 1024)
                     .spawn(move || {
-                        let _ =
-                            smtc::SmtcListener::new(event_tx_worker, listener_config_worker, worker_heartbeat).run();
+                        let _ = smtc::SmtcListener::new(
+                            event_tx_worker,
+                            listener_config_worker,
+                            worker_heartbeat,
+                            worker_generation,
+                            my_generation,
+                            worker_shutdown,
+                        )
+                        .run();
                     });
                 let Ok(worker) = worker else {
                     warn!("could not start the SMTC worker; retrying in 5s");
-                    std::thread::sleep(Duration::from_secs(5));
+                    sleep_interruptible(Duration::from_secs(5), &supervisor_shutdown);
                     continue;
                 };
                 let mut stalled = false;
                 while !worker.is_finished() {
-                    std::thread::sleep(Duration::from_secs(2));
+                    if supervisor_shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
                     if worker_started.elapsed() > Duration::from_secs(120) {
                         consecutive_restarts = 0;
                     }
@@ -368,12 +403,15 @@ fn main() -> Result<()> {
                         break;
                     }
                 }
+                if supervisor_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
                 if stalled {
                     // Do not join: the worker may be blocked inside COM forever.
                     consecutive_restarts += 1;
                     let delay = worker_restart_delay(consecutive_restarts);
                     error!("SMTC worker stalled; restarting it in {}s", delay.as_secs());
-                    std::thread::sleep(delay);
+                    sleep_interruptible(delay, &supervisor_shutdown);
                     continue;
                 }
                 match worker.join() {
@@ -387,7 +425,7 @@ fn main() -> Result<()> {
                 consecutive_restarts += 1;
                 let delay = worker_restart_delay(consecutive_restarts);
                 warn!("SMTC worker exited; restarting it in {}s", delay.as_secs());
-                std::thread::sleep(delay);
+                sleep_interruptible(delay, &supervisor_shutdown);
             }
         })?;
 
@@ -396,15 +434,47 @@ fn main() -> Result<()> {
     let overlay_hwnd = overlay::create_window(config.clone(), overlay_queue.clone())?;
     let main_hwnd = main_window::create_window(shared_config.clone(), main_queue.clone(), overlay_hwnd)?;
 
-    spawn_event_forwarder(main_hwnd, overlay_hwnd, main_queue, overlay_queue, event_rx);
+    let forwarder_handle = spawn_event_forwarder(
+        main_hwnd,
+        overlay_hwnd,
+        main_queue,
+        overlay_queue,
+        event_rx,
+        forwarder_shutdown,
+    );
 
     let message_result = message_loop();
+
+    // Stop the producers before destroying the windows: the forwarder must
+    // not post to an HWND that teardown is about to free. The supervisor
+    // exits within ~200ms of the flag; a stalled worker is left for process
+    // exit (it may be blocked inside COM and cannot be joined).
+    shutdown.store(true, Ordering::SeqCst);
+    let _ = forwarder_handle.join();
+    let _ = supervisor_handle.join();
 
     unsafe {
         let _ = DestroyWindow(overlay_hwnd);
         let _ = DestroyWindow(main_hwnd);
     }
     message_result
+}
+
+/// Upper bound on consecutive SMTC worker restarts without a 2-minute
+/// healthy run in between. Beyond it the supervisor gives up, so a broken
+/// SMTC stack cannot leak one hung thread (plus its COM registrations) every
+/// 90 seconds forever.
+const MAX_WORKER_RESTARTS: u32 = 5;
+
+/// Sleeps in 200ms slices, returning early once `shutdown` is set, so the
+/// supervisor can be joined promptly on exit.
+fn sleep_interruptible(duration: Duration, shutdown: &AtomicBool) {
+    let mut remaining = duration;
+    while remaining > Duration::ZERO && !shutdown.load(Ordering::SeqCst) {
+        let step = remaining.min(Duration::from_millis(200));
+        std::thread::sleep(step);
+        remaining -= step;
+    }
 }
 
 /// Restart delay after `consecutive` SMTC worker failures: quick retries at
@@ -419,20 +489,28 @@ fn worker_restart_delay(consecutive: u32) -> Duration {
 }
 
 /// Drains SMTC events into each window's queue and wakes both windows.
+/// Returns the thread handle so main can join it before destroying the
+/// windows. The loop exits within ~200ms of `shutdown` being set.
 fn spawn_event_forwarder(
     main_hwnd: HWND,
     overlay_hwnd: HWND,
     main_queue: EventQueue,
     overlay_queue: EventQueue,
     receiver: mpsc::Receiver<MediaEvent>,
-) {
+    shutdown: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
     let main_raw = main_hwnd.0 as isize;
     let overlay_raw = overlay_hwnd.0 as isize;
     thread::Builder::new()
         .name("WinGlance-events".to_string())
         .stack_size(256 * 1024)
         .spawn(move || {
-            while let Ok(event) = receiver.recv() {
+            while !shutdown.load(Ordering::SeqCst) {
+                let event = match receiver.recv_timeout(Duration::from_millis(200)) {
+                    Ok(event) => event,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
                 if let Ok(mut queue) = main_queue.lock() {
                     queue.push_back(event.clone());
                 }
@@ -461,7 +539,7 @@ fn spawn_event_forwarder(
                 }
             }
         })
-        .expect("event forwarder thread should start");
+        .expect("event forwarder thread should start")
 }
 
 fn message_loop() -> Result<()> {

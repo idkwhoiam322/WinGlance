@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::BOOLEAN;
-use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HANDLE, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
@@ -28,11 +30,11 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetCursorPos, GetForegroundWindow,
     GetWindowLongPtrW, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW, MA_NOACTIVATE,
-    RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    ULW_ALPHA, WM_APP, WM_DESTROY, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER,
-    WNDCLASS_STYLES, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-    WS_POPUP,
+    MSG, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA, WM_APP, WM_DESTROY, WM_MOUSEACTIVATE, WM_NCCREATE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASS_STYLES, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -116,14 +118,17 @@ struct DibCache {
 }
 
 /// Animation tick driver. Fires from the timer queue and dispatches the tick
-/// to the UI thread; SendMessage blocks the timer thread until the frame is
-/// rendered, so the effective frame rate follows the UI thread's speed.
+/// to the UI thread. `PostMessageW` (not `SendMessageW`) keeps the callback
+/// non-blocking, so the timer can be deleted with a completion wait at
+/// teardown without deadlocking (a blocking callback would wait on the very
+/// thread that is deleting the timer).
 unsafe extern "system" fn animation_timer_proc(parameter: *mut c_void, _fired: BOOLEAN) {
     let hwnd = HWND(parameter);
     unsafe {
-        let _ = SendMessageW(hwnd, TIMER_ANIMATION_MSG, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(hwnd, TIMER_ANIMATION_MSG, WPARAM(0), LPARAM(0));
     }
 }
+
 pub(crate) type EventQueue = Arc<Mutex<VecDeque<MediaEvent>>>;
 
 enum Phase {
@@ -573,12 +578,12 @@ impl OverlayState {
 
     fn delete_anim_timer(&mut self) {
         if !self.anim_timer.0.is_null() {
-            // Do not wait for the callback (INVALID_HANDLE_VALUE would): the
-            // callback blocks in SendMessageW to this very thread, so waiting
-            // here deadlocks. The callback is a single SendMessageW and cannot
-            // outlive the timer meaningfully; the timer simply stops firing.
+            // Wait for any in-flight callback to complete
+            // (INVALID_HANDLE_VALUE): the callback is a single non-blocking
+            // PostMessageW, so the wait cannot deadlock, and no stale tick
+            // message can be posted to a window that is being torn down.
             unsafe {
-                let _ = DeleteTimerQueueTimer(None, self.anim_timer, None);
+                let _ = DeleteTimerQueueTimer(None, self.anim_timer, INVALID_HANDLE_VALUE);
             }
             self.anim_timer = HANDLE::default();
         }
@@ -909,6 +914,13 @@ impl OverlayState {
 
     fn tick(&mut self) {
         let now = Instant::now();
+        // A tick can be delivered after the pill was hidden (one was already
+        // queued when hide() ran). The hidden phase must not re-arm the
+        // refresh-rate timer or do any per-tick work.
+        if matches!(self.phase, Phase::Hidden) {
+            self.last_tick = now;
+            return;
+        }
         let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
         self.last_tick = now;
         // A layered popup can be hidden by fullscreen transitions or external
@@ -3407,6 +3419,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             LRESULT(0)
         }
         TIMER_ANIMATION_MSG => {
+            // The timer-queue callback posts one tick message per period;
+            // when the UI thread stalls, those accumulate. Drain the queue so
+            // one dispatch consumes every queued tick (the animation is
+            // time-based, so a dropped tick changes nothing and the backlog
+            // cannot pile up).
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, hwnd, TIMER_ANIMATION_MSG, TIMER_ANIMATION_MSG, PM_REMOVE).as_bool() {}
+            }
             if !state_ptr.is_null() {
                 (*state_ptr).tick();
             }

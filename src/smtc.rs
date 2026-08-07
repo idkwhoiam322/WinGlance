@@ -3,7 +3,8 @@ use crate::events::{MediaEvent, PlaybackState, TrackInfo};
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
@@ -86,6 +87,14 @@ const ARTWORK_CHANGE_MIN_INTERVAL: Duration = Duration::from_secs(3);
 /// thumbnail is present, `has_artwork` is true and no further retries run.
 const ARTWORK_RETRY_BUDGET: u8 = 3;
 
+/// Capacity of the signal channel between the WinRT event handlers and the
+/// listener loop. `try_send` drops a signal when the queue is full; that is
+/// safe because every dropped signal is a coalescible wake-up — the dirty-set
+/// membership it would have recorded is re-covered by the periodic safety-net
+/// poll within 2s. The bound keeps a session storm from accumulating
+/// unbounded queued COM session references.
+const SIGNAL_QUEUE_CAP: usize = 256;
+
 /// Source labels of every currently open SMTC session, refreshed at each
 /// subscription re-sync. The process picker reads this so media apps that run
 /// without a visible window (tray-only Electron apps, background browser
@@ -110,15 +119,19 @@ struct ListenerState {
     manager: GlobalSystemMediaTransportControlsSessionManager,
     config: Arc<RwLock<Config>>,
     output: Sender<MediaEvent>,
-    signal_tx: Sender<Signal>,
+    signal_tx: SyncSender<Signal>,
     /// Every open session's event subscriptions, keyed by session pointer.
     subscriptions: HashMap<usize, SessionSubscription>,
     /// Last known displayed state per session key.
     states: HashMap<usize, LogicalState>,
-    /// Keys with unprocessed property events in the current tick. The flush
-    /// reads each key once, so a burst of events for one session coalesces
-    /// into one read + one diff + one emit per debounce window.
-    dirty: HashSet<usize>,
+    /// Keys with unprocessed property events in the current tick, in arrival
+    /// order. The flush reads each key once, so a burst of events for one
+    /// session coalesces into one read + one diff + one emit per debounce
+    /// window. A `VecDeque` preserves arrival order (a `HashSet` would emit
+    /// cross-session events in arbitrary order).
+    dirty: VecDeque<usize>,
+    /// Membership mirror of `dirty`, so insertion and eviction stay O(1).
+    dirty_seen: HashSet<usize>,
     /// A SessionsChanged burst is pending its debounce window; the next flush
     /// performs the re-sync once per burst instead of once per event.
     sessions_pending: bool,
@@ -144,6 +157,15 @@ struct ListenerState {
     /// Heartbeat touched each loop iteration so the supervisor can detect a
     /// stall and restart the listener.
     heartbeat: Arc<Mutex<Instant>>,
+    /// Generation counter shared with the supervisor. A worker only emits
+    /// events and updates the heartbeat while its own generation is still the
+    /// current one; a stalled worker that was replaced stops contributing the
+    /// moment its successor increments the counter.
+    live_generation: Arc<AtomicU64>,
+    /// The generation this listener belongs to.
+    my_generation: u64,
+    /// Set by main at exit; the event loop breaks within its receive timeout.
+    shutdown: Arc<AtomicBool>,
     /// Last emitted track per source app (keyed by `source_app`). Persisting
     /// this across session-key changes lets us suppress the duplicate
     /// TrackChanged events a source emits when it recreates its session
@@ -177,14 +199,32 @@ pub struct SmtcListener {
     /// a stalled worker (a WinRT call hanging under session churn) and
     /// restart the listener.
     heartbeat: Arc<Mutex<Instant>>,
+    /// Worker generation guard (see `ListenerState`).
+    live_generation: Arc<AtomicU64>,
+    my_generation: u64,
+    /// Set by main when the process is exiting; the event loop breaks within
+    /// its receive timeout so the worker unsubscribes and releases COM
+    /// promptly instead of running until process termination.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl SmtcListener {
-    pub fn new(output: Sender<MediaEvent>, config: Arc<RwLock<Config>>, heartbeat: Arc<Mutex<Instant>>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        output: Sender<MediaEvent>,
+        config: Arc<RwLock<Config>>,
+        heartbeat: Arc<Mutex<Instant>>,
+        live_generation: Arc<AtomicU64>,
+        my_generation: u64,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             output,
             config,
             heartbeat,
+            live_generation,
+            my_generation,
+            shutdown,
         }
     }
 
@@ -201,10 +241,19 @@ impl SmtcListener {
         let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?
             .get()
             .context("requesting the SMTC session manager")?;
-        let (signal_tx, signal_rx) = mpsc::channel();
+        let (signal_tx, signal_rx) = mpsc::sync_channel(SIGNAL_QUEUE_CAP);
         let sessions_token = register_sessions_handler(&manager, signal_tx.clone())?;
         let current_token = register_current_session_handler(&manager, signal_tx.clone())?;
-        let mut state = ListenerState::new(manager, self.config, self.output, signal_tx, self.heartbeat);
+        let mut state = ListenerState::new(
+            manager,
+            self.config,
+            self.output,
+            signal_tx,
+            self.heartbeat,
+            self.live_generation,
+            self.my_generation,
+            self.shutdown,
+        );
 
         state.sync_subscriptions();
         // Initial read: report what is already playing so the pill does not
@@ -224,8 +273,11 @@ impl ListenerState {
         manager: GlobalSystemMediaTransportControlsSessionManager,
         config: Arc<RwLock<Config>>,
         output: Sender<MediaEvent>,
-        signal_tx: Sender<Signal>,
+        signal_tx: SyncSender<Signal>,
         heartbeat: Arc<Mutex<Instant>>,
+        live_generation: Arc<AtomicU64>,
+        my_generation: u64,
+        shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
             manager,
@@ -234,7 +286,8 @@ impl ListenerState {
             signal_tx,
             subscriptions: HashMap::new(),
             states: HashMap::new(),
-            dirty: HashSet::new(),
+            dirty: VecDeque::new(),
+            dirty_seen: HashSet::new(),
             sessions_pending: false,
             pending_deadline: None,
             last_heap_compact: Instant::now(),
@@ -247,13 +300,28 @@ impl ListenerState {
             icon_cache: HashMap::new(),
             last_emit_at: HashMap::new(),
             heartbeat,
+            live_generation,
+            my_generation,
+            shutdown,
         }
     }
 
     fn event_loop(&mut self, signal_rx: Receiver<Signal>) -> Result<()> {
         let session_check_interval = Duration::from_secs(2);
         loop {
-            *self.heartbeat.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+            // Set by main at exit: leave promptly (within the receive
+            // timeout) so run_initialized's cleanup unsubscribes every
+            // session and uninitializes COM instead of running until process
+            // termination.
+            if self.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            // Only the current worker generation may keep the heartbeat
+            // fresh: a stale worker that wakes after being replaced must not
+            // mask a stall in its successor.
+            if self.is_current_generation() {
+                *self.heartbeat.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+            }
             // The Windows heap keeps freed blocks (artwork decodes, thumbnail
             // bytes) in its free lists instead of returning them to the OS,
             // so RSS climbs as songs change. Compacting on a 60s cadence
@@ -294,6 +362,17 @@ impl ListenerState {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+            // A continuous signal stream must not starve the debounce flush
+            // or the periodic safety net: run both once their deadline has
+            // passed, regardless of how many signals arrived in between.
+            if self.pending_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                self.flush();
+            }
+            if self.last_session_check.elapsed() >= session_check_interval {
+                self.last_session_check = Instant::now();
+                self.sync_subscriptions();
+                self.poll_sessions();
+            }
         }
         Ok(())
     }
@@ -331,7 +410,11 @@ impl ListenerState {
                 }
                 // Coalesce per key: a burst of MediaProperties/PlaybackInfo
                 // events for the same session is resolved once at the flush.
-                self.dirty.insert(key);
+                // The deque preserves arrival order across sessions; the
+                // membership set keeps dedup O(1).
+                if self.dirty_seen.insert(key) {
+                    self.dirty.push_back(key);
+                }
                 self.schedule_flush();
             }
         }
@@ -347,7 +430,8 @@ impl ListenerState {
             self.sync_subscriptions();
         }
         if !self.dirty.is_empty() {
-            let keys: Vec<usize> = self.dirty.drain().collect();
+            let keys: Vec<usize> = self.dirty.drain(..).collect();
+            self.dirty_seen.clear();
             for key in keys {
                 // Clone the COM interface out so the map borrow ends before the
                 // refresh (which can mutate subscriptions via eviction).
@@ -610,9 +694,18 @@ impl ListenerState {
             events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
         }
 
+        // The session may have stopped being current, or its source may have
+        // been disallowed, while the slow reads above were running. Revalidate
+        // before storing state or emitting, so a stale read cannot surface a
+        // track or playback pill after the current session moved on.
+        if !self.should_follow_session(session) || !self.session_source_allowed(session) {
+            debug!("SMTC session changed during read; discarding pending events | key={key}");
+            return Ok(());
+        }
+
         self.states.insert(key, next);
         for event in events {
-            let _ = self.output.send(event);
+            self.emit(event);
         }
         Ok(())
     }
@@ -665,7 +758,7 @@ impl ListenerState {
                     let source_app = read_source_app(session);
                     let (title, artist) = read_session_text(session, &source_app);
                     let state = read_session_state(session);
-                    let _ = self.output.send(MediaEvent::SessionRejected {
+                    self.emit(MediaEvent::SessionRejected {
                         source_app,
                         title,
                         artist,
@@ -673,6 +766,11 @@ impl ListenerState {
                         accepted: false,
                     });
                 }
+                // A session that became disallowed (allow-list edit) or whose
+                // source tripped the churn cool-down must not keep its event
+                // subscriptions: it would otherwise keep firing signals that
+                // every path discards.
+                self.evict(key);
                 continue;
             }
             if !session_matches_current_source(key, &source, current_key, current_source.as_deref()) {
@@ -806,7 +904,7 @@ impl ListenerState {
             info!("track changed | {label}");
             self.last_track_per_source
                 .insert(merged.source_app.clone(), merged.clone());
-            let _ = self.output.send(MediaEvent::TrackChanged(merged.clone()));
+            self.emit(MediaEvent::TrackChanged(merged.clone()));
             if let Some(state) = self.states.get_mut(&key) {
                 state.deferred_at = None;
             }
@@ -910,14 +1008,14 @@ impl ListenerState {
             GlobalSystemMediaTransportControlsSession,
             MediaPropertiesChangedEventArgs,
         > = TypedEventHandler::new(move |_, _| {
-            let _ = properties_tx.send(Signal::MediaProperties(properties_session.clone()));
+            let _ = properties_tx.try_send(Signal::MediaProperties(properties_session.clone()));
             Ok(())
         });
         let playback_handler: TypedEventHandler<
             GlobalSystemMediaTransportControlsSession,
             PlaybackInfoChangedEventArgs,
         > = TypedEventHandler::new(move |_, _| {
-            let _ = playback_tx.send(Signal::PlaybackInfo(playback_session.clone()));
+            let _ = playback_tx.try_send(Signal::PlaybackInfo(playback_session.clone()));
             Ok(())
         });
 
@@ -948,9 +1046,12 @@ impl ListenerState {
     }
 
     /// Removes a session's subscription and stored state. Called when a
-    /// session reports Closed and when it disappears from the session list.
+    /// session reports Closed, disappears from the session list, or its
+    /// source becomes disallowed (allow-list edit or churn cool-down).
     fn evict(&mut self, key: usize) {
-        self.dirty.remove(&key);
+        if self.dirty_seen.remove(&key) {
+            self.dirty.retain(|k| *k != key);
+        }
         if let Some(subscription) = self.subscriptions.remove(&key) {
             let _ = subscription
                 .session
@@ -974,6 +1075,19 @@ impl ListenerState {
     fn schedule_flush(&mut self) {
         let deadline = Instant::now() + debounce_duration(&self.config.read().unwrap_or_else(|p| p.into_inner()));
         self.pending_deadline = Some(self.pending_deadline.map_or(deadline, |d| d.min(deadline)));
+    }
+
+    /// Emits an event only while this worker generation is still current. A
+    /// worker that stalled and was replaced must not keep producing events
+    /// after its successor took over.
+    fn emit(&self, event: MediaEvent) {
+        if self.is_current_generation() {
+            let _ = self.output.send(event);
+        }
+    }
+
+    fn is_current_generation(&self) -> bool {
+        self.live_generation.load(Ordering::SeqCst) == self.my_generation
     }
 }
 
@@ -1199,11 +1313,11 @@ fn is_placeholder_read(prev: &LogicalState, merged: &TrackInfo) -> bool {
 
 fn register_sessions_handler(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
-    signal_tx: Sender<Signal>,
+    signal_tx: SyncSender<Signal>,
 ) -> Result<EventRegistrationToken> {
     let handler: TypedEventHandler<GlobalSystemMediaTransportControlsSessionManager, SessionsChangedEventArgs> =
         TypedEventHandler::new(move |_, _| {
-            let _ = signal_tx.send(Signal::Sessions);
+            let _ = signal_tx.try_send(Signal::Sessions);
             Ok(())
         });
     Ok(manager.SessionsChanged(&handler)?)
@@ -1215,11 +1329,11 @@ fn register_sessions_handler(
 /// same debounced re-sync.
 fn register_current_session_handler(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
-    signal_tx: Sender<Signal>,
+    signal_tx: SyncSender<Signal>,
 ) -> Result<EventRegistrationToken> {
     let handler: TypedEventHandler<GlobalSystemMediaTransportControlsSessionManager, CurrentSessionChangedEventArgs> =
         TypedEventHandler::new(move |_, _| {
-            let _ = signal_tx.send(Signal::Sessions);
+            let _ = signal_tx.try_send(Signal::Sessions);
             Ok(())
         });
     Ok(manager.CurrentSessionChanged(&handler)?)
