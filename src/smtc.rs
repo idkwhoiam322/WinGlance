@@ -1357,6 +1357,19 @@ fn read_source_app(session: &GlobalSystemMediaTransportControlsSession) -> Strin
         .unwrap_or_else(|_| "Media".to_string())
 }
 
+/// Bounds an SMTC-provided metadata string. Sources are untrusted input from
+/// other applications; a pathological value must not be retained at arbitrary
+/// length in history rows, tooltips or the pill.
+fn cap_meta(value: String) -> String {
+    if value.chars().count() > MAX_META_CHARS {
+        value.chars().take(MAX_META_CHARS).collect()
+    } else {
+        value
+    }
+}
+
+const MAX_META_CHARS: usize = 256;
+
 /// Best-effort title/artist for a session's history row. Reads can fail or
 /// return empty for freshly-created sessions; the title falls back to the
 /// source label so the row always names the app.
@@ -1364,11 +1377,14 @@ fn read_session_text(session: &GlobalSystemMediaTransportControlsSession, source
     let Ok(properties) = session.TryGetMediaPropertiesAsync().and_then(|op| op.get()) else {
         return (source_app.to_string(), String::new());
     };
-    let title = non_empty(
+    let title = cap_meta(non_empty(
         properties.Title().map(|v| v.to_string()).unwrap_or_default(),
         source_app,
-    );
-    let artist = non_empty(properties.Artist().map(|v| v.to_string()).unwrap_or_default(), "");
+    ));
+    let artist = cap_meta(non_empty(
+        properties.Artist().map(|v| v.to_string()).unwrap_or_default(),
+        "",
+    ));
     (title, artist)
 }
 
@@ -1387,20 +1403,20 @@ fn read_session_state(session: &GlobalSystemMediaTransportControlsSession) -> Pl
 fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_artwork: bool) -> Result<TrackInfo> {
     let source_app = read_source_app(session);
     let properties = session.TryGetMediaPropertiesAsync()?.get()?;
-    let title = non_empty(properties.Title()?.to_string(), &source_app);
+    let title = cap_meta(non_empty(properties.Title()?.to_string(), &source_app));
     // Keep artist empty when the app has not provided it yet; the pill hides
     // the artist row instead of showing "Unknown" (which duplicates the
     // source-app line and shows a made-up name).
-    let artist = non_empty(properties.Artist()?.to_string(), "");
+    let artist = cap_meta(non_empty(properties.Artist()?.to_string(), ""));
     // Keep album empty when the app has not provided it yet; renderers hide the
     // album line until real data arrives (prevents a bogus "Unknown album").
-    let album = non_empty(properties.AlbumTitle()?.to_string(), "");
+    let album = cap_meta(non_empty(properties.AlbumTitle()?.to_string(), ""));
     // Album artist and subtitle are read as additional data sources. Some apps
     // (e.g. YouTube Music) populate only Title/Artist and leave these empty,
     // but others may fill one but not the album title — the pill falls back to
     // whichever is available.
-    let album_artist = non_empty(properties.AlbumArtist()?.to_string(), "");
-    let subtitle = non_empty(properties.Subtitle()?.to_string(), "");
+    let album_artist = cap_meta(non_empty(properties.AlbumArtist()?.to_string(), ""));
+    let subtitle = cap_meta(non_empty(properties.Subtitle()?.to_string(), ""));
     let artwork = if read_artwork {
         // Artwork reads fail transiently under heavy session churn (overlapping
         // async WinRT calls on one thread); retry once before giving up, and
@@ -1440,7 +1456,7 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_art
     };
     let genre = {
         let genres: Vec<String> = properties.Genres()?.into_iter().map(|g| g.to_string()).collect();
-        let joined = genres.join(", ");
+        let joined = cap_meta(genres.join(", "));
         if joined.trim().is_empty() { None } else { Some(joined) }
     };
     // Total duration is static per track (EndTime - StartTime); fine to read
