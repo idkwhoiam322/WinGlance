@@ -22,7 +22,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT, WPARAM,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     OPEN_ALWAYS, WriteFile,
@@ -31,7 +34,7 @@ use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW, TranslateMessage,
@@ -224,18 +227,73 @@ fn install_panic_hook(logs_dir: &Path) {
     }));
 }
 
-/// Acquires a named mutex owned by the process. When another instance already
-/// holds it, CreateMutexW succeeds with ERROR_ALREADY_EXISTS, and the app
-/// exits without touching the existing instance's windows.
-fn is_already_running() -> bool {
+/// Acquires the single-instance mutex for the process lifetime. Returns the
+/// handle while the caller holds it, or `None` when another instance already
+/// owns the mutex. The handle must be kept alive until process exit; releasing
+/// it would allow a second instance to start.
+fn acquire_singleton() -> anyhow::Result<Option<HANDLE>> {
     unsafe {
         let name = wide("WinGlanceSingleInstance");
-        let _ = CreateMutexW(None, true, PCWSTR(name.as_ptr())).ok();
-        GetLastError() == ERROR_ALREADY_EXISTS
+        let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr()))?;
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            // The mutex already exists, so either a live instance owns it or
+            // the previous instance died without releasing it (crash or kill),
+            // which leaves the mutex abandoned. A zero-timeout wait tells the
+            // cases apart: an abandoned mutex grants ownership immediately,
+            // a live owner returns WAIT_TIMEOUT. Without this, the first
+            // relaunch after a crash would exit, requiring a second launch.
+            match WaitForSingleObject(handle, 0) {
+                WAIT_ABANDONED | WAIT_OBJECT_0 => Ok(Some(handle)),
+                WAIT_TIMEOUT => {
+                    let _ = CloseHandle(handle);
+                    Ok(None)
+                }
+                WAIT_FAILED => {
+                    let _ = CloseHandle(handle);
+                    anyhow::bail!("WaitForSingleObject failed on the single-instance mutex");
+                }
+                _ => {
+                    let _ = CloseHandle(handle);
+                    anyhow::bail!("unexpected wait result on the single-instance mutex");
+                }
+            }
+        } else {
+            Ok(Some(handle))
+        }
     }
 }
 
 fn main() -> Result<()> {
+    // The single-instance guard must come before any side effects: logging
+    // truncates the live log and config recovery touches the user's file, so a
+    // duplicate launch must not get that far.
+    let _singleton = match acquire_singleton() {
+        Ok(Some(handle)) => Some(handle),
+        Ok(None) => {
+            // Another instance holds the mutex; exit without touching its
+            // log or config.
+            return Ok(());
+        }
+        Err(error) => {
+            // Fail closed: running without the singleton would let a second
+            // instance truncate the live log or rewrite config while the
+            // first is running. Logging is not initialized yet, so record the
+            // failure in crash.log and exit.
+            if let Some(dir) = config::Config::data_dir().ok().map(|d| d.join("logs")) {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("crash.log"))
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        f.write_all(format!("could not acquire the single-instance mutex: {error:#}\n").as_bytes())
+                    });
+            }
+            return Err(error.into());
+        }
+    };
+
     // Logging initializes before the config loads: a corrupted config.toml now
     // falls back to defaults, and that fallback must be diagnosable through
     // the log file.
@@ -243,13 +301,6 @@ fn main() -> Result<()> {
     let config = config::Config::load()?;
     install_crash_handler(&config.logs_dir());
     install_panic_hook(&config.logs_dir());
-
-    // Only one instance may run at a time; the mutex lives for the process
-    // lifetime and is released automatically when the process exits.
-    if is_already_running() {
-        warn!("another instance of WinGlance is already running; exiting");
-        return Ok(());
-    }
 
     info!("starting WinGlance");
 
