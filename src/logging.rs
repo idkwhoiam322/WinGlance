@@ -79,7 +79,12 @@ impl Log for FileLogger {
                 files.written = 0;
             }
         }
-        eprint!("{line}");
+        // Echo to the console in debug builds only: the packaged exe is
+        // `windows_subsystem = "windows"` with no console, so every eprint!
+        // in release is a wasted WriteFile against a handle nothing reads.
+        if cfg!(debug_assertions) {
+            eprint!("{line}");
+        }
     }
 
     fn flush(&self) {}

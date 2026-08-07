@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, COLORREF, CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BDR_SUNKENOUTER, BF_RECT, BeginPaint, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect, InvalidateRect,
-    PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect, HBRUSH, HFONT,
+    InvalidateRect, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -63,6 +63,12 @@ struct PickerState {
     /// heights and hit-testing are scaled by it so the picker matches the
     /// DPI-correct main window on high-DPI displays.
     scale: f32,
+    /// Fixed GDI objects for the picker's own chrome (header text + fills),
+    /// created once per open and freed at teardown so paints create nothing.
+    header_font: HFONT,
+    header_brush: HBRUSH,
+    close_brush: HBRUSH,
+    close_hover_brush: HBRUSH,
 }
 
 static OPEN_PICKER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
@@ -348,6 +354,10 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
             last_click_item: None,
             last_click_time: None,
             scale: 1.0,
+            header_font: HFONT::default(),
+            header_brush: HBRUSH::default(),
+            close_brush: HBRUSH::default(),
+            close_hover_brush: HBRUSH::default(),
         });
         let state_ptr = Box::into_raw(state);
         PICKER_STATE_CLAIMED.store(false, Ordering::SeqCst);
@@ -386,6 +396,29 @@ pub(crate) fn open(owner: HWND, trigger_rect: &RECT, current: &[String]) -> bool
         }
 
         let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+        // Fixed GDI objects for the picker's own chrome, created once per open
+        // (WM_PAINT only reads them) and freed in WM_NCDESTROY.
+        let state_ref = &mut *state_ptr;
+        state_ref.scale = scale;
+        state_ref.header_font = CreateFontW(
+            -((14.0 * scale).round() as i32),
+            0,
+            0,
+            0,
+            700,
+            0,
+            0,
+            0,
+            0x01,
+            0,
+            0,
+            0x02,
+            0x00,
+            PCWSTR(wide("Segoe UI Semibold").as_ptr()),
+        );
+        state_ref.header_brush = CreateSolidBrush(COLORREF(0x002D2D2D));
+        state_ref.close_brush = CreateSolidBrush(COLORREF(0x00333333));
+        state_ref.close_hover_brush = CreateSolidBrush(COLORREF(0x00404040));
         let phys_w = (WIDTH as f32 * scale).round() as i32;
         let phys_h = ((HEADER_H + item_count as i32 * ROW_HEIGHT + 10) as f32 * scale).round() as i32;
         let _ = SetWindowPos(
@@ -648,7 +681,46 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             let mut client = RECT::default();
             let _ = unsafe { GetClientRect(hwnd, &mut client) };
 
-            let header_brush = unsafe { CreateSolidBrush(COLORREF(0x002D2D2D)) };
+            // Chrome GDI objects are cached on the state; the null-state path
+            // (window already tearing down) falls back to transient ones that
+            // are deleted at the end of this paint.
+            let (header_font, header_brush, close_brush, close_hover_brush, transient) = if state_ptr.is_null() {
+                let font = unsafe {
+                    CreateFontW(
+                        -((14.0 * scale).round() as i32),
+                        0,
+                        0,
+                        0,
+                        700,
+                        0,
+                        0,
+                        0,
+                        0x01,
+                        0,
+                        0,
+                        0x02,
+                        0x00,
+                        PCWSTR(wide("Segoe UI Semibold").as_ptr()),
+                    )
+                };
+                (
+                    font,
+                    unsafe { CreateSolidBrush(COLORREF(0x002D2D2D)) },
+                    unsafe { CreateSolidBrush(COLORREF(0x00333333)) },
+                    unsafe { CreateSolidBrush(COLORREF(0x00404040)) },
+                    true,
+                )
+            } else {
+                let state = unsafe { &*state_ptr };
+                (
+                    state.header_font,
+                    state.header_brush,
+                    state.close_brush,
+                    state.close_hover_brush,
+                    false,
+                )
+            };
+
             let _ = unsafe {
                 FillRect(
                     hdc,
@@ -661,27 +733,12 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     header_brush,
                 )
             };
-            let _ = unsafe { DeleteObject(header_brush) };
 
-            let font = unsafe {
-                CreateFontW(
-                    -((14.0 * scale).round() as i32),
-                    0,
-                    0,
-                    0,
-                    700,
-                    0,
-                    0,
-                    0,
-                    0x01,
-                    0,
-                    0,
-                    0x02,
-                    0x00,
-                    PCWSTR(wide("Segoe UI Semibold").as_ptr()),
-                )
+            let old_font = if header_font.0.is_null() {
+                None
+            } else {
+                Some(unsafe { SelectObject(hdc, header_font) })
             };
-            let old_font = unsafe { SelectObject(hdc, font) };
             let _ = unsafe { SetBkMode(hdc, TRANSPARENT) };
             let _ = unsafe { SetTextColor(hdc, COLORREF(0x00F0F0F0)) };
             let mut title = wide("Select apps (Enter=apply, Esc=cancel)");
@@ -702,9 +759,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             // Draw close button (X)
             let btn = close_btn_rect(&client, scale);
             let hover = !state_ptr.is_null() && unsafe { (*state_ptr).close_hover };
-            let btn_brush = unsafe { CreateSolidBrush(COLORREF(if hover { 0x00404040 } else { 0x00333333 })) };
-            let _ = unsafe { FillRect(hdc, &btn, btn_brush) };
-            let _ = unsafe { DeleteObject(btn_brush) };
+            let _ = unsafe { FillRect(hdc, &btn, if hover { close_hover_brush } else { close_brush }) };
 
             let _ = unsafe { SetTextColor(hdc, COLORREF(0x00F0F0F0)) };
             let mut x_text = wide("\u{00D7}");
@@ -722,8 +777,15 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 )
             };
 
-            let _ = unsafe { SelectObject(hdc, old_font) };
-            let _ = unsafe { DeleteObject(font) };
+            if let Some(old_font) = old_font {
+                let _ = unsafe { SelectObject(hdc, old_font) };
+            }
+            if transient {
+                let _ = unsafe { DeleteObject(header_font) };
+                let _ = unsafe { DeleteObject(header_brush) };
+                let _ = unsafe { DeleteObject(close_brush) };
+                let _ = unsafe { DeleteObject(close_hover_brush) };
+            }
 
             let _ = unsafe { EndPaint(hwnd, &ps) };
             LRESULT(0)
@@ -868,11 +930,17 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             LRESULT(0)
         }
         WM_NCDESTROY => {
-            // Free the heap-allocated PickerState stashed at WM_NCCREATE.
-            // Every close path (Escape/Enter/click-outside) goes through
-            // DestroyWindow; without this the state leaked on each open.
+            // Free the heap-allocated PickerState stashed at WM_NCCREATE, and
+            // its fixed chrome GDI objects. Every close path
+            // (Escape/Enter/click-outside) goes through DestroyWindow; without
+            // this the state leaked on each open.
             let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
             if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                let _ = unsafe { DeleteObject(state.header_font) };
+                let _ = unsafe { DeleteObject(state.header_brush) };
+                let _ = unsafe { DeleteObject(state.close_brush) };
+                let _ = unsafe { DeleteObject(state.close_hover_brush) };
                 drop(Box::from_raw(state_ptr));
             }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
