@@ -1,7 +1,8 @@
 use crate::autostart;
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo};
-use crate::overlay::{EventQueue, OverlayPos, draw_string, set_duration, set_position, show_sample};
+use crate::gdi::{FontProvider, draw_string};
+use crate::overlay::{EventQueue, OverlayPos, set_duration, set_position, show_sample};
 use crate::process_picker;
 use crate::process_picker::PICKER_RESULT_MSG;
 use crate::winutil::wide;
@@ -326,6 +327,7 @@ struct SettingsBrushes {
 
 #[allow(clippy::too_many_arguments)]
 fn draw_segment_button(
+    fonts: &FontProvider,
     hdc: HDC,
     rect: &RECT,
     label: &str,
@@ -355,11 +357,13 @@ fn draw_segment_button(
     }
     let mut t = inner;
     let tc = if active { SETTINGS_TEXT } else { SETTINGS_MUTED };
-    draw_string(hdc, label, &mut t, (10.0 * scale) as i32, tc, active, true);
+    draw_string(fonts, hdc, label, &mut t, (10.0 * scale) as i32, tc, active, true);
 }
 
 /// Draws an outline button (accent border, dark fill, accent label).
+#[allow(clippy::too_many_arguments)]
 fn draw_small_button(
+    fonts: &FontProvider,
     hdc: HDC,
     rect: &RECT,
     label: &str,
@@ -389,7 +393,7 @@ fn draw_small_button(
         );
     }
     let mut t = inner;
-    draw_string(hdc, label, &mut t, (10.0 * scale) as i32, accent, true, true);
+    draw_string(fonts, hdc, label, &mut t, (10.0 * scale) as i32, accent, true, true);
 }
 
 fn segment_rects(rect: &RECT, count: usize, gap: i32) -> Vec<RECT> {
@@ -499,6 +503,7 @@ struct MainWindowState {
     current: Option<CurrentActivity>,
     history: History,
     listbox_font: HFONT,
+    fonts: FontProvider,
     gray_brush: HBRUSH,
     accent_brush: HBRUSH,
     black_brush: HBRUSH,
@@ -667,6 +672,7 @@ impl MainWindowState {
             current: None,
             history: History::new(HISTORY_CAP),
             listbox_font: HFONT::default(),
+            fonts: FontProvider::new(96),
             gray_brush: HBRUSH::default(),
             accent_brush: HBRUSH::default(),
             black_brush: HBRUSH::default(),
@@ -733,6 +739,7 @@ impl MainWindowState {
         }
         let scale = dpi.max(96) as f32 / 96.0;
         self.listbox_font = Self::make_listbox_font(scale);
+        self.fonts = FontProvider::new(dpi);
         if !self.listbox.0.is_null() {
             unsafe {
                 let item_h = (18.0 * scale).round() as i32;
@@ -1259,6 +1266,7 @@ impl MainWindowState {
             }
             let mut text_rect = item_rect;
             draw_string(
+                &self.fonts,
                 hdc,
                 label,
                 &mut text_rect,
@@ -1294,6 +1302,7 @@ impl MainWindowState {
             bottom: pad + (HEADER_H * scale) as i32,
         };
         draw_string(
+            &self.fonts,
             hdc,
             "NOW PLAYING",
             &mut header_rect,
@@ -1368,6 +1377,7 @@ impl MainWindowState {
                 bottom: art_y + (18.0 * scale) as i32,
             };
             draw_string(
+                &self.fonts,
                 hdc,
                 state_label,
                 &mut state_rect,
@@ -1384,6 +1394,7 @@ impl MainWindowState {
                 bottom: art_y + (48.0 * scale) as i32,
             };
             draw_string(
+                &self.fonts,
                 hdc,
                 &current.track.title,
                 &mut title_rect,
@@ -1405,6 +1416,7 @@ impl MainWindowState {
                 bottom: art_y + (72.0 * scale) as i32,
             };
             draw_string(
+                &self.fonts,
                 hdc,
                 subtitle,
                 &mut artist_rect,
@@ -1422,6 +1434,7 @@ impl MainWindowState {
                     bottom: art_y + (86.0 * scale) as i32,
                 };
                 draw_string(
+                    &self.fonts,
                     hdc,
                     &current.track.album,
                     &mut album_rect,
@@ -1440,6 +1453,7 @@ impl MainWindowState {
                     bottom: art_y + (100.0 * scale) as i32,
                 };
                 draw_string(
+                    &self.fonts,
                     hdc,
                     &extra,
                     &mut extra_rect,
@@ -1457,6 +1471,7 @@ impl MainWindowState {
                     bottom: art_y + (114.0 * scale) as i32,
                 };
                 draw_string(
+                    &self.fonts,
                     hdc,
                     &current.track.source_app,
                     &mut app_rect,
@@ -1474,6 +1489,7 @@ impl MainWindowState {
                 bottom: art_y + art,
             };
             draw_string(
+                &self.fonts,
                 hdc,
                 "No media playing",
                 &mut empty_rect,
@@ -1502,6 +1518,7 @@ impl MainWindowState {
             bottom: sep_y + ((HIST_GAP + HIST_H) * scale) as i32,
         };
         draw_string(
+            &self.fonts,
             hdc,
             "SESSION HISTORY",
             &mut history_rect,
@@ -1520,6 +1537,7 @@ impl MainWindowState {
             bottom: pos_y + (16.0 * scale) as i32,
         };
         draw_string(
+            &self.fonts,
             hdc,
             &pos_label,
             &mut pos_rect,
@@ -1655,7 +1673,16 @@ impl MainWindowState {
             bottom: pad + (24.0 * scale) as i32,
         };
         if rects_intersect(invalid, &hdr) {
-            draw_string(hdc, "SETTINGS", &mut hdr, (13.0 * scale) as i32, accent, true, false);
+            draw_string(
+                &self.fonts,
+                hdc,
+                "SETTINGS",
+                &mut hdr,
+                (13.0 * scale) as i32,
+                accent,
+                true,
+                false,
+            );
         }
 
         let items = self.settings_items(content_left, client_w, pad, scale);
@@ -1676,7 +1703,16 @@ impl MainWindowState {
                 SettingsItem::Header { text, rect } => {
                     if rects_intersect(invalid, rect) {
                         let mut hr = *rect;
-                        draw_string(hdc, text, &mut hr, (9.0 * scale) as i32, SETTINGS_FAINT, true, false);
+                        draw_string(
+                            &self.fonts,
+                            hdc,
+                            text,
+                            &mut hr,
+                            (9.0 * scale) as i32,
+                            SETTINGS_FAINT,
+                            true,
+                            false,
+                        );
                     }
                 }
                 SettingsItem::Row { id, rect } => {
@@ -1756,6 +1792,7 @@ impl MainWindowState {
                     };
                     let mut lbl_rect = label_rect;
                     draw_string(
+                        &self.fonts,
                         hdc,
                         label,
                         &mut lbl_rect,
@@ -1772,6 +1809,7 @@ impl MainWindowState {
                         | SettingId::AllowedApps => {
                             let mut val_rect = control_rect;
                             draw_string(
+                                &self.fonts,
                                 hdc,
                                 &value_text,
                                 &mut val_rect,
@@ -1832,7 +1870,16 @@ impl MainWindowState {
                                 } else {
                                     format!("{}s", values[i] / 1000)
                                 };
-                                draw_string(hdc, &label, &mut t, (10.0 * scale) as i32, tc, active || near, true);
+                                draw_string(
+                                    &self.fonts,
+                                    hdc,
+                                    &label,
+                                    &mut t,
+                                    (10.0 * scale) as i32,
+                                    tc,
+                                    active || near,
+                                    true,
+                                );
                             }
                         }
                         SettingId::Position => {
@@ -1853,6 +1900,7 @@ impl MainWindowState {
                             // Value + Reset button row
                             let mut v = parts.value_row;
                             draw_string(
+                                &self.fonts,
                                 hdc,
                                 &value_text,
                                 &mut v,
@@ -1862,13 +1910,31 @@ impl MainWindowState {
                                 false,
                             );
                             let reset_hovered = settings_hover == Some((current_row, SettingSub::Reset));
-                            draw_small_button(hdc, &parts.reset, "Reset", accent, reset_hovered, scale, brushes);
+                            draw_small_button(
+                                &self.fonts,
+                                hdc,
+                                &parts.reset,
+                                "Reset",
+                                accent,
+                                reset_hovered,
+                                scale,
+                                brushes,
+                            );
 
                             // Anchor segments + Adjust button row
                             for (i, seg) in parts.anchors.iter().enumerate() {
                                 let active = active_anchor == Some(i);
                                 let seg_hovered = settings_hover == Some((current_row, SettingSub::Anchor(i)));
-                                draw_segment_button(hdc, seg, ANCHOR_LABELS[i], active, seg_hovered, scale, brushes);
+                                draw_segment_button(
+                                    &self.fonts,
+                                    hdc,
+                                    seg,
+                                    ANCHOR_LABELS[i],
+                                    active,
+                                    seg_hovered,
+                                    scale,
+                                    brushes,
+                                );
                             }
                             let adjust_hovered = settings_hover == Some((current_row, SettingSub::Adjust));
                             unsafe {
@@ -1883,7 +1949,16 @@ impl MainWindowState {
                                 );
                             }
                             let mut bt = parts.adjust;
-                            draw_string(hdc, "Adjust…", &mut bt, (10.0 * scale) as i32, accent, true, true);
+                            draw_string(
+                                &self.fonts,
+                                hdc,
+                                "Adjust…",
+                                &mut bt,
+                                (10.0 * scale) as i32,
+                                accent,
+                                true,
+                                true,
+                            );
                         }
                         SettingId::ShowSample => {
                             let btn_rect = RECT {
@@ -1894,6 +1969,7 @@ impl MainWindowState {
                             };
                             let hovered = self.settings_hover == Some((current_row, SettingSub::None));
                             draw_small_button(
+                                &self.fonts,
                                 hdc,
                                 &btn_rect,
                                 "Preview the notification",
@@ -1915,6 +1991,7 @@ impl MainWindowState {
                                 .logs_copied_at
                                 .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
                             draw_small_button(
+                                &self.fonts,
                                 hdc,
                                 &btn_rect,
                                 if copied { "Copied" } else { "Copy logs" },
@@ -2080,7 +2157,7 @@ impl MainWindowState {
                 right: x + w,
                 bottom: item.rcItem.bottom,
             };
-            draw_string(hdc, text, &mut rect, font, color, bold, false);
+            draw_string(&self.fonts, hdc, text, &mut rect, font, color, bold, false);
         };
 
         if index == 0 {

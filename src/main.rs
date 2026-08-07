@@ -3,6 +3,7 @@
 mod autostart;
 mod config;
 mod events;
+mod gdi;
 mod icon;
 mod logging;
 mod main_window;

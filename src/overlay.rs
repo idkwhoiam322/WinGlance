@@ -1,9 +1,10 @@
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo, artwork_same};
+use crate::gdi::FontProvider;
 use crate::palette::Palette;
 use crate::winutil::wide;
 use anyhow::{Context, Result};
-use log::{debug, error, warn};
+use log::{debug, error};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -16,13 +17,11 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::Graphics::Gdi::{
-    ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
-    CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DEVMODEW, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER,
-    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, ENUM_CURRENT_SETTINGS,
-    ETO_CLIPPED, EnumDisplaySettingsW, ExtTextOutW, FF_DONTCARE, GdiFlush, GetMonitorInfoW, GetTextMetricsW, HBITMAP,
-    HDC, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW,
-    MonitorFromWindow, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
-    ValidateRect,
+    BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DEVMODEW, DIB_RGB_COLORS,
+    DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
+    ENUM_CURRENT_SETTINGS, ETO_CLIPPED, EnumDisplaySettingsW, ExtTextOutW, GdiFlush, GetMonitorInfoW, HBITMAP, HDC,
+    HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
+    SelectObject, SetBkMode, SetTextColor, TRANSPARENT, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
@@ -337,27 +336,16 @@ struct OverlayState {
     /// refilled on each text-line draw so the render tick performs no per-frame
     /// heap allocation for text encoding.
     scratch_utf16: Vec<u16>,
-    /// Mutex-free font cache: HFONT handles keyed by (height, bold, quality),
-    /// paired with the font's `tmHeight` text metric (a pure function of the
-    /// same key, measured once so the render path never re-queries it per
-    /// text row per frame). Used by the render path instead of the global
-    /// `FONT_CACHE` so per-frame text rendering performs no cross-thread
-    /// synchronization. Fonts are created with `CreateFontW` directly and
-    /// deleted when the DPI changes or the window is destroyed.
-    font_cache: HashMap<FontKey, (HFONT, i32)>,
-    /// Last DPI value observed in render(), so the font cache can be flushed
-    /// when the window moves to another monitor or system scaling changes.
-    last_dpi: u32,
+    /// Per-window font cache (DPI-scoped). `FontProvider::font_for` returns a
+    /// cached Segoe UI HFONT for a pixel height and boldness, creating it once;
+    /// the cache is swapped for a fresh provider on DPI change, whose `Drop`
+    /// deletes the old HFONTs. Owned by the overlay state and touched only from
+    /// this thread, so its inner lock is uncontended.
+    fonts: FontProvider,
     /// Physical-pixel inset from the buffer edge to the pill body, computed
     /// each frame from `AURA_HALO_LOGICAL * dpi * shape`. The pill is
     /// drawn at `(aura_inset, aura_inset)` so the aura fills the outer ring.
     aura_inset: i32,
-}
-
-impl Drop for OverlayState {
-    fn drop(&mut self) {
-        self.flush_fonts();
-    }
 }
 
 /// Resolved placement for the WinGlance pill, pulled from [overlay] config. `x`/`y`
@@ -457,8 +445,7 @@ impl OverlayState {
             pill_text: None,
             text_scratch: None,
             scratch_utf16: Vec::new(),
-            font_cache: HashMap::new(),
-            last_dpi: 0,
+            fonts: FontProvider::new(0),
             aura_inset: 0,
         }
     }
@@ -491,68 +478,6 @@ impl OverlayState {
         self.decoded_art = decoded.and_then(|arc| pm_bgra_to_rgba(arc));
         self.decoded_art_source = decoded.cloned();
         self.palette = self.decoded_art.as_deref().and_then(crate::palette::palette_from_rgba);
-    }
-
-    /// Returns the Segoe UI (ANTIALIASED_QUALITY) HFONT for the given pixel
-    /// height and weight, creating it on first use and caching it locally on
-    /// the state, together with the font's `tmHeight` text metric (used for
-    /// vertical centering; measured once per key instead of on every text
-    /// row of every frame). Unlike the global `cached_font`, this never takes
-    /// a cross-thread Mutex, so it is safe to call on every render tick. The
-    /// cache is flushed on DPI change and window destruction (see
-    /// `flush_fonts`).
-    fn font_for(&mut self, height: i32, bold: bool) -> (HFONT, i32) {
-        let key = (height, bold, ANTIALIASED_QUALITY.0 as u32);
-        if let Some((font, tm_height)) = self.font_cache.get(&key) {
-            return (*font, *tm_height);
-        }
-        let font_name = wide("Segoe UI");
-        let font = unsafe {
-            CreateFontW(
-                -height.max(1),
-                0,
-                0,
-                0,
-                if bold { 600 } else { 400 },
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET.0 as u32,
-                OUT_DEFAULT_PRECIS.0 as u32,
-                CLIP_DEFAULT_PRECIS.0 as u32,
-                ANTIALIASED_QUALITY.0 as u32,
-                DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
-                PCWSTR(font_name.as_ptr()),
-            )
-        };
-        let mut tm_height = 0;
-        if !font.0.is_null() {
-            unsafe {
-                let hdc = CreateCompatibleDC(None);
-                if !hdc.0.is_null() {
-                    let old_font = SelectObject(hdc, font);
-                    let mut tm = TEXTMETRICW::default();
-                    if GetTextMetricsW(hdc, &mut tm).as_bool() {
-                        tm_height = tm.tmHeight;
-                    }
-                    SelectObject(hdc, old_font);
-                    let _ = DeleteDC(hdc);
-                }
-            }
-            self.font_cache.insert(key, (font, tm_height));
-        }
-        (font, tm_height)
-    }
-
-    /// Deletes all cached HFONT handles, releasing GDI resources. Called when
-    /// the DPI changes (fonts become invalid at the new scale) and on window
-    /// destruction.
-    fn flush_fonts(&mut self) {
-        for (_, (font, _)) in self.font_cache.drain() {
-            unsafe {
-                let _ = DeleteObject(font);
-            }
-        }
     }
 
     fn ensure_anim_timer(&mut self) {
@@ -1103,10 +1028,8 @@ impl OverlayState {
         };
         let (alpha, shape) = self.frame();
         let raw_dpi = unsafe { GetDpiForWindow(self.hwnd) };
-        if raw_dpi != 0 && raw_dpi != self.last_dpi {
-            self.last_dpi = raw_dpi;
-            self.flush_fonts();
-            flush_global_fonts();
+        if raw_dpi != 0 && raw_dpi != self.fonts.dpi() {
+            self.fonts = FontProvider::new(raw_dpi);
         }
         let dpi = raw_dpi.max(96) as f32 / 96.0;
         let (logical_width, logical_height) = content_size_of(&self.config, &content);
@@ -1704,7 +1627,7 @@ fn dib_for(state: &mut OverlayState, width: i32, height: i32) -> Result<(HDC, HB
         }
         state.dib = None;
     }
-    let (bound_w, bound_h) = backing_upper_bound(&state.config, state.last_dpi);
+    let (bound_w, bound_h) = backing_upper_bound(&state.config, state.fonts.dpi());
     let alloc_w = width.max(bound_w).max(1);
     let alloc_h = height.max(bound_h).max(1);
     let (hdc, bitmap, bits) = create_dc_with_dib(alloc_w, alloc_h)?;
@@ -2408,10 +2331,10 @@ fn draw_pill_text_rows(
     ];
     let text_color = appearance.text_color;
     let pad = appearance.padding;
-    let (font_title, h_title) = state.font_for(rows[0].1 as i32, true);
-    let (font_artist, h_artist) = state.font_for(rows[1].1 as i32, false);
-    let (font_meta, h_meta) = state.font_for(rows[2].1 as i32, false);
-    let (font_app, h_app) = state.font_for(rows[3].1 as i32, false);
+    let (font_title, h_title) = state.fonts.font_for(rows[0].1 as i32, true);
+    let (font_artist, h_artist) = state.fonts.font_for(rows[1].1 as i32, false);
+    let (font_meta, h_meta) = state.fonts.font_for(rows[2].1 as i32, false);
+    let (font_app, h_app) = state.fonts.font_for(rows[3].1 as i32, false);
     // Only rows that will actually be drawn take up vertical space: the rest
     // of the pill's constant height stays empty below the rows.
     let artist_active = !pill.artist.trim().is_empty();
@@ -2598,8 +2521,8 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                 let text_color = appearance.text_color;
                 let accent_color = appearance.accent_color;
                 let pad = appearance.padding;
-                let (font_title, h_title) = state.font_for(fs_title as i32, true);
-                let (font_artist, h_artist) = state.font_for((fs_artist * 0.85) as i32, false);
+                let (font_title, h_title) = state.fonts.font_for(fs_title as i32, true);
+                let (font_artist, h_artist) = state.fonts.font_for((fs_artist * 0.85) as i32, false);
                 let symbol_size = (fs_title * 1.5).min(fs_title * ROW_HEIGHT);
                 let label_w = (symbol_size + 16.0 * scale) as i32;
                 let mut y = inset as f32 + pad * scale;
@@ -3107,74 +3030,6 @@ fn text_scratch_for(
     Ok((hdc, bits, width, height))
 }
 
-/// Cache key: (font height, bold, GDI quality constant).
-type FontKey = (i32, bool, u32);
-
-/// Process-wide cache of created HFONTs, keyed by (height, bold, quality).
-/// Fonts are pure GDI objects with a tiny key set (a few sizes × 2 weights × 2
-/// qualities), so caching them for the process lifetime replaces thousands of
-/// CreateFontW/DeleteObject pairs per second with hash lookups. Handles are
-/// stored as `usize`: HFONT is a raw pointer and not Send, but GDI font
-/// handles are process-global and every use here is on the UI thread. The
-/// cache is drained (handles deleted) when the DPI changes — a font sized for
-/// one scale is stale at another — see `flush_global_fonts`.
-static FONT_CACHE: OnceLock<Mutex<HashMap<FontKey, usize>>> = OnceLock::new();
-
-/// Returns the cached Segoe UI font for (height, bold, quality), creating it
-/// on first use. The returned handle must not be retained: it stays valid
-/// until a DPI change flushes the cache.
-pub(crate) fn cached_font(height: i32, bold: bool, quality: u32) -> HFONT {
-    let cache = FONT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().unwrap_or_else(|poisoned| {
-        warn!("font cache lock was poisoned; recovering");
-        poisoned.into_inner()
-    });
-    if let Some(font) = guard.get(&(height, bold, quality)) {
-        return HFONT(*font as *mut std::ffi::c_void);
-    }
-    let font_name = wide("Segoe UI");
-    let font = unsafe {
-        CreateFontW(
-            -height.max(1),
-            0,
-            0,
-            0,
-            if bold { 600 } else { 400 },
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0 as u32,
-            OUT_DEFAULT_PRECIS.0 as u32,
-            CLIP_DEFAULT_PRECIS.0 as u32,
-            quality,
-            DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
-            PCWSTR(font_name.as_ptr()),
-        )
-    };
-    if !font.0.is_null() {
-        guard.insert((height, bold, quality), font.0 as usize);
-    }
-    font
-}
-
-/// Deletes every font in the process-wide cache. Called when the DPI changes,
-/// together with the per-window flush: fonts created for the old scale are
-/// stale GDI objects and must not outlive the scale they were sized for.
-fn flush_global_fonts() {
-    let Some(cache) = FONT_CACHE.get() else {
-        return;
-    };
-    let mut guard = cache.lock().unwrap_or_else(|poisoned| {
-        warn!("font cache lock was poisoned; recovering");
-        poisoned.into_inner()
-    });
-    for (_, raw) in guard.drain() {
-        unsafe {
-            let _ = DeleteObject(HFONT(raw as *mut std::ffi::c_void));
-        }
-    }
-}
-
 /// Source-over composite of a premultiplied source (rgb already multiplied by
 /// alpha) onto the premultiplied pill buffer.
 fn composite_pm(pixels: &mut [u8], width: usize, x: usize, y: usize, rgb: [u8; 3], alpha: u32) {
@@ -3188,41 +3043,6 @@ fn composite_pm(pixels: &mut [u8], width: usize, x: usize, y: usize, rgb: [u8; 3
     pixels[offset + 1] = (rgb[1] as u32 + pixels[offset + 1] as u32 * inv / 255) as u8;
     pixels[offset + 2] = (rgb[0] as u32 + pixels[offset + 2] as u32 * inv / 255) as u8;
     pixels[offset + 3] = (alpha + pixels[offset + 3] as u32 * inv / 255) as u8;
-}
-
-pub(crate) fn draw_string(
-    hdc: HDC,
-    value: &str,
-    rect: &mut RECT,
-    height: i32,
-    color: [u8; 4],
-    bold: bool,
-    centered: bool,
-) {
-    // Drawing an empty string is a crash: for an empty Vec<u16> the buffer
-    // pointer is the dangling sentinel 0x2, which DrawTextW dereferences.
-    if value.is_empty() {
-        return;
-    }
-    let mut text = value.encode_utf16().collect::<Vec<_>>();
-    // ClearType subpixel rendering is incorrect on layered windows; grayscale
-    // antialiasing keeps the pill text crisp.
-    let font = cached_font(height, bold, ANTIALIASED_QUALITY.0 as u32);
-    if font.0.is_null() {
-        return;
-    }
-    let old_font = unsafe { SelectObject(hdc, font) };
-    let color = COLORREF(color[0] as u32 | (color[1] as u32) << 8 | (color[2] as u32) << 16);
-    unsafe {
-        SetTextColor(hdc, color);
-        SetBkMode(hdc, TRANSPARENT);
-        let mut flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
-        if centered {
-            flags |= windows::Win32::Graphics::Gdi::DT_CENTER;
-        }
-        let _ = DrawTextW(hdc, &mut text, rect, flags);
-        SelectObject(hdc, old_font);
-    }
 }
 
 /// Converts the worker's premultiplied BGRA artwork (fixed `ARTWORK_DECODE`²)
@@ -3723,7 +3543,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                         let _ = DeleteDC(dib.hdc);
                     }
                 }
-                state.flush_fonts();
                 drop(Box::from_raw(state_ptr));
             }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -3758,6 +3577,10 @@ fn ease_out_back(value: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::events::ARTWORK_DECODE;
+    use windows::Win32::Graphics::Gdi::{
+        ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE,
+        OUT_DEFAULT_PRECIS,
+    };
 
     #[test]
     fn frame_scratch_is_cleared_when_it_grows() {
@@ -4528,7 +4351,7 @@ mod tests {
         };
         let config = Config::default();
         let mut state = OverlayState::new(config, EventQueue::default());
-        let (font, h) = state.font_for(12, false);
+        let (font, h) = state.fonts.font_for(12, false);
         draw_text_line_pixels(
             &mut state.text_scratch,
             &mut state.scratch_utf16,
@@ -4563,7 +4386,7 @@ mod tests {
         };
         let config = Config::default();
         let mut state = OverlayState::new(config, EventQueue::default());
-        let (font, h) = state.font_for(48, false);
+        let (font, h) = state.fonts.font_for(48, false);
         draw_text_line_pixels(
             &mut state.text_scratch,
             &mut state.scratch_utf16,
@@ -4613,7 +4436,7 @@ mod tests {
         let mut state = OverlayState::new(config, EventQueue::default());
         let mut scroll = LineScroll::default();
         let mut strip = None;
-        let (font, h) = state.font_for(12, false);
+        let (font, h) = state.fonts.font_for(12, false);
         draw_text_line_pixels(
             &mut state.text_scratch,
             &mut state.scratch_utf16,
@@ -4649,7 +4472,7 @@ mod tests {
         let mut state = OverlayState::new(config, EventQueue::default());
         let mut scroll = LineScroll::default();
         let mut strip = None;
-        let (font, h) = state.font_for(12, false);
+        let (font, h) = state.fonts.font_for(12, false);
         draw_text_line_pixels(
             &mut state.text_scratch,
             &mut state.scratch_utf16,
@@ -4694,7 +4517,7 @@ mod tests {
             ..LineScroll::default()
         };
         let mut strip = None;
-        let (font, h) = state.font_for(12, false);
+        let (font, h) = state.fonts.font_for(12, false);
         let value = "Feel It (Official Music Video)";
         draw_text_line_pixels(
             &mut state.text_scratch,
@@ -4759,7 +4582,7 @@ mod tests {
             ..LineScroll::default()
         };
         let mut strip = None;
-        let (font, h) = state.font_for(12, false);
+        let (font, h) = state.fonts.font_for(12, false);
         let first = "Feel It (Official Music Video)";
         let second = "A Different Song Name That Also Overflows";
         draw_text_line_pixels(
@@ -4868,7 +4691,7 @@ mod tests {
         };
         let config = Config::default();
         let mut state = OverlayState::new(config, EventQueue::default());
-        let (font, h) = state.font_for(12, false);
+        let (font, h) = state.fonts.font_for(12, false);
         draw_text_line_pixels(
             &mut state.text_scratch,
             &mut state.scratch_utf16,
