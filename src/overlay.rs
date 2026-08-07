@@ -1262,6 +1262,16 @@ impl OverlayState {
         self.dismiss_at = None;
         self.hover_dismiss_at = None;
         self.phase = Phase::Hidden;
+        // Release the per-show render state: the next show re-converts the
+        // artwork and rebuilds the marquee rasters from the cached track, so
+        // an idle pill holds no decoded cover or raster buffers. The
+        // size-reuse buffers (`dib`, `frame_scratch`) and the caches
+        // (`track_cache`, fonts) stay.
+        self.decoded_art = None;
+        self.decoded_art_source = None;
+        self.palette = None;
+        self.marquee_strips = [None, None, None, None];
+        self.pill_text = None;
         // Clear the last-shown source label so a subsequent PlaybackStateChanged
         // from the same source is no longer treated as redundant with a track
         // pill that has already collapsed. The label is re-set in show_next()
