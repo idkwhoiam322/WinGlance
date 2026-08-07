@@ -19,8 +19,8 @@ use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC,
     CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DEVMODEW, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER,
     DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, ENUM_CURRENT_SETTINGS,
-    ETO_CLIPPED, EnumDisplaySettingsW, ExtTextOutW, FF_DONTCARE, GetMonitorInfoW, GetTextMetricsW, HBITMAP, HBRUSH,
-    HDC, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW,
+    ETO_CLIPPED, EnumDisplaySettingsW, ExtTextOutW, FF_DONTCARE, GdiFlush, GetMonitorInfoW, GetTextMetricsW, HBITMAP,
+    HBRUSH, HDC, HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW,
     MonitorFromWindow, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
     ValidateRect,
 };
@@ -2749,6 +2749,12 @@ fn draw_text_line_pixels(
             let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
         }
         SelectObject(hdc, old_font);
+    }
+
+    // CreateDIBSection's documented contract: GDI must finish any drawing
+    // into the DIB before the application reads the bit values directly.
+    unsafe {
+        let _ = GdiFlush();
     }
 
     // Composite the glyph pixels. The scratch is white-on-black, so the RGB

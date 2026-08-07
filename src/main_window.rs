@@ -17,10 +17,11 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
-    BITMAPINFO, BITMAPINFOHEADER, BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
-    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteObject, EndPaint, FF_DONTCARE, FillRect, GetStockObject,
-    HBRUSH, HDC, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, SetBkColor, SetTextColor,
-    StretchDIBits,
+    AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BeginPaint, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FillRect, GetStockObject, HBITMAP,
+    HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SelectObject, SetBkColor,
+    SetTextColor,
 };
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -457,9 +458,13 @@ struct CurrentActivity {
     track: TrackInfo,
     state: PlaybackState,
     /// Decoded artwork: premultiplied BGRA at ART_DECODE×ART_DECODE, cached
-    /// so paint is a single StretchDIBits (no decode or conversion per paint).
+    /// so paint is a single AlphaBlend (no decode or conversion per paint).
     /// Filled lazily on the first paint that needs it.
     art: Option<Vec<u8>>,
+    /// Cached GDI source for AlphaBlend of the decoded artwork: a memory DC
+    /// with the premultiplied pixels in a DIB section, built once per decode
+    /// so repaints blend without per-paint DC/DIB allocation.
+    art_blit: Option<ArtBlit>,
     /// FNV-1a of the artwork bytes this cache was decoded from, so a metadata
     /// refresh with unchanged artwork does not re-decode.
     art_fingerprint: Option<u64>,
@@ -467,6 +472,26 @@ struct CurrentActivity {
     /// the artwork bytes change, so a corrupt cover is attempted once instead
     /// of on every repaint.
     art_decode_failed: bool,
+}
+
+/// Cached memory DC + DIB section holding the decoded premultiplied artwork
+/// pixels, used as the AlphaBlend source. Freed with the activity (track
+/// change) or at window destruction.
+struct ArtBlit {
+    mem: HDC,
+    hbm: HBITMAP,
+    old: HGDIOBJ,
+    base: i32,
+}
+
+impl Drop for ArtBlit {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SelectObject(self.mem, self.old);
+            let _ = DeleteObject(self.hbm);
+            let _ = DeleteDC(self.mem);
+        }
+    }
 }
 
 struct MainWindowState {
@@ -1042,6 +1067,7 @@ impl MainWindowState {
                 // the fingerprint and drop the cached bitmap when bytes changed.
                 if current.art_fingerprint != art_fingerprint {
                     current.art = None;
+                    free_art_blit(&mut current.art_blit);
                     current.art_fingerprint = art_fingerprint;
                     current.art_decode_failed = false;
                 }
@@ -1100,6 +1126,7 @@ impl MainWindowState {
             // (start_in_tray), so a track that never gets looked at pays no
             // decode cost.
             art: None,
+            art_blit: None,
             art_fingerprint,
             art_decode_failed: false,
         });
@@ -1241,12 +1268,26 @@ impl MainWindowState {
                 .as_deref()
                 .and_then(|data| decode_artwork_pm(data, ART_DECODE as usize));
             current.art_decode_failed = current.art.is_none();
+            if current.art.is_none() {
+                free_art_blit(&mut current.art_blit);
+            }
+        }
+        // Build the cached AlphaBlend source once per decode; repaints then
+        // blend without per-paint DC/DIB allocation.
+        if let Some(current) = &mut self.current
+            && current.art.is_some()
+            && current.art_blit.is_none()
+        {
+            current.art_blit = build_art_blit(current.art.as_deref().unwrap_or_default(), ART_DECODE as i32);
+            if current.art_blit.is_none() {
+                log_art_blit_failure();
+            }
         }
 
         if let Some(current) = &self.current {
-            // Artwork is cached after first paint; paint just blits it.
-            if let Some(art_pixels) = current.art.as_deref() {
-                draw_art_pm(hdc, art_pixels, ART_DECODE as i32, art, art_x, art_y);
+            // Artwork is cached after first paint; paint just blends it.
+            if let Some(blit) = &current.art_blit {
+                draw_art_blit(hdc, blit, art, art_x, art_y);
             } else {
                 let art_rect = RECT {
                     left: art_x,
@@ -2026,6 +2067,9 @@ impl MainWindowState {
 
     fn on_destroy(&mut self) {
         remove_tray_icon(self.hwnd);
+        if let Some(current) = &mut self.current {
+            free_art_blit(&mut current.art_blit);
+        }
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_TOOLTIPS_ID);
             if !self.tooltip_ctrl.0.is_null() {
@@ -2234,15 +2278,31 @@ fn history_row(track: &TrackInfo, at: DateTime<Local>, state: PlaybackState) -> 
     row
 }
 
-/// Last time a persistent StretchDIBits failure was logged, so a broken blit
+/// Last time a persistent artwork-blit failure was logged, so a broken blit
 /// cannot flood the log at repaint rate: one line per 30 s of continuous
 /// failure instead.
 static LAST_STRETCH_LOG: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// Blits the cached premultiplied BGRA artwork (decoded once at `base` size
-/// when the track changed) into the tile at `px` pixels — no per-paint
-/// decode or pixel conversion.
-fn draw_art_pm(hdc: HDC, pm: &[u8], base: i32, px: i32, x: i32, y: i32) {
+fn log_art_blit_failure() {
+    let mut last = LAST_STRETCH_LOG.lock().unwrap_or_else(|p| p.into_inner());
+    if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
+        *last = Some(Instant::now());
+        error!("artwork blit failed");
+    }
+}
+
+/// Builds the cached AlphaBlend source for the decoded premultiplied artwork:
+/// a memory DC with the pixels in a DIB section. Built once per decode (the
+/// pixels never change between repaints), so the paint path performs no
+/// per-paint GDI allocation. The buffer must be exactly `base² × 4` bytes.
+fn build_art_blit(pm: &[u8], base: i32) -> Option<ArtBlit> {
+    if base <= 0 || pm.len() != base as usize * base as usize * 4 {
+        return None;
+    }
+    let mem = unsafe { CreateCompatibleDC(None) };
+    if mem.0.is_null() {
+        return None;
+    }
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -2255,29 +2315,52 @@ fn draw_art_pm(hdc: HDC, pm: &[u8], base: i32, px: i32, x: i32, y: i32) {
         },
         ..Default::default()
     };
-    let drawn = unsafe {
-        StretchDIBits(
-            hdc,
-            x,
-            y,
-            px,
-            px,
-            0,
-            0,
-            base,
-            base,
-            Some(pm.as_ptr().cast()),
-            &info,
-            DIB_RGB_COLORS,
-            SRCCOPY,
-        )
-    };
-    if drawn == 0 {
-        let mut last = LAST_STRETCH_LOG.lock().unwrap_or_else(|p| p.into_inner());
-        if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
-            *last = Some(Instant::now());
-            error!("StretchDIBits failed while drawing artwork");
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    let hbm = unsafe { CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, None, 0) };
+    let Ok(hbm) = hbm else {
+        unsafe {
+            let _ = DeleteDC(mem);
         }
+        return None;
+    };
+    if bits.is_null() {
+        unsafe {
+            let _ = DeleteObject(hbm);
+            let _ = DeleteDC(mem);
+        }
+        return None;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(pm.as_ptr(), bits.cast::<u8>(), pm.len());
+        let old = SelectObject(mem, hbm);
+        Some(ArtBlit { mem, hbm, old, base })
+    }
+}
+
+/// Frees a cached art-blit source. The caller keeps it alive across repaints
+/// and drops it when the artwork changes or the window is destroyed.
+fn free_art_blit(blit: &mut Option<ArtBlit>) {
+    blit.take();
+}
+
+/// Blits the cached premultiplied artwork into the tile at `px` pixels.
+/// `AlphaBlend` with `AC_SRC_ALPHA` composites the premultiplied pixels
+/// source-over, so translucent artwork blends correctly over whatever is
+/// beneath the tile; a plain SRCCOPY copy would paste the premultiplied
+/// values verbatim, darkening translucent pixels.
+fn draw_art_blit(hdc: HDC, blit: &ArtBlit, px: i32, x: i32, y: i32) {
+    if px <= 0 {
+        return;
+    }
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    let drawn = unsafe { AlphaBlend(hdc, x, y, px, px, blit.mem, 0, 0, blit.base, blit.base, blend) };
+    if !drawn.as_bool() {
+        log_art_blit_failure();
     }
 }
 
@@ -3081,6 +3164,7 @@ mod tests {
             track,
             state,
             art: None,
+            art_blit: None,
             art_fingerprint: None,
             art_decode_failed: false,
         }
