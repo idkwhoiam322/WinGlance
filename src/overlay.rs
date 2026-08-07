@@ -1045,8 +1045,16 @@ impl OverlayState {
 
         // Advance marquee offsets (driven by this same tick, entirely
         // independent of the dismiss countdown). Time-based so the scroll
-        // speed is identical at any frame rate.
-        let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
+        // speed is identical at any frame rate. The DPI scale is queried
+        // only while a line is actually scrolling: a static pill repaints
+        // nothing, so its coarse tick must not pay for a per-tick DPI call.
+        let marquee_active = self.scroll.iter().any(|line| line.scrolling);
+        let scale = if marquee_active {
+            let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+            dpi.max(96) as f32 / 96.0
+        } else {
+            1.0
+        };
         let per_tick = MARQUEE_SPEED * scale * dt;
         for line in &mut self.scroll {
             if let Some(started) = line.started_at
@@ -1061,7 +1069,6 @@ impl OverlayState {
         // A fully-shown pill is static unless a marquee line is actually
         // overflowing: skip the render (and its UpdateLayeredWindow) entirely
         // when nothing changed. The animation phases still repaint every tick.
-        let marquee_active = self.scroll.iter().any(|line| line.scrolling);
         if animating || marquee_active {
             self.render();
         }
