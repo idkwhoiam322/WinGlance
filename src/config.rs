@@ -52,7 +52,7 @@ pub struct OverlayConfig {
     pub unknown: toml::Table,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VerticalPosition {
     #[default]
@@ -60,7 +60,7 @@ pub enum VerticalPosition {
     Bottom,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HorizontalPosition {
     #[default]

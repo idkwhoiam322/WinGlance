@@ -2665,47 +2665,77 @@ fn show_tray_menu(state: &mut MainWindowState) {
             let _ = DestroyMenu(menu);
             return;
         };
+        // Snapshot the position config (Copy types only) so the read guard
+        // is released before the TrackPopupMenu loop below, which calls
+        // mutate_config on selection.
+        let (current_vertical, current_horizontal, custom_pos) = {
+            let overlay = &state.cfg().overlay;
+            (
+                overlay.vertical,
+                overlay.horizontal,
+                overlay.position_x.zip(overlay.position_y),
+            )
+        };
+        let anchor_active = custom_pos.is_none();
+        let anchor_flags = |v: VerticalPosition, h: HorizontalPosition| {
+            if anchor_active && current_vertical == v && current_horizontal == h {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            }
+        };
         let _ = AppendMenuW(
             position_menu,
-            MF_STRING,
+            anchor_flags(VerticalPosition::Top, HorizontalPosition::Left),
             MENU_POSITION_TOP_LEFT,
             PCWSTR(wide("top-left").as_ptr()),
         );
         let _ = AppendMenuW(
             position_menu,
-            MF_STRING,
+            anchor_flags(VerticalPosition::Top, HorizontalPosition::Center),
             MENU_POSITION_TOP_CENTER,
             PCWSTR(wide("top-center").as_ptr()),
         );
         let _ = AppendMenuW(
             position_menu,
-            MF_STRING,
+            anchor_flags(VerticalPosition::Top, HorizontalPosition::Right),
             MENU_POSITION_TOP_RIGHT,
             PCWSTR(wide("top-right").as_ptr()),
         );
         let _ = AppendMenuW(
             position_menu,
-            MF_STRING,
+            anchor_flags(VerticalPosition::Bottom, HorizontalPosition::Left),
             MENU_POSITION_BOTTOM_LEFT,
             PCWSTR(wide("bottom-left").as_ptr()),
         );
         let _ = AppendMenuW(
             position_menu,
-            MF_STRING,
+            anchor_flags(VerticalPosition::Bottom, HorizontalPosition::Center),
             MENU_POSITION_BOTTOM_CENTER,
             PCWSTR(wide("bottom-center").as_ptr()),
         );
         let _ = AppendMenuW(
             position_menu,
-            MF_STRING,
+            anchor_flags(VerticalPosition::Bottom, HorizontalPosition::Right),
             MENU_POSITION_BOTTOM_RIGHT,
             PCWSTR(wide("bottom-right").as_ptr()),
         );
+        // "Adjust position…" doubles as the custom-position indicator: when a
+        // custom placement is active, it shows the coordinates and a checkmark
+        // so the user can see which kind of position is in effect from the tray
+        // menu alone. "Show sample" and "Reset position" are actions, never
+        // checked.
+        let (custom_label, custom_flags) = if let Some((px, py)) = custom_pos {
+            (format!("Custom ({}, {})", px, py), MF_STRING | MF_CHECKED)
+        } else {
+            ("Adjust position…".to_string(), MF_STRING)
+        };
+        let custom_wide = wide(&custom_label);
         let _ = AppendMenuW(
             position_menu,
-            MF_STRING,
+            custom_flags,
             MENU_POSITION_CUSTOM,
-            PCWSTR(wide("Adjust position…").as_ptr()),
+            PCWSTR(custom_wide.as_ptr()),
         );
         let _ = AppendMenuW(
             position_menu,
