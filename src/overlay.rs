@@ -1,6 +1,7 @@
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo, artwork_same};
 use crate::palette::Palette;
+use crate::winutil::wide;
 use anyhow::{Context, Result};
 use log::{debug, error, warn};
 use std::collections::{HashMap, VecDeque};
@@ -3751,10 +3752,6 @@ fn ease_out_back(value: f32) -> f32 {
     let c1 = 1.40;
     let c3 = c1 + 1.0;
     1.0 + c3 * (value - 1.0).powi(3) + c1 * (value - 1.0).powi(2)
-}
-
-pub(crate) fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(test)]

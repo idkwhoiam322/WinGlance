@@ -44,7 +44,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent};
-use crate::overlay::{EventQueue, wide};
+use crate::overlay::EventQueue;
+use crate::winutil::wide;
 
 static CRASH_LOG_PATH: OnceLock<Vec<u16>> = OnceLock::new();
 

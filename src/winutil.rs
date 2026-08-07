@@ -71,3 +71,10 @@ pub(crate) fn close_registered<T>(slot: &OnceLock<Mutex<T>>, extract: impl FnOnc
         }
     }
 }
+
+/// UTF-16-encodes `value` with a trailing NUL terminator suitable for the
+/// `PCWSTR` Win32 APIs. Single source of truth — used by `overlay`,
+/// `main_window`, `positioner`, `autostart`, `process_picker`, and `main`.
+pub(crate) fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}

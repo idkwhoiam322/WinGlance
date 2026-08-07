@@ -1,9 +1,10 @@
 use crate::autostart;
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo};
-use crate::overlay::{EventQueue, OverlayPos, draw_string, set_duration, set_position, show_sample, wide};
+use crate::overlay::{EventQueue, OverlayPos, draw_string, set_duration, set_position, show_sample};
 use crate::process_picker;
 use crate::process_picker::PICKER_RESULT_MSG;
+use crate::winutil::wide;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use log::{debug, error};

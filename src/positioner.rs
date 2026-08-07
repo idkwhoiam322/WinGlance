@@ -1,4 +1,5 @@
 use crate::events::POSITION_MSG;
+use crate::winutil::wide;
 use log::debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -417,8 +418,4 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
 }

@@ -1,3 +1,4 @@
+use crate::winutil::wide;
 use anyhow::{Context, Result};
 use log::warn;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, WIN32_ERROR};
@@ -160,8 +161,4 @@ fn owned_by(current_exe_name: &str, stored: &str) -> bool {
         .and_then(|n| n.to_str())
         .unwrap_or("");
     !name.is_empty() && name.eq_ignore_ascii_case(current_exe_name)
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
