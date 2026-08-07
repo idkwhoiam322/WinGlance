@@ -1372,14 +1372,32 @@ fn read_source_app(session: &GlobalSystemMediaTransportControlsSession) -> Strin
         .unwrap_or_else(|_| "Media".to_string())
 }
 
-/// Bounds an SMTC-provided metadata string. Sources are untrusted input from
-/// other applications; a pathological value must not be retained at arbitrary
-/// length in history rows, tooltips or the pill.
+/// Bounds and canonicalizes an SMTC-provided metadata string. Sources are
+/// untrusted input from other applications: a pathological value must not be
+/// retained at arbitrary length in history rows, tooltips or the pill, and
+/// cosmetic whitespace must not split one track into two.
+///
+/// Trailing/leading whitespace is trimmed because some sources report the
+/// same title inconsistently (Brave emits a YouTube title once clean and once
+/// padded with trailing spaces ~450 ms later). Every dedup and identity
+/// comparison downstream (`content_differ`, `is_session_recreation`,
+/// `cached_artwork_for`) compares byte-exact, so without trimming the padded
+/// variant escapes dedup and fires a duplicate pill. Whitespace never renders,
+/// so the trim is invisible; when it does bite, the normalization log line
+/// below makes it auditable.
 fn cap_meta(value: String) -> String {
-    if value.chars().count() > MAX_META_CHARS {
-        value.chars().take(MAX_META_CHARS).collect()
+    let trimmed = value.trim();
+    if trimmed.len() != value.len() {
+        debug!(
+            "metadata normalized | raw={value:?} ({} chars) | trimmed={trimmed:?} ({} chars)",
+            value.chars().count(),
+            trimmed.chars().count()
+        );
+    }
+    if trimmed.chars().count() > MAX_META_CHARS {
+        trimmed.chars().take(MAX_META_CHARS).collect()
     } else {
-        value
+        trimmed.to_string()
     }
 }
 
@@ -1721,6 +1739,38 @@ mod tests {
             ..TrackInfo::default()
         };
         assert!(content_differ(&prev, &album_only));
+    }
+
+    #[test]
+    fn cap_meta_trims_whitespace_and_caps_length() {
+        // The Brave case: same title reported once clean, once padded with
+        // trailing spaces. After normalization both must compare equal, so
+        // content_differ / is_session_recreation cannot split one track into
+        // two duplicate pills.
+        assert_eq!(cap_meta("  Song  ".into()), "Song");
+        assert_eq!(cap_meta("Song \u{2009}".into()), "Song");
+        assert_eq!(cap_meta("Song".into()), "Song");
+        assert_eq!(cap_meta("   ".into()), "");
+        // The length cap still applies after trimming.
+        let long = format!("{}{}", "x".repeat(300), "   ");
+        assert_eq!(cap_meta(long).chars().count(), MAX_META_CHARS);
+    }
+
+    #[test]
+    fn whitespace_padded_title_does_not_escape_dedup() {
+        // Regression: Brave reported "The Season 5 Premiere Is Worse Than
+        // Anyone Expected" and the same title with 14 trailing spaces ~450ms
+        // later; byte-exact comparison treated the padded variant as a new
+        // track and fired a duplicate pill. Every read passes through
+        // cap_meta at the boundary, so by the time content_differ and
+        // is_session_recreation compare, both variants are the same string:
+        let clean = cap_meta("The Season 5 Premiere Is Worse Than Anyone Expected".into());
+        let padded = cap_meta("The Season 5 Premiere Is Worse Than Anyone Expected              ".into());
+        assert_eq!(clean, padded);
+        let prev = track(&clean, "Artist");
+        let merged = track(&padded, "Artist");
+        assert!(!content_differ(&state(&clean, "Artist"), &merged));
+        assert!(is_session_recreation(&prev, &merged, true));
     }
 
     #[test]
