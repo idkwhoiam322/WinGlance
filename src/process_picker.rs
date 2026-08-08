@@ -927,10 +927,14 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     let btn = close_btn_rect(&client, scale);
                     let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, Some(&btn), false);
                 };
-                // Change cursor
-                let cursor = unsafe { LoadCursorW(None, windows::Win32::UI::WindowsAndMessaging::IDC_HAND).unwrap() };
-                unsafe {
-                    SetCursor(cursor);
+                // Change cursor; a failed load (broken system resources) just
+                // keeps the current cursor instead of panicking the picker.
+                if let Ok(cursor) = unsafe { LoadCursorW(None, windows::Win32::UI::WindowsAndMessaging::IDC_HAND) } {
+                    unsafe {
+                        SetCursor(cursor);
+                    }
+                } else {
+                    warn!("LoadCursorW(IDC_HAND) failed; keeping the default cursor");
                 }
             }
             DefWindowProcW(hwnd, message, wparam, lparam)

@@ -3,7 +3,7 @@ use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{HINSTANCE, HWND};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HBRUSH, HGDIOBJ};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, IDC_ARROW, LoadCursorW, RegisterClassExW, WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC,
+    DestroyWindow, HCURSOR, IDC_ARROW, LoadCursorW, RegisterClassExW, WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC,
 };
 use windows::core::PCWSTR;
 
@@ -25,7 +25,15 @@ pub(crate) fn register_class_once(
     if guard.get().is_some() {
         return Ok(());
     }
-    let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap();
+    // A null class cursor falls back to the default arrow, so a failed load
+    // must never panic window registration.
+    let cursor = match unsafe { LoadCursorW(None, IDC_ARROW) } {
+        Ok(cursor) => cursor,
+        Err(error) => {
+            warn!("LoadCursorW(IDC_ARROW) failed: {error}; the class will use the default cursor");
+            HCURSOR::default()
+        }
+    };
     let background = background();
     let class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
