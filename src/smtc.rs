@@ -60,6 +60,11 @@ struct LogicalState {
     /// by `ARTWORK_RETRY_BUDGET` so a session that never provides a thumbnail is
     /// not re-read indefinitely (the 2s poll interval keeps this cheap).
     artwork_attempts: u8,
+    /// When this session's state was last refreshed by a successful read
+    /// (event-driven or poll). The periodic poll skips sessions whose read is
+    /// newer than `SESSION_CHECK_INTERVAL` — their state was just re-read by
+    /// the event that woke the worker, so a second read is pure WinRT churn.
+    last_read_at: Option<Instant>,
 }
 
 /// Rolling window, threshold and cool-down for the per-source session-churn
@@ -88,6 +93,12 @@ const ARTWORK_CHANGE_MIN_INTERVAL: Duration = Duration::from_secs(3);
 /// this many times (~6s at the 2s poll interval) before giving up. Once a
 /// thumbnail is present, `has_artwork` is true and no further retries run.
 const ARTWORK_RETRY_BUDGET: u8 = 3;
+
+/// How often the safety net re-syncs sessions and re-reads subscribed
+/// sessions (metadata only). Also the freshness window for the poll skip: a
+/// session read within this interval by an event-driven refresh is not
+/// re-read by the poll.
+const SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Capacity of the signal channel between the WinRT event handlers and the
 /// listener loop. `try_send` drops a signal when the queue is full; that is
@@ -316,7 +327,6 @@ impl ListenerState {
     }
 
     fn event_loop(&mut self, signal_rx: Receiver<Signal>) -> Result<()> {
-        let session_check_interval = Duration::from_secs(2);
         loop {
             // Set by main at exit: leave promptly (within the receive
             // timeout) so run_initialized's cleanup unsubscribes every
@@ -352,8 +362,8 @@ impl ListenerState {
                 // Wake at least every 2 s when nothing is pending, so the
                 // heartbeat stays fresh and the periodic safety-net poll below
                 // keeps its documented cadence.
-                .unwrap_or(session_check_interval)
-                .min(session_check_interval);
+                .unwrap_or(SESSION_CHECK_INTERVAL)
+                .min(SESSION_CHECK_INTERVAL);
 
             match signal_rx.recv_timeout(timeout) {
                 Ok(signal) => self.handle_signal(signal)?,
@@ -363,7 +373,7 @@ impl ListenerState {
                     // without a SessionsChanged event) and re-read every
                     // subscribed session (metadata only, no artwork) so a
                     // missed event still surfaces.
-                    if self.last_session_check.elapsed() >= session_check_interval {
+                    if self.last_session_check.elapsed() >= SESSION_CHECK_INTERVAL {
                         self.last_session_check = Instant::now();
                         self.sync_subscriptions();
                         self.poll_sessions();
@@ -377,7 +387,7 @@ impl ListenerState {
             if self.pending_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                 self.flush();
             }
-            if self.last_session_check.elapsed() >= session_check_interval {
+            if self.last_session_check.elapsed() >= SESSION_CHECK_INTERVAL {
                 self.last_session_check = Instant::now();
                 self.sync_subscriptions();
                 self.poll_sessions();
@@ -703,6 +713,10 @@ impl ListenerState {
                     next.track_number = merged.track_number;
                     next.track_count = merged.track_count;
                     next.genre = merged.genre;
+                    // Marked fresh for the poll skip only on a successful
+                    // read: a failed read must not suppress the poll, which
+                    // is the safety net for exactly that case.
+                    next.last_read_at = Some(Instant::now());
                 }
                 Err(error) => {
                     if is_session_gone(&error) {
@@ -737,6 +751,8 @@ impl ListenerState {
             return Ok(());
         }
 
+        // The revalidation check above runs after the read, so a session
+        // that went stale mid-read never gets stored or emitted.
         self.states.insert(key, next);
         for event in events {
             self.emit(event);
@@ -961,9 +977,14 @@ impl ListenerState {
 
     /// Re-reads every subscribed session (metadata only, no artwork) and diffs
     /// it against the stored state. The 2-second safety net; also used for the
-    /// startup read so the pill reports what is already playing. For sessions
-    /// still missing artwork, the poll also re-reads the thumbnail (up to the
-    /// retry budget) so a slow-to-populate stream still surfaces a cover.
+    /// startup read so the pill reports what is already playing. A session
+    /// whose last successful read is newer than the poll interval (an
+    /// event-driven refresh just re-read it) is skipped — re-reading it again
+    /// would be pure WinRT churn, and a session that goes quiet ages past the
+    /// window and gets polled as before, so the safety net is unchanged. For
+    /// sessions still missing artwork, the poll also re-reads the thumbnail
+    /// (up to the retry budget) so a slow-to-populate stream still surfaces a
+    /// cover.
     fn poll_sessions(&mut self) {
         let keys: Vec<usize> = self.subscriptions.keys().copied().collect();
         for key in keys {
@@ -971,7 +992,17 @@ impl ListenerState {
             // refresh (which can mutate subscriptions via eviction).
             let session = self.subscriptions.get(&key).map(|s| s.session.clone());
             if let Some(session) = session {
-                let _ = self.refresh_session(&session, false);
+                let fresh = self.states.get(&key).is_some_and(|state| {
+                    state
+                        .last_read_at
+                        .is_some_and(|at| at.elapsed() < SESSION_CHECK_INTERVAL)
+                });
+                if !fresh {
+                    let _ = self.refresh_session(&session, false);
+                }
+                // Independent of the skip: the retry only touches the
+                // thumbnail stream, never the metadata the freshness check
+                // guards.
                 if should_poll_artwork(self.states.get(&key))
                     && let Err(error) = self.retry_artwork(&session)
                 {
