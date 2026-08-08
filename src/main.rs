@@ -391,7 +391,7 @@ fn main() -> Result<()> {
                 if supervisor_shutdown.load(Ordering::SeqCst) {
                     break;
                 }
-                if consecutive_restarts >= MAX_WORKER_RESTARTS {
+                if worker_budget_exhausted(consecutive_restarts) {
                     let reason = format!(
                         "SMTC worker failed {MAX_WORKER_RESTARTS} times in a row; restart WinGlance to restore media notifications"
                     );
@@ -424,8 +424,14 @@ fn main() -> Result<()> {
                         .run();
                     });
                 let Ok(worker) = worker else {
-                    warn!("could not start the SMTC worker; retrying in 5s");
-                    sleep_interruptible(Duration::from_secs(5), &supervisor_shutdown);
+                    // A failed spawn consumes the same restart budget as a
+                    // stall or an exit, with the same backoff: a persistently
+                    // un-creatable worker reaches the cap and emits the
+                    // one-shot WorkerFailed instead of retrying forever.
+                    consecutive_restarts += 1;
+                    let delay = worker_restart_delay(consecutive_restarts);
+                    warn!("could not start the SMTC worker; retrying in {}s", delay.as_secs());
+                    sleep_interruptible(delay, &supervisor_shutdown);
                     continue;
                 };
                 let mut stalled = false;
@@ -553,6 +559,15 @@ fn worker_restart_delay(consecutive: u32) -> Duration {
     } else {
         Duration::from_secs(5)
     }
+}
+
+/// Whether the supervisor must give up permanently. Every failure kind —
+/// spawn, exit, and stall — increments the same `consecutive_restarts`
+/// counter, so the budget is exhausted at the same point no matter how the
+/// worker failed; the loop-top check then emits the one-shot WorkerFailed
+/// and stops restarting.
+fn worker_budget_exhausted(consecutive_restarts: u32) -> bool {
+    consecutive_restarts >= MAX_WORKER_RESTARTS
 }
 
 /// Drains SMTC events into each window's queue and wakes both windows.
@@ -715,6 +730,23 @@ fn message_loop() -> Result<()> {
 mod tests {
     use super::*;
     use crate::events::{PlaybackState, media_event_into_owned};
+
+    #[test]
+    fn worker_restart_budget_is_shared_by_every_failure_kind() {
+        // Spawn, exit, and stall failures all increment the one supervisor
+        // counter, so the same cap decision applies to each: below the cap
+        // the supervisor keeps retrying with the shared backoff, and at the
+        // cap the loop emits WorkerFailed and stops.
+        for count in 0..MAX_WORKER_RESTARTS {
+            assert!(!worker_budget_exhausted(count), "failure {count} must still retry");
+        }
+        assert!(worker_budget_exhausted(MAX_WORKER_RESTARTS), "the cap is terminal");
+        assert!(worker_budget_exhausted(MAX_WORKER_RESTARTS + 1));
+        // The backoff is monotone: accumulating failures stretch the retry
+        // delay up to the slow 60 s plateau.
+        assert!(worker_restart_delay(1) < worker_restart_delay(3));
+        assert_eq!(worker_restart_delay(3), worker_restart_delay(4));
+    }
 
     #[test]
     fn window_queue_is_bounded_with_newest_wins() {
