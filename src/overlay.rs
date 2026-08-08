@@ -328,9 +328,11 @@ struct OverlayState {
     /// Per-source track cache: the last TrackChanged shown for each source app,
     /// so that a later PlaybackStateChanged for that source can render the
     /// correct track info instead of the most-recently-shown app's track.
-    /// LRU-ordered and time-bounded (see `TRACK_CACHE_CAP`/`TRACK_CACHE_TTL`),
-    /// so a source that stops playing eventually drops out instead of holding
-    /// its artwork bytes forever. The `Instant` is the last insert time.
+    /// Entries hold the pill text and decoded cover (raw artwork stripped at
+    /// insert — see `cache_track`). LRU-ordered and time-bounded (see
+    /// `TRACK_CACHE_CAP`/`TRACK_CACHE_TTL`), so a source that stops playing
+    /// eventually drops out instead of holding its cover forever. The
+    /// `Instant` is the last insert time.
     track_cache: HashMap<String, (TrackInfo, Instant)>,
     /// Recency order of `track_cache` keys (front = oldest). Kept in sync by
     /// `cache_track`.
@@ -732,7 +734,13 @@ impl OverlayState {
         let now = Instant::now();
         // Insert first so the sweep below sees the fresh entry: a brand-new
         // source must never look like an expired cache miss.
-        self.track_cache.insert(source, (track.clone(), now));
+        let mut cached = track.clone();
+        // The cache only ever serves pill text and the decoded cover; nothing
+        // reads the raw artwork bytes from it. Stripping them keeps the raw
+        // cover (typically 50-500 KB) from being retained per source after
+        // that source stops playing.
+        cached.artwork = None;
+        self.track_cache.insert(source, (cached, now));
         // Lazy sweep: expire idle entries first, then enforce the cap. Only
         // runs here (on insert), so an expired entry is still readable by a
         // pill that arrives before the next insert — the timeout never
