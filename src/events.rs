@@ -132,6 +132,50 @@ impl TrackInfo {
                 }
             }
     }
+
+    /// Merges a later metadata refresh of the same media item into this
+    /// entry: every displayed field is updated when the incoming snapshot
+    /// carries a value, so a late refresh cannot silently drop fields the
+    /// SMTC worker emits (duration, genre, subtitle, album artist, track
+    /// position, app icon). Artwork and its decode are the exception: SMTC
+    /// reads them only on some passes, so a "no art this pass" refresh must
+    /// not clobber the already-queued cover. The worker's own merge inherits
+    /// stored values when a read is empty, so "incoming wins when present"
+    /// never regresses a field that is already displayed.
+    pub fn merge_late_metadata(&mut self, incoming: &TrackInfo) {
+        if !incoming.album.trim().is_empty() {
+            self.album = incoming.album.clone();
+        }
+        if !incoming.album_artist.trim().is_empty() {
+            self.album_artist = incoming.album_artist.clone();
+        }
+        if !incoming.subtitle.trim().is_empty() {
+            self.subtitle = incoming.subtitle.clone();
+        }
+        if incoming.artwork.is_some() {
+            self.artwork = incoming.artwork.clone();
+        }
+        if incoming.decoded_art.is_some() {
+            self.decoded_art = incoming.decoded_art.clone();
+        }
+        if incoming.app_icon.is_some() {
+            self.app_icon = incoming.app_icon.clone();
+        }
+        if let Some(duration) = incoming.duration_secs {
+            self.duration_secs = Some(duration);
+        }
+        if let Some(number) = incoming.track_number {
+            self.track_number = Some(number);
+        }
+        if let Some(count) = incoming.track_count {
+            self.track_count = Some(count);
+        }
+        if let Some(genre) = &incoming.genre
+            && !genre.trim().is_empty()
+        {
+            self.genre = Some(genre.clone());
+        }
+    }
 }
 
 /// Recovers the owned event from a queue's transport `Arc`: zero-copy when

@@ -771,12 +771,12 @@ impl OverlayState {
                         && queued.source_app == incoming.source_app
                     {
                         if queued.same_media(incoming) {
-                            if !incoming.album.trim().is_empty() {
-                                queued.album = incoming.album.clone();
-                            }
-                            if incoming.artwork.is_some() {
-                                queued.artwork = incoming.artwork.clone();
-                            }
+                            // Late metadata for the same song merges into the
+                            // queued pill instead of queueing a duplicate —
+                            // and merges *every* displayed field, not just
+                            // album/artwork (a refresh can carry a later
+                            // duration, genre, subtitle, or icon).
+                            queued.merge_late_metadata(incoming);
                         } else {
                             *queued = incoming.clone();
                         }
@@ -4009,13 +4009,60 @@ mod tests {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.enqueue(MediaEvent::TrackChanged(track_for("youtube-music", "Song", "Artist")));
         let mut refreshed = track_for("youtube-music", "Song", "Artist");
+        refreshed.album = "Album".into();
+        refreshed.album_artist = "Album Artist".into();
+        refreshed.subtitle = "Episode 7".into();
+        refreshed.duration_secs = Some(214);
+        refreshed.track_number = Some(3);
+        refreshed.track_count = Some(12);
+        refreshed.genre = Some("Synthwave".into());
         refreshed.artwork = Some(Arc::new([1u8, 2, 3]));
+        refreshed.decoded_art = Some(Arc::new([4u8, 5, 6, 7]));
+        refreshed.app_icon = Some(Arc::new([8u8, 9, 10, 11]));
         state.enqueue(MediaEvent::TrackChanged(refreshed));
         assert_eq!(state.pending.len(), 1, "a same-media refresh must merge, not queue");
-        assert!(matches!(
-            state.pending.front(),
-            Some(MediaEvent::TrackChanged(t)) if t.artwork.is_some()
-        ));
+        let queued = match state.pending.front() {
+            Some(MediaEvent::TrackChanged(track)) => track,
+            other => panic!("expected a queued track, got {other:?}"),
+        };
+        // Every displayed field the refresh carried lands on the queued pill,
+        // not just album/artwork.
+        assert_eq!(queued.album, "Album");
+        assert_eq!(queued.album_artist, "Album Artist");
+        assert_eq!(queued.subtitle, "Episode 7");
+        assert_eq!(queued.duration_secs, Some(214));
+        assert_eq!(queued.track_number, Some(3));
+        assert_eq!(queued.track_count, Some(12));
+        assert_eq!(queued.genre.as_deref(), Some("Synthwave"));
+        assert!(queued.artwork.is_some());
+        assert!(queued.decoded_art.is_some());
+        assert!(queued.app_icon.is_some());
+    }
+
+    #[test]
+    fn enqueue_merge_keeps_the_queued_cover_on_a_no_art_refresh() {
+        // SMTC reads artwork only on some passes: a refresh without art must
+        // not clobber the already-queued cover (raw bytes, its decode, and
+        // the cached app icon all survive).
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        let mut first = track_for("youtube-music", "Song", "Artist");
+        first.artwork = Some(Arc::new([1u8, 2, 3]));
+        first.decoded_art = Some(Arc::new([4u8, 5, 6, 7]));
+        first.app_icon = Some(Arc::new([8u8, 9, 10, 11]));
+        state.enqueue(MediaEvent::TrackChanged(first));
+        let mut no_art = track_for("youtube-music", "Song", "Artist");
+        no_art.duration_secs = Some(180);
+        state.enqueue(MediaEvent::TrackChanged(no_art));
+        let queued = match state.pending.front() {
+            Some(MediaEvent::TrackChanged(track)) => track,
+            other => panic!("expected a queued track, got {other:?}"),
+        };
+        // The duration still merges...
+        assert_eq!(queued.duration_secs, Some(180));
+        // ...but the cover and icon survive the art-less refresh.
+        assert!(queued.artwork.is_some());
+        assert!(queued.decoded_art.is_some());
+        assert!(queued.app_icon.is_some());
     }
 
     #[test]
