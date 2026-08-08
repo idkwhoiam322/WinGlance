@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
@@ -118,7 +118,7 @@ fn set_active_session_sources(sources: Vec<String>) {
 struct ListenerState {
     manager: GlobalSystemMediaTransportControlsSessionManager,
     config: Arc<RwLock<Config>>,
-    output: Sender<MediaEvent>,
+    output: SyncSender<MediaEvent>,
     signal_tx: SyncSender<Signal>,
     /// Every open session's event subscriptions, keyed by session pointer.
     subscriptions: HashMap<usize, SessionSubscription>,
@@ -193,7 +193,7 @@ struct ListenerState {
 }
 
 pub struct SmtcListener {
-    output: Sender<MediaEvent>,
+    output: SyncSender<MediaEvent>,
     config: Arc<RwLock<Config>>,
     /// Updated by the event loop every few seconds so a supervisor can detect
     /// a stalled worker (a WinRT call hanging under session churn) and
@@ -211,7 +211,7 @@ pub struct SmtcListener {
 impl SmtcListener {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        output: Sender<MediaEvent>,
+        output: SyncSender<MediaEvent>,
         config: Arc<RwLock<Config>>,
         heartbeat: Arc<Mutex<Instant>>,
         live_generation: Arc<AtomicU64>,
@@ -273,7 +273,7 @@ impl ListenerState {
     fn new(
         manager: GlobalSystemMediaTransportControlsSessionManager,
         config: Arc<RwLock<Config>>,
-        output: Sender<MediaEvent>,
+        output: SyncSender<MediaEvent>,
         signal_tx: SyncSender<Signal>,
         heartbeat: Arc<Mutex<Instant>>,
         live_generation: Arc<AtomicU64>,
@@ -1114,10 +1114,22 @@ impl ListenerState {
 
     /// Emits an event only while this worker generation is still current. A
     /// worker that stalled and was replaced must not keep producing events
-    /// after its successor took over.
+    /// after its successor took over. The channel is bounded and never
+    /// blocks the worker: when the forwarder cannot keep up, the event is
+    /// dropped at the source with a log line instead of growing the buffer
+    /// or stalling SMTC callbacks.
     fn emit(&self, event: MediaEvent) {
-        if self.is_current_generation() && self.output.send(event).is_err() {
-            debug!("signal dropped | kind=MediaEvent | reason=closed");
+        if !self.is_current_generation() {
+            return;
+        }
+        match self.output.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                warn!("SMTC event dropped: the event channel is full (UI is not keeping up)");
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                debug!("signal dropped | kind=MediaEvent | reason=closed");
+            }
         }
     }
 

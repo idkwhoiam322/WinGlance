@@ -1042,14 +1042,10 @@ impl MainWindowState {
             self.sync_tooltips();
         }
         // Events that arrived while we were draining need a wake-up: re-arm
-        // and post only if no wake message is already in flight.
-        let more = self.queue.lock().map(|q| !q.is_empty()).unwrap_or(false);
-        if more
-            && !self.wake.swap(true, Ordering::SeqCst)
-            && unsafe { PostMessageW(self.hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
-        {
-            self.wake.store(false, Ordering::SeqCst);
-        }
+        // and post only if no wake message is already in flight. A failed
+        // post drops the pending batch (and accounts for it) instead of
+        // stranding events without a wake.
+        crate::repost_if_pending(&self.queue, &self.wake, self.hwnd, "main window");
     }
 
     /// Appends a history row and syncs the listbox + tooltips. Artwork, the

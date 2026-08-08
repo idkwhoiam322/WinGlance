@@ -341,7 +341,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let (event_tx, event_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CHANNEL_CAP);
     let shared_config: std::sync::Arc<std::sync::RwLock<Config>> =
         std::sync::Arc::new(std::sync::RwLock::new(config.clone()));
     let listener_config = shared_config.clone();
@@ -501,6 +501,21 @@ fn main() -> Result<()> {
 /// 90 seconds forever.
 const MAX_WORKER_RESTARTS: u32 = 5;
 
+/// Cap of the SMTC worker → forwarder event channel. The forwarder drains it
+/// every 200ms, so in practice it never fills; the cap only matters when the
+/// forwarder is wedged, and then it sheds new events at the source (with a
+/// log) instead of growing without bound. Kept larger than the window-queue
+/// cap so the window queues, not this channel, do the realistic overload
+/// shedding with newest-wins semantics.
+const EVENT_CHANNEL_CAP: usize = 1024;
+
+/// Cap of each window's pending event queue (main window and overlay). The
+/// forwarder pushes into these on every SMTC event; a window that is slow to
+/// drain (long paint, message loop stall) must not accumulate events forever.
+/// When the cap is exceeded the oldest buffered event is dropped in favor of
+/// the newest, so the window eventually shows the latest media state.
+const EVENT_QUEUE_CAP: usize = 256;
+
 /// Sleeps in 200ms slices, returning early once `shutdown` is set, so the
 /// supervisor can be joined promptly on exit.
 fn sleep_interruptible(duration: Duration, shutdown: &AtomicBool) {
@@ -576,11 +591,40 @@ fn spawn_event_forwarder(
         .expect("event forwarder thread should start")
 }
 
+/// Applies the window-queue cap after a push: when the queue holds more than
+/// `EVENT_QUEUE_CAP` events, the oldest is dropped in favor of the newest.
+fn enforce_queue_cap(queue: &mut VecDeque<MediaEvent>, name: &str) {
+    if queue.len() > EVENT_QUEUE_CAP {
+        warn!("the {name} event queue exceeded its cap of {EVENT_QUEUE_CAP}; dropping the oldest buffered event");
+        queue.pop_front();
+    }
+}
+
+/// Clears a window's pending-event queue and its wake flag, logging how many
+/// events were dropped. Used when the window cannot be poked (a failed
+/// post): leaving the queue populated without a wake message in flight
+/// would strand those events until some unrelated future event reposts.
+fn clear_and_account(queue: &EventQueue, wake: &AtomicBool, name: &str) {
+    wake.store(false, Ordering::SeqCst);
+    let dropped = queue
+        .lock()
+        .map(|mut q| {
+            let count = q.len();
+            q.clear();
+            count
+        })
+        .unwrap_or(0);
+    if dropped > 0 {
+        warn!("dropped {dropped} queued events for the {name} after a failed wake-up post");
+    }
+}
+
 /// Pushes one event into a window's queue and posts `MEDIA_EVENT_MSG` only
 /// when no wake message is already in flight (`wake` was clear). On a failed
-/// post the flag is cleared and the event removed, so the next push retries
-/// instead of waiting on a message that never arrived. On a poisoned queue
-/// the event is dropped and the wake flag is left untouched.
+/// post the whole pending queue is dropped and the flag cleared: the window
+/// cannot be poked, so nothing may stay queued without a wake message or a
+/// retry. On a poisoned queue the event is dropped and the wake flag is left
+/// untouched.
 fn push_and_wake(queue: &EventQueue, wake: &AtomicBool, event: MediaEvent, hwnd: HWND, name: &str) {
     // A poisoned queue is unusable, so the event cannot be delivered. Do not
     // arm the wake flag: the window would drain nothing and the flag would
@@ -590,12 +634,26 @@ fn push_and_wake(queue: &EventQueue, wake: &AtomicBool, event: MediaEvent, hwnd:
         return;
     };
     q.push_back(event);
+    enforce_queue_cap(&mut q, name);
     if !wake.swap(true, Ordering::SeqCst)
         && unsafe { PostMessageW(hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
     {
-        warn!("posting the media event to the {name} failed; dropping its queue copy");
-        wake.store(false, Ordering::SeqCst);
-        q.pop_back();
+        drop(q);
+        clear_and_account(queue, wake, name);
+    }
+}
+
+/// Re-arms the wake flag and posts `MEDIA_EVENT_MSG` when events arrived
+/// during a drain. On a failed post the pending events are dropped and
+/// accounted for (see `clear_and_account`), so a window can never hold
+/// events without a wake message in flight or a retry pending.
+pub(crate) fn repost_if_pending(queue: &EventQueue, wake: &AtomicBool, hwnd: HWND, name: &str) {
+    let more = queue.lock().map(|q| !q.is_empty()).unwrap_or(false);
+    if more
+        && !wake.swap(true, Ordering::SeqCst)
+        && unsafe { PostMessageW(hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
+    {
+        clear_and_account(queue, wake, name);
     }
 }
 
@@ -615,4 +673,119 @@ fn message_loop() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::PlaybackState;
+
+    #[test]
+    fn window_queue_is_bounded_with_newest_wins() {
+        // Push far more events than the cap: the queue must stay capped and
+        // the newest event must survive, with the oldest evicted first.
+        let mut queue = VecDeque::new();
+        for i in 0..(EVENT_QUEUE_CAP + 50) {
+            queue.push_back(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Paused,
+                format!("src-{i}"),
+            ));
+            enforce_queue_cap(&mut queue, "test");
+        }
+        assert_eq!(queue.len(), EVENT_QUEUE_CAP);
+        match queue.front() {
+            Some(MediaEvent::PlaybackStateChanged(_, source)) => {
+                assert_eq!(source, "src-50", "the oldest surviving event must be the 51st pushed");
+            }
+            _ => panic!("expected a PlaybackStateChanged at the front"),
+        }
+        match queue.back() {
+            Some(MediaEvent::PlaybackStateChanged(_, source)) => {
+                assert_eq!(
+                    source,
+                    &format!("src-{}", EVENT_QUEUE_CAP + 49),
+                    "the newest event must be kept"
+                );
+            }
+            _ => panic!("expected a PlaybackStateChanged at the back"),
+        }
+    }
+
+    #[test]
+    fn window_queue_under_cap_keeps_every_event() {
+        let mut queue = VecDeque::new();
+        for i in 0..EVENT_QUEUE_CAP {
+            queue.push_back(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Playing,
+                format!("src-{i}"),
+            ));
+            enforce_queue_cap(&mut queue, "test");
+        }
+        assert_eq!(queue.len(), EVENT_QUEUE_CAP);
+        match queue.front() {
+            Some(MediaEvent::PlaybackStateChanged(_, source)) => assert_eq!(source, "src-0"),
+            _ => panic!("expected the first event at the front"),
+        }
+    }
+
+    #[test]
+    fn post_failure_drops_the_pending_queue_and_clears_wake() {
+        // PostMessageW to an invalid (non-null) window handle always fails,
+        // injecting the failure the transport must survive: after each failed
+        // post nothing may remain queued without a wake message in flight.
+        // (A null handle would not do: PostMessageW treats it as "post to
+        // the calling thread" and succeeds; so does the -1 sentinel, which
+        // is why the bogus handle is isize::MAX, not usize::MAX.)
+        let bogus_hwnd = HWND(isize::MAX as *mut c_void);
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let wake = Arc::new(AtomicBool::new(false));
+        push_and_wake(
+            &queue,
+            &wake,
+            MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "src-1".into()),
+            bogus_hwnd,
+            "test",
+        );
+        push_and_wake(
+            &queue,
+            &wake,
+            MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "src-2".into()),
+            bogus_hwnd,
+            "test",
+        );
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "a failed post must not leave events stranded"
+        );
+        assert!(
+            !wake.load(Ordering::SeqCst),
+            "a failed post must leave the wake flag clear"
+        );
+    }
+
+    #[test]
+    fn repost_failure_clears_events_that_arrived_during_a_drain() {
+        // The drain-side repost path: events that arrived while the window
+        // was draining must not stay queued when the wake-up post fails.
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let wake = Arc::new(AtomicBool::new(false));
+        {
+            let mut q = queue.lock().unwrap();
+            for i in 0..3 {
+                q.push_back(MediaEvent::PlaybackStateChanged(
+                    PlaybackState::Playing,
+                    format!("src-{i}"),
+                ));
+            }
+        }
+        repost_if_pending(&queue, &wake, HWND(isize::MAX as *mut c_void), "test");
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "a failed repost must not strand pending events"
+        );
+        assert!(
+            !wake.load(Ordering::SeqCst),
+            "a failed repost must leave the wake flag clear"
+        );
+    }
 }
