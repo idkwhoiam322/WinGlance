@@ -1,5 +1,5 @@
 use crate::events::POSITION_MSG;
-use crate::winutil::wide;
+use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
 use log::debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -13,10 +13,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetCursorPos, GetWindowLongPtrW,
-    GetWindowRect, HWND_TOPMOST, PostMessageW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect, HWND_TOPMOST,
+    PostMessageW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos,
+    ShowWindow, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
@@ -270,13 +270,13 @@ fn hit_close_button(hwnd: HWND, cx: i32, cy: i32) -> bool {
 
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PositionerState };
+    let state_ptr = window_state::<PositionerState>(hwnd);
     match message {
         WM_NCCREATE => {
             let create = lparam.0 as *const CREATESTRUCTW;
             if !create.is_null() {
                 let state = (*create).lpCreateParams as *mut PositionerState;
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+                set_window_state(hwnd, state);
                 POSITIONER_STATE_CLAIMED.store(true, Ordering::SeqCst);
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
@@ -413,7 +413,7 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
             {
                 *guard = (0, 0);
             }
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            clear_window_state(hwnd);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),

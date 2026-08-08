@@ -4,7 +4,7 @@ use crate::events::{
 };
 use crate::gdi::FontProvider;
 use crate::palette::Palette;
-use crate::winutil::wide;
+use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
 use anyhow::{Context, Result};
 use log::{debug, error};
 use std::collections::{HashMap, VecDeque};
@@ -29,12 +29,11 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetCursorPos, GetForegroundWindow,
-    GetWindowLongPtrW, HTTRANSPARENT, HWND_TOPMOST, IsWindowVisible, KillTimer, MA_NOACTIVATE, MSG, PM_REMOVE,
-    PeekMessageW, PostMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    ULW_ALPHA, WM_APP, WM_DESTROY, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GetCursorPos, GetForegroundWindow, HTTRANSPARENT, HWND_TOPMOST,
+    IsWindowVisible, KillTimer, MA_NOACTIVATE, MSG, PM_REMOVE, PeekMessageW, PostMessageW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer,
+    SetWindowPos, ShowWindow, ULW_ALPHA, WM_APP, WM_DESTROY, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
+    WM_PAINT, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -386,7 +385,7 @@ pub(crate) fn set_position(hwnd: HWND, pos: OverlayPos) {
         return;
     }
     unsafe {
-        let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverlayState;
+        let state_ptr = window_state::<OverlayState>(hwnd);
         if state_ptr.is_null() {
             return;
         }
@@ -407,7 +406,7 @@ pub(crate) fn set_duration(hwnd: HWND, duration_ms: u64) {
         return;
     }
     unsafe {
-        let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverlayState;
+        let state_ptr = window_state::<OverlayState>(hwnd);
         if state_ptr.is_null() {
             return;
         }
@@ -1338,7 +1337,7 @@ pub(crate) fn show_sample(hwnd: HWND) {
         return;
     }
     unsafe {
-        let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverlayState;
+        let state_ptr = window_state::<OverlayState>(hwnd);
         if !state_ptr.is_null() {
             (*state_ptr).show_sample();
         }
@@ -3478,14 +3477,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         if !create.is_null() {
             let state = (*create).lpCreateParams as *mut OverlayState;
             if !state.is_null() {
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+                set_window_state(hwnd, state);
                 (*state).hwnd = hwnd;
                 OVERLAY_STATE_CLAIMED.store(true, Ordering::SeqCst);
             }
         }
     }
 
-    let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverlayState;
+    let state_ptr = window_state::<OverlayState>(hwnd);
     match message {
         WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
@@ -3553,7 +3552,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 }
                 drop(Box::from_raw(state_ptr));
             }
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            clear_window_state(hwnd);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),

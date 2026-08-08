@@ -3,7 +3,8 @@ use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{HINSTANCE, HWND};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HBRUSH, HGDIOBJ};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, HCURSOR, IDC_ARROW, LoadCursorW, RegisterClassExW, WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC,
+    DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HCURSOR, IDC_ARROW, LoadCursorW, RegisterClassExW,
+    SetWindowLongPtrW, WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC,
 };
 use windows::core::PCWSTR;
 
@@ -54,6 +55,28 @@ pub(crate) fn register_class_once(
     }
     let _ = guard.set(());
     Ok(())
+}
+
+/// Stores a window's per-instance state pointer in its GWLP_USERDATA slot.
+/// The pointer is a leaked box owned by the window, freed in WM_NCDESTROY.
+pub(crate) fn set_window_state<T>(hwnd: HWND, state: *mut T) {
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+    }
+}
+
+/// Clears a window's GWLP_USERDATA slot after WM_NCDESTROY freed the state
+/// box, so a stale pointer is never read from a reused window handle.
+pub(crate) fn clear_window_state(hwnd: HWND) {
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    }
+}
+
+/// Reads a window's per-instance state pointer from GWLP_USERDATA. Returns
+/// null when the slot is empty or was cleared.
+pub(crate) fn window_state<T>(hwnd: HWND) -> *mut T {
+    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut T }
 }
 
 /// Closes a window whose handle is registered in a `OnceLock<Mutex<T>>`

@@ -7,7 +7,7 @@ use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{EventQueue, OverlayPos, set_duration, set_position, show_sample};
 use crate::process_picker;
 use crate::process_picker::PICKER_RESULT_MSG;
-use crate::winutil::wide;
+use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use log::{debug, error, warn};
@@ -41,16 +41,15 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetWindowLongPtrW, HICON, HMENU, HWND_TOP, IDI_APPLICATION,
-    IsWindowVisible, KillTimer, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT,
-    LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT,
-    LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage,
-    RegisterWindowMessageW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX,
-    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
-    WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    GetClientRect, GetCursorPos, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindowVisible, KillTimer, LB_ADDSTRING,
+    LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT,
+    LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos,
+    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE,
+    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER,
+    WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -2969,14 +2968,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         if !create.is_null() {
             let state = (*create).lpCreateParams as *mut MainWindowState;
             if !state.is_null() {
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+                set_window_state(hwnd, state);
                 (*state).hwnd = hwnd;
                 MAIN_STATE_CLAIMED.store(true, Ordering::SeqCst);
             }
         }
     }
 
-    let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut MainWindowState;
+    let state_ptr = window_state::<MainWindowState>(hwnd);
     match message {
         WM_CREATE => {
             if !state_ptr.is_null() {
@@ -3324,7 +3323,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             LRESULT(0)
         }
         WM_NCDESTROY => {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            clear_window_state(hwnd);
             if !state_ptr.is_null() {
                 drop(Box::from_raw(state_ptr));
             }

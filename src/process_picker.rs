@@ -1,4 +1,4 @@
-use crate::winutil::wide;
+use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
 use log::warn;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,14 +21,14 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWLP_USERDATA,
-    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic,
-    IsWindowVisible, LB_ADDSTRING, LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT, LB_GETTOPINDEX, LB_SETCURSEL,
-    LB_SETITEMDATA, LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW,
-    PostMessageW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WS_BORDER, WS_CHILD,
-    WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GetClientRect, GetParent,
+    GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, LB_ADDSTRING,
+    LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT, LB_GETTOPINDEX, LB_SETCURSEL, LB_SETITEMDATA, LB_SETITEMHEIGHT,
+    LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, PostMessageW, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
@@ -546,7 +546,7 @@ fn read_checked(hwnd: HWND, lb: HWND) -> Vec<String> {
     if count.0 <= 0 {
         return Vec::new();
     }
-    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+    let state_ptr = window_state::<PickerState>(hwnd);
     if state_ptr.is_null() {
         return Vec::new();
     }
@@ -564,7 +564,7 @@ fn read_checked(hwnd: HWND, lb: HWND) -> Vec<String> {
 }
 
 fn post_result(hwnd: HWND, cancelled: bool) {
-    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+    let state_ptr = window_state::<PickerState>(hwnd);
     if state_ptr.is_null() {
         return;
     }
@@ -621,7 +621,7 @@ unsafe extern "system" fn listbox_proc(
             unsafe { DefSubclassProc(lb, message, wparam, lparam) }
         }
         WM_LBUTTONDOWN => {
-            let state_ptr = unsafe { GetWindowLongPtrW(parent, GWLP_USERDATA) as *mut PickerState };
+            let state_ptr = window_state::<PickerState>(parent);
             if !state_ptr.is_null() {
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                 // The row height is DPI-scaled like the listbox item height,
@@ -706,7 +706,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             let create = lparam.0 as *const CREATESTRUCTW;
             if !create.is_null() {
                 let state = (*create).lpCreateParams as *mut PickerState;
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+                set_window_state(hwnd, state);
                 PICKER_STATE_CLAIMED.store(true, Ordering::SeqCst);
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
@@ -716,7 +716,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
 
-            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+            let state_ptr = window_state::<PickerState>(hwnd);
             let scale = if state_ptr.is_null() {
                 unsafe { GetDpiForWindow(hwnd).max(96) as f32 / 96.0 }
             } else {
@@ -845,7 +845,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 return DefWindowProcW(hwnd, message, wparam, lparam);
             }
             let draw = unsafe { &*draw_ptr };
-            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+            let state_ptr = window_state::<PickerState>(hwnd);
             if state_ptr.is_null() || draw.itemID as usize >= unsafe { (*state_ptr).list.len() } {
                 return DefWindowProcW(hwnd, message, wparam, lparam);
             }
@@ -912,7 +912,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_MOUSEMOVE => {
             let x = (lparam.0 & 0xFFFF) as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+            let state_ptr = window_state::<PickerState>(hwnd);
             if state_ptr.is_null() {
                 return DefWindowProcW(hwnd, message, wparam, lparam);
             }
@@ -987,7 +987,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             // its fixed chrome GDI objects. Every close path
             // (Escape/Enter/click-outside) goes through DestroyWindow; without
             // this the state leaked on each open.
-            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickerState };
+            let state_ptr = window_state::<PickerState>(hwnd);
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 let _ = unsafe { DeleteObject(state.header_font) };
@@ -999,7 +999,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 let _ = unsafe { DeleteObject(state.row_selected_brush) };
                 drop(Box::from_raw(state_ptr));
             }
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            clear_window_state(hwnd);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
