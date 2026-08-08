@@ -1156,13 +1156,14 @@ impl MainWindowState {
 
     fn add_track(&mut self, track: TrackInfo) {
         let art_fingerprint = track.artwork.as_deref().map(fingerprint);
-        // Metadata refresh for the same song (album/artwork arriving late): update
-        // the current activity and the last history row in place instead of
-        // appending a duplicate entry. The source must match too — two apps
-        // playing the same title+artist are different media.
-        let is_update = self.current.as_ref().is_some_and(|c| {
-            c.track.source_app == track.source_app && c.track.title == track.title && c.track.artist == track.artist
-        });
+        // Metadata refresh for the same song (album/artwork arriving late):
+        // update the current activity and the last history row in place
+        // instead of appending a duplicate entry. Identity is the shared
+        // `same_media` rule the overlay uses: a genuinely different cover for
+        // the same title+artist (video vs audio version) is *new* media, so
+        // it gets a fresh history row instead of silently overwriting the
+        // previous song's row.
+        let is_update = self.current.as_ref().is_some_and(|c| c.track.same_media(&track));
 
         if is_update {
             if let Some(current) = &mut self.current {
