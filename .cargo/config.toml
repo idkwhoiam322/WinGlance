@@ -1,0 +1,6 @@
+# Statically link the MSVC C runtime so the release exe has no dependency on
+# the separately-installed VC++ redistributable (VCRUNTIME140.dll). The UCRT
+# api-set imports that remain are OS-provided on Windows 10+. This file is
+# committed so local builds and CI produce the same self-contained artifact.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
