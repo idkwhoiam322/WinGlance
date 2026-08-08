@@ -185,6 +185,11 @@ struct ListenerState {
     /// Cached app icons keyed by source_app label (derived from AUMID via
     /// `source_app_label`). Populated on first encounter of a source.
     icon_cache: HashMap<String, Option<Arc<[u8]>>>,
+    /// Last-seen `allowed_sources` config list plus its pre-normalized
+    /// patterns. The per-session check runs on the hot path (every re-sync
+    /// of every session), so the clone of the config list and the per-pattern
+    /// normalization only re-run when the config actually changed.
+    cached_allowed: Option<(Vec<String>, Vec<String>)>,
     /// When the last TrackChanged was emitted per source, used to time-gate
     /// the artwork-changed re-emit: SMTC re-reads the thumbnail within ~1s
     /// of a change and may return different bytes for the same cover, which
@@ -299,6 +304,7 @@ impl ListenerState {
             last_track_per_source: HashMap::new(),
             last_known_playback_per_source: HashMap::new(),
             icon_cache: HashMap::new(),
+            cached_allowed: None,
             last_emit_at: HashMap::new(),
             heartbeat,
             live_generation,
@@ -974,7 +980,7 @@ impl ListenerState {
     /// an entry (case-insensitive substring against the AUMID and its derived
     /// label, after normalizing word-boundary characters) are allowed;
     /// everything else is excluded.
-    fn session_source_allowed(&self, session: &GlobalSystemMediaTransportControlsSession) -> bool {
+    fn session_source_allowed(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> bool {
         let aumid = session
             .SourceAppUserModelId()
             .map(|value| value.to_string())
@@ -983,22 +989,32 @@ impl ListenerState {
         if self.source_on_cooldown(&label) {
             return false;
         }
-        let allowed = self
-            .config
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .behavior
-            .allowed_sources
-            .clone();
-        if allowed.is_empty() {
+        // The allowed_sources list only changes through the settings UI, so
+        // compare the live config against the cached copy (element-wise, no
+        // clone) and only re-normalize when it actually differs.
+        {
+            let cfg = self.config.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let raw = &cfg.behavior.allowed_sources;
+            let stale = self
+                .cached_allowed
+                .as_ref()
+                .is_none_or(|(cached_raw, _)| cached_raw != raw);
+            if stale {
+                self.cached_allowed = Some((
+                    raw.clone(),
+                    raw.iter().map(|pattern| normalize_for_match(pattern)).collect(),
+                ));
+            }
+        }
+        let Some((_, normalized)) = &self.cached_allowed else {
+            return true;
+        };
+        if normalized.is_empty() {
             return true;
         }
         let naumid = normalize_for_match(&aumid);
         let nlabel = normalize_for_match(&label);
-        allowed.iter().any(|pattern| {
-            let np = normalize_for_match(pattern);
-            naumid.contains(&np) || nlabel.contains(&np)
-        })
+        normalized.iter().any(|np| naumid.contains(np) || nlabel.contains(np))
     }
 
     /// True while a source app is on the churn cool-down.

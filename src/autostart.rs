@@ -1,6 +1,7 @@
 use crate::winutil::wide;
 use anyhow::{Context, Result};
 use log::warn;
+use std::path::Path;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, WIN32_ERROR};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyW, RegDeleteValueW, RegQueryValueExW,
@@ -39,9 +40,10 @@ pub fn apply(enabled: bool) -> Result<()> {
     // space could fail to launch at logon or resolve to a different program.
     let target = format!("\"{}\"", exe.to_string_lossy());
     let target_wide = wide(&target);
-    // Ownership is keyed on the executable file name, not the full command
-    // line: a stale entry pointing at a WinGlance.exe that has since moved
-    // still identifies as ours.
+    // Ownership is keyed on the full executable path, with a file-name
+    // fallback: a stale entry pointing at a WinGlance.exe that has since
+    // moved still identifies as ours.
+    let exe_path = exe.clone();
     let exe_name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let value = wide(VALUE_NAME);
     let run_key = wide(RUN_KEY);
@@ -57,7 +59,7 @@ pub fn apply(enabled: bool) -> Result<()> {
         // is accepted and the check at least refuses to clobber anything we
         // could not positively identify as ours.
         let error = match read_run_value(key, &value) {
-            RunValue::Ours(current) if owned_by(exe_name, &current) => {
+            RunValue::Ours(current) if owned_by(&exe_path, exe_name, &current) => {
                 if enabled {
                     if current == target {
                         // Already in the desired state.
@@ -136,12 +138,16 @@ fn read_run_value(key: HKEY, name: &[u16]) -> RunValue {
     }
 }
 
-/// Whether a stored Run value belongs to this installation. The command's
-/// executable file name (case-insensitive) decides, not the whole command
-/// line: an entry left behind by a WinGlance.exe that has since moved or
-/// gained arguments is still recognized as ours. A value naming a different
-/// executable stays foreign and is never touched.
-fn owned_by(current_exe_name: &str, stored: &str) -> bool {
+/// Whether a stored Run value belongs to this installation. The full
+/// executable path decides first (case-insensitive, as Path equality is on
+/// Windows): an entry naming this exact installation is ours no matter what
+/// its file name is. When the stored absolute path is a *different* live
+/// executable, the entry is foreign and never touched — a foreign app that
+/// merely shares the file name must not be clobbered. The executable file
+/// name only decides (case-insensitive) for relative commands and for
+/// absolute paths that no longer exist: an entry left behind by a
+/// WinGlance.exe that has since moved is still recognized as ours.
+fn owned_by(current_exe: &Path, current_exe_name: &str, stored: &str) -> bool {
     let stored = stored.trim();
     let token = if let Some(rest) = stored.strip_prefix('"') {
         // Quoted command: take up to the closing quote, so a path with
@@ -156,9 +162,128 @@ fn owned_by(current_exe_name: &str, stored: &str) -> bool {
     if token.is_empty() {
         return false;
     }
-    let name = std::path::Path::new(token)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let stored_path = Path::new(token);
+    if stored_path.is_absolute() {
+        if stored_path == current_exe {
+            return true;
+        }
+        // A live executable at a different path is a different program, even
+        // with the same file name. Only a stored path that no longer exists
+        // can be a stale entry of this installation.
+        if std::fs::metadata(stored_path).is_ok() {
+            return false;
+        }
+    }
+    let name = stored_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    // Documented trade-off of the basename fallback: a *deleted* foreign
+    // program whose entry survives in the Run key with the same file name
+    // would be treated as owned. The Run value is only ever rewritten or
+    // removed when the user toggles WinGlance autostart, so the blast radius
+    // is a single stale foreign entry, accepted in exchange for cleaning up
+    // entries left by a WinGlance.exe that has since moved. Stronger
+    // ownership would need an installation marker in the command line.
     !name.is_empty() && name.eq_ignore_ascii_case(current_exe_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A temporary directory that is removed after the test, so the
+    /// existence checks exercise the real filesystem deterministically.
+    struct TempDir {
+        dir: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("winglance-test-autostart-{}-{stamp}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        /// A path inside the temp dir; the file only exists when `create` is
+        /// set, so both the live-foreign and the moved-stale cases are
+        /// controllable.
+        fn file(&self, name: &str, create: bool) -> std::path::PathBuf {
+            let path = self.dir.join(name);
+            if create {
+                std::fs::write(&path, b"not an exe").unwrap();
+            }
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn exe() -> &'static Path {
+        Path::new(r"C:\Program Files\WinGlance\WinGlance.exe")
+    }
+
+    #[test]
+    fn exact_full_path_is_owned_with_any_arguments() {
+        assert!(owned_by(
+            exe(),
+            "WinGlance.exe",
+            r#""C:\Program Files\WinGlance\WinGlance.exe""#
+        ));
+        assert!(owned_by(
+            exe(),
+            "WinGlance.exe",
+            r#""C:\Program Files\WinGlance\WinGlance.exe" --minimized"#
+        ));
+    }
+
+    #[test]
+    fn full_path_wins_over_a_different_file_name() {
+        // The full path is identical even though the file name differs
+        // (case-insensitive Path equality on Windows).
+        assert!(owned_by(
+            exe(),
+            "WinGlance.exe",
+            r#""C:\PROGRAM FILES\WINGLANCE\WINGLANCE.EXE""#
+        ));
+    }
+
+    #[test]
+    fn live_same_name_file_at_a_different_path_stays_foreign() {
+        // A different installation with the same exe name exists: never ours.
+        let guard = TempDir::new();
+        let foreign = guard.file("WinGlance.exe", true);
+        let stored = format!("\"{}\"", foreign.to_string_lossy());
+        assert!(!owned_by(exe(), "WinGlance.exe", &stored));
+    }
+
+    #[test]
+    fn moved_exe_is_still_ours_via_the_file_name_fallback() {
+        // Stale entry from before the exe moved: the stored absolute path no
+        // longer exists, so the file name decides.
+        let guard = TempDir::new();
+        let stale = guard.file("old/WinGlance.exe", false);
+        let stored = format!("\"{}\" --minimized", stale.to_string_lossy());
+        assert!(owned_by(exe(), "WinGlance.exe", &stored));
+    }
+
+    #[test]
+    fn a_foreign_executable_is_never_owned() {
+        assert!(!owned_by(
+            exe(),
+            "WinGlance.exe",
+            r#""C:\Program Files\Other\other.exe" --x"#
+        ));
+        assert!(!owned_by(exe(), "WinGlance.exe", "notepad.exe"));
+        assert!(!owned_by(exe(), "WinGlance.exe", ""));
+    }
+
+    #[test]
+    fn relative_command_uses_the_file_name() {
+        assert!(owned_by(exe(), "WinGlance.exe", "WinGlance.exe --silent"));
+        assert!(!owned_by(exe(), "WinGlance.exe", "winthing.exe --x"));
+    }
 }
