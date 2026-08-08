@@ -1,5 +1,6 @@
 use log::warn;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::Duration;
 use windows::Win32::Graphics::Gdi::{
@@ -14,11 +15,34 @@ use windows::core::{Interface, PCWSTR};
 /// (`SHCreateItemFromParsingName` + `IShellItemImageFactory::GetImage`) can
 /// block indefinitely on a broken shell extension; running them inline on the
 /// SMTC worker would stall the whole listener until the supervisor's watchdog
-/// restarts it. Extraction runs on a short-lived helper thread instead and is
-/// abandoned past this budget (in the pathological hang case one helper thread
-/// lingers until the shell call returns — bounded and rare), so the worker
-/// never blocks on the shell.
+/// restarts it. Extraction runs on a single persistent worker thread and a
+/// call is abandoned past this budget. A call that *exceeds* the budget trips
+/// the circuit breaker (see `ICON_WORKER_TRIPPED`): the worker is presumed
+/// stuck in a hung shell call, and every later request would only pile into
+/// the queue and time out, so submissions stop until the app restarts.
 const ICON_EXTRACT_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Circuit breaker: once a job's budget expires, the worker may be occupied
+/// by a hung shell call indefinitely. Every later request would wait the full
+/// timeout and then fail, so the breaker stops further submissions (the SMTC
+/// worker keeps processing media events; icons simply stay missing for the
+/// session). Reset only by restarting the app.
+static ICON_WORKER_TRIPPED: AtomicBool = AtomicBool::new(false);
+
+/// Cap of the icon worker's job queue. Requests beyond it are dropped with a
+/// log line (the caller shows the pill without an icon); the SMTC worker
+/// never blocks on a full icon queue.
+const ICON_QUEUE_CAP: usize = 16;
+
+/// One icon-extraction request. The caller waits on `reply` for the result
+/// (up to `ICON_EXTRACT_TIMEOUT`); when the worker is stuck in a hung shell
+/// call, the caller's timeout drops the receiver and the worker's later
+/// send is a harmless no-op.
+struct IconJob {
+    aumid: String,
+    size: usize,
+    reply: mpsc::Sender<Option<Vec<u8>>>,
+}
 
 fn hbitmap_to_bgra_premul(hdc: HDC, bitmap: HBITMAP, size: usize) -> Option<Vec<u8>> {
     let total_bytes = size * size * 4;
@@ -109,36 +133,106 @@ fn extract_from_aumid(aumid: &str, size: usize) -> Option<Vec<u8>> {
     try_parsing_name(&apps_path, size)
 }
 
-pub(crate) fn extract_app_icon(aumid: &str, target_size: usize) -> Option<Vec<u8>> {
-    let size = target_size.clamp(8, 256);
-    let aumid_owned = aumid.to_string();
-    let (tx, rx) = mpsc::channel();
-    if thread::Builder::new()
-        .name("WinGlance-icon".to_string())
-        .spawn(move || {
-            // The shell functions need an apartment on this thread; failure
-            // leaves the calls unable to create shell objects, which simply
-            // yields no icon.
-            let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-            let result = if let Some(pixels) = extract_from_aumid(&aumid_owned, size) {
+/// The single icon worker's job sender, started lazily on first use. All
+/// extraction in the process funnels through this one thread. A failed
+/// spawn caches `None` so it is only attempted (and logged) once.
+fn icon_sender() -> Option<mpsc::SyncSender<IconJob>> {
+    static SENDER: OnceLock<Option<mpsc::SyncSender<IconJob>>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            let (job_tx, job_rx) = mpsc::sync_channel::<IconJob>(ICON_QUEUE_CAP);
+            match thread::Builder::new()
+                .name("WinGlance-icon".to_string())
+                .stack_size(512 * 1024)
+                .spawn(move || icon_worker(job_rx))
+            {
+                Ok(_) => Some(job_tx),
+                Err(error) => {
+                    warn!("could not start the icon-extraction worker: {error}");
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+/// The icon worker's main loop: one COM apartment for the thread's whole
+/// lifetime (initialized once, uninitialized once on exit — never per
+/// request), one job at a time. A panic inside a shell call must not take
+/// down the permanent worker: it is caught, logged, and the job answered
+/// with no icon so the caller can continue.
+fn icon_worker(job_rx: mpsc::Receiver<IconJob>) {
+    // A fresh thread always gets a fresh apartment; the result is still
+    // checked so the single CoUninitialize below is only paired with a
+    // successful init.
+    let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+    if !initialized {
+        warn!("icon worker could not initialize COM; no app icons will be extracted");
+    }
+    loop {
+        let Ok(job) = job_rx.recv() else {
+            break; // every sender is gone; nothing more can be requested
+        };
+        let result = std::panic::catch_unwind(|| {
+            if !initialized {
+                return None;
+            }
+            if let Some(pixels) = extract_from_aumid(&job.aumid, job.size) {
                 Some(pixels)
-            } else if aumid_owned.contains('\\') || aumid_owned.contains("/.") {
-                try_parsing_name(&aumid_owned, size)
+            } else if job.aumid.contains('\\') || job.aumid.contains("/.") {
+                try_parsing_name(&job.aumid, job.size)
             } else {
                 None
-            };
-            unsafe { CoUninitialize() };
-            let _ = tx.send(result);
-        })
-        .is_err()
-    {
-        warn!("could not start the icon-extraction thread for {aumid}");
+            }
+        });
+        match result {
+            Ok(pixels) => {
+                let _ = job.reply.send(pixels);
+            }
+            Err(_) => {
+                warn!("app-icon extraction panicked for {}; continuing", job.aumid);
+                let _ = job.reply.send(None);
+            }
+        }
+    }
+    if initialized {
+        unsafe { CoUninitialize() };
+    }
+}
+
+pub(crate) fn extract_app_icon(aumid: &str, target_size: usize) -> Option<Vec<u8>> {
+    // A tripped breaker means the worker is (likely) stuck in a hung shell
+    // call: skip submitting — the job would only time out anyway, and the
+    // queue must not pile up behind a worker that cannot drain it.
+    if ICON_WORKER_TRIPPED.load(Ordering::SeqCst) {
         return None;
     }
-    match rx.recv_timeout(ICON_EXTRACT_TIMEOUT) {
+    let size = target_size.clamp(8, 256);
+    let Some(sender) = icon_sender() else {
+        warn!("could not start the icon-extraction worker");
+        return None;
+    };
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let job = IconJob {
+        aumid: aumid.to_string(),
+        size,
+        reply: reply_tx,
+    };
+    if sender.try_send(job).is_err() {
+        warn!("icon-extraction queue is full; skipping the icon for {aumid}");
+        return None;
+    }
+    match reply_rx.recv_timeout(ICON_EXTRACT_TIMEOUT) {
         Ok(result) => result,
         Err(_) => {
-            warn!("app-icon extraction timed out for {aumid}; continuing without an icon");
+            if ICON_WORKER_TRIPPED
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                warn!(
+                    "app-icon extraction timed out for {aumid}; the worker may be hung — no further icons will be requested this session"
+                );
+            }
             None
         }
     }
