@@ -9,14 +9,17 @@ the top of the screen when the track or the playback state changes.
 - **No UI framework.** The overlay is a raw Win32 layered window rendered with
   GDI. No `winit`, no `tiny-skia`, no `tokio`. This keeps the dependency tree
   small and the binary lean.
-- **Two isolated threads.** SMTC work (COM, WinRT async, artwork decoding)
-  runs on a dedicated worker thread. The Windows UI runs on the UI thread with a
-  classic `GetMessageW` loop. They communicate only through an `mpsc` channel and
-  `PostMessageW`.
+- **Five isolated threads.** The SMTC worker runs all COM/WinRT work (session
+  reads, artwork bytes, image decode); a supervisor thread watches and
+  restarts it; the event forwarder drains the event channel into the two
+  window queues; a bounded icon worker performs the shell calls for app
+  icons; the UI thread runs every Win32 window with a classic `GetMessageW`
+  loop. They communicate only through `mpsc` channels and `PostMessageW`.
 - **Two windows, two queues.** There is a borderless "WinGlance" pill overlay window
-  and a maximized "tracking" window; both register a `WM_MEDIA_EVENT` handler.
+  and a maximized "tracking" window; both register a `MEDIA_EVENT_MSG` handler.
   A single forwarder thread drains the SMTC `mpsc` receiver into two window-owned
-  queues (`Arc<Mutex<VecDeque<MediaEvent>>>`, one per window) and pokes **both**
+  queues (`Arc<Mutex<VecDeque<Arc<MediaEvent>>>>`, one per window — the transport
+  `Arc` is recovered into an owned event on drain) and pokes **both**
   windows with `PostMessageW`, so each can render from the same event stream
   without owning SMTC. Two queues are required: a single shared queue would let
   one window's drain consume events the other still needs — each window owns and
@@ -30,43 +33,65 @@ the top of the screen when the track or the playback state changes.
 ## Threading model
 
 ```
-SMTC worker thread                      UI thread (message loop)
-────────────────────—                      ─────────────────────────
-CoInitializeEx(MTA)                      RegisterClassExW x2
-SystemMediaTransportControls            create_window x2 (pill + main)
-  ├─ GetCurrentSession()               install tray icon (main window)
-  ├─ get_playback_info()               GetMessageW loop
-  ├─ subscribe PlaybackInfoChanged
+supervisor thread                        UI thread (message loop)
+─────────────────────                    ─────────────────────────
+watchdog on the worker                   RegisterClassExW x2
+heartbeat; restarts a                    create_window x2 (pill + main)
+stalled/exited worker with               install tray icon (main window)
+backoff (max 5 failures,                 GetMessageW loop
+then one WorkerFailed on the
+status channel)                          ┌────────────────────────────┐
+                                         │                           │
+SMTC worker thread               events  │        forwarder thread    │
+─────────────────────  ──────────────────┘───►      ─────────────────│
+CoInitializeEx(MTA)   bounded mpsc channel            drain → main queue │
+SystemMediaTransportControls  (cap 1024)              drain → overlay queue│
+  ├─ GetCurrentSession()                              PostMessageW(MEDIA_EVENT_MSG) to BOTH
+  ├─ get_playback_info()                              PostMessageW(TOGGLE_MSG) to overlay only
+  ├─ subscribe PlaybackInfoChanged                    relay WorkerFailed (status channel)
   ├─ subscribe MediaPropertiesChanged
   │
-  │  events → mpsc channel ─────────► forwarder thread
-  │                                       │
-  │                                       ├──► main queue (Arc<Mutex<VecDeque>>)
-  │                                       │       └──► main window drains it
-  │                                       ├──► overlay queue (Arc<Mutex<VecDeque>>)
-  │                                       │       └──► overlay drains it
-  │                                       ├──► PostMessageW(WM_MEDIA_EVENT) to BOTH
-  │                                       └──► PostMessageW(WM_TOGGLE) to overlay only
-  │
-  │  WM_MEDIA_EVENT → receive_events()  (pill + main)
+  │  MEDIA_EVENT_MSG → receive_events()  (pill + main)
   │  WM_TIMER (debounce) → flush_pending()  (pill)
   │  WM_TIMER (16 ms) → tick() → render()   (pill)
-  │  WM_TOGGLE → toggle_enabled()           (pill, from tray menu)
+  │  TOGGLE_MSG → toggle_enabled()         (pill, from tray menu)
+
+icon worker thread
+──────────────────
+bounded 16-job queue, COM initialized
+once per worker lifetime, 1.5 s per-job
+timeout, circuit breaker (fail-fast
+after one hung shell call)
 ```
 
 - The SMTC worker owns all COM state for its lifetime and initializes COM as
   MTA. Async WinRT calls block on `IAsyncOperation::get()`; blocking the
   worker is acceptable because no other code shares that thread.
-- The event forwarder is a thin thread that drains the `mpsc` receiver into the
-  two window queues and pokes the UI thread with `PostMessageW`. It exists so
-  the UI thread stays responsive even if several SMTC callbacks fire at once.
-- The UI thread owns all Win32 windows, the queue, and GDI surfaces. SMTC
-  reads (metadata + artwork bytes), app-icon extraction (COM shell calls),
-  and image *decoding* (into a fixed `ARTWORK_DECODE`² = 256² premultiplied
-  BGRA buffer, once per unique cover) all run on the worker. The UI thread
-  only converts that buffer to RGBA in `ensure_art` (~0.1 ms, cached for
-  the animation frames); the palette is derived from that same converted
-  buffer, so no separate full-resolution decode is ever needed.
+- The supervisor watches a shared worker heartbeat. A worker that stalls
+  (30 s without a beat) or exits is restarted with an increasing backoff
+  (5 s → 60 s); a worker that runs for two minutes resets the failure
+  counter. After five consecutive failures of any kind — spawn, exit, or
+  stall — the supervisor stops restarting, logs, and sends one `WorkerFailed`
+  event (history row + tray note): media notifications will not resume until
+  the app restarts. A hung worker is never joined (it may be blocked inside
+  COM forever); the restart cap bounds that leak.
+- The event forwarder is a thin thread that drains the bounded event channel
+  into the two window queues and pokes the UI thread with `PostMessageW`. It
+  exists so the UI thread stays responsive even if several SMTC callbacks
+  fire at once. It also relays the supervisor's one-shot `WorkerFailed` from
+  a dedicated unbounded status channel, so that report can never be dropped
+  by an overloaded event channel. Each window queue is bounded (cap 256,
+  newest wins); a failed wake post clears and accounts the affected queue
+  instead of stranding events in it.
+- The UI thread owns all Win32 windows, the queues, and GDI surfaces. The
+  SMTC worker performs the metadata + artwork reads and the fixed-size
+  artwork *decode* (into a fixed `ARTWORK_DECODE`² = 256² premultiplied
+  BGRA buffer, once per unique cover). App-icon extraction runs on the
+  separate icon worker (see above), so a hung shell extension cannot stall
+  the SMTC worker. The UI thread only converts that buffer to RGBA in
+  `ensure_art` (~0.1 ms, cached for the animation frames); the palette is
+  derived from that same converted buffer, so no separate full-resolution
+  decode is ever needed.
 
 ## SMTC session selection
 
