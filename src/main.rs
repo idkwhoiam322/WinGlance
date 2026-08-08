@@ -439,7 +439,7 @@ fn main() -> Result<()> {
                     if supervisor_shutdown.load(Ordering::SeqCst) {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(200));
+                    std::thread::sleep(Duration::from_millis(1000));
                     if worker_started.elapsed() > Duration::from_secs(120) {
                         consecutive_restarts = 0;
                     }
@@ -505,7 +505,7 @@ fn main() -> Result<()> {
 
     // Stop the producers before destroying the windows: the forwarder must
     // not post to an HWND that teardown is about to free. The supervisor
-    // exits within ~200ms of the flag; a stalled worker is left for process
+    // exits within ~1s of the flag; a stalled worker is left for process
     // exit (it may be blocked inside COM and cannot be joined).
     shutdown.store(true, Ordering::SeqCst);
     let _ = forwarder_handle.join();
