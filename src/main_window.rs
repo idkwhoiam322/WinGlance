@@ -652,13 +652,22 @@ impl MainWindowState {
     }
 
     /// Mutates the config under a single write-lock scope, then persists it.
-    /// Never call `self.cfg()` (a read lock) from inside `mutate`.
+    /// Never call `self.cfg()` (a read lock) from inside `mutate`. The lock
+    /// is released before `save()`: the disk write would otherwise stall
+    /// every config read (the SMTC worker's flush decisions, the overlay's
+    /// behavior flags) for its duration. The clone is safe because the main
+    /// window is the single writer — no other site can change the config
+    /// between the lock release and the save.
     fn mutate_config(&mut self, mutate: impl FnOnce(&mut Config)) {
-        // A poisoned lock still yields the (possibly stale) config; recovering
-        // beats panicking on the UI thread for the rest of the run.
-        let mut cfg = self.config.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-        mutate(&mut cfg);
-        if let Err(error) = cfg.save() {
+        // A poisoned lock still yields the (possibly stale) config;
+        // recovering beats panicking on the UI thread for the rest of
+        // the run.
+        let changed = {
+            let mut cfg = self.config.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            mutate(&mut cfg);
+            cfg.clone()
+        };
+        if let Err(error) = changed.save() {
             error!("saving config after a settings change failed: {error}");
         }
     }
