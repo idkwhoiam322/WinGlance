@@ -465,11 +465,15 @@ pub(crate) fn open(
         state_ref.row_selected_brush = CreateSolidBrush(COLORREF(0x003D3D3D));
         let phys_w = (WIDTH as f32 * scale).round() as i32;
         let phys_h = ((HEADER_H + item_count as i32 * ROW_HEIGHT + 10) as f32 * scale).round() as i32;
+        // Reuse the clamped x/y from above: an unclamped reposition here
+        // would put the popup back under the taskbar or off-screen despite
+        // the initial creation being clamped (the owner and picker DPI agree
+        // in practice, so the owner-scale clamp stays valid).
         let _ = SetWindowPos(
             hwnd,
             HWND_TOPMOST,
-            trigger_rect.left,
-            trigger_rect.bottom + (4.0 * scale) as i32,
+            x,
+            y,
             phys_w,
             phys_h,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
