@@ -62,9 +62,13 @@ WinGlance/
   into.
 - **icon.rs** — resolves a source app's icon from its AUMID through the shell
   (`SHCreateItemFromParsingName` + `IShellItemImageFactory`), cached per
-  source. The shell calls run on a short-lived helper thread with its own COM
-  apartment, time-boxed to 1.5 s so a hung shell extension cannot stall the
-  SMTC worker.
+  source. All shell calls run on one persistent bounded worker thread (16-job
+  queue) with its own COM apartment, initialized once for the thread's
+  lifetime. Each extraction is time-boxed to 1.5 s, and the worker has a
+  circuit breaker: once a call actually hangs, the worker trips and all
+  further requests fail fast (no new shell calls), so a hung shell extension
+  cannot stall the SMTC worker or pile up blocked jobs. The breaker resets
+  only when the app restarts.
 - **palette.rs** — the two-color quantizer (4-bit histogram, saturation/
   luminance guard, ≥ 30° hue separation) that feeds the accents and the aura.
 - **main_window.rs** — the tracking window (current activity + history) and the
