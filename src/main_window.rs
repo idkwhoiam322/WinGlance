@@ -82,6 +82,11 @@ const HISTORY_CAP: usize = 400;
 const TIMER_LOGS_ID: usize = 101;
 /// Timer used to keep the native history tooltip's item rects in sync (scroll).
 const TIMER_TOOLTIPS_ID: usize = 102;
+/// One-shot timer that frees the cached artwork blit after the window has
+/// been tray-hidden for `IDLE_ART_RELEASE_MS` (see `on_close`). The blit
+/// rebuilds lazily at the next paint.
+const IDLE_ART_TIMER_ID: usize = 103;
+const IDLE_ART_RELEASE_MS: u32 = 30_000;
 /// Win32 LPSTR_TEXTCALLBACK sentinel: fetch tooltip text on demand.
 const LPSTR_TEXTCALLBACK: isize = -1;
 
@@ -2134,6 +2139,10 @@ impl MainWindowState {
                 // visible; stop it so a tray-hidden window stops waking the
                 // UI thread once a second.
                 let _ = KillTimer(self.hwnd, TIMER_TOOLTIPS_ID);
+                // Arm the idle release so a long tray-hidden window drops its
+                // cached artwork blit (a few hundred KB); show_window() kills
+                // the timer on restore.
+                let _ = SetTimer(self.hwnd, IDLE_ART_TIMER_ID, IDLE_ART_RELEASE_MS, None);
             } else {
                 let _ = DestroyWindow(self.hwnd);
             }
@@ -2319,6 +2328,9 @@ impl MainWindowState {
 
     fn show_window(&mut self) {
         unsafe {
+            // A restored window invalidates the idle-release deadline; if the
+            // blit was released, paint rebuilds it lazily.
+            let _ = KillTimer(self.hwnd, IDLE_ART_TIMER_ID);
             let _ = ShowWindow(self.hwnd, SW_SHOWMAXIMIZED);
             // The foreground lock can reject SetForegroundWindow (the thread
             // never held the foreground); without a fallback the window would
@@ -3047,6 +3059,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if !state_ptr.is_null() {
                 unsafe {
                     (*state_ptr).sync_tooltips();
+                }
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == IDLE_ART_TIMER_ID => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                // show_window() kills this timer, so firing while the window
+                // is visible would be a logic error elsewhere; the check
+                // keeps the free from ever racing a paint.
+                if !unsafe { IsWindowVisible(hwnd).as_bool() }
+                    && let Some(current) = &mut state.current
+                {
+                    free_art_blit(&mut current.art_blit);
                 }
             }
             LRESULT(0)

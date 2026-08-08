@@ -40,6 +40,10 @@ use windows::core::PCWSTR;
 const TIMER_DEBOUNCE: usize = 1;
 /// Window-timer ID used only when the timer-queue fallback is active.
 const ANIM_TIMER_ID: usize = 2;
+/// One-shot window-timer ID that releases the frame pipeline buffers after
+/// the pill has stayed hidden for `IDLE_BUFFER_RELEASE_MS` (see `hide`).
+const IDLE_BUFFER_TIMER_ID: usize = 3;
+const IDLE_BUFFER_RELEASE_MS: u32 = 30_000;
 const LIGHT_DURATION: Duration = Duration::from_millis(120);
 /// Remaining time left on the current pill when something newer wants the
 /// screen: hovering over the pill or a queued update both cap the exit at
@@ -905,6 +909,11 @@ impl OverlayState {
         if !self.enabled {
             return;
         }
+        // A fresh pill invalidates the idle-release deadline: the frame
+        // buffers are about to be reused.
+        unsafe {
+            let _ = KillTimer(self.hwnd, IDLE_BUFFER_TIMER_ID);
+        }
         self.content = Some(event);
         self.resolve_pill_text();
         self.reset_scroll();
@@ -1239,9 +1248,41 @@ impl OverlayState {
                 debug!("SetWindowPos(hide) failed: {error}");
             }
         }
+        // The size-reuse buffers (`dib`, `frame_scratch`) only pay off for
+        // closely-spaced pills; when the pill stays hidden, schedule their
+        // release so a long-idle process holds no frame DIBs. Every show path
+        // kills the timer, so this only fires if no fresh pill appears within
+        // the deadline; the buffers are rebuilt lazily on the next show.
+        unsafe {
+            let _ = SetTimer(self.hwnd, IDLE_BUFFER_TIMER_ID, IDLE_BUFFER_RELEASE_MS, None);
+        }
         // Advance the queue: the next pending notification shows as a fresh
         // pill. show() checks `enabled`, so a toggle-off collapse stays hidden.
         self.show_next();
+    }
+
+    /// Releases the size-reuse buffers after the pill has been hidden for a
+    /// long stretch (fired by `IDLE_BUFFER_TIMER_ID`). The next show rebuilds
+    /// them lazily (`dib_for`, `clear_frame_scratch`, and the text scratch
+    /// creation), so the cost of a release is one CreateDIBSection round on
+    /// the next pill, not on the release itself.
+    fn release_idle_buffers(&mut self) {
+        if let Some(scratch) = self.text_scratch.take() {
+            unsafe {
+                let _ = SelectObject(scratch.hdc, scratch.old_bitmap);
+                let _ = DeleteObject(scratch.bitmap);
+                let _ = DeleteDC(scratch.hdc);
+            }
+        }
+        if let Some(dib) = self.dib.take() {
+            unsafe {
+                let _ = SelectObject(dib.hdc, dib.old_bitmap);
+                let _ = DeleteObject(dib.bitmap);
+                let _ = DeleteDC(dib.hdc);
+            }
+        }
+        self.frame_scratch = Vec::new();
+        debug!("released idle overlay buffers");
     }
 
     fn toggle_enabled(&mut self) {
@@ -1269,6 +1310,11 @@ impl OverlayState {
     /// looks like an actual notification; on a fresh start before any track
     /// has been seen it falls back to a track-change pill with sample data.
     fn show_sample(&mut self) {
+        // A sample pill is a show: cancel the idle-release deadline so the
+        // buffers survive the preview.
+        unsafe {
+            let _ = KillTimer(self.hwnd, IDLE_BUFFER_TIMER_ID);
+        }
         let content = self.last_track.clone().map_or_else(
             || {
                 let track = TrackInfo {
@@ -3524,6 +3570,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_TIMER if wparam.0 == ANIM_TIMER_ID => {
             if !state_ptr.is_null() {
                 (*state_ptr).tick();
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == IDLE_BUFFER_TIMER_ID => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                // Every show path kills this timer, so firing with a visible
+                // pill would be a logic error elsewhere; the check keeps the
+                // release from ever racing a render.
+                if state.content.is_none() {
+                    state.release_idle_buffers();
+                }
             }
             LRESULT(0)
         }
