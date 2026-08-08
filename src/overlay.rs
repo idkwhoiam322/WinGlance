@@ -154,11 +154,13 @@ enum Phase {
 const PENDING_CAP: usize = 4;
 
 /// Upper bound on the per-source track cache. Each entry holds the last
-/// track's decoded cover (256 KB) plus raw artwork bytes, and the worker
-/// evicts its own source-level caches when sessions close — the overlay has
-/// no session knowledge, so an LRU + idle timeout keeps long-idle sources
-/// from accumulating covers that will never be shown again.
-const TRACK_CACHE_CAP: usize = 5;
+/// track's decoded cover (up to 256 KB at the cap; typically 64 KB at 100 %
+/// DPI) plus the pill text, and the worker evicts its own source-level
+/// caches when sessions close — the overlay has no session knowledge, so an
+/// LRU + idle timeout keeps long-idle sources from accumulating covers that
+/// will never be shown again. Three entries bound the retained cover memory
+/// while covering a realistic source mix (music + video + podcast).
+const TRACK_CACHE_CAP: usize = 3;
 
 /// Entries untouched for this long are evicted at the next insert. Eviction
 /// is lazy (sweep inside `cache_track`), so an expired entry remains
