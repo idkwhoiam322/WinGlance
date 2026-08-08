@@ -1022,9 +1022,16 @@ impl MainWindowState {
         // The queue carries Arc<MediaEvent> so the fan-out to both windows
         // never copies the event; recover the owned event here (zero-copy
         // when this window is the last holder, a clone otherwise).
+        // Invalidation is deferred until after the batch: a burst of events
+        // (session churn, a gapless album) redraws the current-activity area
+        // once instead of once per event.
+        let mut dirty = false;
         for event in batch.into_iter().map(media_event_into_owned) {
             match event {
-                MediaEvent::TrackChanged(track) => self.add_track(track),
+                MediaEvent::TrackChanged(track) => {
+                    self.add_track(track);
+                    dirty = true;
+                }
                 MediaEvent::PlaybackStateChanged(state, source_app) => {
                     // Remember the state per source so a later track from the
                     // same source starts with the right state. The event only
@@ -1037,7 +1044,7 @@ impl MainWindowState {
                     {
                         current.state = state;
                         self.add_state_change(state);
-                        self.invalidate();
+                        dirty = true;
                     }
                 }
                 MediaEvent::SessionRejected {
@@ -1049,6 +1056,9 @@ impl MainWindowState {
                 } => self.add_session(source_app, title, artist, state, accepted),
                 MediaEvent::WorkerFailed { reason } => self.add_worker_failure(&reason),
             }
+        }
+        if dirty {
+            self.invalidate();
         }
         // One tooltip rebuild per batch: a session-churn burst otherwise
         // rebuilds the full tool set once per event.
@@ -1153,6 +1163,9 @@ impl MainWindowState {
         show_tray_note(self.hwnd, "Media notifications stopped", reason);
     }
 
+    /// Updates the current activity (and its history row) for a track
+    /// change. Called only from `receive_events`, which invalidates the
+    /// window once after the whole batch — this method does not repaint.
     fn add_track(&mut self, track: TrackInfo) {
         let art_fingerprint = track.artwork.as_deref().map(fingerprint);
         // Metadata refresh for the same song (album/artwork arriving late):
@@ -1210,7 +1223,6 @@ impl MainWindowState {
                 }
             }
             self.tooltips_dirty = true;
-            self.invalidate();
             return;
         }
 
@@ -1237,7 +1249,6 @@ impl MainWindowState {
             art_fingerprint,
             art_decode_failed: false,
         });
-        self.invalidate();
     }
 
     fn paint(&mut self) {
