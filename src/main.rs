@@ -342,6 +342,13 @@ fn main() -> Result<()> {
     }
 
     let (event_tx, event_rx) = mpsc::sync_channel::<Arc<MediaEvent>>(EVENT_CHANNEL_CAP);
+    // Dedicated one-shot status channel for the supervisor's permanent-failure
+    // report, deliberately *not* the bounded event channel: under the very
+    // overload that motivates the event cap, try_send into it could drop the
+    // "notifications stopped" signal. Unbounded is safe here because the
+    // supervisor sends at most one WorkerFailed ever (it gives up right
+    // after), so the channel cannot grow.
+    let (supervisor_tx, supervisor_rx) = mpsc::channel::<Arc<MediaEvent>>();
     let shared_config: std::sync::Arc<std::sync::RwLock<Config>> =
         std::sync::Arc::new(std::sync::RwLock::new(config.clone()));
     let listener_config = shared_config.clone();
@@ -370,6 +377,10 @@ fn main() -> Result<()> {
         .name("WinGlance-smtc".to_string())
         .stack_size(256 * 1024)
         .spawn(move || {
+            // The supervisor reports a permanent worker failure to the main
+            // window (one WorkerFailed event, on the dedicated unbounded
+            // status channel) so the user sees it in the history and as a
+            // tray note instead of the app silently stopping notifications.
             // Consecutive worker failures (stall or exit) back off: a
             // permanently broken SMTC worker must not restart (and re-log)
             // every few seconds forever, and each stalled restart leaks the
@@ -381,9 +392,14 @@ fn main() -> Result<()> {
                     break;
                 }
                 if consecutive_restarts >= MAX_WORKER_RESTARTS {
-                    error!(
-                        "SMTC worker failed {MAX_WORKER_RESTARTS} times in a row; giving up until the process restarts"
+                    let reason = format!(
+                        "SMTC worker failed {MAX_WORKER_RESTARTS} times in a row; restart WinGlance to restore media notifications"
                     );
+                    error!("{reason}");
+                    // Unbounded send: cannot be dropped by an overloaded
+                    // event channel. Only fails if the app is already
+                    // tearing down and the forwarder receiver is gone.
+                    let _ = supervisor_tx.send(Arc::new(MediaEvent::WorkerFailed { reason }));
                     break;
                 }
                 let worker_heartbeat = supervisor_heartbeat.clone();
@@ -475,6 +491,7 @@ fn main() -> Result<()> {
         main_wake,
         overlay_wake,
         event_rx,
+        supervisor_rx,
         forwarder_shutdown,
     );
 
@@ -552,6 +569,7 @@ fn spawn_event_forwarder(
     main_wake: Arc<AtomicBool>,
     overlay_wake: Arc<AtomicBool>,
     receiver: mpsc::Receiver<Arc<MediaEvent>>,
+    supervisor_rx: mpsc::Receiver<Arc<MediaEvent>>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     // HWND is not Send; the raw handle value is all the forwarder needs to
@@ -563,6 +581,18 @@ fn spawn_event_forwarder(
         .stack_size(256 * 1024)
         .spawn(move || {
             while !shutdown.load(Ordering::SeqCst) {
+                // One-shot status events from the supervisor (at most one
+                // WorkerFailed per session, then it gives up). History-only:
+                // never wake the pill or occupy its queue.
+                while let Ok(event) = supervisor_rx.try_recv() {
+                    push_and_wake(
+                        &main_queue,
+                        &main_wake,
+                        event,
+                        HWND(main_raw as *mut c_void),
+                        "main window",
+                    );
+                }
                 let event = match receiver.recv_timeout(Duration::from_millis(200)) {
                     Ok(event) => event,
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -577,9 +607,13 @@ fn spawn_event_forwarder(
                     HWND(main_raw as *mut c_void),
                     "main window",
                 );
-                // Rejected sessions are history-only: the overlay never renders
-                // them, so they must not wake the pill or occupy its queue.
-                if !matches!(event.as_ref(), MediaEvent::SessionRejected { .. }) {
+                // Rejected sessions and worker failures are history-only: the
+                // overlay never renders them, so they must not wake the pill
+                // or occupy its queue.
+                if !matches!(
+                    event.as_ref(),
+                    MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. }
+                ) {
                     push_and_wake(
                         &overlay_queue,
                         &overlay_wake,

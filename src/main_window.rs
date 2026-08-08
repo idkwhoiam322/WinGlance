@@ -10,7 +10,7 @@ use crate::process_picker::PICKER_RESULT_MSG;
 use crate::winutil::wide;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
-use log::{debug, error};
+use log::{debug, error, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,7 +36,8 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -1047,6 +1048,7 @@ impl MainWindowState {
                     state,
                     accepted,
                 } => self.add_session(source_app, title, artist, state, accepted),
+                MediaEvent::WorkerFailed { reason } => self.add_worker_failure(&reason),
             }
         }
         // One tooltip rebuild per batch: a session-churn burst otherwise
@@ -1135,6 +1137,21 @@ impl MainWindowState {
             ..TrackInfo::default()
         };
         self.push_history(track, state, accepted);
+    }
+
+    /// Adds a prominent history row when the SMTC worker gave up permanently:
+    /// the user must see that notifications stopped and need a restart to
+    /// resume, instead of the app silently going quiet. The tray note makes
+    /// the failure visible even while this window is hidden (start in tray).
+    fn add_worker_failure(&mut self, reason: &str) {
+        let track = TrackInfo {
+            title: "Media notifications stopped".into(),
+            artist: reason.to_string(),
+            source_app: "WinGlance".into(),
+            ..TrackInfo::default()
+        };
+        self.push_history(track, PlaybackState::Stopped, false);
+        show_tray_note(self.hwnd, "Media notifications stopped", reason);
     }
 
     fn add_track(&mut self, track: TrackInfo) {
@@ -2629,6 +2646,30 @@ fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
     let count = tip.len().min(data.szTip.len());
     data.szTip[..count].copy_from_slice(&tip[..count]);
     data
+}
+
+/// Shows a one-shot balloon note on the tray icon (NIF_INFO). Used for the
+/// permanent SMTC worker failure: the note is visible even while the tracking
+/// window is hidden (start in tray), unlike the history row alone.
+fn show_tray_note(hwnd: HWND, title: &str, text: &str) {
+    let mut data = tray_data(hwnd);
+    data.uFlags |= NIF_INFO;
+    data.dwInfoFlags = NIIF_ERROR;
+    let title_wide = wide(title);
+    let count = title_wide.len().min(data.szInfoTitle.len());
+    data.szInfoTitle[..count].copy_from_slice(&title_wide[..count]);
+    let text_wide = wide(text);
+    let count = text_wide.len().min(data.szInfo.len());
+    data.szInfo[..count].copy_from_slice(&text_wide[..count]);
+    unsafe {
+        if Shell_NotifyIconW(NIM_MODIFY, &data).0 == 0 {
+            // The balloon is best-effort (the tray icon may be gone or the
+            // notification area unavailable); the history row remains the
+            // reliable fallback, and this log makes a failed update
+            // diagnosable instead of silent.
+            warn!("tray note failed (NIM_MODIFY)");
+        }
+    }
 }
 
 fn show_tray_menu(state: &mut MainWindowState) {

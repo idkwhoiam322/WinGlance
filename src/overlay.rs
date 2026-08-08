@@ -685,8 +685,9 @@ impl OverlayState {
                     self.enqueue(MediaEvent::PlaybackStateChanged(state, source_app));
                 }
                 MediaEvent::TrackChanged(_) | MediaEvent::PlaybackStateChanged(_, _) => {}
-                // Rejected sessions are history-only: never shown as a pill.
-                MediaEvent::SessionRejected { .. } => {}
+                // Rejected sessions and worker failures are history-only:
+                // never shown as a pill.
+                MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => {}
             }
         }
         if !self.pending.is_empty() {
@@ -798,7 +799,7 @@ impl OverlayState {
             }
             // Never queued (receive_events skips it); defensive for
             // exhaustiveness.
-            MediaEvent::SessionRejected { .. } => {}
+            MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => {}
         }
         if self.pending.len() >= PENDING_CAP {
             self.pending.pop_front();
@@ -827,6 +828,9 @@ impl OverlayState {
             // exhaustiveness.
             MediaEvent::SessionRejected { .. } => {
                 debug!("session rejected event reached the pill queue; ignoring");
+            }
+            MediaEvent::WorkerFailed { .. } => {
+                debug!("worker-failed event reached the pill queue; ignoring");
             }
         }
     }
@@ -1304,7 +1308,7 @@ fn content_size_of(config: &Config, content: &MediaEvent) -> (f32, f32) {
         MediaEvent::TrackChanged(_) | MediaEvent::PlaybackStateChanged(_, _) => content_size(config),
         // Never shown (receive_events skips it); the .max(1.0) guards keep the
         // size sane if this dead arm is ever reached.
-        MediaEvent::SessionRejected { .. } => (0.0, 0.0),
+        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => (0.0, 0.0),
     }
 }
 
@@ -1672,7 +1676,7 @@ fn draw_pixels(
                     .and_then(|(t, _)| t.decoded_art.clone())
             }
         }
-        MediaEvent::SessionRejected { .. } => None,
+        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => None,
     };
     state.ensure_art(decoded.as_ref());
     let inset = state.aura_inset as usize;
@@ -1789,7 +1793,7 @@ fn draw_pixels(
             );
         }
         // Never rendered: SessionRejected is filtered out before enqueue.
-        MediaEvent::SessionRejected { .. } => {}
+        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => {}
     }
     Ok(())
 }
@@ -2594,7 +2598,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
             }
         }
         // Never rendered: SessionRejected is filtered out before enqueue.
-        MediaEvent::SessionRejected { .. } => {}
+        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => {}
     }
 }
 

@@ -167,6 +167,12 @@ pub enum MediaEvent {
         state: PlaybackState,
         accepted: bool,
     },
+    /// The SMTC worker gave up after repeated failures (stall or exit) and
+    /// media notifications will not resume until the app restarts. Emitted
+    /// once by the supervisor. History-only: the overlay never renders it.
+    WorkerFailed {
+        reason: String,
+    },
 }
 
 /// Fixed size the SMTC worker decodes album art to (one dimension, square).
