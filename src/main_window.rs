@@ -78,9 +78,6 @@ const LISTBOX_ID: usize = 2;
 /// listbox as UTF-16 row strings, so the cap directly sizes the app's
 /// baseline memory (~1 KB per row across both copies).
 const HISTORY_CAP: usize = 400;
-/// The artwork is decoded on the SMTC worker at `events::ARTWORK_DECODE`; the
-/// main window only ever copies those pixels and blits them at the same size.
-const ART_DECODE: u32 = crate::events::ARTWORK_DECODE;
 /// Timer used to clear the "Copied" feedback on the Copy logs button.
 const TIMER_LOGS_ID: usize = 101;
 /// Timer used to keep the native history tooltip's item rects in sync (scroll).
@@ -1361,7 +1358,8 @@ impl MainWindowState {
 
         // The SMTC worker already decoded the artwork once at event time (see
         // smtc.rs `with_decoded_art`); the UI thread only ever copies the
-        // cached pixels, never decodes an image.
+        // cached pixels, never decodes an image. The decode side is adaptive
+        // (per-DPI), so derive it from the buffer length.
         if let Some(current) = &mut self.current
             && current.art_blit.is_none()
             && !current.art_decode_failed
@@ -1369,7 +1367,8 @@ impl MainWindowState {
         {
             match current.track.decoded_art.as_deref() {
                 Some(pm) => {
-                    current.art_blit = build_art_blit(pm, ART_DECODE as i32);
+                    let base = ((pm.len() / 4) as f64).sqrt() as i32;
+                    current.art_blit = build_art_blit(pm, base);
                     if current.art_blit.is_none() {
                         log_art_blit_failure();
                     }

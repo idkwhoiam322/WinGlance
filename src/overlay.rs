@@ -3052,8 +3052,9 @@ fn composite_pm(pixels: &mut [u8], width: usize, x: usize, y: usize, rgb: [u8; 3
     pixels[offset + 3] = (alpha + pixels[offset + 3] as u32 * inv / 255) as u8;
 }
 
-/// Converts the worker's premultiplied BGRA artwork (fixed `ARTWORK_DECODE`²)
-/// into the straight RGBA buffer the overlay composites and palettizes from.
+/// Converts the worker's premultiplied BGRA artwork (square, adaptive
+/// per-DPI size) into the straight RGBA buffer the overlay composites and
+/// palettizes from.
 /// Runs once per cover change, keyed by the decoded pixels in `ensure_art`.
 /// The result is always a perfect square; `draw_art_scaled` derives the side
 /// from the buffer length.
@@ -3681,8 +3682,8 @@ mod tests {
     }
 
     /// A solid-color artwork buffer in the worker's format: premultiplied
-    /// BGRA at `ARTWORK_DECODE`² (the fixed decode size; the overlay no
-    /// longer controls resolution).
+    /// BGRA at `ARTWORK_DECODE`² (the cap the worker's adaptive decode
+    /// targets; the overlay only reads the side from the buffer length).
     fn pm_art(color: [u8; 3]) -> Arc<[u8]> {
         let (b, g, r) = (color[2], color[1], color[0]);
         let px = [b, g, r, 255];

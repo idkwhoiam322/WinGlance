@@ -28,10 +28,12 @@ pub struct TrackInfo {
     /// be pure waste on every track change. Also the identity used for
     /// same-media comparisons and cache keying.
     pub artwork: Option<Arc<[u8]>>,
-    /// The artwork decoded once by the SMTC worker at `ARTWORK_DECODE`² into
-    /// premultiplied BGRA (the layout AlphaBlend/StretchDIBits consume), so
-    /// neither window ever runs the image decode on its UI thread. The raw
-    /// bytes stay attached (above) for identity and fingerprinting.
+    /// The artwork decoded once by the SMTC worker into premultiplied BGRA
+    /// (the layout AlphaBlend/StretchDIBits consume), at the per-DPI size
+    /// picked by `artwork_decode_size` — both windows derive the side from
+    /// the buffer length, so any size works. Neither window ever runs the
+    /// image decode on its UI thread. The raw bytes stay attached (above)
+    /// for identity and fingerprinting.
     pub decoded_art: Option<Arc<[u8]>>,
     /// App icon (premultiplied BGRA pixel data) extracted from the source's
     /// AUMID via the shell, cached per-app and shared across track clones.
@@ -219,11 +221,28 @@ pub enum MediaEvent {
     },
 }
 
-/// Fixed size the SMTC worker decodes album art to (one dimension, square).
-/// Both windows display art at ≤ ~200 px (overlay) / ~128 px (tile), so 256
-/// covers every DPI with margin; shipping one canonical decode avoids each
-/// window decoding the same JPEG/PNG on its own UI thread.
+/// Maximum side length the SMTC worker decodes album art to (one dimension,
+/// square). The actual size is adaptive — `artwork_decode_size` picks the
+/// smallest size that covers both windows' displays at the current DPI, and
+/// this constant bounds the worst case so memory stays capped no matter what
+/// display is attached. 256² covers a 96 px logical tile at up to ~266 % DPI;
+/// beyond that the windows upscale the 256 buffer slightly (bilinear, not
+/// visible on artwork), which is the pre-existing behavior at 300 %+ DPI.
 pub const ARTWORK_DECODE: u32 = 256;
+
+/// Picks the square artwork decode size: the largest display need is
+/// `max(overlay art_size, main-window tile)` — the tile is fixed at 96
+/// logical px (see `main_window::ART_SIZE`) and the overlay's art_size is
+/// clamped to 24..=96, so the tile always dominates. Scaled by the given DPI,
+/// rounded up to a multiple of 64 so the final display blit downscales a
+/// little (sharper than an upscale), then clamped to the `ARTWORK_DECODE`
+/// cap. A zero/invalid DPI falls back to 100 %.
+pub fn artwork_decode_size(art_size: u32, dpi: u32) -> usize {
+    let logical = art_size.max(96);
+    let scale = dpi.max(96) as f32 / 96.0;
+    let needed = ((logical as f32 * scale).ceil() as usize).max(64);
+    (needed.div_ceil(64) * 64).clamp(64, ARTWORK_DECODE as usize)
+}
 
 /// Artwork only ever displays at ~200px, so refusing anything larger than
 /// this defeats decompression bombs (a header can claim huge dimensions
@@ -397,5 +416,23 @@ mod tests {
             !shorter.same_media(&longer),
             "both known and different -> different media"
         );
+    }
+
+    #[test]
+    fn artwork_decode_size_covers_common_dpis() {
+        // 100 %: 96 logical px needed (tile dominates any art_size) -> 128.
+        assert_eq!(artwork_decode_size(48, 96), 128);
+        assert_eq!(artwork_decode_size(96, 96), 128);
+        // 150 % (144 px) and 200 % (192 px) -> 192.
+        assert_eq!(artwork_decode_size(48, 144), 192);
+        assert_eq!(artwork_decode_size(48, 192), 192);
+        // 250 % (240 px) -> 256, exactly at the cap.
+        assert_eq!(artwork_decode_size(48, 240), 256);
+        // 300 % (288 px) would need 320: capped at 256, the pre-existing
+        // slight upscale.
+        assert_eq!(artwork_decode_size(48, 288), 256);
+        assert_eq!(artwork_decode_size(48, 384), 256);
+        // Zero/invalid DPI falls back to 100 % behavior.
+        assert_eq!(artwork_decode_size(48, 0), 128);
     }
 }

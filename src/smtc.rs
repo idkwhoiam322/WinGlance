@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::events::{ARTWORK_DECODE, MediaEvent, PlaybackState, TrackInfo, decode_artwork_pm};
+use crate::events::{MediaEvent, PlaybackState, TrackInfo, decode_artwork_pm};
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -16,6 +16,8 @@ use windows::Media::Control::{
 use windows::Storage::Streams::{Buffer, DataReader, InputStreamOptions};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 use windows::core::Interface;
 
 enum Signal {
@@ -647,7 +649,8 @@ impl ListenerState {
                     if emit && !session_recreation {
                         let label = track_label(&merged);
                         info!("track changed | {label}");
-                        let emitted = with_decoded_art(merged.clone());
+                        let cfg = self.config.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let emitted = with_decoded_art(merged.clone(), current_decode_size(&cfg));
                         events.push(MediaEvent::TrackChanged(emitted));
                         self.last_track_per_source
                             .insert(merged.source_app.clone(), merged.clone());
@@ -941,7 +944,11 @@ impl ListenerState {
             info!("track changed | {label}");
             self.last_track_per_source
                 .insert(merged.source_app.clone(), merged.clone());
-            self.emit(MediaEvent::TrackChanged(with_decoded_art(merged.clone())));
+            let cfg = self.config.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.emit(MediaEvent::TrackChanged(with_decoded_art(
+                merged.clone(),
+                current_decode_size(&cfg),
+            )));
             if let Some(state) = self.states.get_mut(&key) {
                 state.deferred_at = None;
             }
@@ -1383,15 +1390,29 @@ fn defer_expired(deferred_at: Option<Instant>) -> bool {
     deferred_at.is_some_and(|t| t.elapsed() >= ARTWORK_TIMEOUT)
 }
 
-/// Attaches the worker's fixed-size artwork decode to a track about to be
+/// Picks the artwork decode size for the current display setup: the pill is
+/// shown on the foreground window's monitor, so that monitor's DPI decides
+/// how large the decoded art must be (system DPI when no foreground window
+/// can be sampled). Runs on the worker at emit time, so a DPI change only
+/// affects the next decoded cover.
+fn current_decode_size(config: &Config) -> usize {
+    let foreground = unsafe { GetForegroundWindow() };
+    let dpi = unsafe { GetDpiForWindow(foreground) };
+    let dpi = if dpi > 0 { dpi } else { unsafe { GetDpiForSystem() } };
+    crate::events::artwork_decode_size(config.appearance.art_size, dpi)
+}
+
+/// Attaches the worker's adaptive artwork decode to a track about to be
 /// emitted. Called only on the emit paths (never on poll/merge reads), so the
 /// image decode runs once per actually-emitted track — on the worker thread,
-/// never on a window's UI thread.
-fn with_decoded_art(mut track: TrackInfo) -> TrackInfo {
+/// never on a window's UI thread. The size matches the display the pill will
+/// appear on; both windows derive the side from the buffer length, so any
+/// size works.
+fn with_decoded_art(mut track: TrackInfo, size: usize) -> TrackInfo {
     track.decoded_art = track
         .artwork
         .as_deref()
-        .and_then(|bytes| decode_artwork_pm(bytes, ARTWORK_DECODE as usize))
+        .and_then(|bytes| decode_artwork_pm(bytes, size))
         .map(Arc::from);
     track
 }
