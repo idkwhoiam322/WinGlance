@@ -134,6 +134,14 @@ impl TrackInfo {
     }
 }
 
+/// Recovers the owned event from a queue's transport `Arc`: zero-copy when
+/// this window is the last holder of the shared allocation (the usual case —
+/// each event lives in exactly one window queue), a full clone while the
+/// other window still holds its reference.
+pub fn media_event_into_owned(event: Arc<MediaEvent>) -> MediaEvent {
+    Arc::try_unwrap(event).unwrap_or_else(|shared| (*shared).clone())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackState {
     Playing,

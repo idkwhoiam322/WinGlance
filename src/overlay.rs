@@ -1,5 +1,7 @@
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
-use crate::events::{MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo, artwork_same};
+use crate::events::{
+    MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo, artwork_same, media_event_into_owned,
+};
 use crate::gdi::FontProvider;
 use crate::palette::Palette;
 use crate::winutil::wide;
@@ -130,7 +132,12 @@ unsafe extern "system" fn animation_timer_proc(parameter: *mut c_void, _fired: B
     }
 }
 
-pub(crate) type EventQueue = Arc<Mutex<VecDeque<MediaEvent>>>;
+/// Incoming event transport shared with the main window: an event is
+/// allocated once by the SMTC worker, the forwarder hands the same `Arc` to
+/// both window queues (a refcount bump per window), and each drain recovers
+/// the owned event with `media_event_into_owned` — zero-copy when this window
+/// is the last holder, a single clone while the other window still holds it.
+pub(crate) type EventQueue = Arc<Mutex<VecDeque<Arc<MediaEvent>>>>;
 
 enum Phase {
     Hidden,
@@ -587,12 +594,15 @@ impl OverlayState {
         // state-then-track per read, so the pairing is always ordered.
         let track_sources: Vec<String> = batch
             .iter()
-            .filter_map(|e| match e {
+            .filter_map(|e| match e.as_ref() {
                 MediaEvent::TrackChanged(t) => Some(t.source_app.clone()),
                 _ => None,
             })
             .collect();
-        for event in batch {
+        // The queue carries Arc<MediaEvent> so the fan-out to both windows
+        // never copies the event; recover the owned event here (zero-copy
+        // when this window is the last holder, a clone otherwise).
+        for event in batch.into_iter().map(media_event_into_owned) {
             if !self.enabled {
                 continue;
             }
@@ -3805,15 +3815,21 @@ mod tests {
             (track_for("youtube-music", "Old Song", "Old Artist"), Instant::now()),
         );
 
-        queue.lock().unwrap().push_back(MediaEvent::PlaybackStateChanged(
-            PlaybackState::Playing,
-            "youtube-music".into(),
-        ));
-        queue.lock().unwrap().push_back(MediaEvent::TrackChanged(track_for(
-            "youtube-music",
-            "New Song",
-            "New Artist",
-        )));
+        queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Playing,
+                "youtube-music".into(),
+            )));
+        queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "youtube-music",
+                "New Song",
+                "New Artist",
+            ))));
         state.receive_events();
 
         assert_eq!(state.pending.len(), 1, "only the track pill should be queued");
@@ -3833,10 +3849,13 @@ mod tests {
             (track_for("youtube-music", "Song", "Artist"), Instant::now()),
         );
 
-        queue.lock().unwrap().push_back(MediaEvent::PlaybackStateChanged(
-            PlaybackState::Paused,
-            "youtube-music".into(),
-        ));
+        queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Paused,
+                "youtube-music".into(),
+            )));
         state.receive_events();
 
         assert_eq!(state.pending.len(), 1, "a state change alone still queues a pill");
@@ -3856,10 +3875,14 @@ mod tests {
         state.phase = Phase::Shown;
         state.dismiss_at = Some(Instant::now() + Duration::from_millis(1500));
 
-        state.queue.lock().unwrap().push_back(MediaEvent::PlaybackStateChanged(
-            PlaybackState::Playing,
-            "youtube-music".into(),
-        ));
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Playing,
+                "youtube-music".into(),
+            )));
         state.receive_events();
 
         assert!(
@@ -3890,18 +3913,18 @@ mod tests {
 
         {
             let mut queue = state.queue.lock().unwrap();
-            queue.push_back(MediaEvent::PlaybackStateChanged(
+            queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
                 PlaybackState::Playing,
                 "youtube-music".into(),
-            ));
-            queue.push_back(MediaEvent::PlaybackStateChanged(
+            )));
+            queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
                 PlaybackState::Paused,
                 "youtube-music".into(),
-            ));
-            queue.push_back(MediaEvent::PlaybackStateChanged(
+            )));
+            queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
                 PlaybackState::Playing,
                 "youtube-music".into(),
-            ));
+            )));
         }
         state.receive_events();
 
@@ -3923,10 +3946,14 @@ mod tests {
         state.phase = Phase::Shown;
         state.dismiss_at = Some(Instant::now() + Duration::from_secs(3));
 
-        state.queue.lock().unwrap().push_back(MediaEvent::PlaybackStateChanged(
-            PlaybackState::Paused,
-            "youtube-music".into(),
-        ));
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Playing,
+                "youtube-music".into(),
+            )));
         state.receive_events();
 
         assert!(
@@ -3946,10 +3973,14 @@ mod tests {
         state.phase = Phase::Collapsing(Instant::now() - Duration::from_millis(10));
         state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
 
-        state.queue.lock().unwrap().push_back(MediaEvent::PlaybackStateChanged(
-            PlaybackState::Playing,
-            "youtube-music".into(),
-        ));
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Playing,
+                "youtube-music".into(),
+            )));
         state.receive_events();
 
         assert!(
@@ -4759,11 +4790,11 @@ mod tests {
             .queue
             .lock()
             .unwrap()
-            .push_back(MediaEvent::TrackChanged(TrackInfo {
+            .push_back(Arc::new(MediaEvent::TrackChanged(TrackInfo {
                 source_app: "spotify".into(),
                 title: "Next Song".into(),
                 ..TrackInfo::default()
-            }));
+            })));
         state.receive_events();
 
         assert!(!state.pending.is_empty(), "the update must be queued for the next pill");
@@ -4790,11 +4821,11 @@ mod tests {
             .queue
             .lock()
             .unwrap()
-            .push_back(MediaEvent::TrackChanged(TrackInfo {
+            .push_back(Arc::new(MediaEvent::TrackChanged(TrackInfo {
                 source_app: "spotify".into(),
                 title: "Next Song".into(),
                 ..TrackInfo::default()
-            }));
+            })));
         state.receive_events();
 
         let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());

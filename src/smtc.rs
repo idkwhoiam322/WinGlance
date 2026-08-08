@@ -118,7 +118,7 @@ fn set_active_session_sources(sources: Vec<String>) {
 struct ListenerState {
     manager: GlobalSystemMediaTransportControlsSessionManager,
     config: Arc<RwLock<Config>>,
-    output: SyncSender<MediaEvent>,
+    output: SyncSender<Arc<MediaEvent>>,
     signal_tx: SyncSender<Signal>,
     /// Every open session's event subscriptions, keyed by session pointer.
     subscriptions: HashMap<usize, SessionSubscription>,
@@ -193,7 +193,7 @@ struct ListenerState {
 }
 
 pub struct SmtcListener {
-    output: SyncSender<MediaEvent>,
+    output: SyncSender<Arc<MediaEvent>>,
     config: Arc<RwLock<Config>>,
     /// Updated by the event loop every few seconds so a supervisor can detect
     /// a stalled worker (a WinRT call hanging under session churn) and
@@ -211,7 +211,7 @@ pub struct SmtcListener {
 impl SmtcListener {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        output: SyncSender<MediaEvent>,
+        output: SyncSender<Arc<MediaEvent>>,
         config: Arc<RwLock<Config>>,
         heartbeat: Arc<Mutex<Instant>>,
         live_generation: Arc<AtomicU64>,
@@ -273,7 +273,7 @@ impl ListenerState {
     fn new(
         manager: GlobalSystemMediaTransportControlsSessionManager,
         config: Arc<RwLock<Config>>,
-        output: SyncSender<MediaEvent>,
+        output: SyncSender<Arc<MediaEvent>>,
         signal_tx: SyncSender<Signal>,
         heartbeat: Arc<Mutex<Instant>>,
         live_generation: Arc<AtomicU64>,
@@ -1114,15 +1114,17 @@ impl ListenerState {
 
     /// Emits an event only while this worker generation is still current. A
     /// worker that stalled and was replaced must not keep producing events
-    /// after its successor took over. The channel is bounded and never
-    /// blocks the worker: when the forwarder cannot keep up, the event is
-    /// dropped at the source with a log line instead of growing the buffer
-    /// or stalling SMTC callbacks.
+    /// after its successor took over. The event travels as one shared `Arc`
+    /// allocation that the forwarder clones into both window queues, so the
+    /// fan-out never copies it. The channel is bounded and never blocks the
+    /// worker: when the forwarder cannot keep up, the event is dropped at
+    /// the source with a log line instead of growing the buffer or stalling
+    /// SMTC callbacks.
     fn emit(&self, event: MediaEvent) {
         if !self.is_current_generation() {
             return;
         }
-        match self.output.try_send(event) {
+        match self.output.try_send(Arc::new(event)) {
             Ok(()) => {}
             Err(mpsc::TrySendError::Full(_)) => {
                 warn!("SMTC event dropped: the event channel is full (UI is not keeping up)");

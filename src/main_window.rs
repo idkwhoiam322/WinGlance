@@ -1,6 +1,8 @@
 use crate::autostart;
 use crate::config::{Config, HorizontalPosition, VerticalPosition};
-use crate::events::{MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo};
+use crate::events::{
+    MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo, media_event_into_owned,
+};
 use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{EventQueue, OverlayPos, set_duration, set_position, show_sample};
 use crate::process_picker;
@@ -1008,7 +1010,10 @@ impl MainWindowState {
         if let Ok(mut queue) = self.queue.lock() {
             batch.extend(queue.drain(..));
         }
-        for event in batch {
+        // The queue carries Arc<MediaEvent> so the fan-out to both windows
+        // never copies the event; recover the owned event here (zero-copy
+        // when this window is the last holder, a clone otherwise).
+        for event in batch.into_iter().map(media_event_into_owned) {
             match event {
                 MediaEvent::TrackChanged(track) => self.add_track(track),
                 MediaEvent::PlaybackStateChanged(state, source_app) => {

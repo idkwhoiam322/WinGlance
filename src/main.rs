@@ -341,7 +341,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CHANNEL_CAP);
+    let (event_tx, event_rx) = mpsc::sync_channel::<Arc<MediaEvent>>(EVENT_CHANNEL_CAP);
     let shared_config: std::sync::Arc<std::sync::RwLock<Config>> =
         std::sync::Arc::new(std::sync::RwLock::new(config.clone()));
     let listener_config = shared_config.clone();
@@ -551,7 +551,7 @@ fn spawn_event_forwarder(
     overlay_queue: EventQueue,
     main_wake: Arc<AtomicBool>,
     overlay_wake: Arc<AtomicBool>,
-    receiver: mpsc::Receiver<MediaEvent>,
+    receiver: mpsc::Receiver<Arc<MediaEvent>>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     // HWND is not Send; the raw handle value is all the forwarder needs to
@@ -568,6 +568,8 @@ fn spawn_event_forwarder(
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
+                // One allocation per event, shared by both window queues via
+                // Arc clones; the windows recover the owned event on drain.
                 push_and_wake(
                     &main_queue,
                     &main_wake,
@@ -577,7 +579,7 @@ fn spawn_event_forwarder(
                 );
                 // Rejected sessions are history-only: the overlay never renders
                 // them, so they must not wake the pill or occupy its queue.
-                if !matches!(event, MediaEvent::SessionRejected { .. }) {
+                if !matches!(event.as_ref(), MediaEvent::SessionRejected { .. }) {
                     push_and_wake(
                         &overlay_queue,
                         &overlay_wake,
@@ -593,7 +595,7 @@ fn spawn_event_forwarder(
 
 /// Applies the window-queue cap after a push: when the queue holds more than
 /// `EVENT_QUEUE_CAP` events, the oldest is dropped in favor of the newest.
-fn enforce_queue_cap(queue: &mut VecDeque<MediaEvent>, name: &str) {
+fn enforce_queue_cap(queue: &mut VecDeque<Arc<MediaEvent>>, name: &str) {
     if queue.len() > EVENT_QUEUE_CAP {
         warn!("the {name} event queue exceeded its cap of {EVENT_QUEUE_CAP}; dropping the oldest buffered event");
         queue.pop_front();
@@ -625,7 +627,7 @@ fn clear_and_account(queue: &EventQueue, wake: &AtomicBool, name: &str) {
 /// cannot be poked, so nothing may stay queued without a wake message or a
 /// retry. On a poisoned queue the event is dropped and the wake flag is left
 /// untouched.
-fn push_and_wake(queue: &EventQueue, wake: &AtomicBool, event: MediaEvent, hwnd: HWND, name: &str) {
+fn push_and_wake(queue: &EventQueue, wake: &AtomicBool, event: Arc<MediaEvent>, hwnd: HWND, name: &str) {
     // A poisoned queue is unusable, so the event cannot be delivered. Do not
     // arm the wake flag: the window would drain nothing and the flag would
     // stay set until the next successful push.
@@ -678,7 +680,7 @@ fn message_loop() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::PlaybackState;
+    use crate::events::{PlaybackState, media_event_into_owned};
 
     #[test]
     fn window_queue_is_bounded_with_newest_wins() {
@@ -686,20 +688,20 @@ mod tests {
         // the newest event must survive, with the oldest evicted first.
         let mut queue = VecDeque::new();
         for i in 0..(EVENT_QUEUE_CAP + 50) {
-            queue.push_back(MediaEvent::PlaybackStateChanged(
+            queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
                 PlaybackState::Paused,
                 format!("src-{i}"),
-            ));
+            )));
             enforce_queue_cap(&mut queue, "test");
         }
         assert_eq!(queue.len(), EVENT_QUEUE_CAP);
-        match queue.front() {
+        match queue.front().map(|e| e.as_ref()) {
             Some(MediaEvent::PlaybackStateChanged(_, source)) => {
                 assert_eq!(source, "src-50", "the oldest surviving event must be the 51st pushed");
             }
             _ => panic!("expected a PlaybackStateChanged at the front"),
         }
-        match queue.back() {
+        match queue.back().map(|e| e.as_ref()) {
             Some(MediaEvent::PlaybackStateChanged(_, source)) => {
                 assert_eq!(
                     source,
@@ -715,14 +717,14 @@ mod tests {
     fn window_queue_under_cap_keeps_every_event() {
         let mut queue = VecDeque::new();
         for i in 0..EVENT_QUEUE_CAP {
-            queue.push_back(MediaEvent::PlaybackStateChanged(
+            queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
                 PlaybackState::Playing,
                 format!("src-{i}"),
-            ));
+            )));
             enforce_queue_cap(&mut queue, "test");
         }
         assert_eq!(queue.len(), EVENT_QUEUE_CAP);
-        match queue.front() {
+        match queue.front().map(|e| e.as_ref()) {
             Some(MediaEvent::PlaybackStateChanged(_, source)) => assert_eq!(source, "src-0"),
             _ => panic!("expected the first event at the front"),
         }
@@ -742,14 +744,14 @@ mod tests {
         push_and_wake(
             &queue,
             &wake,
-            MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "src-1".into()),
+            Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "src-1".into())),
             bogus_hwnd,
             "test",
         );
         push_and_wake(
             &queue,
             &wake,
-            MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "src-2".into()),
+            Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "src-2".into())),
             bogus_hwnd,
             "test",
         );
@@ -772,10 +774,10 @@ mod tests {
         {
             let mut q = queue.lock().unwrap();
             for i in 0..3 {
-                q.push_back(MediaEvent::PlaybackStateChanged(
+                q.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
                     PlaybackState::Playing,
                     format!("src-{i}"),
-                ));
+                )));
             }
         }
         repost_if_pending(&queue, &wake, HWND(isize::MAX as *mut c_void), "test");
@@ -787,5 +789,27 @@ mod tests {
             !wake.load(Ordering::SeqCst),
             "a failed repost must leave the wake flag clear"
         );
+    }
+
+    #[test]
+    fn media_event_is_recovered_from_its_transport_arc() {
+        // A sole reference unwraps zero-copy...
+        let sole = Arc::new(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Playing,
+            "spotify".into(),
+        ));
+        let owned = media_event_into_owned(sole);
+        assert!(matches!(owned, MediaEvent::PlaybackStateChanged(PlaybackState::Playing, ref s) if s == "spotify"));
+        // ...while a shared reference falls back to a clone of the same value.
+        let shared = Arc::new(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "youtube-music".into(),
+        ));
+        let other_holder = shared.clone();
+        let owned = media_event_into_owned(shared);
+        assert!(
+            matches!(owned, MediaEvent::PlaybackStateChanged(PlaybackState::Paused, ref s) if s == "youtube-music")
+        );
+        assert_eq!(Arc::strong_count(&other_holder), 1);
     }
 }
