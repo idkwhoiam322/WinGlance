@@ -37,7 +37,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-    Shell_NotifyIconW,
+    Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -180,6 +180,10 @@ enum SettingSub {
     Anchor(usize),
     Reset,
     Adjust,
+    /// The left half of the Diagnostics row ("Open logs" button).
+    Open,
+    /// The right half of the Diagnostics row ("Copy logs" button).
+    Copy,
 }
 
 /// Sub-rects of the Position row: value text, the six anchor segments, the
@@ -215,6 +219,27 @@ fn row_split(rect: &RECT, scale: f32) -> RowSplit {
             bottom: rect.bottom,
         },
     }
+}
+
+/// Splits `rect` down the middle with a small gap, for rows that host two
+/// side-by-side controls (the Diagnostics "Open logs" / "Copy logs" buttons).
+fn halve(rect: &RECT, gap: i32) -> (RECT, RECT) {
+    let mid = rect.left + (rect.right - rect.left) / 2;
+    let half_gap = gap / 2;
+    (
+        RECT {
+            left: rect.left,
+            top: rect.top,
+            right: mid - half_gap,
+            bottom: rect.bottom,
+        },
+        RECT {
+            left: mid + half_gap,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        },
+    )
 }
 
 /// Whether two rects overlap in area. Used to skip repainting rows that the
@@ -2022,23 +2047,35 @@ impl MainWindowState {
                             );
                         }
                         SettingId::CopyLogs => {
-                            let btn_rect = RECT {
-                                left: control_rect.left,
-                                top: control_rect.top,
-                                right: control_rect.right,
-                                bottom: control_rect.bottom,
-                            };
-                            let hovered = self.settings_hover == Some((current_row, SettingSub::None));
+                            // Diagnostics row hosts two side-by-side buttons:
+                            // the left half opens the log in the default editor,
+                            // the right half copies it to the clipboard. Each
+                            // button highlights only when the cursor is over
+                            // its own half.
+                            let gap = (4.0 * scale) as i32;
+                            let (open_rect, copy_rect) = halve(&control_rect, gap);
+                            let hovered_open = self.settings_hover == Some((current_row, SettingSub::Open));
+                            let hovered_copy = self.settings_hover == Some((current_row, SettingSub::Copy));
                             let copied = self
                                 .logs_copied_at
                                 .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
                             draw_small_button(
                                 &self.fonts,
                                 hdc,
-                                &btn_rect,
+                                &open_rect,
+                                "Open logs",
+                                accent,
+                                hovered_open,
+                                scale,
+                                brushes,
+                            );
+                            draw_small_button(
+                                &self.fonts,
+                                hdc,
+                                &copy_rect,
                                 if copied { "Copied" } else { "Copy logs" },
                                 accent,
-                                hovered,
+                                hovered_copy,
                                 scale,
                                 brushes,
                             );
@@ -2075,6 +2112,19 @@ impl MainWindowState {
                     // A click or hover in the gap right of the last segment is
                     // not the first segment; the row stays highlighted.
                     return Some((row_index, seg.map_or(SettingSub::None, SettingSub::Seg)));
+                }
+                if *id == SettingId::CopyLogs {
+                    // Per-button hover for the two side-by-side buttons: the
+                    // left half is "Open logs", the right half "Copy logs".
+                    let gap = (4.0 * scale) as i32;
+                    let (open_rect, copy_rect) = halve(&control_rect, gap);
+                    if x >= open_rect.left && x < open_rect.right {
+                        return Some((row_index, SettingSub::Open));
+                    }
+                    if x >= copy_rect.left && x < copy_rect.right {
+                        return Some((row_index, SettingSub::Copy));
+                    }
+                    return Some((row_index, SettingSub::None));
                 }
                 if *id == SettingId::Position {
                     let parts = position_parts(rect, scale);
@@ -2411,6 +2461,31 @@ impl MainWindowState {
             let _ = SetTimer(self.hwnd, TIMER_LOGS_ID, 2000, None);
         }
         self.invalidate();
+    }
+
+    /// Opens the current run's log file (`log-Live.log`) in the default
+    /// application registered for its extension (i.e. the user's preferred
+    /// text editor), mirroring `copy_logs`, which reads the same path. The OS
+    /// picks the handler; `ShellExecuteW` returns a value <= 32 on failure,
+    /// which is surfaced to the debug log rather than the screen.
+    fn open_logs(&self) {
+        let path = self.cfg().logs_dir().join("log-Live.log");
+        let file = wide(&path.to_string_lossy());
+        let verb = wide("open");
+        let result = unsafe {
+            ShellExecuteW(
+                self.hwnd,
+                PCWSTR(verb.as_ptr()),
+                PCWSTR(file.as_ptr()),
+                None,
+                None,
+                SW_SHOW,
+            )
+        };
+        let code = result.0 as isize;
+        if code <= 32 {
+            debug!("open logs: ShellExecuteW failed (code {code}) for {path:?}");
+        }
     }
 
     /// Pins the overlay to a vertical/horizontal anchor: clears any absolute
@@ -3215,7 +3290,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     show_sample(state.overlay_hwnd);
                                 }
                                 SettingId::CopyLogs => {
-                                    state.copy_logs();
+                                    let gap = (4.0 * scale) as i32;
+                                    let (open_rect, _copy_rect) = halve(&control_rect, gap);
+                                    if x >= open_rect.left && x < open_rect.right {
+                                        state.open_logs();
+                                    } else {
+                                        state.copy_logs();
+                                    }
                                 }
                                 SettingId::AllowedApps => {
                                     if !process_picker::open(
