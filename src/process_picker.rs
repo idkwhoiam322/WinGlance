@@ -218,15 +218,18 @@ fn merge_smtc_sources(mut entries: Vec<ProcessEntry>) -> Vec<ProcessEntry> {
 
 /// Builds the picker's row list from the live process/session set plus the
 /// user's stored allow-list. Every allow-list pattern that has no live
-/// matching entry is appended as a pre-checked row labeled "… (not running)"
-/// so closing the picker can never silently drop a previously-enabled source:
+/// matching entry is added as a pre-checked row labeled "… (not running)" so
+/// closing the picker can never silently drop a previously-enabled source:
 /// the main window replaces (not merges) the allow-list with the picker's
 /// checked result, so anything not shown above a checkbox would be lost.
+/// Not-running rows are pinned above the live apps (each group sorted by
+/// name), so a stored source stays visible even when its app is closed.
 fn build_picker_list(current: &[String], mut entries: Vec<ProcessEntry>) -> Vec<ProcessEntry> {
     // Normalized patterns already represented by a live entry. Match with the
     // same bidirectional-contains rule the pre-check uses, so a "discord" entry
     // is not duplicated by a "discord-helper" running process, and vice-versa.
     let seen: HashSet<String> = entries.iter().map(|e| normalize_pattern(&e.pattern)).collect();
+    let mut not_running = Vec::new();
     for pattern in current {
         let norm = normalize_pattern(pattern);
         if norm.is_empty() || seen.iter().any(|e| e.contains(&norm) || norm.contains(e)) {
@@ -234,13 +237,15 @@ fn build_picker_list(current: &[String], mut entries: Vec<ProcessEntry>) -> Vec<
         }
         // Not currently running: keep it in the row set, pre-checked, with a
         // label that makes its absence from the live process list obvious.
-        entries.push(ProcessEntry {
+        not_running.push(ProcessEntry {
             display_name: format!("{} (not running)", pretty_source_label(pattern)),
             pattern: pattern.clone(),
         });
     }
     entries.sort_by_key(|a| a.display_name.to_lowercase());
-    entries
+    not_running.sort_by_key(|a| a.display_name.to_lowercase());
+    not_running.extend(entries);
+    not_running
 }
 
 /// Same normalization the SMTC worker uses when matching allow-list patterns
@@ -1080,5 +1085,33 @@ mod tests {
         assert!(by_pattern["discord"].display_name.contains("not running"));
         assert_eq!(by_pattern["spotify"].pattern, "spotify");
         assert_eq!(by_pattern["discord"].pattern, "discord");
+    }
+
+    #[test]
+    fn not_running_sources_pin_to_the_top_of_the_list() {
+        // The configured-but-closed app must appear above every running app,
+        // regardless of alphabetical order, so a stored source is never lost
+        // below the fold of a long list.
+        let list = build_picker_list(
+            &["zebra".to_string(), "alpha".to_string()],
+            vec![entry("mango"), entry("banana")],
+        );
+        assert_eq!(list.len(), 4);
+        assert_eq!(list[0].pattern, "alpha");
+        assert_eq!(list[1].pattern, "zebra");
+        assert_eq!(list[2].pattern, "banana");
+        assert_eq!(list[3].pattern, "mango");
+        assert!(list[0].display_name.contains("not running"));
+        assert!(list[1].display_name.contains("not running"));
+        assert!(!list[2].display_name.contains("not running"));
+        assert!(!list[3].display_name.contains("not running"));
+    }
+
+    #[test]
+    fn not_running_group_stays_alphabetically_sorted() {
+        let list = build_picker_list(&["zeta".to_string(), "alpha".to_string()], vec![]);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].pattern, "alpha");
+        assert_eq!(list[1].pattern, "zeta");
     }
 }
