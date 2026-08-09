@@ -193,11 +193,12 @@ struct MarqueeCtx<'a> {
 }
 
 /// The overflowing line rasterized once at its natural width, premultiplied
-/// with the row's color. While the line scrolls, every animation tick samples
-/// the visible window from this strip (two contiguous runs) instead of
-/// re-running GDI text rendering (ExtTextOutW + GdiFlush) at animation
-/// cadence. Keyed by everything that affects the raster, so a content, size,
-/// font, or color change rebuilds it and everything else is a pure memcpy.
+/// with the row's color. Every overflow frame — the pre-scroll hold included
+/// — samples the visible window from this strip (two contiguous runs)
+/// instead of re-running GDI text rendering (ExtTextOutW + GdiFlush) at
+/// animation cadence. Rasterization occurs on a cache miss: the strip is
+/// rebuilt when content, size, font, or color changes, and a cache hit keeps
+/// every later frame a pure composite.
 struct MarqueeStrip {
     value: String,
     rw: i32,
@@ -216,6 +217,10 @@ const MARQUEE_HOLD: Duration = Duration::from_millis(600);
 const MARQUEE_GAP: f32 = 24.0;
 /// Scroll speed in logical px per second.
 const MARQUEE_SPEED: f32 = 40.0;
+/// Width of the horizontal alpha fade at each visible edge of a scrolling
+/// marquee line, in logical px (scaled by the render scale at draw time).
+/// During the pre-scroll hold only the trailing edge fades.
+const MARQUEE_FADE: f32 = 12.0;
 /// Band height per text row as a multiple of the row's font size. Matches the
 /// font's natural line height (ascent + descent ≈ 1.33x for Segoe UI), so rows
 /// pack tightly without clipping.
@@ -2449,6 +2454,7 @@ fn draw_pill_text_rows(
         h_title,
         text_color,
         false,
+        scale,
         Some(MarqueeCtx {
             scroll: &mut state.scroll[0],
             strip: &mut state.marquee_strips[0],
@@ -2479,6 +2485,7 @@ fn draw_pill_text_rows(
             h_artist,
             muted_accent(accent),
             false,
+            scale,
             Some(MarqueeCtx {
                 scroll: &mut state.scroll[1],
                 strip: &mut state.marquee_strips[1],
@@ -2624,6 +2631,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         h_title,
                         text_color,
                         false,
+                        scale,
                         None,
                     );
                     draw_symbol_pixels(
@@ -2647,6 +2655,7 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
                         h_artist,
                         [0xCC, 0xCC, 0xCC, 0xFF],
                         false,
+                        scale,
                         None,
                     );
                 }
@@ -2693,6 +2702,7 @@ fn draw_meta_line_pixels(
             tm_height,
             color,
             false,
+            scale,
             marquee,
         );
         return;
@@ -2717,6 +2727,7 @@ fn draw_meta_line_pixels(
         tm_height,
         color,
         false,
+        scale,
         marquee,
     );
 }
@@ -2740,6 +2751,7 @@ fn draw_text_line_pixels(
     font_height: i32,
     color: [u8; 4],
     centered: bool,
+    scale: f32,
     marquee: Option<MarqueeCtx<'_>>,
 ) {
     if value.is_empty() || rect.right <= rect.left || rect.bottom <= rect.top {
@@ -2805,20 +2817,26 @@ fn draw_text_line_pixels(
                 debug!("marquee overflow | text_w={text_w} | draw_w={rw} | title={value}");
             }
             let hold_elapsed = ctx.scroll.started_at.map(|t| t.elapsed()).unwrap_or_default();
+            // Edge-fade width in the rendering coordinate space (the same
+            // scale the row rects live in), 12 logical px per side.
+            let fade_w = MARQUEE_FADE * scale;
             if text_w <= rw {
                 // Text fits: render once statically (no scrolling needed).
                 let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
-            } else if hold_elapsed < MARQUEE_HOLD {
-                // Overflow but still in the static hold: render with ellipsis so
-                // the text is readable ("…") instead of hard-clipped at the edge.
-                let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
             } else {
-                // Scrolling active: sample the cached marquee strip instead of
-                // re-running GDI text rendering at animation cadence. Returns
-                // early because the strip composite below replaces the general
-                // glyph composite at the end of this function.
+                // Overflowing line, served from the cached strip.
+                // Rasterization occurs on a marquee-strip cache miss (a
+                // content, size, font, or color change); the cached strip is
+                // reused during the initial hold and subsequent scrolling, so
+                // GDI text rendering (ExtTextOutW) never runs at animation
+                // cadence. The tick keeps the offset at 0 through the hold,
+                // so compositing at that offset shows the complete,
+                // unellipsized title stationary — the viewport clips and
+                // fades the overflowing tail. When the hold elapses, the same
+                // strip starts sliding. Returns early because the strip
+                // composite below replaces the general glyph composite at the
+                // end of this function.
                 let total = text_w + MARQUEE_GAP as i32;
-                let off = (ctx.scroll.offset % total as f32) as i32;
                 build_marquee_strip(
                     ctx.strip,
                     text_scratch,
@@ -2834,7 +2852,19 @@ fn draw_text_line_pixels(
                     text_w,
                 );
                 if let Some(strip) = ctx.strip.as_ref() {
-                    composite_marquee_strip(pixels, width, rect, strip, off, total);
+                    let off = (ctx.scroll.offset % total as f32) as i32;
+                    // Edge fade relative to the visible band: during the hold
+                    // only the trailing edge fades — nothing exits the left
+                    // edge, and the text head sits at the band boundary where
+                    // it must stay readable. Once the line scrolls, text
+                    // exits the left edge and enters at the right, so both
+                    // edges fade.
+                    let (fade_left, fade_right) = if hold_elapsed < MARQUEE_HOLD {
+                        (0.0, fade_w)
+                    } else {
+                        (fade_w, fade_w)
+                    };
+                    composite_marquee_strip(pixels, width, rect, strip, off, total, fade_left, fade_right);
                 }
                 return;
             }
@@ -2855,7 +2885,9 @@ fn draw_text_line_pixels(
     // color's own alpha, and the color is premultiplied by alpha for
     // `composite_pm`. Drawing the final color via SetTextColor instead would
     // make GDI pre-dim the scratch, and reading that dimmed value as coverage
-    // would render gray text at ~brightness² opacity.
+    // would render gray text at ~brightness² opacity. The edge mask never
+    // applies here: only the marquee strip composite (above) fades, relative
+    // to the visible band.
     composite_glyphs(
         pixels,
         width,
@@ -2949,6 +2981,8 @@ fn build_marquee_strip(
         let _ = SelectObject(hdc, old_font);
     }
     let mut pixels = vec![0u8; text_w as usize * rh as usize * 4];
+    // No edge mask: the strip keeps the full raster, and the fade is applied
+    // relative to the visible band at composite time.
     composite_glyphs(
         &mut pixels,
         text_w as usize,
@@ -2978,8 +3012,20 @@ fn build_marquee_strip(
 /// copy 1 of the loop covers [x1, x1+text_w), copy 2 covers
 /// [x1+total, x1+total+text_w) with x1 = -off. Pixels between the copies are
 /// background and stay untouched. The strip holds premultiplied pixels, so
-/// the composite is the same source-over math as `composite_pm`.
-fn composite_marquee_strip(pixels: &mut [u8], width: usize, rect: &RECT, strip: &MarqueeStrip, off: i32, total: i32) {
+/// the composite is the same source-over math as `composite_pm`. `fade_left`
+/// and `fade_right` are the horizontal edge-fade widths in pixels; 0 disables
+/// that edge's mask (the pre-scroll hold fades only the trailing edge).
+#[allow(clippy::too_many_arguments)]
+fn composite_marquee_strip(
+    pixels: &mut [u8],
+    width: usize,
+    rect: &RECT,
+    strip: &MarqueeStrip,
+    off: i32,
+    total: i32,
+    fade_left: f32,
+    fade_right: f32,
+) {
     let rw = (rect.right - rect.left) as usize;
     let rh = (rect.bottom - rect.top) as usize;
     let tw = strip.text_w as usize;
@@ -3003,20 +3049,66 @@ fn composite_marquee_strip(pixels: &mut [u8], width: usize, rect: &RECT, strip: 
             if alpha == 0 {
                 continue;
             }
+            // The strip is premultiplied, so the fade must scale the
+            // premultiplied RGB together with the alpha, or a fading glyph
+            // would keep its color while its coverage falls. The mask is
+            // relative to the visible row `[rect.left, rect.right)`.
+            let fade = edge_fade_factor(
+                (rect.left + x) as f32,
+                rect.left as f32,
+                rect.right as f32,
+                fade_left,
+                fade_right,
+            );
+            let alpha = ((alpha as f32) * fade).round() as u32;
+            if alpha == 0 {
+                continue;
+            }
+            let src_r = (src_row[sp] as f32 * fade).round() as u32;
+            let src_g = (src_row[sp + 1] as f32 * fade).round() as u32;
+            let src_b = (src_row[sp + 2] as f32 * fade).round() as u32;
             let inv = 255 - alpha;
             let dp = x as usize * 4;
-            dst_row[dp] = (src_row[sp] as u32 + dst_row[dp] as u32 * inv / 255) as u8;
-            dst_row[dp + 1] = (src_row[sp + 1] as u32 + dst_row[dp + 1] as u32 * inv / 255) as u8;
-            dst_row[dp + 2] = (src_row[sp + 2] as u32 + dst_row[dp + 2] as u32 * inv / 255) as u8;
+            dst_row[dp] = (src_r + dst_row[dp] as u32 * inv / 255) as u8;
+            dst_row[dp + 1] = (src_g + dst_row[dp + 1] as u32 * inv / 255) as u8;
+            dst_row[dp + 2] = (src_b + dst_row[dp + 2] as u32 * inv / 255) as u8;
             dst_row[dp + 3] = (alpha + dst_row[dp + 3] as u32 * inv / 255) as u8;
         }
     }
 }
 
+/// Horizontal alpha mask for overflowing marquee text: full opacity across
+/// the interior of the visible row, ramping linearly to zero across
+/// `fade_left` pixels from the left boundary and `fade_right` pixels from
+/// the right. `x`, `left` and `right` share one coordinate space (the visible
+/// row rect, `[left, right)`). A non-positive edge width disables that
+/// edge's ramp, so the pre-scroll hold can fade only its trailing edge while
+/// the text head stays at full opacity. When the fade zones overlap, the
+/// stronger ramp wins, so a pixel near both boundaries is attenuated once,
+/// never twice. A degenerate rect disables the mask (factor stays 1.0).
+fn edge_fade_factor(x: f32, left: f32, right: f32, fade_left: f32, fade_right: f32) -> f32 {
+    if right <= left {
+        return 1.0;
+    }
+    let left_t = if fade_left > 0.0 {
+        ((x - left) / fade_left).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let right_t = if fade_right > 0.0 {
+        ((right - x) / fade_right).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    left_t.min(right_t)
+}
+
 /// Premultiplies the glyph coverage in the scratch DIB (white-on-black, stride
 /// `sw` pixels per row) into `dest` at (left, top) with `color`, skipping
 /// fully transparent pixels. Shared by the per-frame text composite and the
-/// marquee-strip build.
+/// marquee-strip build. The edge mask is never applied here: the strip keeps
+/// the full raster so the fade can be re-evaluated relative to the visible
+/// band at composite time.
 #[allow(clippy::too_many_arguments)]
 fn composite_glyphs(
     dest: &mut [u8],
@@ -3244,6 +3336,7 @@ fn draw_source_app_row(
             tm_height,
             color,
             false,
+            scale,
             marquee,
         );
     } else {
@@ -3258,6 +3351,7 @@ fn draw_source_app_row(
             tm_height,
             color,
             false,
+            scale,
             marquee,
         );
     }
@@ -4507,6 +4601,7 @@ mod tests {
             h,
             [255, 255, 255, 255],
             false,
+            1.0,
             None,
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
@@ -4542,6 +4637,7 @@ mod tests {
             h,
             [0x80, 0x80, 0x80, 0xFF],
             false,
+            1.0,
             None,
         );
         // Find the highest alpha in the buffer: the interior of the glyphs.
@@ -4592,6 +4688,7 @@ mod tests {
             h,
             [255, 255, 255, 255],
             false,
+            1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
                 strip: &mut strip,
@@ -4628,6 +4725,7 @@ mod tests {
             h,
             [255, 255, 255, 255],
             false,
+            1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
                 strip: &mut strip,
@@ -4674,6 +4772,7 @@ mod tests {
             h,
             [255, 255, 255, 255],
             false,
+            1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
                 strip: &mut strip,
@@ -4696,6 +4795,7 @@ mod tests {
             h,
             [255, 255, 255, 255],
             false,
+            1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
                 strip: &mut strip,
@@ -4740,6 +4840,7 @@ mod tests {
             h,
             [255, 255, 255, 255],
             false,
+            1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
                 strip: &mut strip,
@@ -4757,6 +4858,7 @@ mod tests {
             h,
             [255, 255, 255, 255],
             false,
+            1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
                 strip: &mut strip,
@@ -4792,7 +4894,7 @@ mod tests {
             right: 40,
             bottom: 20,
         };
-        composite_marquee_strip(&mut pixels, 40, &rect, &strip, 2, 30);
+        composite_marquee_strip(&mut pixels, 40, &rect, &strip, 2, 30, 0.0, 0.0);
         for (i, p) in pixels.chunks(4).enumerate() {
             let x = i % 40;
             let in_tail = (0..8).contains(&x); // x1 = -2, x1 + text_w = 8
@@ -4803,6 +4905,386 @@ mod tests {
                 assert_eq!(p, &[0, 0, 0, 0], "background must stay clear at x={x}");
             }
         }
+    }
+
+    #[test]
+    fn edge_fade_factor_ramps_to_zero_at_both_edges() {
+        // The mask must read 0 at each visible boundary, 1 across the
+        // interior, and linear in between; a zero fade width or a degenerate
+        // rect must disable it entirely. The two edge widths are independent:
+        // disabling one edge leaves that boundary at full opacity.
+        let (left, right, fade_w) = (10.0, 110.0, 12.0);
+        let at = |x: f32| edge_fade_factor(x, left, right, fade_w, fade_w);
+        assert_eq!(at(left), 0.0, "left boundary must be fully faded");
+        assert!(
+            (at(left + fade_w / 2.0) - 0.5).abs() < 1e-6,
+            "halfway through the left fade must read ~0.5"
+        );
+        assert_eq!(at((left + right) / 2.0), 1.0, "the interior must stay at full opacity");
+        assert!(
+            (at(right - fade_w / 2.0) - 0.5).abs() < 1e-6,
+            "halfway through the right fade must read ~0.5"
+        );
+        assert_eq!(at(right), 0.0, "right boundary must be fully faded");
+        assert_eq!(
+            edge_fade_factor(50.0, 0.0, 100.0, 0.0, 0.0),
+            1.0,
+            "a zero fade width must disable the mask"
+        );
+        assert_eq!(
+            edge_fade_factor(50.0, 100.0, 50.0, 12.0, 12.0),
+            1.0,
+            "a degenerate rect must disable the mask"
+        );
+        // Trailing-only hold fade: a disabled left edge keeps the left
+        // boundary at full opacity while the right edge still ramps (and the
+        // mirror case for a disabled right edge).
+        assert_eq!(
+            edge_fade_factor(left, left, right, 0.0, fade_w),
+            1.0,
+            "a disabled left edge must keep the left boundary at full opacity"
+        );
+        assert_eq!(
+            edge_fade_factor(right, left, right, 0.0, fade_w),
+            0.0,
+            "the right edge must still fade when only the left is disabled"
+        );
+        assert_eq!(
+            edge_fade_factor(left, left, right, fade_w, 0.0),
+            0.0,
+            "the left edge must still fade when only the right is disabled"
+        );
+        assert_eq!(
+            edge_fade_factor(right, left, right, fade_w, 0.0),
+            1.0,
+            "a disabled right edge must keep the right boundary at full opacity"
+        );
+    }
+
+    #[test]
+    fn non_overflowing_marquee_line_renders_identically_to_static_text() {
+        // The edge mask must not touch text that fits its band: a fitting line
+        // drawn with marquee state must be byte-identical to the same line
+        // drawn without it, and must not be flagged as scrolling.
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 40,
+        };
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+        let (font, h) = state.fonts.font_for(12, false);
+        let mut static_pixels = vec![0u8; 200 * 40 * 4];
+        draw_text_line_pixels(
+            &mut state.text_scratch,
+            &mut state.scratch_utf16,
+            &mut static_pixels,
+            200,
+            "Hello",
+            &rect,
+            font,
+            h,
+            [255, 255, 255, 255],
+            false,
+            1.0,
+            None,
+        );
+        let mut marquee_pixels = vec![0u8; 200 * 40 * 4];
+        let mut scroll = LineScroll::default();
+        let mut strip = None;
+        draw_text_line_pixels(
+            &mut state.text_scratch,
+            &mut state.scratch_utf16,
+            &mut marquee_pixels,
+            200,
+            "Hello",
+            &rect,
+            font,
+            h,
+            [255, 255, 255, 255],
+            false,
+            1.0,
+            Some(MarqueeCtx {
+                scroll: &mut scroll,
+                strip: &mut strip,
+            }),
+        );
+        assert!(!scroll.scrolling, "fitting text must not be marked as scrolling");
+        assert!(strip.is_none(), "fitting text must not build a strip");
+        assert_eq!(
+            marquee_pixels, static_pixels,
+            "non-overflowing marquee text must render exactly like static text"
+        );
+    }
+
+    #[test]
+    fn overflowing_hold_shows_full_text_and_stays_stationary() {
+        // One LineScroll and one Option<MarqueeStrip> serve both the hold and
+        // the scroll: the strip is built on the first overflow frame, and the
+        // same cached raster must be reused through the hold and into the
+        // scroll, with the offset held at 0 the whole time. The hold fades
+        // only the trailing edge (the text head sits at the band boundary and
+        // is not clipped); once the hold elapses, both edges fade.
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 80, // narrow, forces overflow
+            bottom: 40,
+        };
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+        let (font, h) = state.fonts.font_for(12, false);
+        let value = "Feel It (Official Music Video)";
+
+        let mut scroll = LineScroll {
+            started_at: Some(Instant::now()),
+            ..LineScroll::default()
+        };
+        let mut strip = None;
+
+        // --- Hold phase: full text at offset 0 ---
+        let mut hold_pixels = vec![0u8; 200 * 40 * 4];
+        draw_text_line_pixels(
+            &mut state.text_scratch,
+            &mut state.scratch_utf16,
+            &mut hold_pixels,
+            200,
+            value,
+            &rect,
+            font,
+            h,
+            [255, 255, 255, 255],
+            false,
+            1.0,
+            Some(MarqueeCtx {
+                scroll: &mut scroll,
+                strip: &mut strip,
+            }),
+        );
+        assert!(scroll.scrolling, "overflow must be detected during the hold");
+        assert_eq!(scroll.offset, 0.0, "the hold must not advance the scroll offset");
+
+        // A second hold frame must be served from the same cached strip: the
+        // strip pixels must not change (no fresh GDI rasterization on later
+        // hold frames) and the frame must be pixel-identical.
+        let strip_before = strip
+            .as_ref()
+            .expect("the hold must build the cached strip")
+            .pixels
+            .clone();
+        let mut hold2_pixels = vec![0u8; 200 * 40 * 4];
+        draw_text_line_pixels(
+            &mut state.text_scratch,
+            &mut state.scratch_utf16,
+            &mut hold2_pixels,
+            200,
+            value,
+            &rect,
+            font,
+            h,
+            [255, 255, 255, 255],
+            false,
+            1.0,
+            Some(MarqueeCtx {
+                scroll: &mut scroll,
+                strip: &mut strip,
+            }),
+        );
+        assert_eq!(
+            strip.as_ref().unwrap().pixels,
+            strip_before,
+            "a second hold frame must reuse the cached strip without re-rasterizing"
+        );
+        assert_eq!(
+            hold2_pixels, hold_pixels,
+            "a second hold frame must render identically to the first"
+        );
+        assert_eq!(scroll.offset, 0.0, "the offset must stay at 0 throughout the hold");
+
+        let built = strip.as_ref().expect("the hold must build the cached strip");
+        assert!(
+            built.text_w > 80,
+            "the strip must carry the full natural text width, not an ellipsized band"
+        );
+        assert!(
+            state.text_scratch.as_ref().unwrap().width > 80,
+            "the strip build must rasterize the full natural text width"
+        );
+        // The raster must contain the title's tail beyond the visible band:
+        // an ellipsized draw would end at the band width and leave the
+        // strip's outer columns empty, while the full title clips there.
+        let tail_lit = (0..built.rh as usize).any(|r| {
+            let row = r * built.text_w as usize * 4;
+            built.pixels[row + rect.right as usize * 4..row + built.text_w as usize * 4]
+                .chunks(4)
+                .any(|p| p[3] > 0)
+        });
+        assert!(
+            tail_lit,
+            "the hold raster must contain the title's tail, not an ellipsis"
+        );
+        // Owned copies so the comparisons below can run while `strip` is
+        // borrowed mutably for the scrolling draw.
+        let strip_pixels = built.pixels.clone();
+        let tw = built.text_w as usize;
+
+        // Leading edge stays unfaded during the hold: every pixel of the hold
+        // frame inside the left fade zone is byte-identical to the cached
+        // strip (fade_left is disabled, so the mask never touches it).
+        for r in 0..rect.bottom as usize {
+            for x in 0..MARQUEE_FADE as usize {
+                let s = &strip_pixels[(r * tw + x) * 4..(r * tw + x) * 4 + 4];
+                let f = &hold_pixels[(r * 200 + x) * 4..(r * 200 + x) * 4 + 4];
+                assert_eq!(s, f, "the hold must not fade the leading edge at row {r}, column {x}");
+            }
+        }
+
+        // The trailing edge must fade during the hold: the tail crossing the
+        // band's right boundary is attenuated against the cached, unfaded
+        // strip (scanning every row over the columns strictly inside the
+        // 12px fade zone, where the factor is always < 1).
+        let zone_from = (rect.right - MARQUEE_FADE as i32 + 1) as usize;
+        let strip_max = (0..rect.bottom as usize)
+            .flat_map(|r| {
+                let row = r * tw * 4;
+                strip_pixels[row + zone_from * 4..row + rect.right as usize * 4]
+                    .chunks(4)
+                    .map(|p| p[3])
+            })
+            .max()
+            .unwrap_or(0);
+        let frame_max = (0..rect.bottom as usize)
+            .flat_map(|r| {
+                let row = r * 200 * 4;
+                hold_pixels[row + zone_from * 4..row + rect.right as usize * 4]
+                    .chunks(4)
+                    .map(|p| p[3])
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            strip_max > frame_max,
+            "the hold must fade the tail at the right boundary (strip {strip_max} vs frame {frame_max})"
+        );
+
+        // --- Scroll phase: the hold elapses, the same strip scrolls ---
+        scroll.started_at = Some(Instant::now() - MARQUEE_HOLD - Duration::from_millis(100));
+        // The offset is still 0 (the tick only advances it after the hold):
+        // the first scrolling frame shows the same window, now with both edge
+        // fades active.
+        let mut scroll_pixels = vec![0u8; 200 * 40 * 4];
+        draw_text_line_pixels(
+            &mut state.text_scratch,
+            &mut state.scratch_utf16,
+            &mut scroll_pixels,
+            200,
+            value,
+            &rect,
+            font,
+            h,
+            [255, 255, 255, 255],
+            false,
+            1.0,
+            Some(MarqueeCtx {
+                scroll: &mut scroll,
+                strip: &mut strip,
+            }),
+        );
+        assert_eq!(
+            strip.as_ref().unwrap().pixels,
+            strip_pixels,
+            "the scrolling draw must reuse the same cached strip built during the hold"
+        );
+
+        // Both edges fade once scrolling begins: every visible column of the
+        // scrolling frame must match the same strip column scaled by the
+        // linear edge mask — x / fade_w from the left boundary, (rw - x) /
+        // fade_w from the right, 1.0 across the interior. The strip holds
+        // premultiplied white text (RGB == alpha), so the expected pixel is
+        // the masked alpha in every channel.
+        let rw_f = rect.right as f32;
+        for r in 0..rect.bottom as usize {
+            for x in 0..rect.right as usize {
+                let fade = ((x as f32) / MARQUEE_FADE)
+                    .min((rw_f - x as f32) / MARQUEE_FADE)
+                    .clamp(0.0, 1.0);
+                let sa = strip_pixels[(r * tw + x) * 4 + 3] as f32;
+                let a = (sa * fade).round() as u8;
+                let f = &scroll_pixels[(r * 200 + x) * 4..(r * 200 + x) * 4 + 4];
+                assert_eq!(
+                    f,
+                    &[a, a, a, a],
+                    "the scrolling frame must match strip x fade at row {r}, column {x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn marquee_strip_composite_fades_the_visible_edges() {
+        // The scrolling path must fade glyphs near both visible boundaries
+        // while the row interior keeps full opacity. The strip holds
+        // premultiplied pixels, so the fade must scale RGB with alpha: a
+        // faded pixel keeps its hue while its coverage falls.
+        let strip = MarqueeStrip {
+            value: "x".into(),
+            rw: 40,
+            rh: 20,
+            font: HFONT(std::ptr::null_mut()),
+            font_height: 10,
+            color: [0, 0, 255, 255],
+            centered: false,
+            text_w: 40,
+            pixels: [255u8, 0, 0, 255].repeat(40 * 20), // solid premultiplied blue (BGRA)
+        };
+        let mut pixels = vec![0u8; 40 * 20 * 4];
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 40,
+            bottom: 20,
+        };
+        composite_marquee_strip(&mut pixels, 40, &rect, &strip, 2, 70, MARQUEE_FADE, MARQUEE_FADE);
+        let px = |x: usize| -> [u8; 4] {
+            let p = &pixels[x * 4..x * 4 + 4];
+            [p[0], p[1], p[2], p[3]]
+        };
+        assert_eq!(px(0), [0, 0, 0, 0], "the left boundary must be fully faded");
+        let half = px(6); // halfway through the 12px left fade
+        assert!(
+            (half[3] as f32 - 127.5).abs() <= 2.0,
+            "the left fade must halve the alpha at its midpoint, got {:?}",
+            half
+        );
+        assert!(
+            (half[0] as i32 - half[3] as i32).abs() <= 2,
+            "premultiplied RGB must fade with the alpha, got {:?}",
+            half
+        );
+        assert_eq!(px(12), [255, 0, 0, 255], "the left fade boundary must be full opacity");
+        assert_eq!(px(20), [255, 0, 0, 255], "the row center must keep its original alpha");
+        let tail = px(31); // three quarters through the right fade: 255 * 0.75
+        assert!(
+            (tail[3] as f32 - 191.0).abs() <= 2.0,
+            "the right fade must attenuate toward the edge, got {:?}",
+            tail
+        );
+        let edge = px(37); // 3px before the right boundary: 255 * 0.25
+        assert!(
+            (edge[3] as f32 - 64.0).abs() <= 2.0,
+            "the right fade must approach zero at the boundary, got {:?}",
+            edge
+        );
+        // Same attenuation on a middle row: the mask must be uniform down the
+        // row, not just at the first scanline.
+        let mid = &pixels[10 * 40 * 4 + 6 * 4..10 * 40 * 4 + 6 * 4 + 4];
+        assert!(
+            (mid[3] as i32 - half[3] as i32).abs() <= 1,
+            "every row must fade identically, got {:?} vs {:?}",
+            mid,
+            half
+        );
     }
 
     #[test]
@@ -4847,6 +5329,7 @@ mod tests {
             h,
             [255, 255, 255, 255],
             false,
+            1.0,
             None,
         );
         let upper = pixels
