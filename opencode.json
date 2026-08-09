@@ -3,7 +3,6 @@
   "permission": {
     "external_directory": {
       "~/AppData/Roaming/WinGlance/WinGlance/data/logs/**": "allow",
-      "~/AppData/Local/Temp/opencode/**": "allow"
     }
   }
 }
