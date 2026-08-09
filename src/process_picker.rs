@@ -1,6 +1,6 @@
 use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
 use log::warn;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -216,6 +216,33 @@ fn merge_smtc_sources(mut entries: Vec<ProcessEntry>) -> Vec<ProcessEntry> {
     entries
 }
 
+/// Builds the picker's row list from the live process/session set plus the
+/// user's stored allow-list. Every allow-list pattern that has no live
+/// matching entry is appended as a pre-checked row labeled "… (not running)"
+/// so closing the picker can never silently drop a previously-enabled source:
+/// the main window replaces (not merges) the allow-list with the picker's
+/// checked result, so anything not shown above a checkbox would be lost.
+fn build_picker_list(current: &[String], mut entries: Vec<ProcessEntry>) -> Vec<ProcessEntry> {
+    // Normalized patterns already represented by a live entry. Match with the
+    // same bidirectional-contains rule the pre-check uses, so a "discord" entry
+    // is not duplicated by a "discord-helper" running process, and vice-versa.
+    let seen: HashSet<String> = entries.iter().map(|e| normalize_pattern(&e.pattern)).collect();
+    for pattern in current {
+        let norm = normalize_pattern(pattern);
+        if norm.is_empty() || seen.iter().any(|e| e.contains(&norm) || norm.contains(e)) {
+            continue;
+        }
+        // Not currently running: keep it in the row set, pre-checked, with a
+        // label that makes its absence from the live process list obvious.
+        entries.push(ProcessEntry {
+            display_name: format!("{} (not running)", pretty_source_label(pattern)),
+            pattern: pattern.clone(),
+        });
+    }
+    entries.sort_by_key(|a| a.display_name.to_lowercase());
+    entries
+}
+
 /// Same normalization the SMTC worker uses when matching allow-list patterns
 /// against AUMIDs, so picker pre-checking agrees with session filtering.
 fn normalize_pattern(value: &str) -> String {
@@ -304,7 +331,7 @@ pub(crate) fn open(
     current: &[String],
     result: Arc<Mutex<Option<Vec<String>>>>,
 ) -> bool {
-    let list = merge_smtc_sources(enumerate_app_processes());
+    let list = build_picker_list(current, merge_smtc_sources(enumerate_app_processes()));
     if list.is_empty() {
         warn!("no app processes or SMTC sessions found for picker");
         return false;
@@ -1003,5 +1030,55 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(pattern: &str) -> ProcessEntry {
+        ProcessEntry {
+            display_name: pretty_source_label(pattern).to_string(),
+            pattern: pattern.to_string(),
+        }
+    }
+
+    #[test]
+    fn running_app_is_not_duplicated_with_a_not_running_row() {
+        let list = build_picker_list(&["telegram".to_string()], vec![entry("telegram")]);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].pattern, "telegram");
+        assert!(!list[0].display_name.contains("not running"));
+    }
+
+    #[test]
+    fn not_running_configured_source_is_retained_and_pre_checkable() {
+        let current = vec!["discord".to_string()];
+        let list = build_picker_list(&current, vec![]);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].display_name.ends_with("(not running)"));
+        // The row's pattern is the stored pattern verbatim, so the existing
+        // pre-check (which matches normalized current patterns) marks it checked
+        // and it survives the main window's full-replace-on-save.
+        assert_eq!(list[0].pattern, "discord");
+        let norm = normalize_pattern(&list[0].pattern);
+        assert!(current.iter().any(|p| normalize_pattern(p) == norm));
+    }
+
+    #[test]
+    fn empty_patterns_add_no_rows() {
+        assert!(build_picker_list(&[" ".to_string(), "".to_string()], vec![]).is_empty());
+    }
+
+    #[test]
+    fn running_and_configured_sources_coexist() {
+        let list = build_picker_list(&["spotify".to_string(), "discord".to_string()], vec![entry("spotify")]);
+        assert_eq!(list.len(), 2);
+        let by_pattern: HashMap<&str, &ProcessEntry> = list.iter().map(|e| (e.pattern.as_str(), e)).collect();
+        assert!(!by_pattern["spotify"].display_name.contains("not running"));
+        assert!(by_pattern["discord"].display_name.contains("not running"));
+        assert_eq!(by_pattern["spotify"].pattern, "spotify");
+        assert_eq!(by_pattern["discord"].pattern, "discord");
     }
 }
