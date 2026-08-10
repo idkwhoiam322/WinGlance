@@ -10,7 +10,7 @@ use crate::process_picker::PICKER_RESULT_MSG;
 use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -669,6 +669,7 @@ pub fn create_window(
         }
         return Err(error);
     }
+    debug!("tray icon installed");
     Ok(hwnd)
 }
 
@@ -775,6 +776,7 @@ impl MainWindowState {
     /// the creation DPI otherwise, leaving rows overlapping the header after
     /// a cross-DPI move.
     fn on_dpi_changed(&mut self, dpi: u32) {
+        debug!("DPI changed to {dpi}");
         unsafe {
             if !self.listbox_font.0.is_null() {
                 let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.listbox_font.0));
@@ -2245,6 +2247,7 @@ impl MainWindowState {
     fn on_close(&self) {
         unsafe {
             if self.cfg().behavior.close_to_tray {
+                debug!("window close requested; hiding to the tray");
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
                 // The tooltip sync timer only runs while the window is
                 // visible; stop it so a tray-hidden window stops waking the
@@ -2255,6 +2258,7 @@ impl MainWindowState {
                 // the timer on restore.
                 let _ = SetTimer(self.hwnd, IDLE_ART_TIMER_ID, IDLE_ART_RELEASE_MS, None);
             } else {
+                debug!("window close requested; quitting (close to tray is off)");
                 let _ = DestroyWindow(self.hwnd);
             }
         }
@@ -2355,6 +2359,7 @@ impl MainWindowState {
     }
 
     fn on_destroy(&mut self) {
+        info!("main window destroyed; app quitting");
         remove_tray_icon(self.hwnd);
         if let Some(current) = &mut self.current {
             free_art_blit(&mut current.art_blit);
@@ -2468,6 +2473,7 @@ impl MainWindowState {
         // The window was hidden, so the timer skipped its syncs; rebuild
         // the tool definitions now so hover works immediately on restore.
         self.sync_tooltips();
+        debug!("main window shown");
     }
 
     /// Copies the current run's log file to the clipboard (UTF-16 with per-line
@@ -2518,6 +2524,7 @@ impl MainWindowState {
         }
 
         self.logs_copied_at = Some(Instant::now());
+        info!("copied the live log to the clipboard");
         unsafe {
             let _ = SetTimer(self.hwnd, TIMER_LOGS_ID, 2000, None);
         }
@@ -2546,6 +2553,8 @@ impl MainWindowState {
         let code = result.0 as isize;
         if code <= 32 {
             debug!("open logs: ShellExecuteW failed (code {code}) for {path:?}");
+        } else {
+            info!("opened the live log in the default editor");
         }
     }
 
@@ -2578,6 +2587,8 @@ impl MainWindowState {
         let code = result.0 as isize;
         if code <= 32 {
             debug!("open config: ShellExecuteW failed (code {code}) for {path:?}");
+        } else {
+            info!("opened config.toml in the default editor");
         }
     }
 
@@ -2599,6 +2610,7 @@ impl MainWindowState {
             cfg.overlay.position_x = None;
             cfg.overlay.position_y = None;
         });
+        info!("overlay position set: vertical={vertical:?} horizontal={horizontal:?}");
         set_position(self.overlay_hwnd, OverlayPos::from_config(&self.cfg()));
     }
 
@@ -2872,6 +2884,7 @@ fn show_tray_note(hwnd: HWND, title: &str, text: &str) {
 }
 
 fn show_tray_menu(state: &mut MainWindowState) {
+    debug!("tray menu opened");
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
         return;
     };
@@ -3107,8 +3120,13 @@ fn show_tray_menu(state: &mut MainWindowState) {
                 MENU_CLOSE_TRAY_ID => {
                     let new_value = !state.cfg().behavior.close_to_tray;
                     state.mutate_config(|cfg| cfg.behavior.close_to_tray = new_value);
+                    info!(
+                        "close to tray {} (tray menu)",
+                        if new_value { "enabled" } else { "disabled" }
+                    );
                 }
                 MENU_QUIT_ID => {
+                    info!("quit requested from the tray menu");
                     let _ = DestroyWindow(state.hwnd);
                 }
                 MENU_POSITION_TOP_LEFT => state.apply_anchor(VerticalPosition::Top, HorizontalPosition::Left),
@@ -3157,6 +3175,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
     // Explorer (re)started and rebuilt the notification area: re-add the
     // tray icon, which Explorer's restart wiped.
     if message == taskbar_created_msg() {
+        debug!("Explorer restarted the notification area; re-adding the tray icon");
         if let Err(error) = install_tray_icon(hwnd) {
             error!("re-adding the tray icon after an Explorer restart failed: {error}");
         }
@@ -3288,10 +3307,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     let item_h = (32.0 * scale) as i32;
                     let item0_y = (40.0 * scale) as i32;
                     let item1_y = item0_y + item_h + (4.0 * scale) as i32;
+                    let previous = state.active_pane;
                     if y >= item0_y && y < item0_y + item_h {
                         state.active_pane = Pane::Activity;
                     } else if y >= item1_y && y < item1_y + item_h {
                         state.active_pane = Pane::Settings;
+                    }
+                    if previous != state.active_pane {
+                        debug!("switched to the {:?} pane", state.active_pane);
                     }
                     state.apply_pane();
                     state.invalidate();
@@ -3343,6 +3366,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                 SettingId::CloseToTray => {
                                     let new_value = !state.cfg().behavior.close_to_tray;
                                     state.mutate_config(|cfg| cfg.behavior.close_to_tray = new_value);
+                                    info!("close to tray {}", if new_value { "enabled" } else { "disabled" });
                                     state.invalidate();
                                 }
                                 SettingId::Duration => {
@@ -3504,6 +3528,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     cfg.overlay.position_x = Some(x);
                     cfg.overlay.position_y = Some(y);
                 });
+                info!("overlay position set from the adjustor: ({x}, {y})");
                 set_position(state.overlay_hwnd, OverlayPos::from_config(&state.cfg()));
             }
             LRESULT(0)
