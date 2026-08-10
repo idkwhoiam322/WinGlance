@@ -43,6 +43,15 @@ pub struct OverlayConfig {
     pub horizontal: HorizontalPosition,
     pub margin: i32,
     pub max_width: u32,
+    /// Caps the overlay's animation tick rate to this many Hz. The pill animates
+    /// at most at this refresh; on higher-refresh monitors the UI thread is
+    /// throttled down to it. The cap only limits repaint frequency — motion
+    /// stays time-based (see `overlay::sync_anim_timer`). Normalized into the
+    /// range [60, 1000]: values at or below 60 keep the default 60 Hz cap, and
+    /// values above 1000 are clamped to 1000. Configurable only via config.toml,
+    /// not the Settings UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tick_hz: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position_x: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,6 +233,7 @@ impl Default for OverlayConfig {
             horizontal: HorizontalPosition::Center,
             margin: 8,
             max_width: 340,
+            max_tick_hz: Some(60),
             position_x: None,
             position_y: None,
             monitor: MonitorMode::default(),
@@ -486,6 +496,7 @@ impl Config {
         self.overlay.duration_ms = self.overlay.duration_ms.clamp(500, 60_000);
         self.overlay.animation_ms = self.overlay.animation_ms.clamp(100, 500);
         self.overlay.max_width = self.overlay.max_width.clamp(180, 800);
+        self.overlay.max_tick_hz = self.overlay.max_tick_hz.map(|hz| hz.clamp(60, 1000));
         self.overlay.margin = self.overlay.margin.clamp(0, 500);
         self.overlay.compact_margin = self.overlay.compact_margin.clamp(0, 500);
         self.behavior.debounce_ms = self.behavior.debounce_ms.clamp(150, 250);
@@ -513,6 +524,31 @@ mod tests {
         assert_eq!(config.overlay.max_width, 800);
         assert_eq!(config.appearance.art_size, 24);
         assert_eq!(config.behavior.debounce_ms, 150);
+    }
+
+    #[test]
+    fn max_tick_hz_defaults_to_60_and_normalizes_to_bounds() {
+        // Default is the 60 Hz cap requested; it is always present.
+        let config = Config::default();
+        assert_eq!(config.overlay.max_tick_hz, Some(60));
+
+        // Below the floor clamps up to 60 (including 0, which must not disable
+        // the cap). Above the ceiling clamps down to 1000.
+        let mut low = Config::default();
+        low.overlay.max_tick_hz = Some(0);
+        low.normalize();
+        assert_eq!(low.overlay.max_tick_hz, Some(60));
+
+        let mut high = Config::default();
+        high.overlay.max_tick_hz = Some(5000);
+        high.normalize();
+        assert_eq!(high.overlay.max_tick_hz, Some(1000));
+
+        // A value inside the band is preserved.
+        let mut mid = Config::default();
+        mid.overlay.max_tick_hz = Some(144);
+        mid.normalize();
+        assert_eq!(mid.overlay.max_tick_hz, Some(144));
     }
 
     #[test]
