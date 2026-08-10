@@ -164,6 +164,15 @@ fn process_names() -> HashMap<u32, String> {
     names
 }
 
+/// The executable name of a process, from a fresh Toolhelp snapshot. Used by
+/// the overlay to identify the foreground window's app for Auto-layout source
+/// matching. `None` when the process does not exist or cannot be read (e.g.
+/// an elevated process snapshot from a non-elevated instance) — callers treat
+/// that as "no match".
+pub(crate) fn exe_name_for_pid(pid: u32) -> Option<String> {
+    process_names().remove(&pid)
+}
+
 /// Scan state threaded through the EnumWindows callback: the accumulated
 /// window entries and the prebuilt pid → exe-name map.
 struct WindowScan {

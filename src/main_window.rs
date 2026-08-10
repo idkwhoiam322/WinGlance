@@ -4,7 +4,7 @@ use crate::events::{
     MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo, media_event_into_owned,
 };
 use crate::gdi::{FontProvider, draw_string};
-use crate::overlay::{EventQueue, OverlayPos, enumerate_displays, set_duration, set_position, show_sample};
+use crate::overlay::{EventQueue, OverlayPos, enumerate_displays, set_duration, set_positions, show_sample};
 use crate::process_picker;
 use crate::process_picker::PICKER_RESULT_MSG;
 use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
@@ -2673,7 +2673,12 @@ impl MainWindowState {
             cfg.overlay.position_y = None;
         });
         info!("overlay position set: vertical={vertical:?} horizontal={horizontal:?}");
-        set_position(self.overlay_hwnd, OverlayPos::from_config(&self.cfg()));
+        let cfg = self.cfg();
+        set_positions(
+            self.overlay_hwnd,
+            OverlayPos::from_config(&cfg),
+            OverlayPos::compact_from_config(&cfg),
+        );
     }
 
     /// Clears any custom X/Y override and returns to the default top-center anchor.
@@ -2689,7 +2694,12 @@ impl MainWindowState {
     fn apply_monitor(&mut self, mode: MonitorMode) {
         self.mutate_config(|cfg| cfg.overlay.monitor = mode);
         info!("overlay monitor set: {mode:?}");
-        set_position(self.overlay_hwnd, OverlayPos::from_config(&self.cfg()));
+        let cfg = self.cfg();
+        set_positions(
+            self.overlay_hwnd,
+            OverlayPos::from_config(&cfg),
+            OverlayPos::compact_from_config(&cfg),
+        );
     }
 }
 
@@ -3675,7 +3685,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     cfg.overlay.position_y = Some(y);
                 });
                 info!("overlay position set from the adjustor: ({x}, {y})");
-                set_position(state.overlay_hwnd, OverlayPos::from_config(&state.cfg()));
+                let cfg = state.cfg();
+                set_positions(
+                    state.overlay_hwnd,
+                    OverlayPos::from_config(&cfg),
+                    OverlayPos::compact_from_config(&cfg),
+                );
             }
             LRESULT(0)
         }

@@ -1,4 +1,4 @@
-use crate::config::{Config, HorizontalPosition, MonitorMode, VerticalPosition};
+use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, VerticalPosition};
 use crate::events::{
     MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo, artwork_same, media_event_into_owned,
 };
@@ -22,17 +22,18 @@ use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DEVMODEW, DIB_RGB_COLORS,
     DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
     ENUM_CURRENT_SETTINGS, ETO_CLIPPED, EnumDisplayMonitors, EnumDisplaySettingsW, ExtTextOutW, GdiFlush,
-    GetMonitorInfoW, HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW,
+    GetMonitorInfoW, HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW,
     MonitorFromWindow, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GetCursorPos, GetForegroundWindow, HTTRANSPARENT, HWND_TOPMOST,
-    IsWindowVisible, KillTimer, MA_NOACTIVATE, MONITORINFOF_PRIMARY, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
-    SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer, SetWindowPos, ShowWindow, ULW_ALPHA, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GWL_EXSTYLE, GetClassNameW, GetCursorPos, GetForegroundWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST, IsIconic, IsWindowVisible,
+    KillTimer, MA_NOACTIVATE, MONITORINFOF_PRIMARY, MSG, PM_REMOVE, PeekMessageW, PostMessageW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetTimer, SetWindowPos, ShowWindow, ULW_ALPHA, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE,
     WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -348,6 +349,114 @@ fn placement(work: RECT, width: i32, height: i32, position: &OverlayPos, inset: 
     POINT { x, y }
 }
 
+/// The sampled foreground state a layout decision is based on. Produced by
+/// `OverlayState::sample_foreground` (the only place Win32 is queried), so
+/// `decide_layout` stays pure and unit-testable.
+struct ForegroundVerdict {
+    /// The foreground window's executable name (with extension, as the
+    /// process table reports it), when it could be read.
+    exe: Option<String>,
+    /// Whether the foreground window is a fullscreen app covering its
+    /// monitor's entire screen.
+    fullscreen: bool,
+}
+
+/// Whether a foreground window counts as a fullscreen app for Auto layout.
+/// Conservative on purpose: the window must be visible, not minimized, not a
+/// tool window, not a desktop/shell/taskbar surface, not this overlay's own
+/// window, and its window rect must cover the entire monitor — not merely
+/// the work area, so a maximized window stays Expanded. Anything ambiguous
+/// resolves to `false` (Expanded).
+fn window_is_fullscreen(hwnd: HWND, overlay: HWND) -> bool {
+    if hwnd.0.is_null() || hwnd == overlay {
+        return false;
+    }
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return false;
+        }
+        // Desktop and shell surfaces are windows too, but never fullscreen apps.
+        let mut class = [0u16; 64];
+        let len = GetClassNameW(hwnd, &mut class);
+        if len > 0 {
+            let name = String::from_utf16_lossy(&class[..len as usize]);
+            if matches!(
+                name.as_str(),
+                "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+            ) {
+                return false;
+            }
+        }
+        // Transient tool windows (flyouts, popups) never count as fullscreen.
+        if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32) & WS_EX_TOOLWINDOW.0 != 0 {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return false;
+        }
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if monitor.0.is_null() {
+            return false;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return false;
+        }
+        // A maximized window covers the work area, which excludes the
+        // taskbar band; only a real fullscreen window covers rcMonitor.
+        const TOLERANCE: i32 = 2;
+        let m = info.rcMonitor;
+        rect.left <= m.left + TOLERANCE
+            && rect.top <= m.top + TOLERANCE
+            && rect.right >= m.right - TOLERANCE
+            && rect.bottom >= m.bottom - TOLERANCE
+    }
+}
+
+/// Whether the foreground app's executable name matches the Auto-compact
+/// source list. Mirrors the `media_sources` matching convention (normalized
+/// case-insensitive substring; word-boundary characters stripped), with the
+/// process-picker's `.exe`-stripping applied to the name. Unlike
+/// `media_sources`, an empty list allows nothing: Auto-compact is opt-in
+/// per app, so an unlisted foreground never compacts.
+fn auto_source_matches(config: &Config, exe_name: Option<&str>) -> bool {
+    let Some(exe) = exe_name else {
+        return false;
+    };
+    let patterns = &config.behavior.auto_compact_sources;
+    if patterns.is_empty() {
+        return false;
+    }
+    let exe = exe.trim_end_matches(".exe").trim_end_matches(".EXE");
+    let n_exe = crate::smtc::normalize_for_match(exe);
+    patterns
+        .iter()
+        .any(|pattern| n_exe.contains(&crate::smtc::normalize_for_match(pattern)))
+}
+
+/// Decides the effective pill layout from the configured mode and the
+/// foreground verdict. Pure: the caller samples the foreground and feeds the
+/// verdict in, so every branch is unit-testable without Win32. Auto compacts
+/// when the foreground app is fullscreen or on the `auto_compact_sources`
+/// list; everything else stays Expanded.
+fn decide_layout(config: &Config, verdict: &ForegroundVerdict) -> LayoutMode {
+    match config.overlay.layout {
+        LayoutMode::Expanded => LayoutMode::Expanded,
+        LayoutMode::Compact => LayoutMode::Compact,
+        LayoutMode::Auto => {
+            if verdict.fullscreen || auto_source_matches(config, verdict.exe.as_deref()) {
+                LayoutMode::Compact
+            } else {
+                LayoutMode::Expanded
+            }
+        }
+    }
+}
+
 /// Reusable device context + DIB section for the pill's frames. The overlay
 /// redraws every animation tick; recreating the DIB per frame is pure waste.
 struct DibCache {
@@ -511,6 +620,26 @@ struct OverlayState {
     /// pushing the deadline forward while the cursor stays put).
     hover_dismiss_at: Option<Instant>,
     position: OverlayPos,
+    /// The compact pill's resolved placement (independent of `position` only
+    /// while `compact_position_separate` is on; see `active_pos`).
+    compact_position: OverlayPos,
+    /// The layout actually applied to the current pill. `Auto` is already
+    /// resolved to Expanded/Compact from the foreground (see
+    /// `refresh_layout`/`tick_layout_check`), so every consumer just reads
+    /// this.
+    layout: LayoutMode,
+    /// Foreground HWND the cached executable identity (`layout_fg_exe`)
+    /// belongs to. The process table is only re-enumerated when this
+    /// changes; a static foreground is served from the cache.
+    layout_fg: Option<HWND>,
+    /// Cached executable name of the foreground window, keyed by
+    /// `layout_fg`. `None` when the process could not be read (missing or
+    /// elevated) — callers treat that as "no Auto-compact source match".
+    layout_fg_exe: Option<String>,
+    /// Last time the fullscreen geometry of an unchanged foreground window
+    /// was re-checked. The same-window re-check is throttled to 1 Hz (the
+    /// geometry can only change on a window resize, never at 4 Hz).
+    last_geometry_check: Option<Instant>,
     /// Per-row marquee state for the four track lines (title/subtitle/meta/app).
     scroll: [LineScroll; 4],
     /// Per-row cached marquee rasters (parallel to `scroll`), see `MarqueeStrip`.
@@ -628,10 +757,27 @@ impl OverlayPos {
             monitor: config.overlay.monitor,
         }
     }
+
+    /// Resolves the compact pill's placement from config through the shared
+    /// effective rule (`compact_effective`): while `compact_position_separate`
+    /// is off this is exactly the expanded position, so the overlay and the
+    /// settings UI can never disagree about where a compact pill sits.
+    pub(crate) fn compact_from_config(config: &Config) -> Self {
+        let compact = config.overlay.compact_effective();
+        Self {
+            vertical: compact.vertical,
+            horizontal: compact.horizontal,
+            margin: compact.margin,
+            x: compact.x,
+            y: compact.y,
+            monitor: compact.monitor,
+        }
+    }
 }
 
-/// Updates the live overlay's placement from a resolved position.
-pub(crate) fn set_position(hwnd: HWND, pos: OverlayPos) {
+/// Updates the live overlay's placement from the resolved expanded and
+/// compact positions.
+pub(crate) fn set_positions(hwnd: HWND, pos: OverlayPos, compact_pos: OverlayPos) {
     if hwnd.0.is_null() {
         return;
     }
@@ -642,9 +788,19 @@ pub(crate) fn set_position(hwnd: HWND, pos: OverlayPos) {
         }
         let state = &mut *state_ptr;
         state.position = pos;
+        state.compact_position = compact_pos;
         debug!(
-            "overlay position applied: vertical={:?} horizontal={:?} x={:?} y={:?} monitor={:?}",
-            pos.vertical, pos.horizontal, pos.x, pos.y, pos.monitor
+            "overlay position applied: vertical={:?} horizontal={:?} x={:?} y={:?} monitor={:?} | compact vertical={:?} horizontal={:?} x={:?} y={:?} monitor={:?}",
+            pos.vertical,
+            pos.horizontal,
+            pos.x,
+            pos.y,
+            pos.monitor,
+            compact_pos.vertical,
+            compact_pos.horizontal,
+            compact_pos.x,
+            compact_pos.y,
+            compact_pos.monitor
         );
         if matches!(state.phase, Phase::Hidden) {
             state.show_sample();
@@ -674,6 +830,7 @@ pub(crate) fn set_duration(hwnd: HWND, duration_ms: u64) {
 impl OverlayState {
     fn new(config: Config, queue: EventQueue) -> Self {
         let position = OverlayPos::from_config(&config);
+        let compact_position = OverlayPos::compact_from_config(&config);
         let enabled = config.behavior.notifications_enabled;
         Self {
             hwnd: HWND::default(),
@@ -687,6 +844,14 @@ impl OverlayState {
             dismiss_at: None,
             hover_dismiss_at: None,
             position,
+            compact_position,
+            // Every show path re-resolves the layout before the first frame
+            // (see `show_with_duration`), so this initial value is only a
+            // placeholder until then.
+            layout: LayoutMode::Expanded,
+            layout_fg: None,
+            layout_fg_exe: None,
+            last_geometry_check: None,
             scroll: [LineScroll::default(); 4],
             marquee_strips: [None, None, None, None],
             anim_timer: HANDLE::default(),
@@ -1118,6 +1283,10 @@ impl OverlayState {
     /// reserved — so a refresh only changes the drawn rows, never the pill's
     /// dimensions.
     fn update_content(&mut self, event: MediaEvent, min_visible: Duration) {
+        // An in-place refresh is a meaningful pill update too: re-resolve
+        // the layout so a foreground change since the pill appeared takes
+        // effect with the update rather than on the next static tick.
+        self.refresh_layout();
         self.content = Some(event);
         self.resolve_pill_text();
         self.reset_scroll();
@@ -1159,6 +1328,11 @@ impl OverlayState {
         if !self.enabled {
             return;
         }
+        // A show is a meaningful pill-update boundary: re-resolve the Auto
+        // layout from the current foreground before the frame geometry is
+        // computed, so a pill that appears over a fullscreen game (or over a
+        // listed app) is compact from its very first frame.
+        self.refresh_layout();
         // A fresh pill invalidates the idle-release deadline: the frame
         // buffers are about to be reused.
         unsafe {
@@ -1189,6 +1363,73 @@ impl OverlayState {
             foreground.0 as usize
         );
         self.render();
+    }
+
+    /// Re-resolves the effective layout from the current foreground. Runs at
+    /// every show boundary (a fresh decision per meaningful pill update) and
+    /// from the static-tick re-check. The process table is re-enumerated
+    /// only when the foreground HWND changed since the last decision; the
+    /// fullscreen geometry of an unchanged window is re-read on every call
+    /// (cheap window/monitor queries).
+    fn refresh_layout(&mut self) {
+        let verdict = self.sample_foreground();
+        let decided = decide_layout(&self.config, &verdict);
+        if decided != self.layout {
+            debug!(
+                "overlay layout: {:?} (mode={:?} fullscreen={} source={:?})",
+                decided, self.config.overlay.layout, verdict.fullscreen, verdict.exe
+            );
+            self.layout = decided;
+        }
+    }
+
+    /// Samples the foreground window once: the fullscreen verdict is always
+    /// recomputed (cheap window/monitor reads), while the executable
+    /// identity is cached with the foreground HWND, so the process table is
+    /// enumerated only when the foreground window actually changed.
+    fn sample_foreground(&mut self) -> ForegroundVerdict {
+        let foreground = unsafe { GetForegroundWindow() };
+        let fullscreen = window_is_fullscreen(foreground, self.hwnd);
+        let exe = if self.layout_fg == Some(foreground) {
+            self.layout_fg_exe.clone()
+        } else {
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(foreground, Some(&mut pid)) };
+            let exe = if pid == 0 {
+                None
+            } else {
+                crate::process_picker::exe_name_for_pid(pid)
+            };
+            self.layout_fg = Some(foreground);
+            self.layout_fg_exe = exe.clone();
+            exe
+        };
+        ForegroundVerdict { exe, fullscreen }
+    }
+
+    /// The static-tick re-check for Auto layout: reacts to a foreground
+    /// change within one static tick (250 ms) even when no media event
+    /// arrives (e.g. an alt-tab into a fullscreen game while the pill is
+    /// up). The full decision (process enumeration) runs only when the
+    /// foreground HWND changed; an unchanged window gets its fullscreen
+    /// geometry re-checked at most once per second — a same-window resize
+    /// (fullscreen toggle) cannot matter more often than that. Returns
+    /// whether the layout flipped, so the caller can force a re-render.
+    fn tick_layout_check(&mut self) -> bool {
+        let now = Instant::now();
+        let foreground = unsafe { GetForegroundWindow() };
+        let hwnd_changed = self.layout_fg != Some(foreground);
+        let geometry_due = hwnd_changed
+            || self
+                .last_geometry_check
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+        if !geometry_due {
+            return false;
+        }
+        self.last_geometry_check = Some(now);
+        let before = self.layout;
+        self.refresh_layout();
+        self.layout != before
     }
 
     fn tick(&mut self) {
@@ -1286,10 +1527,17 @@ impl OverlayState {
                 line.offset += per_tick;
             }
         }
+        // Auto layout re-check: a foreground change flips the pill between
+        // layouts within one static tick even when no media event arrives
+        // (an alt-tab into a fullscreen game mid-pill). Only the static tick
+        // runs it; animation frames skip it, so a flip never lands mid-
+        // expand/collapse. A flipped layout forces a render (the pill's
+        // size, content layout and placement all change with it).
+        let layout_flipped = self.config.overlay.layout == LayoutMode::Auto && !animating && self.tick_layout_check();
         // A fully-shown pill is static unless a marquee line is actually
         // overflowing: skip the render (and its UpdateLayeredWindow) entirely
         // when nothing changed. The animation phases still repaint every tick.
-        if animating || marquee_active {
+        if layout_flipped || animating || marquee_active {
             self.render();
         }
         // Re-sync the timer to the phase: a static pill drops to the coarse
@@ -1315,12 +1563,13 @@ impl OverlayState {
             self.fonts = FontProvider::new(raw_dpi);
         }
         let dpi = raw_dpi as f32 / 96.0;
-        let (logical_width, logical_height) = content_size_of(&self.config, &content);
+        let compact = self.layout == LayoutMode::Compact;
+        let (logical_width, logical_height) = content_size_of(&self.config, &content, compact);
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
         self.aura_inset = (AURA_HALO_LOGICAL * dpi * shape).round() as i32;
-        let position = placement(target.work, width, height, &self.position, self.aura_inset, dpi);
-        let result = render_layered(self, &content, width, height, dpi * shape, alpha, position);
+        let position = placement(target.work, width, height, self.active_pos(), self.aura_inset, dpi);
+        let result = render_layered(self, &content, width, height, dpi * shape, alpha, position, compact);
         self.content = Some(content);
         if let Err(error) = result {
             error!("rendering overlay: {error:#}");
@@ -1375,6 +1624,24 @@ impl OverlayState {
         Some(target)
     }
 
+    /// Whether the current pill is compact: the applied layout is Compact.
+    fn effective_compact(&self) -> bool {
+        self.layout == LayoutMode::Compact
+    }
+
+    /// The position governing the current pill. A compact pill uses the
+    /// separate compact position only while `compact_position_separate` is
+    /// on; otherwise it sits exactly where the expanded pill would — the
+    /// same shared rule (`compact_effective`) the settings UI highlights,
+    /// so the preview and the pill can never disagree.
+    fn active_pos(&self) -> &OverlayPos {
+        if self.effective_compact() && self.config.overlay.compact_position_separate {
+            &self.compact_position
+        } else {
+            &self.position
+        }
+    }
+
     /// The pill's screen top-left for a `width`×`height` window on the
     /// currently resolved target display, or `None` when no display is
     /// available.
@@ -1385,7 +1652,7 @@ impl OverlayState {
             target.work,
             width,
             height,
-            &self.position,
+            self.active_pos(),
             self.aura_inset,
             scale,
         ))
@@ -1531,7 +1798,8 @@ impl OverlayState {
         let content = self.content.as_ref()?;
         let (_, shape) = self.frame();
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
-        let (logical_width, logical_height) = content_size_of(&self.config, content);
+        let (logical_width, logical_height) =
+            content_size_of(&self.config, content, self.layout == LayoutMode::Compact);
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
         Some((width, height))
@@ -1549,6 +1817,9 @@ impl OverlayState {
         unsafe {
             let _ = KillTimer(self.hwnd, IDLE_BUFFER_TIMER_ID);
         }
+        // The sample follows the same layout decision as a real pill (the
+        // settings preview must show what a real notification would show).
+        self.refresh_layout();
         let content = self.last_track.clone().map_or_else(
             || {
                 let track = TrackInfo {
@@ -1592,9 +1863,17 @@ fn update_min_duration(config: &Config) -> Duration {
 
 /// Logical (96-DPI) size of a pill for the given content. Single source of
 /// truth shared by `render()` and `content_size()` so they cannot drift.
-fn content_size_of(config: &Config, content: &MediaEvent) -> (f32, f32) {
+/// `compact` selects the compact pill geometry (one title row, trailing app
+/// icon and playback symbol) over the expanded four-row layout.
+fn content_size_of(config: &Config, content: &MediaEvent, compact: bool) -> (f32, f32) {
     match content {
-        MediaEvent::TrackChanged(_) | MediaEvent::PlaybackStateChanged(_, _) => content_size(config),
+        MediaEvent::TrackChanged(_) | MediaEvent::PlaybackStateChanged(_, _) => {
+            if compact {
+                compact_size(config)
+            } else {
+                content_size(config)
+            }
+        }
         // Never shown (receive_events skips it); the .max(1.0) guards keep the
         // size sane if this dead arm is ever reached.
         MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => (0.0, 0.0),
@@ -1619,6 +1898,64 @@ fn content_size(config: &Config) -> (f32, f32) {
     let text_h: f32 = rows.iter().sum();
     let height = (appearance.art_size as f32 + 2.0 * appearance.padding).max(text_h + 2.0 * appearance.padding + 8.0);
     (config.overlay.max_width.max(180) as f32, height)
+}
+
+/// Derived per-element metrics of the compact pill (logical px). Single
+/// source of truth shared by `compact_size` (window sizing) and the compact
+/// draw path (element placement), so the title viewport can never drift
+/// from the pill width. Each element reuses an expanded-pill convention:
+/// the art tile fits the title row band (the state pill's art clamp), the
+/// app icon is the 16 px base the app row uses, and the playback symbol is
+/// the title font × 1.5 capped at the row height the expanded title row
+/// uses.
+struct CompactMetrics {
+    /// Art tile side length.
+    art: f32,
+    /// App icon side length.
+    icon: f32,
+    /// Playback symbol box size.
+    symbol: f32,
+}
+
+fn compact_metrics(config: &Config) -> CompactMetrics {
+    let appearance = &config.appearance;
+    let row_h = appearance.font_size_title * ROW_HEIGHT;
+    CompactMetrics {
+        art: (appearance.art_size as f32).min(row_h).max(1.0),
+        icon: 16.0,
+        symbol: (appearance.font_size_title * 1.5).min(row_h).max(1.0),
+    }
+}
+
+/// Logical (96-DPI) size of the compact pill: one title row high, and wide
+/// enough for `[ART] [TITLE] [APP ICON] [▶]`, with the title band taking
+/// half the configured max width (floored at the 180 px minimum pill
+/// width). The total is capped at max_width, so a compact pill is never
+/// wider than the expanded one; when the cap bites, the title viewport
+/// (derived from the same metrics) simply shrinks and the title marquees.
+fn compact_size(config: &Config) -> (f32, f32) {
+    let appearance = &config.appearance;
+    let metrics = compact_metrics(config);
+    let max_w = config.overlay.max_width.max(180) as f32;
+    let title = (max_w * 0.5).clamp(180.0, (max_w - 160.0).max(180.0));
+    let width = (2.0 * appearance.padding + metrics.art + 12.0 + title + 6.0 + metrics.icon + 16.0 + metrics.symbol)
+        .min(max_w)
+        .max(1.0);
+    let height = (appearance.font_size_title * ROW_HEIGHT + 2.0 * appearance.padding).max(1.0);
+    (width, height)
+}
+
+/// Horizontal extents of the compact pill's title viewport (logical px,
+/// relative to the pill body): everything between the art tile and the
+/// trailing app icon. The icon, its gap and the playback symbol are all
+/// excluded, so marquee text and the edge fade can never render under them.
+fn compact_title_viewport(config: &Config) -> (f32, f32) {
+    let metrics = compact_metrics(config);
+    let appearance = &config.appearance;
+    let (pill_w, _) = compact_size(config);
+    let left = appearance.padding + metrics.art + 12.0;
+    let right = pill_w - appearance.padding - metrics.symbol - 16.0 - metrics.icon - 6.0;
+    (left, right)
 }
 
 /// Forces the live overlay at `hwnd` to preview its current placement.
@@ -1698,6 +2035,7 @@ fn render_layered(
     scale: f32,
     alpha: u8,
     position: POINT,
+    compact: bool,
 ) -> Result<()> {
     let inset = state.aura_inset;
     let buf_w = (width + inset * 2).max(1);
@@ -1731,8 +2069,9 @@ fn render_layered(
         buf_w as usize,
         buf_h as usize,
         scale,
+        compact,
     )?;
-    draw_text_pixels(state, &mut scratch[..needed], content, buf_w, scale);
+    draw_text_pixels(state, &mut scratch[..needed], content, buf_w, buf_h, scale, compact);
     // A single oversized metadata string (huge title/album) can inflate the
     // retained UTF-16 scratch far beyond any real row; shrink it back so the
     // capacity does not stay bloated for the rest of the run.
@@ -1947,6 +2286,7 @@ fn draw_pixels(
     width: usize,
     height: usize,
     scale: f32,
+    compact: bool,
 ) -> Result<()> {
     let radius = state.config.appearance.corner_radius * scale;
     // Resolve the artwork that will be displayed and convert it (once per
@@ -2036,53 +2376,59 @@ fn draw_pixels(
     // brighter along the top-left than the bottom-right.
     draw_edge_stroke(pixels, width, inset, pill_w, pill_h, radius, scale);
 
-    match content {
-        MediaEvent::TrackChanged(_) => {
-            let padding = (state.config.appearance.padding * scale).round() as usize;
-            let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
-            let art_radius = art_size as f32 * 0.2;
-            let art_x = inset + padding;
-            let art_y = inset + pill_h.saturating_sub(art_size) / 2;
-            draw_art_tile(
-                pixels,
-                width,
-                state.palette,
-                state.config.appearance.accent_color,
-                art_x,
-                art_y,
-                art_size,
-                art_radius,
-                state.decoded_art.as_deref(),
-                scale,
-            );
+    // The compact pill draws its own smaller art tile (plus the title row
+    // and the trailing icon/symbol) in `draw_compact_pill`; drawing it here
+    // as well would composite the halo, the cover and the rim twice. The
+    // expanded pills draw the art tile at the configured art size.
+    if !compact {
+        match content {
+            MediaEvent::TrackChanged(_) => {
+                let padding = (state.config.appearance.padding * scale).round() as usize;
+                let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
+                let art_radius = art_size as f32 * 0.2;
+                let art_x = inset + padding;
+                let art_y = inset + pill_h.saturating_sub(art_size) / 2;
+                draw_art_tile(
+                    pixels,
+                    width,
+                    state.palette,
+                    state.config.appearance.accent_color,
+                    art_x,
+                    art_y,
+                    art_size,
+                    art_radius,
+                    state.decoded_art.as_deref(),
+                    scale,
+                );
+            }
+            MediaEvent::PlaybackStateChanged(_, _) => {
+                // State pills reuse the cached track's artwork for the source that
+                // produced the state change, so a pause/play pill still shows the
+                // right cover. Falls back to the accent placeholder when nothing
+                // has been cached for this source yet. The art size is clamped to
+                // the pill body: the state-pill layout reserves no extra rows.
+                let padding = (state.config.appearance.padding * scale).round() as usize;
+                let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
+                let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
+                let art_radius = art_size as f32 * 0.2;
+                let art_x = inset + padding;
+                let art_y = inset + pill_h.saturating_sub(art_size) / 2;
+                draw_art_tile(
+                    pixels,
+                    width,
+                    state.palette,
+                    state.config.appearance.accent_color,
+                    art_x,
+                    art_y,
+                    art_size,
+                    art_radius,
+                    state.decoded_art.as_deref(),
+                    scale,
+                );
+            }
+            // Never rendered: SessionRejected is filtered out before enqueue.
+            MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => {}
         }
-        MediaEvent::PlaybackStateChanged(_, _) => {
-            // State pills reuse the cached track's artwork for the source that
-            // produced the state change, so a pause/play pill still shows the
-            // right cover. Falls back to the accent placeholder when nothing
-            // has been cached for this source yet. The art size is clamped to
-            // the pill body: the state-pill layout reserves no extra rows.
-            let padding = (state.config.appearance.padding * scale).round() as usize;
-            let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
-            let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
-            let art_radius = art_size as f32 * 0.2;
-            let art_x = inset + padding;
-            let art_y = inset + pill_h.saturating_sub(art_size) / 2;
-            draw_art_tile(
-                pixels,
-                width,
-                state.palette,
-                state.config.appearance.accent_color,
-                art_x,
-                art_y,
-                art_size,
-                art_radius,
-                state.decoded_art.as_deref(),
-                scale,
-            );
-        }
-        // Never rendered: SessionRejected is filtered out before enqueue.
-        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => {}
     }
     Ok(())
 }
@@ -2782,8 +3128,22 @@ fn pill_text_from_track(track: &TrackInfo) -> PillText {
 /// Draws the pill's text rows into the same premultiplied pixel buffer as the
 /// shapes: glyph coverage from fontdue becomes alpha, so text alpha-composites
 /// exactly like every other element (GDI text cannot do this on a layered
-/// window — it never touches the alpha channel).
-fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &MediaEvent, width: i32, scale: f32) {
+/// window — it never touches the alpha channel). The compact layout draws a
+/// single title row via `draw_compact_pill` instead.
+#[allow(clippy::too_many_arguments)]
+fn draw_text_pixels(
+    state: &mut OverlayState,
+    pixels: &mut [u8],
+    content: &MediaEvent,
+    width: i32,
+    height: i32,
+    scale: f32,
+    compact: bool,
+) {
+    if compact {
+        draw_compact_pill(state, pixels, content, width, height, scale);
+        return;
+    }
     match content {
         MediaEvent::TrackChanged(track) => {
             // The pill pieces were resolved when the content changed (see
@@ -2893,6 +3253,155 @@ fn draw_text_pixels(state: &mut OverlayState, pixels: &mut [u8], content: &Media
         // Never rendered: SessionRejected is filtered out before enqueue.
         MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => {}
     }
+}
+
+/// Draws the compact pill's content: `[ART] [TITLE] [APP ICON] [▶]`. The art
+/// tile is drawn here (not in `draw_pixels`, which sizes the expanded art),
+/// the title occupies exactly `compact_title_viewport` — so marquee text and
+/// its edge fade can never render under the app icon or the playback symbol
+/// — and the trailing icon and symbol reuse the shared app-icon and
+/// playback-symbol drawing. The take/put-back of the resolved pill text
+/// mirrors `draw_pill_text_rows`.
+#[allow(clippy::too_many_arguments)]
+fn draw_compact_pill(
+    state: &mut OverlayState,
+    pixels: &mut [u8],
+    content: &MediaEvent,
+    width: i32,
+    height: i32,
+    scale: f32,
+) {
+    let inset = state.aura_inset;
+    let appearance = &state.config.appearance;
+    let accent = state.palette.map(|p| p.primary).unwrap_or(appearance.accent_color);
+    let metrics = compact_metrics(&state.config);
+    let padding = (appearance.padding * scale).round() as i32;
+    let pill_h = height - inset * 2;
+    let (title_vp_left, title_vp_right) = compact_title_viewport(&state.config);
+
+    // Art tile: left-aligned like the expanded pill (inset + padding),
+    // vertically centered on the row. This is the only place the compact
+    // art is drawn — `draw_pixels` skips its art arms in compact mode, so
+    // the halo, cover and rim composite exactly once. The placeholder is
+    // drawn here too when no cover is available.
+    let art_size = (metrics.art * scale).round() as i32;
+    let art_x = inset + padding;
+    let art_y = inset + (pill_h - art_size) / 2;
+    draw_art_tile(
+        pixels,
+        width as usize,
+        state.palette,
+        appearance.accent_color,
+        art_x as usize,
+        art_y as usize,
+        art_size as usize,
+        art_size as f32 * 0.2,
+        state.decoded_art.as_deref(),
+        scale,
+    );
+
+    // Title row band: the title font's own row height, vertically centered
+    // in the pill.
+    let fs_title = appearance.font_size_title * scale;
+    let row_h = (fs_title * ROW_HEIGHT).round() as i32;
+    let band_top = inset + (pill_h - row_h) / 2;
+    let (font_title, h_title) = state.fonts.font_for(fs_title as i32, true);
+    let title_rect = RECT {
+        left: inset + (title_vp_left * scale).round() as i32,
+        top: band_top,
+        right: inset + (title_vp_right * scale).round() as i32,
+        bottom: band_top + row_h,
+    };
+
+    let (title, app_icon, playback) = match content {
+        MediaEvent::TrackChanged(track) => {
+            let pill = state.pill_text.take().unwrap_or_else(|| pill_text_from_track(track));
+            let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
+            state.pill_text = Some(pill);
+            (title, app_icon, PlaybackState::NowPlaying)
+        }
+        MediaEvent::PlaybackStateChanged(playback, source_app) => {
+            let pill = state.pill_text.take().or_else(|| {
+                if source_app.is_empty() {
+                    None
+                } else {
+                    state.track_cache.get(source_app).map(|(t, _)| pill_text_from_track(t))
+                }
+            });
+            match pill {
+                Some(pill) => {
+                    let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
+                    state.pill_text = Some(pill);
+                    (title, app_icon, *playback)
+                }
+                // No cached track (the state change arrived before the first
+                // TrackChanged): the source name stands in for the title, and
+                // no app icon is available.
+                None => {
+                    let name = if !source_app.is_empty() {
+                        source_app.clone()
+                    } else {
+                        state.current_source.clone().unwrap_or_default()
+                    };
+                    (name, None, *playback)
+                }
+            }
+        }
+        // Never rendered: SessionRejected is filtered out before enqueue.
+        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => return,
+    };
+
+    draw_text_line_pixels(
+        &mut state.text_scratch,
+        &mut state.scratch_utf16,
+        pixels,
+        width as usize,
+        &title,
+        &title_rect,
+        font_title,
+        h_title,
+        appearance.text_color,
+        false,
+        scale,
+        Some(MarqueeCtx {
+            scroll: &mut state.scroll[0],
+            strip: &mut state.marquee_strips[0],
+        }),
+    );
+
+    // Trailing elements, from the title viewport's right edge outward:
+    // 6 px gap, app icon, 16 px gap (the expanded symbol gap), playback
+    // symbol. The chain mirrors `compact_title_viewport`, so the viewport
+    // and the elements can never overlap.
+    let icon_size = (metrics.icon * scale).round() as i32;
+    let gap = (6.0 * scale).round() as i32;
+    let symbol_gap = (16.0 * scale).round() as i32;
+    let symbol = (metrics.symbol * scale).round() as i32;
+    let viewport_right = inset + (title_vp_right * scale).round() as i32;
+    let icon_x = viewport_right + gap;
+    let icon_y = inset + (pill_h - icon_size) / 2;
+    if let Some(icon) = app_icon {
+        draw_icon_scaled(
+            pixels,
+            width as usize,
+            &icon,
+            24,
+            icon_x as usize,
+            icon_y as usize,
+            icon_size as usize,
+        );
+    }
+    let symbol_right = icon_x + icon_size + symbol_gap + symbol;
+    let symbol_y = inset + (pill_h - symbol) / 2;
+    draw_symbol_pixels(
+        pixels,
+        width as usize,
+        symbol_right,
+        symbol_y,
+        symbol as f32,
+        playback,
+        accent,
+    );
 }
 
 /// Draws the meta row of a track pill: when it carries a duration (`clock`),
@@ -4549,7 +5058,7 @@ mod tests {
             title: "Title".into(),
             ..TrackInfo::default()
         };
-        let (width, height) = content_size_of(&config, &MediaEvent::TrackChanged(full));
+        let (width, height) = content_size_of(&config, &MediaEvent::TrackChanged(full), false);
         assert_eq!(width, config.overlay.max_width as f32);
         // Height must clear the sum of all four row bands plus padding, so
         // no row gets clipped.
@@ -4562,14 +5071,181 @@ mod tests {
         assert!(height >= needed);
         // A sparse track must not shrink the pill: same size, empty space
         // below the drawn rows instead.
-        let (_, compact) = content_size_of(&config, &MediaEvent::TrackChanged(minimal));
+        let (_, compact) = content_size_of(&config, &MediaEvent::TrackChanged(minimal), false);
         assert_eq!(compact, height, "missing rows must not shrink the pill");
         // State pills share the same constant height.
         let (_, state_h) = content_size_of(
             &config,
             &MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "App".into()),
+            false,
         );
         assert_eq!(state_h, height, "state pills must match the track pill height");
+    }
+
+    #[test]
+    fn compact_metrics_fit_the_title_row_band() {
+        let config = Config::default();
+        let metrics = compact_metrics(&config);
+        let row_h = config.appearance.font_size_title * ROW_HEIGHT;
+        // The art tile and the playback symbol must fit the single title
+        // row band; the app icon is the app row's 16 px base.
+        assert!(metrics.art <= row_h, "art {} exceeds the row band {row_h}", metrics.art);
+        assert!(
+            metrics.symbol <= row_h,
+            "symbol {} exceeds the row band {row_h}",
+            metrics.symbol
+        );
+        assert_eq!(metrics.icon, 16.0);
+        // A huge configured art size must still yield a compact tile.
+        let mut big = Config::default();
+        big.appearance.art_size = 96;
+        assert_eq!(compact_metrics(&big).art, row_h);
+    }
+
+    #[test]
+    fn compact_size_is_a_single_row_and_smaller_than_expanded() {
+        let config = Config::default();
+        let (expanded_w, expanded_h) = content_size(&config);
+        let (width, height) = compact_size(&config);
+        assert!(
+            width < expanded_w,
+            "compact width {width} must stay below the expanded {expanded_w}"
+        );
+        assert!(
+            height < expanded_h,
+            "compact height {height} must stay below the expanded {expanded_h}"
+        );
+        // One title row + padding, nothing else.
+        let row_h = config.appearance.font_size_title * ROW_HEIGHT;
+        assert_eq!(height, row_h + 2.0 * config.appearance.padding);
+        // The compact pill never exceeds max_width (the expanded pill's cap).
+        assert!(width <= config.overlay.max_width as f32);
+    }
+
+    #[test]
+    fn compact_size_never_exceeds_max_width_at_any_config() {
+        // A tiny max_width caps the compact pill at the configured maximum
+        // rather than overflowing, and never collapses below the 180 px
+        // minimum pill width.
+        let mut tiny = Config::default();
+        tiny.overlay.max_width = 200;
+        let (width, _) = compact_size(&tiny);
+        assert!(
+            width <= 200.0,
+            "compact width {width} must never exceed the configured max_width"
+        );
+        assert!(
+            width >= 180.0,
+            "compact width {width} must never collapse below the min pill width"
+        );
+        // A very wide max_width still caps the compact pill at max_width.
+        let mut wide = Config::default();
+        wide.overlay.max_width = 800;
+        let (width, _) = compact_size(&wide);
+        assert!(width <= 800.0);
+        assert!(width < 800.0, "a compact pill must not fill the full max width");
+    }
+
+    #[test]
+    fn compact_title_viewport_reserves_the_trailing_elements() {
+        let config = Config::default();
+        let metrics = compact_metrics(&config);
+        let (pill_w, _) = compact_size(&config);
+        let (left, right) = compact_title_viewport(&config);
+        // The viewport sits between the art tile (with its 12 px gap) and
+        // the trailing chain: 6 px gap, app icon, 16 px gap, playback
+        // symbol, padding — the marquee band can never reach them.
+        let expected_right = pill_w - config.appearance.padding - metrics.symbol - 16.0 - metrics.icon - 6.0;
+        assert_eq!(right, expected_right, "the viewport must end before the icon chain");
+        assert_eq!(left, config.appearance.padding + metrics.art + 12.0);
+        assert!(
+            right > left,
+            "the viewport must have positive width (got {left}..{right})"
+        );
+    }
+
+    #[test]
+    fn decide_layout_applies_the_configured_mode_directly() {
+        let config = Config::default();
+        let verdict = ForegroundVerdict {
+            exe: Some("Spotify.exe".into()),
+            fullscreen: true,
+        };
+        let mut explicit = config.clone();
+        explicit.overlay.layout = LayoutMode::Expanded;
+        assert_eq!(decide_layout(&explicit, &verdict), LayoutMode::Expanded);
+        explicit.overlay.layout = LayoutMode::Compact;
+        assert_eq!(decide_layout(&explicit, &verdict), LayoutMode::Compact);
+    }
+
+    #[test]
+    fn decide_layout_auto_compacts_for_fullscreen() {
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::Auto;
+        let fullscreen = ForegroundVerdict {
+            exe: None,
+            fullscreen: true,
+        };
+        assert_eq!(decide_layout(&config, &fullscreen), LayoutMode::Compact);
+        let windowed = ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        };
+        assert_eq!(decide_layout(&config, &windowed), LayoutMode::Expanded);
+    }
+
+    #[test]
+    fn decide_layout_auto_compacts_only_for_listed_sources() {
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::Auto;
+        config.behavior.auto_compact_sources = vec!["spotify".into()];
+        let listed = ForegroundVerdict {
+            exe: Some("Spotify.exe".into()),
+            fullscreen: false,
+        };
+        assert_eq!(decide_layout(&config, &listed), LayoutMode::Compact);
+        let unlisted = ForegroundVerdict {
+            exe: Some("chrome.exe".into()),
+            fullscreen: false,
+        };
+        assert_eq!(decide_layout(&config, &unlisted), LayoutMode::Expanded);
+        // An empty list means Auto-compact is off: nothing compacts.
+        config.behavior.auto_compact_sources.clear();
+        assert_eq!(decide_layout(&config, &listed), LayoutMode::Expanded);
+    }
+
+    #[test]
+    fn auto_source_matches_strips_the_exe_extension_and_normalizes() {
+        let config = Config::default();
+        // Mirrors the media_sources convention: normalized case-insensitive
+        // substring, with the picker's .exe-stripping applied to the name.
+        assert!(auto_source_matches(
+            &config_with_sources(&config, ["youtube-music"]),
+            Some("YouTube.Music.exe")
+        ));
+        assert!(auto_source_matches(
+            &config_with_sources(&config, ["spotify"]),
+            Some("Spotify.exe")
+        ));
+        // Case and word boundaries in the pattern are irrelevant.
+        assert!(auto_source_matches(
+            &config_with_sources(&config, ["YouTube Music"]),
+            Some("youtube-music.exe")
+        ));
+        assert!(!auto_source_matches(
+            &config_with_sources(&config, ["spotify"]),
+            Some("chrome.exe")
+        ));
+        // An empty list allows nothing (opt-in), and a missing executable
+        // identity (elevated process, dead pid) never matches.
+        assert!(!auto_source_matches(&config, Some("spotify.exe")));
+        assert!(!auto_source_matches(&config_with_sources(&config, ["spotify"]), None));
+    }
+
+    fn config_with_sources<const N: usize>(base: &Config, sources: [&str; N]) -> Config {
+        let mut config = base.clone();
+        config.behavior.auto_compact_sources = sources.iter().map(|s| s.to_string()).collect();
+        config
     }
 
     #[test]
@@ -5542,7 +6218,15 @@ mod tests {
             artist: "John Muirhead".into(),
             ..TrackInfo::default()
         };
-        draw_text_pixels(&mut state, &mut pixels, &MediaEvent::TrackChanged(track), 240, 1.0);
+        draw_text_pixels(
+            &mut state,
+            &mut pixels,
+            &MediaEvent::TrackChanged(track),
+            240,
+            76,
+            1.0,
+            false,
+        );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 500, "expected text + art pixels, got {lit}");
     }
