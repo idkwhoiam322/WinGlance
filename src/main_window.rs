@@ -1,16 +1,19 @@
 use crate::autostart;
-use crate::config::{Config, HorizontalPosition, VerticalPosition};
+use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, VerticalPosition};
 use crate::events::{
-    MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo, media_event_into_owned,
+    COMPACT_POSITION_MSG, MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo,
+    media_event_into_owned,
 };
 use crate::gdi::{FontProvider, draw_string};
-use crate::overlay::{EventQueue, OverlayPos, set_duration, set_position, show_sample};
+use crate::overlay::{
+    EventQueue, OverlayPos, enumerate_displays, set_duration, set_layout, set_positions, show_sample,
+};
 use crate::process_picker;
-use crate::process_picker::PICKER_RESULT_MSG;
+use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG};
 use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +40,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-    Shell_NotifyIconW,
+    Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -73,6 +76,27 @@ const MENU_DURATION_2S: usize = 1017;
 const MENU_DURATION_3S: usize = 1018;
 const MENU_DURATION_5S: usize = 1019;
 const MENU_DURATION_10S: usize = 1020;
+const MENU_MONITOR_ACTIVE: usize = 1021;
+const MENU_MONITOR_PRIMARY: usize = 1022;
+/// Display entries in the Monitor submenu use sequential ids starting here;
+/// display `i` gets `MENU_MONITOR_DISPLAY_BASE + i`.
+const MENU_MONITOR_DISPLAY_BASE: usize = 1023;
+/// Layout-mode entries of the tray "Layout" submenu.
+const MENU_LAYOUT_EXPANDED: usize = 1024;
+const MENU_LAYOUT_COMPACT: usize = 1025;
+const MENU_LAYOUT_AUTO: usize = 1026;
+/// Toggles whether the Compact layout gets its own position (tray menu).
+const MENU_SEPARATE_COMPACT: usize = 1027;
+/// Compact-position entries of the tray "Compact position" submenu (nested
+/// under "Expanded Position", mirroring the settings row of the same name).
+const MENU_COMPACT_POSITION_TOP_LEFT: usize = 1028;
+const MENU_COMPACT_POSITION_TOP_CENTER: usize = 1029;
+const MENU_COMPACT_POSITION_TOP_RIGHT: usize = 1030;
+const MENU_COMPACT_POSITION_BOTTOM_LEFT: usize = 1031;
+const MENU_COMPACT_POSITION_BOTTOM_CENTER: usize = 1032;
+const MENU_COMPACT_POSITION_BOTTOM_RIGHT: usize = 1033;
+const MENU_COMPACT_POSITION_CUSTOM: usize = 1034;
+const MENU_COMPACT_POSITION_RESET: usize = 1035;
 const LISTBOX_ID: usize = 2;
 /// History rows are kept in the heap (as entries) and duplicated in the
 /// listbox as UTF-16 row strings, so the cap directly sizes the app's
@@ -134,9 +158,15 @@ enum SettingId {
     StartOnLogin,
     CloseToTray,
     AllowedApps,
+    Layout,
     Position,
+    SeparateCompact,
+    CompactPosition,
+    AutoCompactApps,
+    Monitor,
     ShowSample,
     CopyLogs,
+    OpenConfig,
 }
 
 enum SettingsItem {
@@ -180,6 +210,14 @@ enum SettingSub {
     Anchor(usize),
     Reset,
     Adjust,
+    /// The left half of the Diagnostics row ("Open logs" button).
+    Open,
+    /// The right half of the Diagnostics row ("Copy logs" button).
+    Copy,
+    /// The left half of the Config row ("Open config" button).
+    OpenConfig,
+    /// The right half of the Config row ("Reload config" button).
+    ReloadConfig,
 }
 
 /// Sub-rects of the Position row: value text, the six anchor segments, the
@@ -217,6 +255,27 @@ fn row_split(rect: &RECT, scale: f32) -> RowSplit {
     }
 }
 
+/// Splits `rect` down the middle with a small gap, for rows that host two
+/// side-by-side controls (the Diagnostics "Open logs" / "Copy logs" buttons).
+fn halve(rect: &RECT, gap: i32) -> (RECT, RECT) {
+    let mid = rect.left + (rect.right - rect.left) / 2;
+    let half_gap = gap / 2;
+    (
+        RECT {
+            left: rect.left,
+            top: rect.top,
+            right: mid - half_gap,
+            bottom: rect.bottom,
+        },
+        RECT {
+            left: mid + half_gap,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        },
+    )
+}
+
 /// Whether two rects overlap in area. Used to skip repainting rows that the
 /// invalid region does not cover.
 fn rects_intersect(a: &RECT, b: &RECT) -> bool {
@@ -246,6 +305,72 @@ fn position_label(config: &Config) -> String {
                 HorizontalPosition::Right => "right",
             }
         )
+    }
+}
+
+/// The Compact layout's effective position as a display string, via
+/// `compact_effective` (independent fields when `compact_position_separate`
+/// is set, otherwise the live Expanded position).
+fn compact_position_label(config: &Config) -> String {
+    let p = config.overlay.compact_effective();
+    if p.x.is_some() {
+        format!("Custom ({}, {})", p.x.unwrap_or(0), p.y.unwrap_or(0))
+    } else {
+        format!(
+            "{}-{}",
+            match p.vertical {
+                VerticalPosition::Top => "top",
+                VerticalPosition::Bottom => "bottom",
+            },
+            match p.horizontal {
+                HorizontalPosition::Left => "left",
+                HorizontalPosition::Center => "center",
+                HorizontalPosition::Right => "right",
+            }
+        )
+    }
+}
+
+/// The overlay's target display as a display string, e.g. "Active window",
+/// "Primary", "Display 2". An index beyond the currently attached displays
+/// still shows the configured intent, flagged as unavailable — the config is
+/// not rewritten on a hot-unplug, so the label must not lie about it.
+fn monitor_label(config: &Config, display_count: usize) -> String {
+    match config.overlay.monitor {
+        MonitorMode::ActiveWindow => "Active window".to_string(),
+        MonitorMode::Primary => "Primary".to_string(),
+        MonitorMode::Index(index) => {
+            let n = index as usize;
+            if n < display_count {
+                format!("Display {}", n + 1)
+            } else {
+                format!("Display {} (unavailable)", n + 1)
+            }
+        }
+    }
+}
+
+/// The next monitor mode when the settings row is clicked: Active window →
+/// Primary → Display 1 → Display 2 → … → back to Active window. With fewer
+/// than two displays the list degrades gracefully instead of offering an
+/// index that could never resolve.
+fn next_monitor_mode(current: MonitorMode, display_count: usize) -> MonitorMode {
+    match current {
+        MonitorMode::ActiveWindow => MonitorMode::Primary,
+        MonitorMode::Primary => {
+            if display_count > 1 {
+                MonitorMode::Index(0)
+            } else {
+                MonitorMode::ActiveWindow
+            }
+        }
+        MonitorMode::Index(index) => {
+            if (index as usize) + 1 < display_count {
+                MonitorMode::Index(index + 1)
+            } else {
+                MonitorMode::ActiveWindow
+            }
+        }
     }
 }
 
@@ -421,7 +546,7 @@ struct HistoryEntry {
     at_label: String,
     track: TrackInfo,
     state: PlaybackState,
-    /// Whether the source session passed the `allowed_sources` filter.
+    /// Whether the source session passed the `media_sources` filter.
     /// Accepted entries are highlighted; rejected ones render muted so every
     /// media source is visible in the history.
     accepted: bool,
@@ -543,6 +668,9 @@ struct MainWindowState {
     /// picker writes the result here and posts a bare `PICKER_RESULT_MSG`; no
     /// pointer ever crosses the message boundary.
     picker_result: Arc<Mutex<Option<Vec<String>>>>,
+    /// Shared slot for the Auto-compact apps picker, which posts
+    /// `AUTO_SOURCES_RESULT_MSG` (same contract as `picker_result`).
+    auto_sources_result: Arc<Mutex<Option<Vec<String>>>>,
     /// Last playback state each source app reported, so a new track from a
     /// source starts with its own state instead of inheriting the previous
     /// activity's (which may belong to another app).
@@ -639,6 +767,7 @@ pub fn create_window(
         }
         return Err(error);
     }
+    debug!("tray icon installed");
     Ok(hwnd)
 }
 
@@ -710,6 +839,7 @@ impl MainWindowState {
             tooltips_dirty: false,
             logs_copied_at: None,
             picker_result: Arc::new(Mutex::new(None)),
+            auto_sources_result: Arc::new(Mutex::new(None)),
             source_states: HashMap::new(),
             source_order: VecDeque::new(),
             wake: Arc::new(AtomicBool::new(false)),
@@ -745,6 +875,7 @@ impl MainWindowState {
     /// the creation DPI otherwise, leaving rows overlapping the header after
     /// a cross-DPI move.
     fn on_dpi_changed(&mut self, dpi: u32) {
+        debug!("DPI changed to {dpi}");
         unsafe {
             if !self.listbox_font.0.is_null() {
                 let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.listbox_font.0));
@@ -1138,7 +1269,7 @@ impl MainWindowState {
     }
 
     /// Records a session that was seen but not tracked (filtered by
-    /// `allowed_sources` or on the churn cool-down). The row renders muted;
+    /// `media_sources` or on the churn cool-down). The row renders muted;
     /// it never becomes the "Now Playing" activity.
     fn add_session(&mut self, source_app: String, title: String, artist: String, state: PlaybackState, accepted: bool) {
         let track = TrackInfo {
@@ -1641,6 +1772,16 @@ impl MainWindowState {
         });
         y += (22.0 * scale) as i32;
         items.push(SettingsItem::Row {
+            id: SettingId::Layout,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        items.push(SettingsItem::Row {
             id: SettingId::Position,
             rect: RECT {
                 left,
@@ -1651,6 +1792,47 @@ impl MainWindowState {
             },
         });
         y += (70.0 * scale) as i32 + gap;
+        items.push(SettingsItem::Row {
+            id: SettingId::SeparateCompact,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        items.push(SettingsItem::Row {
+            id: SettingId::CompactPosition,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                // Same two-line layout as Position (value/Reset + anchors).
+                bottom: y + (70.0 * scale) as i32,
+            },
+        });
+        y += (70.0 * scale) as i32 + gap;
+        items.push(SettingsItem::Row {
+            id: SettingId::AutoCompactApps,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        items.push(SettingsItem::Row {
+            id: SettingId::Monitor,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
         items.push(SettingsItem::Row {
             id: SettingId::ShowSample,
             rect: RECT {
@@ -1681,6 +1863,16 @@ impl MainWindowState {
                 bottom: y + row_h,
             },
         });
+        y += row_h + gap;
+        items.push(SettingsItem::Row {
+            id: SettingId::OpenConfig,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
         items
     }
 
@@ -1704,9 +1896,15 @@ impl MainWindowState {
         let duration_ms = cfg.overlay.duration_ms;
         let start_on_login = cfg.behavior.start_on_login;
         let close_to_tray = cfg.behavior.close_to_tray;
-        let allowed_sources = cfg.behavior.allowed_sources.join(", ");
+        let media_sources = cfg.behavior.media_sources.join(", ");
         let custom_position = cfg.overlay.position_x.is_some();
         let position_label = position_label(&cfg);
+        let layout_mode = cfg.overlay.layout;
+        let compact_separate = cfg.overlay.compact_position_separate;
+        let compact_position_label = compact_position_label(&cfg);
+        let compact_custom = cfg.overlay.compact_effective().x.is_some();
+        let auto_compact_sources = cfg.behavior.auto_compact_sources.join(", ");
+        let display_count = enumerate_displays().len();
 
         let mut hdr = RECT {
             left: content_left + pad,
@@ -1819,18 +2017,49 @@ impl MainWindowState {
                             if close_to_tray { accent } else { SETTINGS_FAINT },
                         ),
                         SettingId::Duration => ("Duration", format!("{}s", duration_ms / 1000), SETTINGS_MUTED),
-                        SettingId::Position => ("Position", position_label.clone(), SETTINGS_MUTED),
+                        SettingId::Layout => ("Layout", String::new(), SETTINGS_MUTED),
+                        SettingId::Position => ("Expanded Position", position_label.clone(), SETTINGS_MUTED),
+                        SettingId::SeparateCompact => (
+                            // Displayed polarity is inverted from the persisted
+                            // `compact_position_separate` field so the label
+                            // reads naturally: ON means the Compact pill
+                            // follows the Expanded position (field `false`),
+                            // OFF means independent (field `true`). Do NOT
+                            // rename the TOML key to match the label — it is a
+                            // documented persisted setting.
+                            "Compact Position follows Expanded Position",
+                            if compact_separate {
+                                "OFF".to_string()
+                            } else {
+                                "ON".to_string()
+                            },
+                            if compact_separate { SETTINGS_FAINT } else { accent },
+                        ),
+                        SettingId::CompactPosition => {
+                            ("Compact position", compact_position_label.clone(), SETTINGS_MUTED)
+                        }
+                        SettingId::AutoCompactApps => (
+                            "Auto-compact apps",
+                            if auto_compact_sources.is_empty() {
+                                "Only fullscreen".to_string()
+                            } else {
+                                auto_compact_sources.clone()
+                            },
+                            SETTINGS_MUTED,
+                        ),
+                        SettingId::Monitor => ("Monitor", monitor_label(&cfg, display_count), SETTINGS_MUTED),
                         SettingId::AllowedApps => (
                             "Allowed apps",
-                            if allowed_sources.is_empty() {
+                            if media_sources.is_empty() {
                                 "All".to_string()
                             } else {
-                                allowed_sources.clone()
+                                media_sources.clone()
                             },
                             SETTINGS_MUTED,
                         ),
                         SettingId::ShowSample => ("Show sample", String::new(), SETTINGS_MUTED),
                         SettingId::CopyLogs => ("Logs", String::new(), SETTINGS_MUTED),
+                        SettingId::OpenConfig => ("Config", String::new(), SETTINGS_MUTED),
                     };
                     let mut lbl_rect = label_rect;
                     draw_string(
@@ -1848,7 +2077,10 @@ impl MainWindowState {
                         SettingId::Notifications
                         | SettingId::StartOnLogin
                         | SettingId::CloseToTray
-                        | SettingId::AllowedApps => {
+                        | SettingId::AllowedApps
+                        | SettingId::SeparateCompact
+                        | SettingId::AutoCompactApps
+                        | SettingId::Monitor => {
                             let mut val_rect = control_rect;
                             draw_string(
                                 &self.fonts,
@@ -1920,6 +2152,48 @@ impl MainWindowState {
                                     (10.0 * scale) as i32,
                                     tc,
                                     active || near,
+                                    true,
+                                );
+                            }
+                        }
+                        SettingId::Layout => {
+                            // Three segments mirroring the LayoutMode variants;
+                            // the same accent/hover treatment as Duration.
+                            let segments = segment_rects(&control_rect, 3, (4.0 * scale) as i32);
+                            let values = [LayoutMode::Expanded, LayoutMode::Compact, LayoutMode::Auto];
+                            let labels = ["Expanded", "Compact", "Auto"];
+                            for (i, seg) in segments.iter().enumerate() {
+                                let active = layout_mode == values[i];
+                                let seg_hovered = settings_hover == Some((current_row, SettingSub::Seg(i)));
+                                unsafe {
+                                    let _ = FillRect(hdc, seg, if active { brushes.accent } else { brushes.border });
+                                }
+                                let s_inner = RECT {
+                                    left: seg.left + 1,
+                                    top: seg.top + 1,
+                                    right: seg.right - 1,
+                                    bottom: seg.bottom - 1,
+                                };
+                                let fill = if active {
+                                    brushes.accent_soft
+                                } else if seg_hovered {
+                                    brushes.hover
+                                } else {
+                                    brushes.surface
+                                };
+                                unsafe {
+                                    let _ = FillRect(hdc, &s_inner, fill);
+                                }
+                                let mut t = s_inner;
+                                let tc = if active { SETTINGS_TEXT } else { SETTINGS_MUTED };
+                                draw_string(
+                                    &self.fonts,
+                                    hdc,
+                                    labels[i],
+                                    &mut t,
+                                    (10.0 * scale) as i32,
+                                    tc,
+                                    active,
                                     true,
                                 );
                             }
@@ -2002,6 +2276,94 @@ impl MainWindowState {
                                 true,
                             );
                         }
+                        SettingId::CompactPosition => {
+                            // The compact row mirrors the Position row, but on
+                            // the Compact position fields and through
+                            // `compact_effective`: the row always shows where
+                            // the compact pill currently sits — the Expanded
+                            // position while "follows Expanded" is ON — and it
+                            // is always editable. Edits land in the raw
+                            // `compact_*` fields and take visible effect once
+                            // the follow toggle is OFF (independent) and the
+                            // pill is actually compact; while following, the
+                            // stored values are simply waiting (the
+                            // copy-on-first-enable in `set_compact_separate`
+                            // skips them, since they are no longer default).
+                            let parts = position_parts(rect, scale);
+                            let effective = cfg.overlay.compact_effective();
+                            let active_anchor = if compact_custom {
+                                None
+                            } else {
+                                Some(match (effective.vertical, effective.horizontal) {
+                                    (VerticalPosition::Top, HorizontalPosition::Left) => 0,
+                                    (VerticalPosition::Top, HorizontalPosition::Center) => 1,
+                                    (VerticalPosition::Top, HorizontalPosition::Right) => 2,
+                                    (VerticalPosition::Bottom, HorizontalPosition::Left) => 3,
+                                    (VerticalPosition::Bottom, HorizontalPosition::Center) => 4,
+                                    (VerticalPosition::Bottom, HorizontalPosition::Right) => 5,
+                                })
+                            };
+
+                            let mut v = parts.value_row;
+                            draw_string(
+                                &self.fonts,
+                                hdc,
+                                &value_text,
+                                &mut v,
+                                (10.0 * scale) as i32,
+                                SETTINGS_FAINT,
+                                false,
+                                false,
+                            );
+                            let reset_hovered = settings_hover == Some((current_row, SettingSub::Reset));
+                            draw_small_button(
+                                &self.fonts,
+                                hdc,
+                                &parts.reset,
+                                "Reset",
+                                accent,
+                                reset_hovered,
+                                scale,
+                                brushes,
+                            );
+                            for (i, seg) in parts.anchors.iter().enumerate() {
+                                let active = active_anchor == Some(i);
+                                let seg_hovered = settings_hover == Some((current_row, SettingSub::Anchor(i)));
+                                draw_segment_button(
+                                    &self.fonts,
+                                    hdc,
+                                    seg,
+                                    ANCHOR_LABELS[i],
+                                    active,
+                                    seg_hovered,
+                                    scale,
+                                    brushes,
+                                );
+                            }
+                            let adjust_hovered = settings_hover == Some((current_row, SettingSub::Adjust));
+                            unsafe {
+                                let _ = FillRect(
+                                    hdc,
+                                    &parts.adjust,
+                                    if adjust_hovered {
+                                        brushes.adjust_hover
+                                    } else {
+                                        brushes.accent_soft
+                                    },
+                                );
+                            }
+                            let mut bt = parts.adjust;
+                            draw_string(
+                                &self.fonts,
+                                hdc,
+                                "Adjust…",
+                                &mut bt,
+                                (10.0 * scale) as i32,
+                                accent,
+                                true,
+                                true,
+                            );
+                        }
                         SettingId::ShowSample => {
                             let btn_rect = RECT {
                                 left: control_rect.left,
@@ -2022,23 +2384,67 @@ impl MainWindowState {
                             );
                         }
                         SettingId::CopyLogs => {
-                            let btn_rect = RECT {
-                                left: control_rect.left,
-                                top: control_rect.top,
-                                right: control_rect.right,
-                                bottom: control_rect.bottom,
-                            };
-                            let hovered = self.settings_hover == Some((current_row, SettingSub::None));
+                            // Diagnostics row hosts two side-by-side buttons:
+                            // the left half opens the log in the default editor,
+                            // the right half copies it to the clipboard. Each
+                            // button highlights only when the cursor is over
+                            // its own half.
+                            let gap = (4.0 * scale) as i32;
+                            let (open_rect, copy_rect) = halve(&control_rect, gap);
+                            let hovered_open = self.settings_hover == Some((current_row, SettingSub::Open));
+                            let hovered_copy = self.settings_hover == Some((current_row, SettingSub::Copy));
                             let copied = self
                                 .logs_copied_at
                                 .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
                             draw_small_button(
                                 &self.fonts,
                                 hdc,
-                                &btn_rect,
+                                &open_rect,
+                                "Open logs",
+                                accent,
+                                hovered_open,
+                                scale,
+                                brushes,
+                            );
+                            draw_small_button(
+                                &self.fonts,
+                                hdc,
+                                &copy_rect,
                                 if copied { "Copied" } else { "Copy logs" },
                                 accent,
-                                hovered,
+                                hovered_copy,
+                                scale,
+                                brushes,
+                            );
+                        }
+                        SettingId::OpenConfig => {
+                            // Config row hosts two side-by-side buttons: the
+                            // left half opens config.toml in the default editor
+                            // (see open_config); the right half relaunches the
+                            // app so the edited config.toml is reloaded (see
+                            // reload_config). Each button highlights only when
+                            // the cursor is over its own half.
+                            let gap = (4.0 * scale) as i32;
+                            let (open_rect, reload_rect) = halve(&control_rect, gap);
+                            let hovered_open = self.settings_hover == Some((current_row, SettingSub::OpenConfig));
+                            let hovered_reload = self.settings_hover == Some((current_row, SettingSub::ReloadConfig));
+                            draw_small_button(
+                                &self.fonts,
+                                hdc,
+                                &open_rect,
+                                "Open config",
+                                accent,
+                                hovered_open,
+                                scale,
+                                brushes,
+                            );
+                            draw_small_button(
+                                &self.fonts,
+                                hdc,
+                                &reload_rect,
+                                "Reload config",
+                                accent,
+                                hovered_reload,
                                 scale,
                                 brushes,
                             );
@@ -2076,7 +2482,38 @@ impl MainWindowState {
                     // not the first segment; the row stays highlighted.
                     return Some((row_index, seg.map_or(SettingSub::None, SettingSub::Seg)));
                 }
-                if *id == SettingId::Position {
+                if *id == SettingId::Layout {
+                    let segments = segment_rects(&control_rect, 3, (4.0 * scale) as i32);
+                    let seg = segments.iter().position(|s| x >= s.left && x < s.right);
+                    return Some((row_index, seg.map_or(SettingSub::None, SettingSub::Seg)));
+                }
+                if *id == SettingId::CopyLogs {
+                    // Per-button hover for the two side-by-side buttons: the
+                    // left half is "Open logs", the right half "Copy logs".
+                    let gap = (4.0 * scale) as i32;
+                    let (open_rect, copy_rect) = halve(&control_rect, gap);
+                    if x >= open_rect.left && x < open_rect.right {
+                        return Some((row_index, SettingSub::Open));
+                    }
+                    if x >= copy_rect.left && x < copy_rect.right {
+                        return Some((row_index, SettingSub::Copy));
+                    }
+                    return Some((row_index, SettingSub::None));
+                }
+                if *id == SettingId::OpenConfig {
+                    // Per-button hover for the two side-by-side buttons: the
+                    // left half is "Open config", the right half "Reload config".
+                    let gap = (4.0 * scale) as i32;
+                    let (open_rect, reload_rect) = halve(&control_rect, gap);
+                    if x >= open_rect.left && x < open_rect.right {
+                        return Some((row_index, SettingSub::OpenConfig));
+                    }
+                    if x >= reload_rect.left && x < reload_rect.right {
+                        return Some((row_index, SettingSub::ReloadConfig));
+                    }
+                    return Some((row_index, SettingSub::None));
+                }
+                if *id == SettingId::Position || *id == SettingId::CompactPosition {
                     let parts = position_parts(rect, scale);
                     if let Some(i) = parts
                         .anchors
@@ -2085,6 +2522,9 @@ impl MainWindowState {
                     {
                         return Some((row_index, SettingSub::Anchor(i)));
                     }
+                    // The compact row's action buttons are always painted and
+                    // clickable (its edits are stored even while "follows
+                    // Expanded" is ON), so the hits below always register.
                     if x >= parts.reset.left && x < parts.reset.right && y >= parts.reset.top && y < parts.reset.bottom
                     {
                         return Some((row_index, SettingSub::Reset));
@@ -2134,6 +2574,7 @@ impl MainWindowState {
     fn on_close(&self) {
         unsafe {
             if self.cfg().behavior.close_to_tray {
+                debug!("window close requested; hiding to the tray");
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
                 // The tooltip sync timer only runs while the window is
                 // visible; stop it so a tray-hidden window stops waking the
@@ -2144,6 +2585,7 @@ impl MainWindowState {
                 // the timer on restore.
                 let _ = SetTimer(self.hwnd, IDLE_ART_TIMER_ID, IDLE_ART_RELEASE_MS, None);
             } else {
+                debug!("window close requested; quitting (close to tray is off)");
                 let _ = DestroyWindow(self.hwnd);
             }
         }
@@ -2244,6 +2686,7 @@ impl MainWindowState {
     }
 
     fn on_destroy(&mut self) {
+        info!("main window destroyed; app quitting");
         remove_tray_icon(self.hwnd);
         if let Some(current) = &mut self.current {
             free_art_blit(&mut current.art_blit);
@@ -2287,6 +2730,11 @@ impl MainWindowState {
         }
     }
 
+    /// Marks the whole window for repaint on the next WM_PAINT. Deliberately
+    /// cheap — it only invalidates the client area and does no work at call
+    /// time (no DIB recreation, no font/brush setup), so settings-mutating
+    /// click arms may call it freely after every mutation to repaint the new
+    /// value and hover state in the same frame.
     fn invalidate(&self) {
         unsafe {
             let _ = InvalidateRect(self.hwnd, None, false);
@@ -2357,6 +2805,7 @@ impl MainWindowState {
         // The window was hidden, so the timer skipped its syncs; rebuild
         // the tool definitions now so hover works immediately on restore.
         self.sync_tooltips();
+        debug!("main window shown");
     }
 
     /// Copies the current run's log file to the clipboard (UTF-16 with per-line
@@ -2407,10 +2856,81 @@ impl MainWindowState {
         }
 
         self.logs_copied_at = Some(Instant::now());
+        info!("copied the live log to the clipboard");
         unsafe {
             let _ = SetTimer(self.hwnd, TIMER_LOGS_ID, 2000, None);
         }
         self.invalidate();
+    }
+
+    /// Opens the current run's log file (`log-Live.log`) in the default
+    /// application registered for its extension (i.e. the user's preferred
+    /// text editor), mirroring `copy_logs`, which reads the same path. The OS
+    /// picks the handler; `ShellExecuteW` returns a value <= 32 on failure,
+    /// which is surfaced to the debug log rather than the screen.
+    fn open_logs(&self) {
+        let path = self.cfg().logs_dir().join("log-Live.log");
+        let file = wide(&path.to_string_lossy());
+        let verb = wide("open");
+        let result = unsafe {
+            ShellExecuteW(
+                self.hwnd,
+                PCWSTR(verb.as_ptr()),
+                PCWSTR(file.as_ptr()),
+                None,
+                None,
+                SW_SHOW,
+            )
+        };
+        let code = result.0 as isize;
+        if code <= 32 {
+            debug!("open logs: ShellExecuteW failed (code {code}) for {path:?}");
+        } else {
+            info!("opened the live log in the default editor");
+        }
+    }
+
+    /// Opens `config.toml` in the default application registered for its
+    /// extension (i.e. the user's preferred text editor), mirroring
+    /// `open_logs`. The path is resolved via `Config::config_path`, the same
+    /// path `save()` writes. The OS picks the handler; `ShellExecuteW` returns
+    /// a value <= 32 on failure, which is surfaced to the debug log rather
+    /// than the screen. Hand-edits apply on the next launch (no live reload).
+    fn open_config(&self) {
+        let path = match Config::config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                debug!("open config: resolving the config path failed: {error:#}");
+                return;
+            }
+        };
+        let file = wide(&path.to_string_lossy());
+        let verb = wide("open");
+        let result = unsafe {
+            ShellExecuteW(
+                self.hwnd,
+                PCWSTR(verb.as_ptr()),
+                PCWSTR(file.as_ptr()),
+                None,
+                None,
+                SW_SHOW,
+            )
+        };
+        let code = result.0 as isize;
+        if code <= 32 {
+            debug!("open config: ShellExecuteW failed (code {code}) for {path:?}");
+        } else {
+            info!("opened config.toml in the default editor");
+        }
+    }
+
+    /// Relaunches the app so the on-disk `config.toml` is reloaded. The new
+    /// process re-acquires the single-instance mutex (released by
+    /// `crate::relaunch_self` before it spawns) and loads config from disk;
+    /// no app data is cleared, so any on-disk cache survives. See
+    /// `crate::relaunch_self`.
+    fn reload_config(&self) {
+        crate::relaunch_self();
     }
 
     /// Pins the overlay to a vertical/horizontal anchor: clears any absolute
@@ -2422,7 +2942,13 @@ impl MainWindowState {
             cfg.overlay.position_x = None;
             cfg.overlay.position_y = None;
         });
-        set_position(self.overlay_hwnd, OverlayPos::from_config(&self.cfg()));
+        info!("overlay position set: vertical={vertical:?} horizontal={horizontal:?}");
+        let cfg = self.cfg();
+        set_positions(
+            self.overlay_hwnd,
+            OverlayPos::from_config(&cfg),
+            OverlayPos::compact_from_config(&cfg),
+        );
     }
 
     /// Clears any custom X/Y override and returns to the default top-center anchor.
@@ -2430,6 +2956,87 @@ impl MainWindowState {
         self.apply_anchor(VerticalPosition::Top, HorizontalPosition::Center);
         // If the position adjustor is open, move it back to the default spot too.
         crate::positioner::reset_position();
+    }
+
+    /// Pins the Compact layout to a vertical/horizontal anchor (independent
+    /// position): clears any absolute override, persists, and nudges the live
+    /// overlay into place.
+    fn apply_compact_anchor(&mut self, vertical: VerticalPosition, horizontal: HorizontalPosition) {
+        self.mutate_config(|cfg| {
+            cfg.overlay.compact_vertical = vertical;
+            cfg.overlay.compact_horizontal = horizontal;
+            cfg.overlay.compact_position_x = None;
+            cfg.overlay.compact_position_y = None;
+        });
+        info!("compact position set: vertical={vertical:?} horizontal={horizontal:?}");
+        let cfg = self.cfg();
+        set_positions(
+            self.overlay_hwnd,
+            OverlayPos::from_config(&cfg),
+            OverlayPos::compact_from_config(&cfg),
+        );
+    }
+
+    /// Clears the Compact layout's custom X/Y override and returns it to the
+    /// default top-center anchor. The shared adjustor moves with it when open.
+    fn reset_compact_position(&mut self) {
+        self.apply_compact_anchor(VerticalPosition::Top, HorizontalPosition::Center);
+        crate::positioner::reset_position();
+    }
+
+    /// Enables or disables the independent Compact position. The first enable
+    /// initializes the Compact fields from the current Expanded position
+    /// (Compact never starts from a hard-coded spot); later re-enables restore
+    /// the previously customized values instead. The compact row is editable
+    /// even while following, so values the user set there count as
+    /// customization (`compact_is_default` returns false) and the first-enable
+    /// copy is skipped, preserving them. See
+    /// `config::OverlayConfig::compact_is_default`.
+    fn set_compact_separate(&mut self, separate: bool) {
+        // Same lock discipline as `mutate_config`: the write guard covers only
+        // the in-memory mutation, and `save()` runs after the lock is released
+        // so the disk write never stalls other config readers.
+        let changed = {
+            let mut cfg = self.config.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if separate {
+                if cfg.overlay.compact_is_default() {
+                    cfg.overlay.compact_vertical = cfg.overlay.vertical;
+                    cfg.overlay.compact_horizontal = cfg.overlay.horizontal;
+                    cfg.overlay.compact_margin = cfg.overlay.margin;
+                    cfg.overlay.compact_position_x = cfg.overlay.position_x;
+                    cfg.overlay.compact_position_y = cfg.overlay.position_y;
+                    cfg.overlay.compact_monitor = cfg.overlay.monitor;
+                }
+                cfg.overlay.compact_position_separate = true;
+            } else {
+                cfg.overlay.compact_position_separate = false;
+            }
+            cfg.clone()
+        };
+        if let Err(error) = changed.save() {
+            error!("saving config after the compact position follow toggle change failed: {error}");
+        }
+        // The log keeps the raw field value (greppable) and the displayed
+        // polarity (ON = follows Expanded = field false).
+        info!(
+            "compact_position_separate set to {separate} (display: {})",
+            if separate { "OFF" } else { "ON" }
+        );
+        crate::overlay::set_compact_separate(self.overlay_hwnd, separate);
+    }
+
+    /// Sets the target display mode, persists it, and nudges the live overlay.
+    /// The overlay resolves the target against the current display layout
+    /// itself on every placement, so no display handles are exchanged here.
+    fn apply_monitor(&mut self, mode: MonitorMode) {
+        self.mutate_config(|cfg| cfg.overlay.monitor = mode);
+        info!("overlay monitor set: {mode:?}");
+        let cfg = self.cfg();
+        set_positions(
+            self.overlay_hwnd,
+            OverlayPos::from_config(&cfg),
+            OverlayPos::compact_from_config(&cfg),
+        );
     }
 }
 
@@ -2695,6 +3302,7 @@ fn show_tray_note(hwnd: HWND, title: &str, text: &str) {
 }
 
 fn show_tray_menu(state: &mut MainWindowState) {
+    debug!("tray menu opened");
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
         return;
     };
@@ -2822,11 +3430,151 @@ fn show_tray_menu(state: &mut MainWindowState) {
             MENU_POSITION_RESET,
             PCWSTR(wide("Reset position").as_ptr()),
         );
+        let _ = AppendMenuW(position_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        // Compact position submenu: the same anchors for the Compact layout.
+        // Always clickable (the settings row is always editable too): while
+        // "follows Expanded" is ON the checkmarks mirror the live effective
+        // placement and the edits are stored, taking visible effect once the
+        // follow toggle is OFF or the pill is actually compact.
+        let Ok(compact_menu) = CreatePopupMenu() else {
+            let _ = DestroyMenu(menu);
+            return;
+        };
+        let compact_effective = state.cfg().overlay.compact_effective();
+        let compact_anchor_active = compact_effective.x.is_none();
+        let compact_anchor_flags = |v: VerticalPosition, h: HorizontalPosition| {
+            let mut flags = MF_STRING;
+            if compact_anchor_active && compact_effective.vertical == v && compact_effective.horizontal == h {
+                flags |= MF_CHECKED;
+            }
+            flags
+        };
+        let _ = AppendMenuW(
+            compact_menu,
+            compact_anchor_flags(VerticalPosition::Top, HorizontalPosition::Left),
+            MENU_COMPACT_POSITION_TOP_LEFT,
+            PCWSTR(wide("top-left").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            compact_menu,
+            compact_anchor_flags(VerticalPosition::Top, HorizontalPosition::Center),
+            MENU_COMPACT_POSITION_TOP_CENTER,
+            PCWSTR(wide("top-center").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            compact_menu,
+            compact_anchor_flags(VerticalPosition::Top, HorizontalPosition::Right),
+            MENU_COMPACT_POSITION_TOP_RIGHT,
+            PCWSTR(wide("top-right").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            compact_menu,
+            compact_anchor_flags(VerticalPosition::Bottom, HorizontalPosition::Left),
+            MENU_COMPACT_POSITION_BOTTOM_LEFT,
+            PCWSTR(wide("bottom-left").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            compact_menu,
+            compact_anchor_flags(VerticalPosition::Bottom, HorizontalPosition::Center),
+            MENU_COMPACT_POSITION_BOTTOM_CENTER,
+            PCWSTR(wide("bottom-center").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            compact_menu,
+            compact_anchor_flags(VerticalPosition::Bottom, HorizontalPosition::Right),
+            MENU_COMPACT_POSITION_BOTTOM_RIGHT,
+            PCWSTR(wide("bottom-right").as_ptr()),
+        );
+        let (compact_custom_label, compact_custom_flags) =
+            if let Some((px, py)) = compact_effective.x.zip(compact_effective.y) {
+                (format!("Custom ({}, {})", px, py), MF_STRING | MF_CHECKED)
+            } else {
+                ("Adjust compact position…".to_string(), MF_STRING)
+            };
+        let compact_custom_wide = wide(&compact_custom_label);
+        let _ = AppendMenuW(
+            compact_menu,
+            compact_custom_flags,
+            MENU_COMPACT_POSITION_CUSTOM,
+            PCWSTR(compact_custom_wide.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            compact_menu,
+            MF_STRING,
+            MENU_COMPACT_POSITION_RESET,
+            PCWSTR(wide("Reset compact position").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            position_menu,
+            MF_POPUP,
+            compact_menu.0 as usize,
+            PCWSTR(wide("Compact position").as_ptr()),
+        );
         let _ = AppendMenuW(
             menu,
             MF_POPUP,
             position_menu.0 as usize,
-            PCWSTR(wide("Position").as_ptr()),
+            PCWSTR(wide("Expanded Position").as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        // Monitor submenu: which display the pill is placed on. The display
+        // entries mirror the current enumeration (Display 1 is index 0), so
+        // the checkmarks line up with what the overlay resolves at placement.
+        let Ok(monitor_menu) = CreatePopupMenu() else {
+            let _ = DestroyMenu(menu);
+            return;
+        };
+        // Snapshot the configured mode (Copy type) so the read guard is
+        // released before the TrackPopupMenu loop below, which calls
+        // mutate_config on selection.
+        let monitor_mode = state.cfg().overlay.monitor;
+        let displays = enumerate_displays();
+        let monitor_flags = |mode: MonitorMode| {
+            if monitor_mode == mode {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            }
+        };
+        let _ = AppendMenuW(
+            monitor_menu,
+            monitor_flags(MonitorMode::ActiveWindow),
+            MENU_MONITOR_ACTIVE,
+            PCWSTR(wide("Active window").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            monitor_menu,
+            monitor_flags(MonitorMode::Primary),
+            MENU_MONITOR_PRIMARY,
+            PCWSTR(wide("Primary").as_ptr()),
+        );
+        if !displays.is_empty() {
+            let _ = AppendMenuW(monitor_menu, MF_SEPARATOR, 0, PCWSTR::null());
+            for (i, display) in displays.iter().enumerate() {
+                let label = if display.primary {
+                    format!("Display {} (primary)", i + 1)
+                } else {
+                    format!("Display {}", i + 1)
+                };
+                let label_wide = wide(&label);
+                let flags = if monitor_mode == MonitorMode::Index(i as u32) {
+                    MF_STRING | MF_CHECKED
+                } else {
+                    MF_STRING
+                };
+                let _ = AppendMenuW(
+                    monitor_menu,
+                    flags,
+                    MENU_MONITOR_DISPLAY_BASE + i,
+                    PCWSTR(label_wide.as_ptr()),
+                );
+            }
+        }
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            monitor_menu.0 as usize,
+            PCWSTR(wide("Monitor").as_ptr()),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         // Duration submenu
@@ -2886,6 +3634,54 @@ fn show_tray_menu(state: &mut MainWindowState) {
             PCWSTR(wide("Duration").as_ptr()),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        // Layout submenu: which pill layout is used. The current mode carries
+        // the checkmark; Auto additionally resolves per-foreground at runtime.
+        let Ok(layout_menu) = CreatePopupMenu() else {
+            let _ = DestroyMenu(menu);
+            return;
+        };
+        let layout_mode = state.cfg().overlay.layout;
+        let layout_flags = |mode: LayoutMode| {
+            if layout_mode == mode {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            }
+        };
+        let _ = AppendMenuW(
+            layout_menu,
+            layout_flags(LayoutMode::Expanded),
+            MENU_LAYOUT_EXPANDED,
+            PCWSTR(wide("Expanded").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            layout_menu,
+            layout_flags(LayoutMode::Compact),
+            MENU_LAYOUT_COMPACT,
+            PCWSTR(wide("Compact").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            layout_menu,
+            layout_flags(LayoutMode::Auto),
+            MENU_LAYOUT_AUTO,
+            PCWSTR(wide("Auto").as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_POPUP, layout_menu.0 as usize, PCWSTR(wide("Layout").as_ptr()));
+        // Displayed polarity is inverted from the persisted
+        // `compact_position_separate` field (the checkmark means ON, i.e. the
+        // Compact pill follows the Expanded position, field `false`). The TOML
+        // key keeps its name; only the user-facing label changed.
+        let mut separate_compact_flags = MF_STRING;
+        if !state.cfg().overlay.compact_position_separate {
+            separate_compact_flags |= MF_CHECKED;
+        }
+        let _ = AppendMenuW(
+            menu,
+            separate_compact_flags,
+            MENU_SEPARATE_COMPACT,
+            PCWSTR(wide("Compact Position follows Expanded Position").as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT_ID, PCWSTR(wide("Quit").as_ptr()));
 
         let mut point = POINT::default();
@@ -2930,8 +3726,13 @@ fn show_tray_menu(state: &mut MainWindowState) {
                 MENU_CLOSE_TRAY_ID => {
                     let new_value = !state.cfg().behavior.close_to_tray;
                     state.mutate_config(|cfg| cfg.behavior.close_to_tray = new_value);
+                    info!(
+                        "close to tray {} (tray menu)",
+                        if new_value { "enabled" } else { "disabled" }
+                    );
                 }
                 MENU_QUIT_ID => {
+                    info!("quit requested from the tray menu");
                     let _ = DestroyWindow(state.hwnd);
                 }
                 MENU_POSITION_TOP_LEFT => state.apply_anchor(VerticalPosition::Top, HorizontalPosition::Left),
@@ -2965,6 +3766,51 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = 10000);
                     set_duration(state.overlay_hwnd, 10000);
                 }
+                MENU_MONITOR_ACTIVE => state.apply_monitor(MonitorMode::ActiveWindow),
+                MENU_MONITOR_PRIMARY => state.apply_monitor(MonitorMode::Primary),
+                _ if command >= MENU_MONITOR_DISPLAY_BASE && command < MENU_MONITOR_DISPLAY_BASE + displays.len() => {
+                    state.apply_monitor(MonitorMode::Index((command - MENU_MONITOR_DISPLAY_BASE) as u32));
+                }
+                MENU_LAYOUT_EXPANDED => {
+                    state.mutate_config(|cfg| cfg.overlay.layout = LayoutMode::Expanded);
+                    set_layout(state.overlay_hwnd, LayoutMode::Expanded);
+                }
+                MENU_LAYOUT_COMPACT => {
+                    state.mutate_config(|cfg| cfg.overlay.layout = LayoutMode::Compact);
+                    set_layout(state.overlay_hwnd, LayoutMode::Compact);
+                }
+                MENU_LAYOUT_AUTO => {
+                    state.mutate_config(|cfg| cfg.overlay.layout = LayoutMode::Auto);
+                    set_layout(state.overlay_hwnd, LayoutMode::Auto);
+                }
+                MENU_SEPARATE_COMPACT => {
+                    let new_value = !state.cfg().overlay.compact_position_separate;
+                    state.set_compact_separate(new_value);
+                }
+                MENU_COMPACT_POSITION_TOP_LEFT => {
+                    state.apply_compact_anchor(VerticalPosition::Top, HorizontalPosition::Left)
+                }
+                MENU_COMPACT_POSITION_TOP_CENTER => {
+                    state.apply_compact_anchor(VerticalPosition::Top, HorizontalPosition::Center)
+                }
+                MENU_COMPACT_POSITION_TOP_RIGHT => {
+                    state.apply_compact_anchor(VerticalPosition::Top, HorizontalPosition::Right)
+                }
+                MENU_COMPACT_POSITION_BOTTOM_LEFT => {
+                    state.apply_compact_anchor(VerticalPosition::Bottom, HorizontalPosition::Left)
+                }
+                MENU_COMPACT_POSITION_BOTTOM_CENTER => {
+                    state.apply_compact_anchor(VerticalPosition::Bottom, HorizontalPosition::Center)
+                }
+                MENU_COMPACT_POSITION_BOTTOM_RIGHT => {
+                    state.apply_compact_anchor(VerticalPosition::Bottom, HorizontalPosition::Right)
+                }
+                MENU_COMPACT_POSITION_CUSTOM => {
+                    let _ = crate::positioner::open_compact(state.hwnd, state.overlay_hwnd);
+                }
+                MENU_COMPACT_POSITION_RESET => {
+                    state.reset_compact_position();
+                }
                 _ => {}
             }
         }
@@ -2980,6 +3826,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
     // Explorer (re)started and rebuilt the notification area: re-add the
     // tray icon, which Explorer's restart wiped.
     if message == taskbar_created_msg() {
+        debug!("Explorer restarted the notification area; re-adding the tray icon");
         if let Err(error) = install_tray_icon(hwnd) {
             error!("re-adding the tray icon after an Explorer restart failed: {error}");
         }
@@ -3111,10 +3958,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     let item_h = (32.0 * scale) as i32;
                     let item0_y = (40.0 * scale) as i32;
                     let item1_y = item0_y + item_h + (4.0 * scale) as i32;
+                    let previous = state.active_pane;
                     if y >= item0_y && y < item0_y + item_h {
                         state.active_pane = Pane::Activity;
                     } else if y >= item1_y && y < item1_y + item_h {
                         state.active_pane = Pane::Settings;
+                    }
+                    if previous != state.active_pane {
+                        debug!("switched to the {:?} pane", state.active_pane);
                     }
                     state.apply_pane();
                     state.invalidate();
@@ -3166,6 +4017,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                 SettingId::CloseToTray => {
                                     let new_value = !state.cfg().behavior.close_to_tray;
                                     state.mutate_config(|cfg| cfg.behavior.close_to_tray = new_value);
+                                    info!("close to tray {}", if new_value { "enabled" } else { "disabled" });
                                     state.invalidate();
                                 }
                                 SettingId::Duration => {
@@ -3178,6 +4030,74 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                         state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
                                         set_duration(state.overlay_hwnd, duration);
                                         state.invalidate();
+                                    }
+                                }
+                                SettingId::Layout => {
+                                    let segments = segment_rects(&control_rect, 3, (4.0 * scale) as i32);
+                                    let values = [LayoutMode::Expanded, LayoutMode::Compact, LayoutMode::Auto];
+                                    if let Some((i, _)) =
+                                        segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right)
+                                    {
+                                        let mode = values[i];
+                                        state.mutate_config(|cfg| cfg.overlay.layout = mode);
+                                        set_layout(state.overlay_hwnd, mode);
+                                        info!("layout mode set: {mode:?}");
+                                        state.invalidate();
+                                    }
+                                }
+                                SettingId::SeparateCompact => {
+                                    let new_value = !state.cfg().overlay.compact_position_separate;
+                                    state.set_compact_separate(new_value);
+                                    state.invalidate();
+                                }
+                                SettingId::CompactPosition => {
+                                    // Always editable: clicks land in the raw
+                                    // compact_* fields. While "follows
+                                    // Expanded" is ON the row mirrors the
+                                    // Expanded position and these edits are
+                                    // stored, taking visible effect once the
+                                    // follow toggle is OFF or the pill is
+                                    // actually compact.
+                                    let parts = position_parts(rect, scale);
+                                    if let Some((i, _)) = parts
+                                        .anchors
+                                        .iter()
+                                        .enumerate()
+                                        .find(|(_, a)| x >= a.left && x < a.right && y >= a.top && y < a.bottom)
+                                    {
+                                        let (v, h) = match i {
+                                            0 => (VerticalPosition::Top, HorizontalPosition::Left),
+                                            1 => (VerticalPosition::Top, HorizontalPosition::Center),
+                                            2 => (VerticalPosition::Top, HorizontalPosition::Right),
+                                            3 => (VerticalPosition::Bottom, HorizontalPosition::Left),
+                                            4 => (VerticalPosition::Bottom, HorizontalPosition::Center),
+                                            _ => (VerticalPosition::Bottom, HorizontalPosition::Right),
+                                        };
+                                        state.apply_compact_anchor(v, h);
+                                    } else if x >= parts.reset.left
+                                        && x < parts.reset.right
+                                        && y >= parts.reset.top
+                                        && y < parts.reset.bottom
+                                    {
+                                        state.reset_compact_position();
+                                    } else if x >= parts.adjust.left
+                                        && x < parts.adjust.right
+                                        && y >= parts.adjust.top
+                                        && y < parts.adjust.bottom
+                                    {
+                                        let _ = crate::positioner::open_compact(hwnd, state.overlay_hwnd);
+                                    }
+                                    state.invalidate();
+                                }
+                                SettingId::AutoCompactApps => {
+                                    if !process_picker::open(
+                                        hwnd,
+                                        &control_rect,
+                                        &state.cfg().behavior.auto_compact_sources,
+                                        state.auto_sources_result.clone(),
+                                        AUTO_SOURCES_RESULT_MSG,
+                                    ) {
+                                        debug!("auto-compact sources picker failed to open");
                                     }
                                 }
                                 SettingId::Position => {
@@ -3210,19 +4130,52 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     {
                                         let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
                                     }
+                                    // Repaint in the same frame the anchor was
+                                    // clicked: the row's highlighted anchor and
+                                    // value changed, and — while the compact
+                                    // pill follows — the compact row's mirror
+                                    // must update without waiting for the next
+                                    // mouse move.
+                                    state.invalidate();
                                 }
                                 SettingId::ShowSample => {
                                     show_sample(state.overlay_hwnd);
                                 }
+                                SettingId::Monitor => {
+                                    // One click steps to the next choice
+                                    // (Active window → Primary → Display 1 →
+                                    // … → back); the tray menu offers direct
+                                    // selection.
+                                    let displays = enumerate_displays();
+                                    let next = next_monitor_mode(state.cfg().overlay.monitor, displays.len());
+                                    state.apply_monitor(next);
+                                    state.invalidate();
+                                }
                                 SettingId::CopyLogs => {
-                                    state.copy_logs();
+                                    let gap = (4.0 * scale) as i32;
+                                    let (open_rect, _copy_rect) = halve(&control_rect, gap);
+                                    if x >= open_rect.left && x < open_rect.right {
+                                        state.open_logs();
+                                    } else {
+                                        state.copy_logs();
+                                    }
+                                }
+                                SettingId::OpenConfig => {
+                                    let gap = (4.0 * scale) as i32;
+                                    let (open_rect, _reload_rect) = halve(&control_rect, gap);
+                                    if x >= open_rect.left && x < open_rect.right {
+                                        state.open_config();
+                                    } else {
+                                        state.reload_config();
+                                    }
                                 }
                                 SettingId::AllowedApps => {
                                     if !process_picker::open(
                                         hwnd,
                                         &control_rect,
-                                        &state.cfg().behavior.allowed_sources,
+                                        &state.cfg().behavior.media_sources,
                                         state.picker_result.clone(),
+                                        PICKER_RESULT_MSG,
                                     ) {
                                         debug!("process picker failed to open");
                                     }
@@ -3312,7 +4265,37 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     cfg.overlay.position_x = Some(x);
                     cfg.overlay.position_y = Some(y);
                 });
-                set_position(state.overlay_hwnd, OverlayPos::from_config(&state.cfg()));
+                info!("overlay position set from the adjustor: ({x}, {y})");
+                let cfg = state.cfg();
+                set_positions(
+                    state.overlay_hwnd,
+                    OverlayPos::from_config(&cfg),
+                    OverlayPos::compact_from_config(&cfg),
+                );
+            }
+            LRESULT(0)
+        }
+        COMPACT_POSITION_MSG => {
+            // Custom Compact position posted by the positioner (logical
+            // pixels). Applied unconditionally: the compact row and tray
+            // submenu are always editable, so a legitimately open adjustor
+            // must persist even while "follows Expanded" is ON — the values
+            // are stored and take effect once the follow toggle is OFF.
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                let x = wparam.0 as i32;
+                let y = lparam.0 as i32;
+                state.mutate_config(|cfg| {
+                    cfg.overlay.compact_position_x = Some(x);
+                    cfg.overlay.compact_position_y = Some(y);
+                });
+                info!("compact position set from the adjustor: ({x}, {y})");
+                let cfg = state.cfg();
+                set_positions(
+                    state.overlay_hwnd,
+                    OverlayPos::from_config(&cfg),
+                    OverlayPos::compact_from_config(&cfg),
+                );
             }
             LRESULT(0)
         }
@@ -3330,7 +4313,25 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .take();
                 if let Some(patterns) = patterns {
-                    state.mutate_config(|cfg| cfg.behavior.allowed_sources = patterns);
+                    state.mutate_config(|cfg| cfg.behavior.media_sources = patterns);
+                    state.invalidate();
+                }
+            }
+            LRESULT(0)
+        }
+        AUTO_SOURCES_RESULT_MSG => {
+            // Same contract as PICKER_RESULT_MSG, but for the Auto-compact
+            // sources picker: the confirmed patterns land in the shared slot
+            // and are taken here into `behavior.auto_compact_sources`.
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                let patterns = state
+                    .auto_sources_result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if let Some(patterns) = patterns {
+                    state.mutate_config(|cfg| cfg.behavior.auto_compact_sources = patterns);
                     state.invalidate();
                 }
             }

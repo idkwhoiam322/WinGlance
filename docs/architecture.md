@@ -205,20 +205,43 @@ anti-aliased.
 `overlay::position()` resolves the pill's screen top-left from `[overlay]`:
 
 - `vertical` (`top`/`bottom`) × `horizontal` (`left`/`center`/`right`) pick an
-  anchor on the active monitor's work area (the monitor of `GetForegroundWindow`);
+  anchor on the target display's work area;
 - `margin` offsets from the chosen edge in 96-DPI logical pixels (scaled by the
-  window DPI);
+  target display DPI);
 - `position_x`/`position_y`, when set, override the anchor with an absolute
-  location and are clamped to the work area so they stay on-screen.
+  location (virtual-screen coordinates) and are clamped to the target work
+  area so they stay on-screen.
+
+The target display comes from `monitor`: `active-window` (the monitor of
+`GetForegroundWindow`, the historical behavior), `primary` (the display
+flagged `MONITORINFOF_PRIMARY`), or `index-N` (the (N+1)-th display in
+`EnumDisplayMonitors` order). `overlay::enumerate_displays()` takes a fresh
+snapshot on every placement — handles are never cached — and
+`resolve_target()` maps the mode onto it; an out-of-range index falls back to
+the primary (with a throttled warning) without touching the config, so the
+setting reapplies when the display returns. `position_x`/`position_y` retain
+their existing semantics — absolute virtual-screen coordinates in 96-DPI
+logical pixels — and the resulting position is clamped into the target
+display's work area.
+
+DPI for sizing, fonts, and the margin comes from the target display via
+`GetDpiForMonitor(MDT_EFFECTIVE_DPI)` (`overlay::monitor_dpi()`), not from
+the monitor the overlay window currently sits on — the first frame after a
+display switch is already scaled correctly. The animation timer's refresh
+period is queried against the overlay window itself (it sits on the target
+while animating), falling back to the target's display-mode frequency.
 
 Because the 16 ms `WM_TIMER` recomputes geometry each tick while the pill is
-shown, a monitor removal or resolution change moves the pill back onto the new
-work area on the next frame. The tray **Position → Adjust position…** command
-opens `src/positioner.rs`, a draggable sample that posts the chosen
+shown, a monitor removal or resolution change moves the pill back onto the
+new work area on the next frame; `WM_DISPLAYCHANGE` additionally repositions
+a visible pill immediately. The tray **Expanded Position → Adjust position…**
+command opens `src/positioner.rs`, a draggable sample that posts the chosen
 `position_x`/`position_y` to the main window via `POSITION_MSG`; the main
 window — the single owner of the config — applies and persists them, and
-nudges the live overlay via `overlay::set_position` (which calls
-`reposition()` without a full redraw).
+nudges the live overlay via `overlay::set_positions` (which calls
+`reposition()` without a full redraw). `OverlayPos` carries the monitor mode,
+so anchor, custom-position and monitor changes all flow through the same
+push path.
 
 ## Main window: panes and the process picker
 
@@ -231,10 +254,10 @@ switching between two panes:
   synced to the visible row band on a 1 Hz timer while the window is visible.
 - **Settings** — cards mirroring the tray menu and `[behavior]`/`[overlay]`
   config: notifications toggle, duration presets, start-on-login, close-to-
-  tray, allowed apps, position anchors + Reset/Adjust, "Show sample", and the
-  "Copy logs" button. The main window is the single writer of the in-memory
-  config (see the guardrail in `AGENTS.md`); every change goes through
-  `mutate_config` and is persisted.
+  tray, allowed apps, position anchors + Reset/Adjust, target display
+  selection, "Show sample", and the "Copy logs" button. The main window is the
+  single writer of the in-memory config (see the guardrail in `AGENTS.md`);
+  every change goes through `mutate_config` and is persisted.
 
 The **process picker** (`src/process_picker.rs`, ~900 lines) is an
 owner-drawn popup opened from the Settings "Allowed apps" card. It lists
@@ -242,7 +265,7 @@ visible windows' processes (one Toolhelp snapshot + one `EnumWindows` pass)
 plus every open SMTC session source, pre-checks the current allow-list with
 the same normalization the worker uses, and posts the confirmed patterns back
 to the main window via `PICKER_RESULT_MSG`, which applies them to
-`behavior.allowed_sources` — so allow-list changes apply to the live worker
+`behavior.media_sources` — so allow-list changes apply to the live worker
 without a restart.
 
 ## Configuration

@@ -16,12 +16,60 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 |----------------|---------|---------|---------------------------------------------------|
 | `duration_ms`  | `3000`  | 500–60000 | How long the pill stays visible before collapsing |
 | `animation_ms` | `280`   | 100–500 | Expand/collapse animation length                  |
+| `layout`       | `"expanded"` | `expanded` \| `compact` \| `auto` | Which pill layout is used (see below) |
 | `vertical`     | `"top"` | `top` \| `bottom` | Which monitor edge the pill anchors to |
 | `horizontal`   | `"center"` | `left` \| `center` \| `right` | Horizontal anchor within the work area |
 | `margin`       | `8`     | 0–500   | Distance from the chosen edge (logical px)        |
 | `max_width`    | `340`   | 180–800 | Maximum pill width in logical pixels              |
 | `position_x`   | *(unset)* | integer | Absolute X override (96-DPI logical px); set by *Adjust position…* |
 | `position_y`   | *(unset)* | integer | Absolute Y override (96-DPI logical px); set by *Adjust position…* |
+| `monitor`      | `"active-window"` | string | Which display the pill is placed on (see below) |
+| `compact_position_separate` | `false` | bool | Give the Compact layout its own position (see below). The settings/tray toggle displays the *inverse* polarity: ON = Compact follows Expanded (`false`), OFF = independent (`true`) |
+| `compact_vertical` | `"top"` | `top` \| `bottom` | Compact layout's vertical anchor (only consulted while `compact_position_separate` is on) |
+| `compact_horizontal` | `"center"` | `left` \| `center` \| `right` | Compact layout's horizontal anchor (same condition) |
+| `compact_margin` | `8`   | 0–500   | Compact layout's edge distance (same condition)   |
+| `compact_position_x` | *(unset)* | integer | Absolute X override for the Compact layout; set by the compact *Adjust position…* |
+| `compact_position_y` | *(unset)* | integer | Absolute Y override for the Compact layout        |
+| `compact_monitor` | `"active-window"` | string | Which display the Compact layout is placed on     |
+
+`layout` accepts one of:
+
+- `"expanded"` — the classic pill: title, artist, source app and a small
+  album-art square.
+- `"compact"` — a slim pill: album art, single title line, app icon and the
+  playback symbol, no artist/source rows.
+- `"auto"` — per-foreground resolution: the pill compacts while the
+  foreground app is fullscreen or its executable matches an
+  `auto_compact_sources` pattern, and expands otherwise. The verdict is
+  re-sampled at every show and whenever the foreground window changes.
+
+While `compact_position_separate` is `false`, the Compact layout follows the
+live Expanded position — changing `vertical`/`horizontal`/`margin`/`monitor`
+or dragging a custom placement moves the compact pill with it, and the
+`compact_*` fields are retained but ignored. The settings row and the tray
+submenu stay fully editable in this state: edits land in the `compact_*`
+fields and take visible effect once the toggle is turned off (independent)
+and the pill is actually Compact (or Auto resolving to Compact). They are
+never lost: the first switch to independent copies the current Expanded
+position into still-default `compact_*` fields, while later switches restore
+the previously customized values.
+
+`monitor` accepts one of:
+
+- `"active-window"` — the display of the foreground window (the historical
+  behavior; also the default for configs written before this key existed).
+- `"primary"` — the display Windows marks as primary.
+- `"index-N"` — the (N+1)-th display in Windows' enumeration order, so
+  `"index-0"` is the first display, `"index-1"` the second, and so on.
+
+The index is resolved against the *current* display layout each time the pill
+is placed. If the configured display is temporarily unplugged or reordered,
+the pill falls back to the primary display while the setting stays untouched,
+so it reapplies automatically when the display returns. Custom
+`position_x`/`position_y` values keep their existing semantics: absolute
+virtual-screen coordinates in 96-DPI logical pixels — not relative to the
+selected display — and the resulting position is clamped into the selected
+display's work area.
 
 ## [behavior]
 
@@ -34,7 +82,8 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `start_in_tray`                 | `true`  | bool   | Start silently: no window, only the tray icon + pill |
 | `start_on_login`                | `false` | bool   | Register a Windows startup entry to launch WinGlance at logon |
 | `close_to_tray`                 | `true`  | bool   | Hide (instead of close) the window when its X is pressed |
-| `allowed_sources`               | `[]`    | list   | Source apps (case-insensitive substrings) to allow; empty = all apps |
+| `media_sources`                 | `[]`    | list   | Media source apps (case-insensitive substrings) to allow; empty = all apps |
+| `auto_compact_sources`          | `[]`    | list   | Apps (case-insensitive substrings) that force the Compact layout while `layout` is `"auto"`; empty = only fullscreen compacts |
 
 ## [appearance]
 
@@ -44,6 +93,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `text_color`       | `[255, 255, 255, 255]` | RGBA 0–255 | Title and state-label color |
 | `accent_color`     | `[240, 110, 155, 255]` | RGBA 0–255 | Playback symbols, music note, album-art rim; aura fallback when the artwork palette has no vibrant color |
 | `corner_radius`    | `26.0`     | 4–48    | Corner rounding in logical pixels       |
+| `compact_corner_radius` | `12.0` | 4–48    | Corner rounding of the Compact layout, in logical pixels (independent of `corner_radius`; see below) |
 | `padding`          | `15.0`      | 4–32    | Gap between pill edge and content       |
 | `art_size`         | `48`       | 24–96   | Album-art square size (pill height is derived from this) |
 | `font_size_title`  | `16.0`     | 8–32    | Track title font size                   |
@@ -53,6 +103,16 @@ Colors are `[R, G, B, A]` with 0–255 components. The alpha channel is used
 for compositing; the default (235, ~92%) keeps the pill near-opaque while
 letting a hint of the backdrop through. Text, album art and symbols stay
 fully opaque regardless of the body alpha.
+
+`compact_corner_radius` rounds the Compact layout independently of
+`corner_radius` (which keeps controlling Expanded). The default of `12.0`
+makes the slim Compact pill a moderately rounded media card rather than a
+capsule; values near `6.0` read as a nearly square rectangle. Setting both
+keys to the same value makes the layouts look alike — e.g. both `26.0` —
+though on the shorter Compact pill a high radius visually approaches a
+capsule (the render clamps it to half the smaller pill dimension). Both
+radii use the same DPI scaling, aura, fill, border and clipping pipeline —
+only the corner amount differs.
 
 ## Per-track theming (not configurable)
 
@@ -101,6 +161,20 @@ The tray menu mirrors the `[behavior]` toggles in real time:
 - **Toggle notifications** — enable/disable SMTC track-change + state-change events.
 - **Start with Windows** — write/remove the `%APPDATA%\...\Run` registry entry.
 - **Close window to tray** — on-off (mirrors `close_to_tray`).
+- **Expanded Position** — anchor the pill (`top-left` … `bottom-right`), open
+  the *Adjust position…* drag adjustor, show a sample, or reset to top-center.
+  A nested **Compact position** submenu offers the same controls for the
+  Compact layout; its entries are always clickable. While the follow toggle
+  below is ON they show the live effective placement (the Expanded position)
+  and edits are stored, taking visible effect once the toggle is OFF.
+- **Monitor** — which display the pill is placed on.
+- **Duration** — 2 s / 3 s / 5 s / 10 s.
+- **Layout** — Expanded / Compact / Auto (mirrors `overlay.layout`).
+- **Compact Position follows Expanded Position** — on-off. The displayed
+  polarity is inverted from the `compact_position_separate` key: ON (checked)
+  means the Compact pill follows the Expanded position (`false`), OFF means
+  independent (`true`). The first switch to OFF copies the current Expanded
+  position into the compact fields.
 - **Quit** — stop the process and remove the tray icon.
 
 ## Compact WinGlance defaults

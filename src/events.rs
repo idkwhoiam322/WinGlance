@@ -12,6 +12,10 @@ pub const TOGGLE_MSG: u32 = WM_APP + 3;
 /// keeps a single owner of the in-memory config, so a position commit can never
 /// clobber a concurrent settings change with a stale disk reload.
 pub const POSITION_MSG: u32 = WM_APP + 5;
+/// Same contract as `POSITION_MSG`, but for the independent Compact position
+/// (`compact_position_x`/`compact_position_y`): posted by the compact-mode
+/// positioner, handled by the same single-owner rule.
+pub const COMPACT_POSITION_MSG: u32 = WM_APP + 9;
 
 #[derive(Debug, Clone, Default)]
 pub struct TrackInfo {
@@ -202,7 +206,7 @@ pub enum PlaybackState {
 pub enum MediaEvent {
     TrackChanged(TrackInfo),
     PlaybackStateChanged(PlaybackState, String),
-    /// A session was seen but is not tracked (rejected by `allowed_sources`
+    /// A session was seen but is not tracked (rejected by `media_sources`
     /// or on the churn cool-down). Carries whatever display info SMTC exposed
     /// at discovery time. The history records it as a muted row so all media
     /// sources are visible; `accepted` marks entries from tracked sessions.

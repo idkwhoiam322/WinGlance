@@ -198,7 +198,7 @@ struct ListenerState {
     /// Cached app icons keyed by source_app label (derived from AUMID via
     /// `source_app_label`). Populated on first encounter of a source.
     icon_cache: HashMap<String, Option<Arc<[u8]>>>,
-    /// Last-seen `allowed_sources` config list plus its pre-normalized
+    /// Last-seen `media_sources` config list plus its pre-normalized
     /// patterns. The per-session check runs on the hot path (every re-sync
     /// of every session), so the clone of the config list and the per-pattern
     /// normalization only re-run when the config actually changed.
@@ -792,14 +792,14 @@ impl ListenerState {
             let source = read_source_app(session);
             let allowed = self.session_source_allowed(session);
             debug!(
-                "SMTC session {} | key={key} | source={} | allowed_sources={:?}",
+                "SMTC session {} | key={key} | source={} | media_sources={:?}",
                 if allowed { "accepted" } else { "rejected" },
                 read_source_app(session),
                 self.config
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .behavior
-                    .allowed_sources
+                    .media_sources
             );
             if !allowed {
                 // Log rejected sessions once per appearance so the history
@@ -1013,7 +1013,7 @@ impl ListenerState {
     }
 
     /// Whether a session's source app is excluded: on the churn cool-down, or
-    /// not matching the user's `allowed_sources` config. When `allowed_sources`
+    /// not matching the user's `media_sources` config. When `media_sources`
     /// is empty, all sources are allowed. When non-empty, only sources matching
     /// an entry (case-insensitive substring against the AUMID and its derived
     /// label, after normalizing word-boundary characters) are allowed;
@@ -1027,12 +1027,12 @@ impl ListenerState {
         if self.source_on_cooldown(&label) {
             return false;
         }
-        // The allowed_sources list only changes through the settings UI, so
+        // The media_sources list only changes through the settings UI, so
         // compare the live config against the cached copy (element-wise, no
         // clone) and only re-normalize when it actually differs.
         {
             let cfg = self.config.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let raw = &cfg.behavior.allowed_sources;
+            let raw = &cfg.behavior.media_sources;
             let stale = self
                 .cached_allowed
                 .as_ref()

@@ -1,5 +1,5 @@
 use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
-use log::warn;
+use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -45,6 +45,9 @@ const BST_UNCHECKED: usize = 0;
 const CB_SIZE: i32 = 13;
 
 pub(crate) const PICKER_RESULT_MSG: u32 = WM_APP + 7;
+/// Result message for the Auto-compact sources picker (same contract as
+/// `PICKER_RESULT_MSG`, same picker window, different config field).
+pub(crate) const AUTO_SOURCES_RESULT_MSG: u32 = WM_APP + 11;
 
 /// Identifier for the listbox's Comctl32 subclass registration.
 const LISTBOX_SUBCLASS_ID: usize = 1;
@@ -80,6 +83,11 @@ struct PickerState {
     /// the result here and posts a bare `PICKER_RESULT_MSG`; the main window
     /// reads the slot. No pointers ever cross the message boundary.
     result: Arc<Mutex<Option<Vec<String>>>>,
+    /// The result message posted on confirm: `PICKER_RESULT_MSG` for the
+    /// media-sources picker, `AUTO_SOURCES_RESULT_MSG` for the Auto-compact
+    /// sources picker. The main window distinguishes the two by this message
+    /// and writes the matching config field.
+    result_msg: u32,
 }
 
 static OPEN_PICKER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
@@ -164,6 +172,15 @@ fn process_names() -> HashMap<u32, String> {
     names
 }
 
+/// The executable name of a process, from a fresh Toolhelp snapshot. Used by
+/// the overlay to identify the foreground window's app for Auto-layout source
+/// matching. `None` when the process does not exist or cannot be read (e.g.
+/// an elevated process snapshot from a non-elevated instance) — callers treat
+/// that as "no match".
+pub(crate) fn exe_name_for_pid(pid: u32) -> Option<String> {
+    process_names().remove(&pid)
+}
+
 /// Scan state threaded through the EnumWindows callback: the accumulated
 /// window entries and the prebuilt pid → exe-name map.
 struct WindowScan {
@@ -218,15 +235,18 @@ fn merge_smtc_sources(mut entries: Vec<ProcessEntry>) -> Vec<ProcessEntry> {
 
 /// Builds the picker's row list from the live process/session set plus the
 /// user's stored allow-list. Every allow-list pattern that has no live
-/// matching entry is appended as a pre-checked row labeled "… (not running)"
-/// so closing the picker can never silently drop a previously-enabled source:
+/// matching entry is added as a pre-checked row labeled "… (not running)" so
+/// closing the picker can never silently drop a previously-enabled source:
 /// the main window replaces (not merges) the allow-list with the picker's
 /// checked result, so anything not shown above a checkbox would be lost.
+/// Not-running rows are pinned above the live apps (each group sorted by
+/// name), so a stored source stays visible even when its app is closed.
 fn build_picker_list(current: &[String], mut entries: Vec<ProcessEntry>) -> Vec<ProcessEntry> {
     // Normalized patterns already represented by a live entry. Match with the
     // same bidirectional-contains rule the pre-check uses, so a "discord" entry
     // is not duplicated by a "discord-helper" running process, and vice-versa.
     let seen: HashSet<String> = entries.iter().map(|e| normalize_pattern(&e.pattern)).collect();
+    let mut not_running = Vec::new();
     for pattern in current {
         let norm = normalize_pattern(pattern);
         if norm.is_empty() || seen.iter().any(|e| e.contains(&norm) || norm.contains(e)) {
@@ -234,13 +254,15 @@ fn build_picker_list(current: &[String], mut entries: Vec<ProcessEntry>) -> Vec<
         }
         // Not currently running: keep it in the row set, pre-checked, with a
         // label that makes its absence from the live process list obvious.
-        entries.push(ProcessEntry {
+        not_running.push(ProcessEntry {
             display_name: format!("{} (not running)", pretty_source_label(pattern)),
             pattern: pattern.clone(),
         });
     }
     entries.sort_by_key(|a| a.display_name.to_lowercase());
-    entries
+    not_running.sort_by_key(|a| a.display_name.to_lowercase());
+    not_running.extend(entries);
+    not_running
 }
 
 /// Same normalization the SMTC worker uses when matching allow-list patterns
@@ -330,6 +352,7 @@ pub(crate) fn open(
     trigger_rect: &RECT,
     current: &[String],
     result: Arc<Mutex<Option<Vec<String>>>>,
+    result_msg: u32,
 ) -> bool {
     let list = build_picker_list(current, merge_smtc_sources(enumerate_app_processes()));
     if list.is_empty() {
@@ -407,6 +430,7 @@ pub(crate) fn open(
             row_brush: HBRUSH::default(),
             row_selected_brush: HBRUSH::default(),
             result,
+            result_msg,
         });
         let state_ptr = Box::into_raw(state);
         PICKER_STATE_CLAIMED.store(false, Ordering::SeqCst);
@@ -564,6 +588,7 @@ pub(crate) fn open(
         }
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        debug!("process picker opened");
         true
     }
 }
@@ -599,19 +624,25 @@ fn post_result(hwnd: HWND, cancelled: bool) {
     let owner = unsafe { GetParent(hwnd).unwrap_or_default() };
 
     // The selected patterns travel through the shared result slot, never as a
-    // pointer in the message. The main window takes the slot on
-    // PICKER_RESULT_MSG; if the post fails the slot is simply never read and
-    // the next picker open overwrites it.
+    // pointer in the message. The main window takes the slot on the posted
+    // result message (PICKER_RESULT_MSG / AUTO_SOURCES_RESULT_MSG); if the
+    // post fails the slot is simply never read and the next picker open
+    // overwrites it.
+    let patterns = if cancelled {
+        None
+    } else {
+        Some(read_checked(hwnd, state.listbox))
+    };
     if let Ok(mut slot) = state.result.lock() {
-        *slot = if cancelled {
-            None
-        } else {
-            Some(read_checked(hwnd, state.listbox))
-        };
+        *slot = patterns.clone();
     }
 
-    if unsafe { PostMessageW(owner, PICKER_RESULT_MSG, WPARAM(0), LPARAM(0)) }.is_err() {
+    if unsafe { PostMessageW(owner, state.result_msg, WPARAM(0), LPARAM(0)) }.is_err() {
         warn!("posting the picker result failed");
+    } else if let Some(patterns) = patterns {
+        info!("picker result updated to {patterns:?}");
+    } else {
+        debug!("process picker cancelled; source list unchanged");
     }
 }
 
@@ -1080,5 +1111,33 @@ mod tests {
         assert!(by_pattern["discord"].display_name.contains("not running"));
         assert_eq!(by_pattern["spotify"].pattern, "spotify");
         assert_eq!(by_pattern["discord"].pattern, "discord");
+    }
+
+    #[test]
+    fn not_running_sources_pin_to_the_top_of_the_list() {
+        // The configured-but-closed app must appear above every running app,
+        // regardless of alphabetical order, so a stored source is never lost
+        // below the fold of a long list.
+        let list = build_picker_list(
+            &["zebra".to_string(), "alpha".to_string()],
+            vec![entry("mango"), entry("banana")],
+        );
+        assert_eq!(list.len(), 4);
+        assert_eq!(list[0].pattern, "alpha");
+        assert_eq!(list[1].pattern, "zebra");
+        assert_eq!(list[2].pattern, "banana");
+        assert_eq!(list[3].pattern, "mango");
+        assert!(list[0].display_name.contains("not running"));
+        assert!(list[1].display_name.contains("not running"));
+        assert!(!list[2].display_name.contains("not running"));
+        assert!(!list[3].display_name.contains("not running"));
+    }
+
+    #[test]
+    fn not_running_group_stays_alphabetically_sorted() {
+        let list = build_picker_list(&["zeta".to_string(), "alpha".to_string()], vec![]);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].pattern, "alpha");
+        assert_eq!(list[1].pattern, "zeta");
     }
 }

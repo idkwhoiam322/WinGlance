@@ -58,7 +58,7 @@ WinGlance/
   the expand/light/collapse state machine, the palette aura, the per-track
   fill tint, the directional edge highlight, vector playback
   glyphs (play/pause/stop/music note), marquee rows, and hover-dismiss.
-  `set_position`/`show_sample` are the only entry points other windows reach
+  `set_positions`/`show_sample` are the only entry points other windows reach
   into.
 - **icon.rs** — resolves a source app's icon from its AUMID through the shell
   (`SHCreateItemFromParsingName` + `IShellItemImageFactory`), cached per
@@ -73,17 +73,17 @@ WinGlance/
   luminance guard, ≥ 30° hue separation) that feeds the accents and the aura.
 - **main_window.rs** — the tracking window (current activity + history) and the
   full tray menu: Open, Toggle notifications, Start with Windows, Close to tray,
-  Position submenu, and Quit.
+  Expanded Position submenu, and Quit.
 - **autostart.rs** — reads/writes the `HKCU ...\Run` entry for start-on-login.
 - **positioner.rs** — the in-app floating sample used to drag-place the pill; it
   posts the chosen `position_x`/`position_y` to the main window via
   `POSITION_MSG` (the main window owns the config, applies, and persists), and
-  the overlay is nudged via `overlay::set_position`.
+  the overlay is nudged via `overlay::set_positions`.
 - **process_picker.rs** — the owner-drawn "Allowed apps" popup opened from the
   Settings pane: lists running processes and open SMTC session sources,
   pre-checks the allow-list, and posts the confirmed patterns back to the main
   window via `PICKER_RESULT_MSG` (which applies them to
-  `behavior.allowed_sources`).
+  `behavior.media_sources`).
 
 ## Build and verify
 

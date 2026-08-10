@@ -66,7 +66,7 @@ verified headless.
   emits `MediaEvent`s over `mpsc`; the UI thread owns all Win32 windows.
 - The main window (`src/main_window.rs`) is the single owner/writer of the
   in-memory config; settings changes are pushed to the overlay via
-  `overlay::set_position` / `overlay::set_duration`, and the positioner posts
+  `overlay::set_positions` / `overlay::set_duration`, and the positioner posts
   its result back via `POSITION_MSG` — never reload config from disk in
   `positioner.rs`.
 - Smoke test against the log after changing SMTC logic: one song change should

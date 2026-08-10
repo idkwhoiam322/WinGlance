@@ -16,11 +16,13 @@ mod winutil;
 
 use crate::config::Config;
 use anyhow::Result;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::VecDeque;
+use std::env;
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
@@ -37,7 +39,7 @@ use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW, TranslateMessage,
@@ -254,6 +256,14 @@ fn install_panic_hook(logs_dir: &Path) {
 /// Upper bound on `crash.log` before the next panic truncates it.
 const CRASH_LOG_CAP: u64 = 1024 * 1024;
 
+/// Holds the raw value of the single-instance mutex handle for the lifetime of
+/// the process so the "Reload config" button can release it before spawning
+/// the next instance. A relaunch must free it first, otherwise the freshly
+/// launched process would see a live owner (this one) and exit immediately.
+/// Stored as `isize` because `HANDLE` is neither `Send` nor `Sync` and cannot
+/// live in a `static` directly.
+static SINGLETON_HANDLE: OnceLock<isize> = OnceLock::new();
+
 /// Acquires the single-instance mutex for the process lifetime. Returns the
 /// handle while the caller holds it, or `None` when another instance already
 /// owns the mutex. The handle must be kept alive until process exit; releasing
@@ -270,7 +280,10 @@ fn acquire_singleton() -> anyhow::Result<Option<HANDLE>> {
             // a live owner returns WAIT_TIMEOUT. Without this, the first
             // relaunch after a crash would exit, requiring a second launch.
             match WaitForSingleObject(handle, 0) {
-                WAIT_ABANDONED | WAIT_OBJECT_0 => Ok(Some(handle)),
+                WAIT_ABANDONED | WAIT_OBJECT_0 => {
+                    let _ = SINGLETON_HANDLE.set(handle.0 as isize);
+                    Ok(Some(handle))
+                }
                 WAIT_TIMEOUT => {
                     let _ = CloseHandle(handle);
                     Ok(None)
@@ -285,7 +298,37 @@ fn acquire_singleton() -> anyhow::Result<Option<HANDLE>> {
                 }
             }
         } else {
+            let _ = SINGLETON_HANDLE.set(handle.0 as isize);
             Ok(Some(handle))
+        }
+    }
+}
+
+/// Restarts the app in place so it reloads `config.toml` from disk. The
+/// single-instance mutex is released first (see `SINGLETON_HANDLE`), then the
+/// current executable is launched with the `--reload-config` marker (so the
+/// new instance can record the reload in its own log) and this process exits.
+/// Nothing under `%APPDATA%\WinGlance\WinGlance\data\` is deleted, so any
+/// on-disk cache survives; only in-memory caches (icon/track/period) are lost,
+/// as they are on any restart. If the new process cannot be launched, this
+/// instance keeps running rather than disappearing.
+pub fn relaunch_self() {
+    if let Some(raw) = SINGLETON_HANDLE.get() {
+        let handle = HANDLE(*raw as *mut c_void);
+        unsafe {
+            let _ = ReleaseMutex(handle);
+            let _ = CloseHandle(handle);
+        }
+    }
+    match env::current_exe() {
+        Ok(exe) => {
+            if process::Command::new(exe).arg("--reload-config").spawn().is_ok() {
+                process::exit(0);
+            }
+            error!("reload config: launching the new process failed; keeping this instance running");
+        }
+        Err(error) => {
+            error!("reload config: resolving the current executable path failed: {error:#}");
         }
     }
 }
@@ -330,6 +373,14 @@ fn main() -> Result<()> {
     install_panic_hook(&config.logs_dir());
 
     info!("starting WinGlance");
+
+    // Distinguish a user-requested reload (Settings "Reload config" button)
+    // from a plain launch, tray start or autostart: the old process cannot
+    // log it reliably because the new process truncates the live log at
+    // startup, so the marker is passed as an argument and recorded here.
+    if std::env::args_os().any(|arg| arg == "--reload-config") {
+        info!("started via the Settings 'Reload config' action; applying the on-disk config");
+    }
 
     if let Err(error) = autostart::apply(config.behavior.start_on_login) {
         warn!("start-on-login sync failed: {error:#}");
@@ -502,6 +553,7 @@ fn main() -> Result<()> {
     );
 
     let message_result = message_loop();
+    debug!("message loop exited; shutting down");
 
     // Stop the producers before destroying the windows: the forwarder must
     // not post to an HWND that teardown is about to free. The supervisor

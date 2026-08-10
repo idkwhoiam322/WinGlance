@@ -1,4 +1,4 @@
-use crate::events::POSITION_MSG;
+use crate::events::{COMPACT_POSITION_MSG, POSITION_MSG};
 use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
 use log::debug;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +39,11 @@ static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
 struct PositionerState {
     owner: HWND,
     overlay: HWND,
+    /// Which position the commit applies to: `POSITION_MSG` for the expanded
+    /// pill, `COMPACT_POSITION_MSG` for the independent compact position.
+    /// The message routes through the main window (the single config owner),
+    /// which writes the matching `position_*` or `compact_position_*` fields.
+    result_msg: u32,
     dragging: bool,
     drag_offset: POINT,
     /// Last position committed to the main window (logical coords), so a
@@ -62,6 +67,17 @@ static POSITIONER_STATE_CLAIMED: AtomicBool = AtomicBool::new(false);
 /// Opens a floating sample notification that the user can drag to set WinGlance's
 /// placement. The window stays open until the user clicks X or presses Escape.
 pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
+    open_with(owner, overlay, POSITION_MSG)
+}
+
+/// Opens the position adjustor for the independent Compact position. The
+/// commit is posted with `COMPACT_POSITION_MSG`, so the main window writes the
+/// `compact_position_*` fields instead of the expanded ones.
+pub(crate) fn open_compact(owner: HWND, overlay: HWND) -> bool {
+    open_with(owner, overlay, COMPACT_POSITION_MSG)
+}
+
+fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
     unsafe {
         let instance = match GetModuleHandleW(None) {
             Ok(handle) => HINSTANCE(handle.0),
@@ -76,6 +92,7 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
         let state = Box::new(PositionerState {
             owner,
             overlay,
+            result_msg,
             dragging: false,
             drag_offset: POINT::default(),
             last_commit: None,
@@ -109,6 +126,7 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
                     *guard = (hwnd.0 as usize, overlay.0 as usize);
                 }
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                debug!("position adjustor opened");
                 true
             }
             Err(_) => {
@@ -171,6 +189,8 @@ pub(crate) fn reset_position() {
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         ) {
             debug!("positioner reset SetWindowPos failed: {error}");
+        } else {
+            debug!("position adjustor reset to the default spot");
         }
     }
 }
@@ -246,7 +266,7 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
     if let Err(error) = unsafe {
         PostMessageW(
             state.owner,
-            POSITION_MSG,
+            state.result_msg,
             WPARAM(log_x as usize),
             LPARAM(log_y as isize),
         )
@@ -254,6 +274,7 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
         debug!("positioner PostMessageW failed: {error}");
     } else {
         state.last_commit = Some((log_x, log_y));
+        debug!("position adjustor committed ({log_x}, {log_y})");
     }
 }
 
@@ -398,6 +419,7 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
             LRESULT(0)
         }
         WM_NCDESTROY => {
+            debug!("position adjustor closed");
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 unsafe {

@@ -1,5 +1,5 @@
-use log::warn;
-use serde::{Deserialize, Serialize};
+use log::{debug, info, warn};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -47,12 +47,39 @@ pub struct OverlayConfig {
     pub position_x: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position_y: Option<i32>,
+    /// Which display the pill is placed on (see `MonitorMode`).
+    pub monitor: MonitorMode,
+    /// Which pill layout is used (see `LayoutMode`).
+    pub layout: LayoutMode,
+    /// Whether the Compact layout uses its own independent position
+    /// (`compact_*` below). While `false`, the Compact layout always follows
+    /// the Expanded position (`vertical`/`horizontal`/`margin`/`position_x`/
+    /// `position_y`/`monitor`) in both effective behavior and the settings
+    /// UI; the independent fields are retained for later restoration but
+    /// never consulted. See `compact_effective`.
+    pub compact_position_separate: bool,
+    /// Independent Compact position, used only while
+    /// `compact_position_separate` is `true` and the effective layout is
+    /// Compact. When separation is first enabled and these fields are still
+    /// at their defaults (never customized), the UI initializes them from
+    /// the current Expanded position — Compact never starts from a
+    /// hard-coded spot.
+    pub compact_vertical: VerticalPosition,
+    pub compact_horizontal: HorizontalPosition,
+    pub compact_margin: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_position_x: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_position_y: Option<i32>,
+    /// Which display the Compact pill is placed on while it uses its own
+    /// position (see `MonitorMode`).
+    pub compact_monitor: MonitorMode,
     /// Unknown keys under `[overlay]`, preserved across saves.
     #[serde(flatten)]
     pub unknown: toml::Table,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VerticalPosition {
     #[default]
@@ -60,13 +87,83 @@ pub enum VerticalPosition {
     Bottom,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HorizontalPosition {
     #[default]
     Center,
     Left,
     Right,
+}
+
+/// Which pill layout is in effect. Serialized as a string so a hand-edited
+/// `config.toml` stays readable:
+///
+/// ```toml
+/// layout = "expanded"   # the full four-row pill (default)
+/// layout = "compact"    # single-line pill: small art, title, app icon,
+///                       # playback symbol
+/// layout = "auto"       # compact while a configured source app is the
+///                       # foreground app or a genuine fullscreen window is
+///                       # foreground; expanded otherwise
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LayoutMode {
+    #[default]
+    Expanded,
+    Compact,
+    Auto,
+}
+
+/// Which display the overlay pill is placed on. Serialized as a string so a
+/// hand-edited `config.toml` stays readable and unambiguous:
+///
+/// ```toml
+/// monitor = "active-window"   # monitor of the foreground window (default)
+/// monitor = "primary"         # the display marked primary in Windows
+/// monitor = "index-2"         # the third active display (zero-based)
+/// ```
+///
+/// `Index(n)` is resolved against the *current* enumeration of active
+/// displays every time the pill is placed; an index that is temporarily
+/// out of range (a display unplugged or reordered after the config was
+/// saved) falls back to the primary display at placement time while the
+/// configured value is preserved, so it becomes valid again automatically
+/// when the display comes back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MonitorMode {
+    /// Preserves the behavior of configs written before the field existed.
+    #[default]
+    ActiveWindow,
+    Primary,
+    Index(u32),
+}
+
+impl Serialize for MonitorMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let text = match self {
+            Self::ActiveWindow => "active-window".to_string(),
+            Self::Primary => "primary".to_string(),
+            Self::Index(index) => format!("index-{index}"),
+        };
+        serializer.serialize_str(&text)
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        match text.as_str() {
+            "active-window" => Ok(Self::ActiveWindow),
+            "primary" => Ok(Self::Primary),
+            _ => text
+                .strip_prefix("index-")
+                .and_then(|digits| digits.parse::<u32>().ok())
+                .map(Self::Index)
+                .ok_or_else(|| serde::de::Error::custom(format!("invalid monitor mode {text:?}"))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,7 +182,13 @@ pub struct BehaviorConfig {
     /// its derived label) whose SMTC sessions are followed. When empty, all
     /// non-cooldown sources are allowed (default). When non-empty, only matching
     /// sources generate pill notifications.
-    pub allowed_sources: Vec<String>,
+    pub media_sources: Vec<String>,
+    /// Source apps (same form, identity and matching rules as `media_sources`)
+    /// that force the pill into the Compact layout while `layout = "auto"` and
+    /// one of them is the foreground app. Persisted even while layout is
+    /// Expanded or Compact, but only ever consulted in Auto mode — switching
+    /// the layout never clears this list.
+    pub auto_compact_sources: Vec<String>,
     /// Unknown keys under `[behavior]`, preserved across saves.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -98,6 +201,11 @@ pub struct AppearanceConfig {
     pub text_color: [u8; 4],
     pub accent_color: [u8; 4],
     pub corner_radius: f32,
+    /// Corner rounding of the Compact layout, in logical pixels. Independent
+    /// of `corner_radius` (which keeps controlling the Expanded layout), so
+    /// the two layouts can be rounded differently — the shipped default makes
+    /// Compact a moderately rounded media card rather than a capsule.
+    pub compact_corner_radius: f32,
     pub padding: f32,
     pub art_size: u32,
     pub font_size_title: f32,
@@ -118,7 +226,79 @@ impl Default for OverlayConfig {
             max_width: 340,
             position_x: None,
             position_y: None,
+            monitor: MonitorMode::default(),
+            layout: LayoutMode::default(),
+            compact_position_separate: false,
+            compact_vertical: VerticalPosition::Top,
+            compact_horizontal: HorizontalPosition::Center,
+            compact_margin: 8,
+            compact_position_x: None,
+            compact_position_y: None,
+            compact_monitor: MonitorMode::default(),
             unknown: toml::Table::new(),
+        }
+    }
+}
+
+/// The resolved position the Compact layout actually uses: the independent
+/// `compact_*` fields while separation is enabled, otherwise the current
+/// Expanded position. Single source of truth shared by the overlay placement
+/// and every settings/tray preview, so the UI can never show a position the
+/// pill would not use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactPosition {
+    pub vertical: VerticalPosition,
+    pub horizontal: HorizontalPosition,
+    pub margin: i32,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub monitor: MonitorMode,
+}
+
+impl OverlayConfig {
+    /// Whether the independent Compact position fields are still at their
+    /// defaults — i.e. never customized. The settings UI uses this to decide
+    /// whether a first enable of `compact_position_separate` may initialize
+    /// them from the current Expanded position (Compact never starts from a
+    /// hard-coded spot); once any field deviates — including edits made from
+    /// the compact position row or tray submenu while the follow toggle is
+    /// still ON — re-enabling separation restores the previously customized
+    /// values instead.
+    pub fn compact_is_default(&self) -> bool {
+        // Derived from the struct's own defaults rather than hardcoded
+        // literals, so a future default change cannot silently break the
+        // copy-on-first-enable decision that leans on this.
+        let defaults = Self::default();
+        self.compact_vertical == defaults.compact_vertical
+            && self.compact_horizontal == defaults.compact_horizontal
+            && self.compact_margin == defaults.compact_margin
+            && self.compact_position_x == defaults.compact_position_x
+            && self.compact_position_y == defaults.compact_position_y
+            && self.compact_monitor == defaults.compact_monitor
+    }
+
+    /// The position the Compact layout resolves to, per the separation rule:
+    /// independent fields when `compact_position_separate` is set, otherwise
+    /// the live Expanded position.
+    pub fn compact_effective(&self) -> CompactPosition {
+        if self.compact_position_separate {
+            CompactPosition {
+                vertical: self.compact_vertical,
+                horizontal: self.compact_horizontal,
+                margin: self.compact_margin,
+                x: self.compact_position_x,
+                y: self.compact_position_y,
+                monitor: self.compact_monitor,
+            }
+        } else {
+            CompactPosition {
+                vertical: self.vertical,
+                horizontal: self.horizontal,
+                margin: self.margin,
+                x: self.position_x,
+                y: self.position_y,
+                monitor: self.monitor,
+            }
         }
     }
 }
@@ -133,7 +313,8 @@ impl Default for BehaviorConfig {
             start_on_login: false,
             start_in_tray: true,
             close_to_tray: true,
-            allowed_sources: Vec::new(),
+            media_sources: Vec::new(),
+            auto_compact_sources: Vec::new(),
             unknown: toml::Table::new(),
         }
     }
@@ -155,11 +336,30 @@ impl Default for AppearanceConfig {
             // pill's white text.
             accent_color: [240, 110, 155, 255],
             corner_radius: 26.0,
+            // Moderately rounded so the slim Compact pill reads as a small
+            // media card, not a capsule (a 26 px radius would nearly round
+            // it end to end at the Compact height).
+            compact_corner_radius: 12.0,
             padding: 15.0,
             art_size: 48,
             font_size_title: 16.0,
             font_size_artist: 13.0,
             unknown: toml::Table::new(),
+        }
+    }
+}
+
+impl AppearanceConfig {
+    /// The corner radius (logical px) for the effective pill layout: the
+    /// Compact layout's own radius when the pill is Compact, the Expanded
+    /// radius otherwise. The caller passes the already-resolved effective
+    /// layout — Auto has been decided into Expanded/Compact before any
+    /// rendering — so the selected radius always matches what is drawn.
+    pub fn effective_corner_radius(&self, compact: bool) -> f32 {
+        if compact {
+            self.compact_corner_radius
+        } else {
+            self.corner_radius
         }
     }
 }
@@ -206,6 +406,7 @@ impl Config {
             let mut config = Config::default();
             config.normalize();
             config.save_to(config_path)?;
+            info!("no config at {config_path:?}; wrote defaults");
             return Ok(config);
         }
         let content = match read_config_with_retry(config_path) {
@@ -220,6 +421,7 @@ impl Config {
         match toml::from_str::<Config>(&content) {
             Ok(mut config) => {
                 config.normalize();
+                debug!("config loaded from {config_path:?}");
                 Ok(config)
             }
             Err(error) => Ok(Self::defaults_in_memory(&format!("is not valid TOML ({error})"))),
@@ -264,7 +466,10 @@ impl Config {
         Ok(())
     }
 
-    fn config_path() -> anyhow::Result<PathBuf> {
+    /// The on-disk location of `config.toml`, resolved the same way `save()`
+    /// writes it. Exposed so the Settings "Open config" button can hand the
+    /// exact file to the shell without guessing the data dir itself.
+    pub fn config_path() -> anyhow::Result<PathBuf> {
         Ok(Self::data_dir()?.join("config.toml"))
     }
 
@@ -282,8 +487,10 @@ impl Config {
         self.overlay.animation_ms = self.overlay.animation_ms.clamp(100, 500);
         self.overlay.max_width = self.overlay.max_width.clamp(180, 800);
         self.overlay.margin = self.overlay.margin.clamp(0, 500);
+        self.overlay.compact_margin = self.overlay.compact_margin.clamp(0, 500);
         self.behavior.debounce_ms = self.behavior.debounce_ms.clamp(150, 250);
         self.appearance.corner_radius = self.appearance.corner_radius.clamp(4.0, 48.0);
+        self.appearance.compact_corner_radius = self.appearance.compact_corner_radius.clamp(4.0, 48.0);
         self.appearance.padding = self.appearance.padding.clamp(4.0, 32.0);
         self.appearance.art_size = self.appearance.art_size.clamp(24, 96);
         self.appearance.font_size_title = self.appearance.font_size_title.clamp(8.0, 32.0);
@@ -442,5 +649,268 @@ nested_appearance = [1, 2, 3]
             vec!["config.toml"],
             "no temp file may remain after the rename"
         );
+    }
+
+    #[test]
+    fn default_monitor_mode_is_active_window() {
+        let config = Config::default();
+        assert_eq!(config.overlay.monitor, MonitorMode::ActiveWindow);
+    }
+
+    #[test]
+    fn config_without_a_monitor_field_deserializes_to_active_window() {
+        // A config.toml written by a build before the monitor setting existed
+        // has no `[overlay] monitor` key and must keep today's behavior.
+        let config: Config = toml::from_str("[overlay]\nduration_ms = 4000\n").unwrap();
+        assert_eq!(config.overlay.monitor, MonitorMode::ActiveWindow);
+        assert_eq!(config.overlay.duration_ms, 4000);
+    }
+
+    #[test]
+    fn monitor_mode_round_trips_through_toml() {
+        // Round-trip direction: within a table, a mode serializes to a plain
+        // string value and parses back to the same variant.
+        #[derive(Serialize, Deserialize)]
+        struct Wrapper {
+            m: MonitorMode,
+        }
+        for mode in [
+            MonitorMode::ActiveWindow,
+            MonitorMode::Primary,
+            MonitorMode::Index(0),
+            MonitorMode::Index(3),
+        ] {
+            let text = toml::to_string_pretty(&Wrapper { m: mode }).unwrap();
+            let back: Wrapper = toml::from_str(&text).unwrap();
+            assert_eq!(back.m, mode, "round trip of {text:?} must preserve the mode");
+        }
+        // The exact on-disk forms, as a user would hand-edit them.
+        for (form, expected) in [
+            ("active-window", MonitorMode::ActiveWindow),
+            ("primary", MonitorMode::Primary),
+            ("index-0", MonitorMode::Index(0)),
+            ("index-2", MonitorMode::Index(2)),
+        ] {
+            let config: Config = toml::from_str(&format!("[overlay]\nmonitor = \"{form}\"\n")).unwrap();
+            assert_eq!(
+                config.overlay.monitor, expected,
+                "monitor = \"{form}\" in [overlay] must map to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_monitor_mode_is_rejected_not_reinterpreted() {
+        // Unknown strings and malformed indices are hard deserialization
+        // errors (the load path then applies defaults in memory and leaves
+        // the user's file untouched), never a silent reinterpretation.
+        for bad in [
+            "\"bogus\"",
+            "\"Index(1)\"",
+            "\"index\"",
+            "\"index-\"",
+            "\"index--1\"",
+            "\"index-abc\"",
+        ] {
+            assert!(
+                toml::from_str::<MonitorMode>(bad).is_err(),
+                "{bad} must not parse as a monitor mode"
+            );
+        }
+    }
+
+    #[test]
+    fn monitor_setting_survives_a_config_save_round_trip() {
+        let mut config = Config::default();
+        config.overlay.monitor = MonitorMode::Index(2);
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            saved.contains("monitor = \"index-2\""),
+            "the mode must serialize in its hand-editable string form:\n{saved}"
+        );
+        let reloaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded.overlay.monitor, MonitorMode::Index(2));
+    }
+
+    #[test]
+    fn layout_defaults_to_expanded_with_separation_off() {
+        let config = Config::default();
+        assert_eq!(config.overlay.layout, LayoutMode::Expanded);
+        assert!(!config.overlay.compact_position_separate);
+        assert_eq!(
+            config.overlay.compact_effective(),
+            CompactPosition {
+                vertical: VerticalPosition::Top,
+                horizontal: HorizontalPosition::Center,
+                margin: 8,
+                x: None,
+                y: None,
+                monitor: MonitorMode::ActiveWindow,
+            }
+        );
+    }
+
+    #[test]
+    fn layout_round_trips_through_toml() {
+        for (form, expected) in [
+            ("expanded", LayoutMode::Expanded),
+            ("compact", LayoutMode::Compact),
+            ("auto", LayoutMode::Auto),
+        ] {
+            let config: Config = toml::from_str(&format!("[overlay]\nlayout = \"{form}\"\n")).unwrap();
+            assert_eq!(
+                config.overlay.layout, expected,
+                "layout = \"{form}\" in [overlay] must map to {expected:?}"
+            );
+            let saved = toml::to_string_pretty(&config).unwrap();
+            assert!(
+                saved.contains(&format!("layout = \"{form}\"")),
+                "the mode must serialize in its hand-editable string form:\n{saved}"
+            );
+        }
+        // Unknown modes are hard deserialization errors, never a silent
+        // reinterpretation.
+        assert!(toml::from_str::<Config>("[overlay]\nlayout = \"bogus\"\n").is_err());
+    }
+
+    #[test]
+    fn compact_effective_mirrors_expanded_while_separation_is_off() {
+        let mut config = Config::default();
+        config.overlay.vertical = VerticalPosition::Bottom;
+        config.overlay.horizontal = HorizontalPosition::Right;
+        config.overlay.margin = 24;
+        config.overlay.position_x = Some(120);
+        config.overlay.position_y = Some(40);
+        config.overlay.monitor = MonitorMode::Index(1);
+        // A stale/customized independent Compact position must not leak
+        // through while separation is off.
+        config.overlay.compact_vertical = VerticalPosition::Top;
+        config.overlay.compact_horizontal = HorizontalPosition::Left;
+        assert_eq!(
+            config.overlay.compact_effective(),
+            CompactPosition {
+                vertical: VerticalPosition::Bottom,
+                horizontal: HorizontalPosition::Right,
+                margin: 24,
+                x: Some(120),
+                y: Some(40),
+                monitor: MonitorMode::Index(1),
+            }
+        );
+    }
+
+    #[test]
+    fn compact_effective_uses_independent_fields_while_separation_is_on() {
+        let mut config = Config::default();
+        config.overlay.vertical = VerticalPosition::Bottom;
+        config.overlay.compact_vertical = VerticalPosition::Top;
+        config.overlay.compact_horizontal = HorizontalPosition::Left;
+        config.overlay.compact_position_x = Some(80);
+        config.overlay.compact_position_separate = true;
+        assert_eq!(config.overlay.compact_effective().vertical, VerticalPosition::Top);
+        assert_eq!(config.overlay.compact_effective().x, Some(80));
+        // The Expanded position itself is untouched by the separation flag.
+        assert_eq!(config.overlay.vertical, VerticalPosition::Bottom);
+    }
+
+    #[test]
+    fn compact_is_default_tracks_customization() {
+        let mut config = Config::default();
+        assert!(config.overlay.compact_is_default());
+        config.overlay.compact_horizontal = HorizontalPosition::Right;
+        assert!(!config.overlay.compact_is_default());
+    }
+
+    #[test]
+    fn auto_compact_sources_survive_a_save_round_trip() {
+        let mut config = Config::default();
+        config.behavior.auto_compact_sources = vec!["youtube-music".into(), "netflix".into()];
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(saved.contains("auto_compact_sources"), "{saved}");
+        let reloaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            reloaded.behavior.auto_compact_sources,
+            vec!["youtube-music".to_string(), "netflix".to_string()]
+        );
+    }
+
+    #[test]
+    fn switching_layout_keeps_auto_compact_sources() {
+        // Auto-compact sources are persisted regardless of the selected
+        // layout and must never be cleared by a layout switch.
+        let mut config = Config::default();
+        config.behavior.auto_compact_sources = vec!["spotify".into()];
+        for mode in [LayoutMode::Expanded, LayoutMode::Compact, LayoutMode::Auto] {
+            config.overlay.layout = mode;
+            let saved = toml::to_string_pretty(&config).unwrap();
+            let reloaded: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(reloaded.behavior.auto_compact_sources, vec!["spotify".to_string()]);
+        }
+    }
+
+    #[test]
+    fn compact_margin_is_bounded() {
+        let mut config = Config::default();
+        config.overlay.compact_margin = 10_000;
+        config.normalize();
+        assert_eq!(config.overlay.compact_margin, 500);
+    }
+
+    #[test]
+    fn compact_corner_radius_defaults_without_touching_the_expanded_radius() {
+        let config = Config::default();
+        assert_eq!(config.appearance.corner_radius, 26.0);
+        assert_eq!(config.appearance.compact_corner_radius, 12.0);
+    }
+
+    #[test]
+    fn missing_compact_corner_radius_loads_with_the_default() {
+        // A config written before this key existed must load successfully and
+        // use the new default, with the existing radius untouched.
+        let config: Config = toml::from_str("[appearance]\ncorner_radius = 26.0\n").unwrap();
+        assert_eq!(config.appearance.corner_radius, 26.0);
+        assert_eq!(config.appearance.compact_corner_radius, 12.0);
+    }
+
+    #[test]
+    fn compact_corner_radius_round_trips_and_stays_independent() {
+        // Expanded and Compact radii are independent knobs: any combination is
+        // valid, including equal values for both layouts.
+        for (corner, compact) in [(26.0, 12.0), (20.0, 8.0), (26.0, 26.0)] {
+            let config: Config = toml::from_str(&format!(
+                "[appearance]\ncorner_radius = {corner}\ncompact_corner_radius = {compact}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.appearance.corner_radius, corner);
+            assert_eq!(config.appearance.compact_corner_radius, compact);
+            let saved = toml::to_string_pretty(&config).unwrap();
+            assert!(saved.contains("compact_corner_radius"), "{saved}");
+            let reloaded: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(reloaded.appearance.corner_radius, corner);
+            assert_eq!(reloaded.appearance.compact_corner_radius, compact);
+        }
+    }
+
+    #[test]
+    fn effective_corner_radius_follows_the_effective_layout() {
+        let mut config = Config::default();
+        config.appearance.corner_radius = 20.0;
+        config.appearance.compact_corner_radius = 8.0;
+        // `compact` is the already-resolved effective layout, so Auto that
+        // resolved to Expanded/Compact selects the matching radius without
+        // any Auto-specific logic here.
+        assert_eq!(config.appearance.effective_corner_radius(false), 20.0);
+        assert_eq!(config.appearance.effective_corner_radius(true), 8.0);
+    }
+
+    #[test]
+    fn compact_corner_radius_is_bounded() {
+        let mut config = Config::default();
+        config.appearance.compact_corner_radius = 1000.0;
+        config.normalize();
+        assert_eq!(config.appearance.compact_corner_radius, 48.0);
+        config.appearance.compact_corner_radius = -5.0;
+        config.normalize();
+        assert_eq!(config.appearance.compact_corner_radius, 4.0);
     }
 }
