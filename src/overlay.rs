@@ -6,7 +6,7 @@ use crate::gdi::FontProvider;
 use crate::palette::Palette;
 use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
 use anyhow::{Context, Result};
-use log::{debug, error};
+use log::{debug, error, info};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -404,6 +404,10 @@ pub(crate) fn set_position(hwnd: HWND, pos: OverlayPos) {
         }
         let state = &mut *state_ptr;
         state.position = pos;
+        debug!(
+            "overlay position applied: vertical={:?} horizontal={:?} x={:?} y={:?}",
+            pos.vertical, pos.horizontal, pos.x, pos.y
+        );
         if matches!(state.phase, Phase::Hidden) {
             state.show_sample();
         } else {
@@ -425,6 +429,7 @@ pub(crate) fn set_duration(hwnd: HWND, duration_ms: u64) {
         }
         let state = &mut *state_ptr;
         state.config.overlay.duration_ms = duration_ms.clamp(500, 60_000);
+        info!("overlay duration set to {} ms", state.config.overlay.duration_ms);
     }
 }
 
@@ -1213,6 +1218,7 @@ impl OverlayState {
     }
 
     fn hide(&mut self) {
+        debug!("pill hidden");
         self.content = None;
         self.dismiss_at = None;
         self.hover_dismiss_at = None;
@@ -1292,6 +1298,7 @@ impl OverlayState {
 
     fn toggle_enabled(&mut self) {
         self.enabled = !self.enabled;
+        info!("notifications {}", if self.enabled { "enabled" } else { "disabled" });
         if !self.enabled {
             self.pending.clear();
             self.hide();
@@ -1315,6 +1322,7 @@ impl OverlayState {
     /// looks like an actual notification; on a fresh start before any track
     /// has been seen it falls back to a track-change pill with sample data.
     fn show_sample(&mut self) {
+        debug!("sample pill shown");
         // A sample pill is a show: cancel the idle-release deadline so the
         // buffers survive the preview.
         unsafe {
