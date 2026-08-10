@@ -83,6 +83,9 @@ pub struct OverlayConfig {
     /// Which display the Compact pill is placed on while it uses its own
     /// position (see `MonitorMode`).
     pub compact_monitor: MonitorMode,
+    /// What hovering over the pill does while the effective layout is
+    /// Compact (see `CompactHoverAction`).
+    pub compact_hover_action: CompactHoverAction,
     /// Unknown keys under `[overlay]`, preserved across saves.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -123,6 +126,27 @@ pub enum LayoutMode {
     Expanded,
     Compact,
     Auto,
+}
+
+/// What hovering over a pill with the *compact* layout does.
+///
+/// ```toml
+/// compact_hover_action = "dismiss"   # hover dismisses after 500 ms (default)
+/// compact_hover_action = "expand"    # hover morphs the compact pill in place
+///                                    # to the expanded layout once per
+///                                    # notification; the next hover entry
+///                                    # dismisses
+/// ```
+///
+/// Only pills whose layout mode is explicitly `Compact` expand: an
+/// Auto-resolved compact pill is a deliberate choice (fullscreen app, or a
+/// source on the auto-compact list) and always keeps the Dismiss behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompactHoverAction {
+    #[default]
+    Dismiss,
+    Expand,
 }
 
 /// Which display the overlay pill is placed on. Serialized as a string so a
@@ -245,6 +269,7 @@ impl Default for OverlayConfig {
             compact_position_x: None,
             compact_position_y: None,
             compact_monitor: MonitorMode::default(),
+            compact_hover_action: CompactHoverAction::default(),
             unknown: toml::Table::new(),
         }
     }
@@ -807,6 +832,33 @@ nested_appearance = [1, 2, 3]
         // Unknown modes are hard deserialization errors, never a silent
         // reinterpretation.
         assert!(toml::from_str::<Config>("[overlay]\nlayout = \"bogus\"\n").is_err());
+    }
+
+    #[test]
+    fn compact_hover_action_defaults_to_dismiss_and_round_trips_through_toml() {
+        // Defaults to Dismiss: current hover behavior is untouched out of the box.
+        assert_eq!(
+            Config::default().overlay.compact_hover_action,
+            CompactHoverAction::Dismiss
+        );
+        for (form, expected) in [
+            ("dismiss", CompactHoverAction::Dismiss),
+            ("expand", CompactHoverAction::Expand),
+        ] {
+            let config: Config = toml::from_str(&format!("[overlay]\ncompact_hover_action = \"{form}\"\n")).unwrap();
+            assert_eq!(
+                config.overlay.compact_hover_action, expected,
+                "compact_hover_action = \"{form}\" in [overlay] must map to {expected:?}"
+            );
+            let saved = toml::to_string_pretty(&config).unwrap();
+            assert!(
+                saved.contains(&format!("compact_hover_action = \"{form}\"")),
+                "the action must serialize in its hand-editable string form:\n{saved}"
+            );
+        }
+        // Unknown actions are hard deserialization errors, never a silent
+        // reinterpretation.
+        assert!(toml::from_str::<Config>("[overlay]\ncompact_hover_action = \"bogus\"\n").is_err());
     }
 
     #[test]
