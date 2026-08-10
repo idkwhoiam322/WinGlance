@@ -1674,9 +1674,10 @@ impl OverlayState {
         // and after that one expansion (or for a pill whose Compact comes
         // from Auto, which never expands) hover-to-dismiss applies again.
         if !matches!(self.phase, Phase::Hidden) {
-            // A morph leg completes first so the same tick sees `done`.
+            // A morph leg completes first so the same tick sees `done`. The
+            // leg duration is per-direction (the collapse leg is shorter).
             if let Some(morph) = &mut self.hover_expand
-                && morph.start.elapsed() >= animation_duration(&self.config)
+                && morph.start.elapsed() >= morph_duration(&self.config, morph.direction)
             {
                 match morph.direction {
                     MorphDirection::Expand if !morph.done => {
@@ -2198,15 +2199,29 @@ fn content_size_of(config: &Config, content: &MediaEvent, compact: bool) -> (f32
     }
 }
 
-/// Current hover-morph size progress in [0, 1]: 0 = compact, 1 = expanded.
-/// The expand leg uses the springy `ease_out_back` (its overshoot is clamped
-/// away so the size never exceeds the expanded pill), the collapse leg eases
-/// from the progress it reversed at back down to compact.
+/// Duration of one hover-morph leg. The expand leg gets the full animation
+/// duration — room for the spring to play out — while the collapse leg runs
+/// shorter: a quick, confident return that still reads smooth. Shared by the
+/// completion check in `tick` and the progress curve, so a leg always
+/// settles exactly when its animation is done.
+fn morph_duration(config: &Config, direction: MorphDirection) -> Duration {
+    match direction {
+        MorphDirection::Expand => animation_duration(config),
+        MorphDirection::Collapse => Duration::from_millis((animation_duration(config).as_millis() * 3 / 5) as u64),
+    }
+}
+
+/// Current hover-morph size progress: 0 = compact, 1 = expanded. The expand
+/// leg is the springy `spring_expand` curve — it may pass 1.0 mid-flight,
+/// which `morph_size`'s geometry clamp contains, so the bounce reads as a
+/// quick settle without the pill ever exceeding the expanded size. The
+/// collapse leg eases from the progress it reversed at back down to compact:
+/// monotonic and unbouncy, a confident return.
 fn hover_progress(morph: &HoverExpand, config: &Config) -> f32 {
-    let total = animation_duration(config).as_secs_f32();
+    let total = morph_duration(config, morph.direction).as_secs_f32();
     let t = (morph.start.elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
     match morph.direction {
-        MorphDirection::Expand => ease_out_back(t).clamp(0.0, 1.0),
+        MorphDirection::Expand => spring_expand(t),
         MorphDirection::Collapse => morph.from * (1.0 - ease_out_quint(t)),
     }
 }
@@ -4852,6 +4867,35 @@ fn ease_out_back(value: f32) -> f32 {
     1.0 + c3 * (value - 1.0).powi(3) + c1 * (value - 1.0).powi(2)
 }
 
+/// The hover-expand spring: the closed-form step response of a damped
+/// harmonic oscillator, fitted so the whole motion plays out inside the leg
+/// duration. iOS-style: a punchy attack (strong initial acceleration, so the
+/// card starts growing immediately), a controlled overshoot past 1.0, one
+/// visible settle-back, and an exact 1.0 endpoint — the pinned expanded
+/// state must render at the true expanded size. The mid-flight overshoot
+/// never reaches the geometry: `morph_size` clamps the rendered rectangle,
+/// the clipping region, and the hit-testing bounds to the Compact..Expanded
+/// interval, so the bounce reads as a quick settle, not a wobble. `ZETA` is
+/// the damping ratio (lower = more bounce; 0.5 is the iOS default), and
+/// `HALF_CYCLES` how many spring half-cycles fit into the leg (2.8 puts the
+/// overshoot peak at ~40 % in and the residual decay below 1 % at the end).
+fn spring_expand(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if t >= 1.0 {
+        return 1.0;
+    }
+    const ZETA: f32 = 0.5;
+    const HALF_CYCLES: f32 = 2.8;
+    // Normalized angular frequency (omega * leg duration) and the damped
+    // variant of it.
+    let w = HALF_CYCLES * std::f32::consts::PI;
+    let damped = (1.0 - ZETA * ZETA).sqrt();
+    let phase = w * damped * t;
+    let decay = (-ZETA * w * t).exp();
+    // 1 - e^(-zeta*w*t) * (cos(wd*t) + zeta/sqrt(1-zeta^2) * sin(wd*t))
+    1.0 - decay * (phase.cos() + (ZETA / damped) * phase.sin())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7019,6 +7063,183 @@ mod tests {
                 "height out of range at {progress}: {height}"
             );
         }
+        // The spring's mid-flight overshoot (the easing peaks well past 1.0)
+        // must never leak into the geometry: the rendered rectangle, the
+        // clipping region, and the hit-testing bounds all stay inside the
+        // Compact..Expanded interval at every sampled frame.
+        for i in 0..=200 {
+            let (width, height) = morph_size(&config, &content, spring_expand(i as f32 / 200.0));
+            assert!(
+                width >= compact_w.min(expanded_w) && width <= compact_w.max(expanded_w),
+                "spring-driven width out of range at frame {i}: {width}"
+            );
+            assert!(
+                height >= compact_h.min(expanded_h) && height <= compact_h.max(expanded_h),
+                "spring-driven height out of range at frame {i}: {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn spring_expand_overshoots_then_settles_exactly() {
+        // Starts at compact, and the settle endpoint is exact: the pinned
+        // expanded state must render at the true expanded size, not a hair
+        // short (a sub-pixel shortfall would clip the expanded content).
+        assert!((spring_expand(0.0) - 0.0).abs() < 1e-4);
+        assert_eq!(spring_expand(1.0), 1.0);
+        assert_eq!(
+            spring_expand(2.0),
+            1.0,
+            "out-of-range input clamps to the settle endpoint"
+        );
+        // The spring overshoots past 1.0 mid-flight — the geometry clamp in
+        // `morph_size` contains that — with a controlled amplitude.
+        let samples: Vec<f32> = (0..=200).map(|i| spring_expand(i as f32 / 200.0)).collect();
+        let peak = samples.iter().cloned().fold(0.0_f32, f32::max);
+        assert!(
+            (1.05..1.30).contains(&peak),
+            "spring overshoot must be visible but controlled, got {peak}"
+        );
+        // Never negative, never wild.
+        for v in &samples {
+            assert!((0.0..=1.3).contains(v), "spring out of range: {v}");
+        }
+        // The curve crosses 1.0 exactly twice: up into the overshoot and down
+        // into the settle. One visible bounce, then a stable expanded state —
+        // no repeated wobble (the next oscillation would land past the leg).
+        let crossings = samples.windows(2).filter(|w| (w[0] - 1.0) * (w[1] - 1.0) < 0.0).count();
+        assert_eq!(crossings, 2, "the spring must overshoot once and settle once");
+        // The attack is fast: well past half size within the first third.
+        assert!(spring_expand(1.0 / 3.0) > 0.6, "the spring must feel responsive");
+    }
+
+    #[test]
+    fn collapse_leg_is_shorter_and_monotonic_back_to_compact() {
+        let config = Config::default();
+        let expand = morph_duration(&config, MorphDirection::Expand);
+        let collapse = morph_duration(&config, MorphDirection::Collapse);
+        assert!(
+            collapse < expand,
+            "collapse must be faster than expand: {collapse:?} vs {expand:?}"
+        );
+        // Sampled over its whole leg, the collapse eases strictly back to
+        // compact: monotonic, no bounce, no overshoot below zero.
+        let from = 0.6;
+        let mut last = from;
+        for i in 0..=100 {
+            let elapsed = Duration::from_millis((collapse.as_millis() as u64 * i / 100).max(1));
+            let morph = HoverExpand {
+                start: Instant::now() - elapsed,
+                direction: MorphDirection::Collapse,
+                from,
+                done: false,
+            };
+            let progress = hover_progress(&morph, &config);
+            assert!(
+                progress <= last + 1e-4,
+                "collapse must not grow: {progress} after {last} at step {i}"
+            );
+            last = progress;
+        }
+        assert!(last.abs() < 1e-3, "collapse must reach compact, got {last}");
+    }
+
+    #[test]
+    fn expand_leg_is_more_expressive_than_collapse() {
+        // The asymmetry that makes expansion feel like a reveal and collapse
+        // like a close: expand springs (overshoots its endpoint), collapse
+        // stays monotonic; and the collapse leg itself is shorter.
+        let config = Config::default();
+        assert!(morph_duration(&config, MorphDirection::Collapse) < morph_duration(&config, MorphDirection::Expand));
+        // Mid-flight, the expand spring travels past its endpoint...
+        let expand_mid = HoverExpand {
+            start: Instant::now()
+                - Duration::from_millis(morph_duration(&config, MorphDirection::Expand).as_millis() as u64 * 2 / 5),
+            direction: MorphDirection::Expand,
+            from: 0.0,
+            done: false,
+        };
+        let expand_progress = hover_progress(&expand_mid, &config);
+        assert!(
+            expand_progress > 1.0,
+            "expand must overshoot mid-flight, got {expand_progress}"
+        );
+        // ...while the collapse at its own midpoint has only closed toward
+        // compact, never exceeding its start.
+        let collapse_mid = HoverExpand {
+            start: Instant::now()
+                - Duration::from_millis(morph_duration(&config, MorphDirection::Collapse).as_millis() as u64 / 2),
+            direction: MorphDirection::Collapse,
+            from: 0.75,
+            done: false,
+        };
+        let collapse_progress = hover_progress(&collapse_mid, &config);
+        assert!(
+            collapse_progress > 0.0 && collapse_progress < 0.75,
+            "collapse must be strictly inside its return path, got {collapse_progress}"
+        );
+    }
+
+    #[test]
+    fn morph_anchor_stays_fixed_while_the_pill_grows() {
+        // The morph must feel like the card is unfolding in place: the
+        // anchored edge(s) of the Compact pill do not move as the size
+        // lerps to the expanded geometry (placement re-anchors every frame
+        // from the current size).
+        let config = Config::default();
+        let content = MediaEvent::TrackChanged(TrackInfo {
+            source_app: "youtube-music".into(),
+            title: "A reasonably long title".into(),
+            ..TrackInfo::default()
+        });
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let (compact_w, compact_h) = morph_size(&config, &content, 0.0);
+        let (expanded_w, expanded_h) = morph_size(&config, &content, 1.0);
+        assert!(
+            compact_w < expanded_w && compact_h < expanded_h,
+            "the morph needs a real size difference"
+        );
+        // Bottom-right anchor: the right and bottom edges of the pill body
+        // stay pinned while it grows left/up.
+        let bottom_right = OverlayPos {
+            vertical: VerticalPosition::Bottom,
+            horizontal: HorizontalPosition::Right,
+            ..anchor_pos(None, None)
+        };
+        let compact_pt = placement(work, compact_w as i32, compact_h as i32, &bottom_right, 0, 1.0);
+        let expanded_pt = placement(work, expanded_w as i32, expanded_h as i32, &bottom_right, 0, 1.0);
+        assert_eq!(
+            compact_pt.x + compact_w as i32,
+            expanded_pt.x + expanded_w as i32,
+            "the right edge must stay anchored while the pill grows"
+        );
+        assert_eq!(
+            compact_pt.y + compact_h as i32,
+            expanded_pt.y + expanded_h as i32,
+            "the bottom edge must stay anchored while the pill grows"
+        );
+        // Top-center anchor: the horizontal center of the pill body stays
+        // pinned while it grows outward to both sides. (Center placement
+        // halves the span with integer division, so the pixel center may
+        // jitter by 1 px between sizes of different parity.)
+        let top_center = OverlayPos {
+            vertical: VerticalPosition::Top,
+            horizontal: HorizontalPosition::Center,
+            ..anchor_pos(None, None)
+        };
+        let compact_pt = placement(work, compact_w as i32, compact_h as i32, &top_center, 0, 1.0);
+        let expanded_pt = placement(work, expanded_w as i32, expanded_h as i32, &top_center, 0, 1.0);
+        let center_drift = (compact_pt.x + compact_w as i32 / 2 - (expanded_pt.x + expanded_w as i32 / 2)).abs();
+        assert!(
+            center_drift <= 1,
+            "the horizontal center must stay anchored, drifted {center_drift}px"
+        );
+        assert_eq!(compact_pt.y, expanded_pt.y, "the top edge must stay anchored");
     }
 
     #[test]
@@ -7032,17 +7253,18 @@ mod tests {
             done: false,
         };
         assert!(hover_progress(&expand, &config).abs() < 1e-3);
-        // ...and a finished one is at expanded (the spring overshoot is
-        // clamped away).
+        // ...and a finished one is at exactly expanded (the spring settles
+        // to an exact endpoint).
         let finished = HoverExpand {
-            start: Instant::now() - animation_duration(&config),
+            start: Instant::now() - morph_duration(&config, MorphDirection::Expand),
             direction: MorphDirection::Expand,
             from: 0.0,
             done: true,
         };
-        assert!((hover_progress(&finished, &config) - 1.0).abs() < 1e-3);
+        assert_eq!(hover_progress(&finished, &config), 1.0);
         // A collapse leg starts from the progress it reversed at and eases
-        // down to compact, never jumping back up to expanded.
+        // down to compact over its own (shorter) leg duration, never jumping
+        // back up to expanded.
         let collapse = HoverExpand {
             start: Instant::now(),
             direction: MorphDirection::Collapse,
@@ -7051,12 +7273,12 @@ mod tests {
         };
         assert!((hover_progress(&collapse, &config) - 0.6).abs() < 1e-3);
         let collapse_done = HoverExpand {
-            start: Instant::now() - animation_duration(&config),
+            start: Instant::now() - morph_duration(&config, MorphDirection::Collapse),
             direction: MorphDirection::Collapse,
             from: 0.6,
             done: false,
         };
-        assert!(hover_progress(&collapse_done, &config).abs() < 1e-3);
+        assert_eq!(hover_progress(&collapse_done, &config), 0.0);
     }
 
     #[test]
