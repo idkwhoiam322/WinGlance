@@ -1,12 +1,13 @@
 use crate::autostart;
-use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, VerticalPosition};
+use crate::config::{CompactHoverAction, Config, HorizontalPosition, LayoutMode, MonitorMode, VerticalPosition};
 use crate::events::{
     COMPACT_POSITION_MSG, MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo,
     media_event_into_owned,
 };
 use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
-    EventQueue, OverlayPos, enumerate_displays, set_duration, set_layout, set_positions, show_sample,
+    EventQueue, OverlayPos, enumerate_displays, set_compact_hover_action, set_duration, set_layout, set_positions,
+    show_sample,
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG};
@@ -161,6 +162,7 @@ enum SettingId {
     Layout,
     Position,
     SeparateCompact,
+    CompactHoverAction,
     CompactPosition,
     AutoCompactApps,
     Monitor,
@@ -1803,6 +1805,16 @@ impl MainWindowState {
         });
         y += row_h + gap;
         items.push(SettingsItem::Row {
+            id: SettingId::CompactHoverAction,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        items.push(SettingsItem::Row {
             id: SettingId::CompactPosition,
             rect: RECT {
                 left,
@@ -1901,6 +1913,7 @@ impl MainWindowState {
         let position_label = position_label(&cfg);
         let layout_mode = cfg.overlay.layout;
         let compact_separate = cfg.overlay.compact_position_separate;
+        let compact_hover_action = cfg.overlay.compact_hover_action;
         let compact_position_label = compact_position_label(&cfg);
         let compact_custom = cfg.overlay.compact_effective().x.is_some();
         let auto_compact_sources = cfg.behavior.auto_compact_sources.join(", ");
@@ -2038,6 +2051,7 @@ impl MainWindowState {
                         SettingId::CompactPosition => {
                             ("Compact position", compact_position_label.clone(), SETTINGS_MUTED)
                         }
+                        SettingId::CompactHoverAction => ("Compact hover action", String::new(), SETTINGS_MUTED),
                         SettingId::AutoCompactApps => (
                             "Auto-compact apps",
                             if auto_compact_sources.is_empty() {
@@ -2164,6 +2178,48 @@ impl MainWindowState {
                             let labels = ["Expanded", "Compact", "Auto"];
                             for (i, seg) in segments.iter().enumerate() {
                                 let active = layout_mode == values[i];
+                                let seg_hovered = settings_hover == Some((current_row, SettingSub::Seg(i)));
+                                unsafe {
+                                    let _ = FillRect(hdc, seg, if active { brushes.accent } else { brushes.border });
+                                }
+                                let s_inner = RECT {
+                                    left: seg.left + 1,
+                                    top: seg.top + 1,
+                                    right: seg.right - 1,
+                                    bottom: seg.bottom - 1,
+                                };
+                                let fill = if active {
+                                    brushes.accent_soft
+                                } else if seg_hovered {
+                                    brushes.hover
+                                } else {
+                                    brushes.surface
+                                };
+                                unsafe {
+                                    let _ = FillRect(hdc, &s_inner, fill);
+                                }
+                                let mut t = s_inner;
+                                let tc = if active { SETTINGS_TEXT } else { SETTINGS_MUTED };
+                                draw_string(
+                                    &self.fonts,
+                                    hdc,
+                                    labels[i],
+                                    &mut t,
+                                    (10.0 * scale) as i32,
+                                    tc,
+                                    active,
+                                    true,
+                                );
+                            }
+                        }
+                        SettingId::CompactHoverAction => {
+                            // Two segments mirroring the CompactHoverAction
+                            // variants; same treatment as the Layout row.
+                            let segments = segment_rects(&control_rect, 2, (4.0 * scale) as i32);
+                            let values = [CompactHoverAction::Dismiss, CompactHoverAction::Expand];
+                            let labels = ["Dismiss", "Expand"];
+                            for (i, seg) in segments.iter().enumerate() {
+                                let active = compact_hover_action == values[i];
                                 let seg_hovered = settings_hover == Some((current_row, SettingSub::Seg(i)));
                                 unsafe {
                                     let _ = FillRect(hdc, seg, if active { brushes.accent } else { brushes.border });
@@ -2484,6 +2540,11 @@ impl MainWindowState {
                 }
                 if *id == SettingId::Layout {
                     let segments = segment_rects(&control_rect, 3, (4.0 * scale) as i32);
+                    let seg = segments.iter().position(|s| x >= s.left && x < s.right);
+                    return Some((row_index, seg.map_or(SettingSub::None, SettingSub::Seg)));
+                }
+                if *id == SettingId::CompactHoverAction {
+                    let segments = segment_rects(&control_rect, 2, (4.0 * scale) as i32);
                     let seg = segments.iter().position(|s| x >= s.left && x < s.right);
                     return Some((row_index, seg.map_or(SettingSub::None, SettingSub::Seg)));
                 }
@@ -4042,6 +4103,19 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                         state.mutate_config(|cfg| cfg.overlay.layout = mode);
                                         set_layout(state.overlay_hwnd, mode);
                                         info!("layout mode set: {mode:?}");
+                                        state.invalidate();
+                                    }
+                                }
+                                SettingId::CompactHoverAction => {
+                                    let segments = segment_rects(&control_rect, 2, (4.0 * scale) as i32);
+                                    let values = [CompactHoverAction::Dismiss, CompactHoverAction::Expand];
+                                    if let Some((i, _)) =
+                                        segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right)
+                                    {
+                                        let action = values[i];
+                                        state.mutate_config(|cfg| cfg.overlay.compact_hover_action = action);
+                                        set_compact_hover_action(state.overlay_hwnd, action);
+                                        info!("compact hover action set: {action:?}");
                                         state.invalidate();
                                     }
                                 }
