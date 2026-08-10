@@ -64,15 +64,6 @@ const MENU_NOTIFY_ID: usize = 1002;
 const MENU_AUTOSTART_ID: usize = 1003;
 const MENU_CLOSE_TRAY_ID: usize = 1004;
 const MENU_QUIT_ID: usize = 1006;
-const MENU_POSITION_TOP_LEFT: usize = 1007;
-const MENU_POSITION_TOP_CENTER: usize = 1008;
-const MENU_POSITION_TOP_RIGHT: usize = 1009;
-const MENU_POSITION_BOTTOM_LEFT: usize = 1010;
-const MENU_POSITION_BOTTOM_CENTER: usize = 1011;
-const MENU_POSITION_BOTTOM_RIGHT: usize = 1012;
-const MENU_POSITION_CUSTOM: usize = 1013;
-const MENU_POSITION_SAMPLE: usize = 1014;
-const MENU_POSITION_RESET: usize = 1015;
 const MENU_DURATION_2S: usize = 1017;
 const MENU_DURATION_3S: usize = 1018;
 const MENU_DURATION_5S: usize = 1019;
@@ -86,18 +77,6 @@ const MENU_MONITOR_DISPLAY_BASE: usize = 1023;
 const MENU_LAYOUT_EXPANDED: usize = 1024;
 const MENU_LAYOUT_COMPACT: usize = 1025;
 const MENU_LAYOUT_AUTO: usize = 1026;
-/// Toggles whether the Compact layout gets its own position (tray menu).
-const MENU_SEPARATE_COMPACT: usize = 1027;
-/// Compact-position entries of the tray "Compact position" submenu (nested
-/// under "Expanded Position", mirroring the settings row of the same name).
-const MENU_COMPACT_POSITION_TOP_LEFT: usize = 1028;
-const MENU_COMPACT_POSITION_TOP_CENTER: usize = 1029;
-const MENU_COMPACT_POSITION_TOP_RIGHT: usize = 1030;
-const MENU_COMPACT_POSITION_BOTTOM_LEFT: usize = 1031;
-const MENU_COMPACT_POSITION_BOTTOM_CENTER: usize = 1032;
-const MENU_COMPACT_POSITION_BOTTOM_RIGHT: usize = 1033;
-const MENU_COMPACT_POSITION_CUSTOM: usize = 1034;
-const MENU_COMPACT_POSITION_RESET: usize = 1035;
 const LISTBOX_ID: usize = 2;
 /// History rows are kept in the heap (as entries) and duplicated in the
 /// listbox as UTF-16 row strings, so the cap directly sizes the app's
@@ -3402,182 +3381,6 @@ fn show_tray_menu(state: &mut MainWindowState) {
             PCWSTR(wide("Close window to tray").as_ptr()),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        // Position submenu
-        let Ok(position_menu) = CreatePopupMenu() else {
-            let _ = DestroyMenu(menu);
-            return;
-        };
-        // Snapshot the position config (Copy types only) so the read guard
-        // is released before the TrackPopupMenu loop below, which calls
-        // mutate_config on selection.
-        let (current_vertical, current_horizontal, custom_pos) = {
-            let overlay = &state.cfg().overlay;
-            (
-                overlay.vertical,
-                overlay.horizontal,
-                overlay.position_x.zip(overlay.position_y),
-            )
-        };
-        let anchor_active = custom_pos.is_none();
-        let anchor_flags = |v: VerticalPosition, h: HorizontalPosition| {
-            if anchor_active && current_vertical == v && current_horizontal == h {
-                MF_STRING | MF_CHECKED
-            } else {
-                MF_STRING
-            }
-        };
-        let _ = AppendMenuW(
-            position_menu,
-            anchor_flags(VerticalPosition::Top, HorizontalPosition::Left),
-            MENU_POSITION_TOP_LEFT,
-            PCWSTR(wide("top-left").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            position_menu,
-            anchor_flags(VerticalPosition::Top, HorizontalPosition::Center),
-            MENU_POSITION_TOP_CENTER,
-            PCWSTR(wide("top-center").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            position_menu,
-            anchor_flags(VerticalPosition::Top, HorizontalPosition::Right),
-            MENU_POSITION_TOP_RIGHT,
-            PCWSTR(wide("top-right").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            position_menu,
-            anchor_flags(VerticalPosition::Bottom, HorizontalPosition::Left),
-            MENU_POSITION_BOTTOM_LEFT,
-            PCWSTR(wide("bottom-left").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            position_menu,
-            anchor_flags(VerticalPosition::Bottom, HorizontalPosition::Center),
-            MENU_POSITION_BOTTOM_CENTER,
-            PCWSTR(wide("bottom-center").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            position_menu,
-            anchor_flags(VerticalPosition::Bottom, HorizontalPosition::Right),
-            MENU_POSITION_BOTTOM_RIGHT,
-            PCWSTR(wide("bottom-right").as_ptr()),
-        );
-        // "Adjust position…" doubles as the custom-position indicator: when a
-        // custom placement is active, it shows the coordinates and a checkmark
-        // so the user can see which kind of position is in effect from the tray
-        // menu alone. "Show sample" and "Reset position" are actions, never
-        // checked.
-        let (custom_label, custom_flags) = if let Some((px, py)) = custom_pos {
-            (format!("Custom ({}, {})", px, py), MF_STRING | MF_CHECKED)
-        } else {
-            ("Adjust position…".to_string(), MF_STRING)
-        };
-        let custom_wide = wide(&custom_label);
-        let _ = AppendMenuW(
-            position_menu,
-            custom_flags,
-            MENU_POSITION_CUSTOM,
-            PCWSTR(custom_wide.as_ptr()),
-        );
-        let _ = AppendMenuW(
-            position_menu,
-            MF_STRING,
-            MENU_POSITION_SAMPLE,
-            PCWSTR(wide("Show sample").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            position_menu,
-            MF_STRING,
-            MENU_POSITION_RESET,
-            PCWSTR(wide("Reset position").as_ptr()),
-        );
-        let _ = AppendMenuW(position_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        // Compact position submenu: the same anchors for the Compact layout.
-        // Always clickable (the settings row is always editable too): while
-        // "follows Expanded" is ON the checkmarks mirror the live effective
-        // placement and the edits are stored, taking visible effect once the
-        // follow toggle is OFF or the pill is actually compact.
-        let Ok(compact_menu) = CreatePopupMenu() else {
-            let _ = DestroyMenu(menu);
-            return;
-        };
-        let compact_effective = state.cfg().overlay.compact_effective();
-        let compact_anchor_active = compact_effective.x.is_none();
-        let compact_anchor_flags = |v: VerticalPosition, h: HorizontalPosition| {
-            let mut flags = MF_STRING;
-            if compact_anchor_active && compact_effective.vertical == v && compact_effective.horizontal == h {
-                flags |= MF_CHECKED;
-            }
-            flags
-        };
-        let _ = AppendMenuW(
-            compact_menu,
-            compact_anchor_flags(VerticalPosition::Top, HorizontalPosition::Left),
-            MENU_COMPACT_POSITION_TOP_LEFT,
-            PCWSTR(wide("top-left").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            compact_menu,
-            compact_anchor_flags(VerticalPosition::Top, HorizontalPosition::Center),
-            MENU_COMPACT_POSITION_TOP_CENTER,
-            PCWSTR(wide("top-center").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            compact_menu,
-            compact_anchor_flags(VerticalPosition::Top, HorizontalPosition::Right),
-            MENU_COMPACT_POSITION_TOP_RIGHT,
-            PCWSTR(wide("top-right").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            compact_menu,
-            compact_anchor_flags(VerticalPosition::Bottom, HorizontalPosition::Left),
-            MENU_COMPACT_POSITION_BOTTOM_LEFT,
-            PCWSTR(wide("bottom-left").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            compact_menu,
-            compact_anchor_flags(VerticalPosition::Bottom, HorizontalPosition::Center),
-            MENU_COMPACT_POSITION_BOTTOM_CENTER,
-            PCWSTR(wide("bottom-center").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            compact_menu,
-            compact_anchor_flags(VerticalPosition::Bottom, HorizontalPosition::Right),
-            MENU_COMPACT_POSITION_BOTTOM_RIGHT,
-            PCWSTR(wide("bottom-right").as_ptr()),
-        );
-        let (compact_custom_label, compact_custom_flags) =
-            if let Some((px, py)) = compact_effective.x.zip(compact_effective.y) {
-                (format!("Custom ({}, {})", px, py), MF_STRING | MF_CHECKED)
-            } else {
-                ("Adjust compact position…".to_string(), MF_STRING)
-            };
-        let compact_custom_wide = wide(&compact_custom_label);
-        let _ = AppendMenuW(
-            compact_menu,
-            compact_custom_flags,
-            MENU_COMPACT_POSITION_CUSTOM,
-            PCWSTR(compact_custom_wide.as_ptr()),
-        );
-        let _ = AppendMenuW(
-            compact_menu,
-            MF_STRING,
-            MENU_COMPACT_POSITION_RESET,
-            PCWSTR(wide("Reset compact position").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            position_menu,
-            MF_POPUP,
-            compact_menu.0 as usize,
-            PCWSTR(wide("Compact position").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            position_menu.0 as usize,
-            PCWSTR(wide("Expanded Position").as_ptr()),
-        );
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         // Monitor submenu: which display the pill is placed on. The display
         // entries mirror the current enumeration (Display 1 is index 0), so
         // the checkmarks line up with what the overlay resolves at placement.
@@ -3728,20 +3531,6 @@ fn show_tray_menu(state: &mut MainWindowState) {
             PCWSTR(wide("Auto").as_ptr()),
         );
         let _ = AppendMenuW(menu, MF_POPUP, layout_menu.0 as usize, PCWSTR(wide("Layout").as_ptr()));
-        // Displayed polarity is inverted from the persisted
-        // `compact_position_separate` field (the checkmark means ON, i.e. the
-        // Compact pill follows the Expanded position, field `false`). The TOML
-        // key keeps its name; only the user-facing label changed.
-        let mut separate_compact_flags = MF_STRING;
-        if !state.cfg().overlay.compact_position_separate {
-            separate_compact_flags |= MF_CHECKED;
-        }
-        let _ = AppendMenuW(
-            menu,
-            separate_compact_flags,
-            MENU_SEPARATE_COMPACT,
-            PCWSTR(wide("Compact Position follows Expanded Position").as_ptr()),
-        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT_ID, PCWSTR(wide("Quit").as_ptr()));
 
@@ -3796,21 +3585,6 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     info!("quit requested from the tray menu");
                     let _ = DestroyWindow(state.hwnd);
                 }
-                MENU_POSITION_TOP_LEFT => state.apply_anchor(VerticalPosition::Top, HorizontalPosition::Left),
-                MENU_POSITION_TOP_CENTER => state.apply_anchor(VerticalPosition::Top, HorizontalPosition::Center),
-                MENU_POSITION_TOP_RIGHT => state.apply_anchor(VerticalPosition::Top, HorizontalPosition::Right),
-                MENU_POSITION_BOTTOM_LEFT => state.apply_anchor(VerticalPosition::Bottom, HorizontalPosition::Left),
-                MENU_POSITION_BOTTOM_CENTER => state.apply_anchor(VerticalPosition::Bottom, HorizontalPosition::Center),
-                MENU_POSITION_BOTTOM_RIGHT => state.apply_anchor(VerticalPosition::Bottom, HorizontalPosition::Right),
-                MENU_POSITION_CUSTOM => {
-                    let _ = crate::positioner::open(state.hwnd, state.overlay_hwnd);
-                }
-                MENU_POSITION_SAMPLE => {
-                    show_sample(state.overlay_hwnd);
-                }
-                MENU_POSITION_RESET => {
-                    state.reset_position();
-                }
                 MENU_DURATION_2S => {
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = 2000);
                     set_duration(state.overlay_hwnd, 2000);
@@ -3843,34 +3617,6 @@ fn show_tray_menu(state: &mut MainWindowState) {
                 MENU_LAYOUT_AUTO => {
                     state.mutate_config(|cfg| cfg.overlay.layout = LayoutMode::Auto);
                     set_layout(state.overlay_hwnd, LayoutMode::Auto);
-                }
-                MENU_SEPARATE_COMPACT => {
-                    let new_value = !state.cfg().overlay.compact_position_separate;
-                    state.set_compact_separate(new_value);
-                }
-                MENU_COMPACT_POSITION_TOP_LEFT => {
-                    state.apply_compact_anchor(VerticalPosition::Top, HorizontalPosition::Left)
-                }
-                MENU_COMPACT_POSITION_TOP_CENTER => {
-                    state.apply_compact_anchor(VerticalPosition::Top, HorizontalPosition::Center)
-                }
-                MENU_COMPACT_POSITION_TOP_RIGHT => {
-                    state.apply_compact_anchor(VerticalPosition::Top, HorizontalPosition::Right)
-                }
-                MENU_COMPACT_POSITION_BOTTOM_LEFT => {
-                    state.apply_compact_anchor(VerticalPosition::Bottom, HorizontalPosition::Left)
-                }
-                MENU_COMPACT_POSITION_BOTTOM_CENTER => {
-                    state.apply_compact_anchor(VerticalPosition::Bottom, HorizontalPosition::Center)
-                }
-                MENU_COMPACT_POSITION_BOTTOM_RIGHT => {
-                    state.apply_compact_anchor(VerticalPosition::Bottom, HorizontalPosition::Right)
-                }
-                MENU_COMPACT_POSITION_CUSTOM => {
-                    let _ = crate::positioner::open_compact(state.hwnd, state.overlay_hwnd);
-                }
-                MENU_COMPACT_POSITION_RESET => {
-                    state.reset_compact_position();
                 }
                 _ => {}
             }
