@@ -47,23 +47,27 @@ jobs:
         run: cargo deny check
 
   # Isolated from the check job: only workflow_dispatch runs (which the repo
-  # owner triggers) may create tags, and they get a write token for exactly
-  # that step — PR code never runs here.
-  release-tag:
+  # owner triggers) may publish a release, and they get a write token for
+  # exactly that step — PR code never runs here. The release is created
+  # directly via the Releases API (which also creates the tag at the dispatch
+  # commit), so it does NOT fire a push event and therefore does not re-trigger
+  # this workflow or release.yml.
+  release:
     if: github.event_name == 'workflow_dispatch' && inputs.release != 'none'
     needs: check
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Create release tag
+      - name: Compute release tag
+        id: compute
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
           RELEASE_INPUT: ${{ inputs.release }}
         run: |
           # The input travels through the environment, never into the script
@@ -88,5 +92,32 @@ jobs:
             Write-Error "invalid release input '$release': expected 'auto' or a vN.N.N tag"
             exit 1
           }
-          Write-Host "Creating release tag $tag at $env:GITHUB_SHA"
-          gh api -X POST repos/${{ github.repository }}/git/refs -f ref="refs/tags/$tag" -f sha=$env:GITHUB_SHA
+          Write-Host "Release tag: $tag"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
+      - name: Download CI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: WinGlance-windows
+          path: staging
+      - name: Stage release assets
+        id: stage
+        shell: pwsh
+        run: |
+          $fullSha = "${{ github.sha }}"
+          $shortSha = $fullSha.Substring(0, [Math]::Min(7, $fullSha.Length))
+          $stamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss")
+          $assetName = "WinGlance-$stamp-$shortSha.exe"
+          Copy-Item staging/WinGlance.exe "staging/$assetName"
+          $hash = Get-FileHash -Algorithm SHA256 "staging/$assetName"
+          Set-Content -Path "staging/$assetName.sha256" -Value ($hash.Hash.ToLowerInvariant() + "  " + $assetName) -Encoding ascii
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "asset=$assetName"
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.compute.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            staging/${{ steps.stage.outputs.asset }}
+            staging/${{ steps.stage.outputs.asset }}.sha256
+            config.example.toml
+          generate_release_notes: true
