@@ -51,7 +51,7 @@ jobs:
   # exactly that step — PR code never runs here. The release is created
   # directly via the Releases API (which also creates the tag at the dispatch
   # commit), so it does NOT fire a push event and therefore does not re-trigger
-  # this workflow or release.yml.
+  # this workflow.
   release:
     if: github.event_name == 'workflow_dispatch' && inputs.release != 'none'
     needs: check

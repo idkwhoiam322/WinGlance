@@ -30,7 +30,6 @@ docs/
   architecture.md, development.md, configuration.md
 .github/workflows/
   ci.yml      fmt / clippy / test / build / cargo-deny
-  release.yml build release exe on tag push, attach to GitHub Release
 config.example.toml
 ```
 

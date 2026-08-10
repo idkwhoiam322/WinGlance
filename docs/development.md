@@ -14,9 +14,7 @@ WinGlance/
 ├── create_exe.ps1          Build/format/check/test/audit packaging script
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml          fmt / clippy / test / build / cargo-deny on push/PR
-│       └── release.yml     builds the self-contained WinGlance.exe and attaches it
-│                           to a GitHub Release on tag push
+│       └── ci.yml          fmt / clippy / test / build / cargo-deny on push/PR
 ├── docs/
 │   ├── architecture.md     Design, threading, SMTC selection, rendering, placement
 │   ├── development.md      This file

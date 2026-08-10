@@ -101,9 +101,9 @@ rendering pipeline and dedup design.
 
 ## CI and releases
 
-`ci.yml` runs format/lint/test/release-build/cargo-deny on every push and PR.
-`release.yml` builds a self-contained `WinGlance.exe` on tag pushes (`v*`) and
-attaches it (plus the example config) to a GitHub Release.
+`ci.yml` runs format/lint/test/release-build/cargo-deny on every push and PR, and
+publishes a GitHub Release (with the built exe and example config) only when manually
+dispatched from the Actions tab.
 
 ## License
 
