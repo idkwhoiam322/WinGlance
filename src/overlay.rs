@@ -10,12 +10,12 @@ use log::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::BOOLEAN;
 use windows::Win32::Foundation::{
-    BOOL, COLORREF, HANDLE, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    BOOL, COLORREF, HANDLE, HINSTANCE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::Graphics::Gdi::{
@@ -27,15 +27,16 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
+use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GWL_EXSTYLE, GetClassNameW, GetCursorPos, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST, IsIconic, IsWindowVisible,
-    KillTimer, MA_NOACTIVATE, MONITORINFOF_PRIMARY, MSG, PM_REMOVE, PeekMessageW, PostMessageW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SetTimer, SetWindowPos, ShowWindow, ULW_ALPHA, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE, GetClassNameW, GetCursorPos,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST,
+    IsIconic, IsWindowVisible, KillTimer, MA_NOACTIVATE, MONITORINFOF_PRIMARY, MSG, PM_REMOVE, PeekMessageW,
+    PostMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer, SetWindowPos, ShowWindow, ULW_ALPHA, WINEVENT_OUTOFCONTEXT,
+    WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT,
+    WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -59,6 +60,15 @@ const STATIC_TICK_MS: u32 = 250;
 
 /// Posted by the high-resolution animation timer to drive pill frames.
 const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
+/// Posted to the overlay window by the `EVENT_SYSTEM_FOREGROUND` WinEvent hook
+/// callback whenever the system foreground window changes. The callback only
+/// posts this message; the real re-resolve happens on the UI thread in its
+/// `FOREGROUND_CHANGE_MSG` handler, which reuses the existing
+/// `sample_foreground` / `effective_work_area` / `reposition` / `render`
+/// decisioning. This constant is overlay-internal: it lives next to
+/// `TIMER_ANIMATION_MSG`, not in `events.rs` (the `WM_APP + 2` slot there is
+/// already taken by the main window's `WM_TRAY` on main_window.rs).
+const FOREGROUND_CHANGE_MSG: u32 = WM_APP + 4;
 
 /// Samples the monitor's current refresh period in ms, so the animation timer
 /// can tick once per presented frame on any display (60 Hz → 16 ms, 120 Hz → 8 ms,
@@ -145,6 +155,11 @@ pub(crate) struct DisplayInfo {
     /// The display's work area (excludes taskbars and app bars) in virtual
     /// screen coordinates.
     pub work: RECT,
+    /// The display's physical bounds (`rcMonitor`) in virtual screen
+    /// coordinates. Used when a genuine fullscreen foreground window occupies
+    /// this monitor: the work area is collapsed to the full monitor so the
+    /// pill does not keep a stale work-area (taskbar) gap.
+    pub monitor: RECT,
     /// Whether Windows flags this as the primary display.
     pub primary: bool,
     /// The device name (`\\.\DISPLAY1`), as reported by the system.
@@ -174,6 +189,7 @@ pub(crate) fn enumerate_displays() -> Vec<DisplayInfo> {
         displays.push(DisplayInfo {
             handle: monitor,
             work: info.monitorInfo.rcWork,
+            monitor: info.monitorInfo.rcMonitor,
             primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
             name: String::from_utf16_lossy(&info.szDevice[..name_len]),
         });
@@ -297,6 +313,10 @@ pub(crate) struct TargetMonitor {
     /// The display's work area in virtual screen coordinates — the pill's
     /// anchors and clamping operate on this.
     pub work: RECT,
+    /// The display's physical bounds (`rcMonitor`) in virtual screen
+    /// coordinates; the fallback edge rectangle when a fullscreen foreground
+    /// window occupies this monitor.
+    pub monitor: RECT,
     /// Zero-based position in the enumeration.
     pub index: usize,
     /// Whether this is the display Windows flags as primary.
@@ -369,14 +389,35 @@ struct ForegroundVerdict {
 /// tool window, not a desktop/shell/taskbar surface, not this overlay's own
 /// window, and its window rect must cover the entire monitor — not merely
 /// the work area, so a maximized window stays Expanded. Anything ambiguous
-/// resolves to `false` (Expanded).
+/// resolves to `false` (Expanded). Tests the window against its *own* monitor's
+/// `rcMonitor` (the historical behavior), preserving Auto-Compact unchanged.
 fn window_is_fullscreen(hwnd: HWND, overlay: HWND) -> bool {
-    if hwnd.0.is_null() || hwnd == overlay {
+    let Some(rect) = fullscreen_candidate_rect(hwnd, overlay) else {
+        return false;
+    };
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if monitor.0.is_null() {
         return false;
     }
+    let Some(rc) = monitor_rc_monitor(monitor) else {
+        return false;
+    };
+    rect_covers_monitor(&rect, &rc)
+}
+
+/// Returns the window's rect when it clears the fullscreen-candidate guards
+/// (non-null, not the overlay, visible, not minimized, not a shell or transient
+/// tool surface); `None` otherwise. Shared by `window_is_fullscreen` and the
+/// work-area positioning check so the guard set is never duplicated.
+fn fullscreen_candidate_rect(hwnd: HWND, overlay: HWND) -> Option<RECT> {
+    if hwnd.0.is_null() || hwnd == overlay {
+        return None;
+    }
     unsafe {
+        // A visible, non-minimized window is a prerequisite; an iconized or
+        // hidden surface cannot be a fullscreen app.
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
-            return false;
+            return None;
         }
         // Desktop and shell surfaces are windows too, but never fullscreen apps.
         let mut class = [0u16; 64];
@@ -387,36 +428,79 @@ fn window_is_fullscreen(hwnd: HWND, overlay: HWND) -> bool {
                 name.as_str(),
                 "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
             ) {
-                return false;
+                return None;
             }
         }
         // Transient tool windows (flyouts, popups) never count as fullscreen.
         if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32) & WS_EX_TOOLWINDOW.0 != 0 {
-            return false;
+            return None;
         }
         let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_err() {
-            return false;
-        }
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        if monitor.0.is_null() {
-            return false;
-        }
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-            return false;
-        }
-        // A maximized window covers the work area, which excludes the
-        // taskbar band; only a real fullscreen window covers rcMonitor.
-        const TOLERANCE: i32 = 2;
-        let m = info.rcMonitor;
-        rect.left <= m.left + TOLERANCE
-            && rect.top <= m.top + TOLERANCE
-            && rect.right >= m.right - TOLERANCE
-            && rect.bottom >= m.bottom - TOLERANCE
+        GetWindowRect(hwnd, &mut rect).ok()?;
+        Some(rect)
+    }
+}
+
+/// Tolerance shared by the fullscreen geometry checks: a window within this many
+/// physical pixels of the monitor edge counts as covering it.
+const FULLSCREEN_TOLERANCE: i32 = 2;
+
+/// Pure: does `window_rect` cover `monitor_rc_monitor` within
+/// `FULLSCREEN_TOLERANCE`? A maximized window reaches only `rcWork` (the area
+/// inside the taskbar band) and so never covers `rcMonitor`; only a genuine
+/// fullscreen window does.
+fn rect_covers_monitor(window_rect: &RECT, monitor_rc_monitor: &RECT) -> bool {
+    window_rect.left <= monitor_rc_monitor.left + FULLSCREEN_TOLERANCE
+        && window_rect.top <= monitor_rc_monitor.top + FULLSCREEN_TOLERANCE
+        && window_rect.right >= monitor_rc_monitor.right - FULLSCREEN_TOLERANCE
+        && window_rect.bottom >= monitor_rc_monitor.bottom - FULLSCREEN_TOLERANCE
+}
+
+/// The physical (`rcMonitor`) rect of `monitor`; `None` when it cannot be read.
+fn monitor_rc_monitor(monitor: HMONITOR) -> Option<RECT> {
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return None;
+    }
+    Some(info.rcMonitor)
+}
+
+/// Whether a genuine fullscreen foreground window occupies the *selected target
+/// monitor* — i.e. its rect covers the target monitor's `rcMonitor`. A window
+/// fullscreen on a different display does not override the target's work area.
+/// Uses the target's already-resolved `rcMonitor`, so no extra `GetMonitorInfoW`.
+fn foreground_fullscreens_target(target: &TargetMonitor, overlay: HWND) -> bool {
+    let foreground = unsafe { GetForegroundWindow() };
+    let Some(rect) = fullscreen_candidate_rect(foreground, overlay) else {
+        return false;
+    };
+    rect_covers_monitor(&rect, &target.monitor)
+}
+
+/// The rectangle `placement` anchors against for the target monitor. A genuine
+/// fullscreen foreground window on this monitor collapses the work area to the
+/// full `rcMonitor` (no work-area inset to respect); otherwise the
+/// taskbar-/app-bar-aware `rcWork` is used. Pure given its inputs, so the
+/// fullscreen-vs-work-area decision is unit-testable.
+fn effective_position_rect(monitor_rc: RECT, work_rc: RECT, fullscreen: bool) -> RECT {
+    if fullscreen { monitor_rc } else { work_rc }
+}
+
+/// Pure: did a foreground switch leave the pill's anchor and layout unchanged?
+/// Given the last resolved anchor (`None` before the first resolve), the
+/// freshly re-resolved anchor for the selected monitor, and whether the Auto
+/// layout flipped — returns true when the caller can skip the reposition/render.
+/// The `layout_flipped` escape hatch means a Compact<->Expanded toggle through
+/// the same anchor still re-renders, since the pill's size and contents changed
+/// even though the anchor did not. Kept pure so the §11 "skip when nothing
+/// changed" rule is unit-testable without Win32.
+fn anchor_unchanged(last: Option<RECT>, edge: RECT, layout_flipped: bool) -> bool {
+    match last {
+        Some(prev) => prev == edge && !layout_flipped,
+        None => false,
     }
 }
 
@@ -801,6 +885,20 @@ struct OverlayState {
     /// flight. The forwarder and this window only post when the flag was
     /// clear, so an event burst collapses into one wake message per drain.
     wake: Arc<AtomicBool>,
+    /// Handle of the `EVENT_SYSTEM_FOREGROUND` WinEvent hook, installed once in
+    /// `create_window` and unhooked in `WM_NCDESTROY`. `None` if the hook could
+    /// not be installed (foreground repositioning then degrades to the 250 ms
+    /// static tick; the overlay still functions).
+    hook: Option<HWINEVENTHOOK>,
+    /// Last effective anchor rectangle (`rcWork` or `rcMonitor`) resolved by
+    /// `on_foreground_change`. Captures the last settled anchor so a foreground
+    /// switch that did not actually move it (e.g. Alt-Tab between two normal
+    /// apps on the same monitor) is skipped instead of issuing a redundant
+    /// `SetWindowPos`. Maintained only on the foreground-change path: a stale
+    /// value from another path (e.g. `WM_DISPLAYCHANGE`) can at most cause one
+    /// extra move, never a misplacement, since every reposition recomputes the
+    /// anchor from scratch.
+    last_anchor_edge: Option<RECT>,
     /// Source app of the last TrackChanged shown, used as the label fallback
     /// in state pills for current-session playback states so the pill always
     /// names the app that owns the media — never another app's last track.
@@ -1047,6 +1145,8 @@ impl OverlayState {
             last_reassert: None,
             period_cache: None,
             wake: Arc::new(AtomicBool::new(false)),
+            hook: None,
+            last_anchor_edge: None,
             current_source: None,
             track_cache: HashMap::new(),
             track_cache_order: VecDeque::new(),
@@ -1886,7 +1986,11 @@ impl OverlayState {
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
         self.aura_inset = (AURA_HALO_LOGICAL * dpi * shape).round() as i32;
-        let position = placement(target.work, width, height, self.active_pos(), self.aura_inset, dpi);
+        // A genuine fullscreen foreground window on the target monitor collapses
+        // the work area to the full `rcMonitor`; otherwise the pill anchors
+        // against the selected monitor's `rcWork` (taskbar- and app-bar-aware).
+        let edge = self.effective_work_area(&target);
+        let position = placement(edge, width, height, self.active_pos(), self.aura_inset, dpi);
         let result = render_layered(
             self,
             &content,
@@ -1944,6 +2048,7 @@ impl OverlayState {
         let target = TargetMonitor {
             handle: display.handle,
             work: display.work,
+            monitor: display.monitor,
             index,
             primary: display.primary,
         };
@@ -1969,14 +2074,26 @@ impl OverlayState {
         }
     }
 
+    /// The rectangle `placement` anchors against for the resolved target
+    /// monitor: the target monitor's `rcMonitor` when a genuine fullscreen
+    /// foreground window occupies the target monitor (no work-area inset to
+    /// respect), otherwise the taskar-/app-bar-aware `rcWork`. A stale work-area
+    /// gap is never retained after a fullscreen transition, because Windows is
+    /// not assumed to align `rcWork` with `rcMonitor`.
+    fn effective_work_area(&self, target: &TargetMonitor) -> RECT {
+        let fullscreen = foreground_fullscreens_target(target, self.hwnd);
+        effective_position_rect(target.monitor, target.work, fullscreen)
+    }
+
     /// The pill's screen top-left for a `width`×`height` window on the
     /// currently resolved target display, or `None` when no display is
     /// available.
     fn position(&self, width: i32, height: i32) -> Option<POINT> {
         let target = self.target()?;
         let scale = monitor_dpi(target.handle) as f32 / 96.0;
+        let edge = self.effective_work_area(&target);
         Some(placement(
-            target.work,
+            edge,
             width,
             height,
             self.active_pos(),
@@ -2029,6 +2146,63 @@ impl OverlayState {
             ) {
                 debug!("SetWindowPos(reposition) failed: {error}");
             }
+        }
+    }
+
+    /// Reacts to a foreground-window change, posted from the
+    /// `EVENT_SYSTEM_FOREGROUND` hook via `FOREGROUND_CHANGE_MSG`. Re-resolves
+    /// the Auto layout and the effective anchor rectangle (rcWork vs rcMonitor)
+    /// for the selected target monitor and repositions immediately — instead of
+    /// waiting for the next media event or the 250 ms static tick. Layout is
+    /// re-evaluated independently of position (so an Explicit Compact/Expanded
+    /// pill still moves when the fullscreen inset changes), and the move is
+    /// skipped when nothing actually changed since the last resolve (e.g.
+    /// Alt-Tab between two normal apps on the same monitor). All foreground and
+    /// fullscreen verdicts are recomputed here through the existing
+    /// `sample_foreground` / `foreground_fullscreens_target` decisioning, so
+    /// this is the only trigger that consults them — no second detection path.
+    fn on_foreground_change(&mut self) {
+        // While the pill is hidden there is nothing to anchor; bail before any
+        // display/monitor enumeration so a foreground switch with no pill up
+        // only pays for the posted-message round-trip.
+        if matches!(self.phase, Phase::Hidden) {
+            return;
+        }
+        let before_layout = self.layout;
+        self.refresh_layout();
+        let layout_flipped = self.layout != before_layout;
+        // Re-resolve the target (per-frame enumeration, never cached) and the
+        // current rcWork/rcMonitor anchor for the SELECTED monitor. The
+        // fullscreen verdict comes from `effective_work_area` ->
+        // `foreground_fullscreens_target`, the single source of truth.
+        let Some(target) = self.target() else {
+            // No display available: return without touching `last_anchor_edge`
+            // so a transient no-display state cannot poison the §11 skip guard.
+            return;
+        };
+        let edge = self.effective_work_area(&target);
+        // Skip the redundant reposition/render when the foreground switch did
+        // not move the anchor and did not flip the Auto layout (e.g. Alt-Tab
+        // between two normal apps on the same monitor). The first resolve
+        // (`last_anchor_edge == None`) always proceeds. The resolved `edge` is
+        // authoritative (recomputed from scratch here), so a stale cached value
+        // can at most cause one extra move, never a misplacement.
+        if anchor_unchanged(self.last_anchor_edge, edge, layout_flipped) {
+            return;
+        }
+        self.last_anchor_edge = Some(edge);
+        if layout_flipped {
+            // Compact<->Expanded changed the pill size and content layout: a
+            // full re-render re-blits at the new dimensions and re-applies the
+            // position. The animation phase is preserved by render() (it reads
+            // self.phase via frame()), so a foreground switch never restarts an
+            // in-flight expand/collapse/hover morph.
+            self.render();
+        } else {
+            // Layout unchanged but the rcWork<->_rcMonitor anchor may have
+            // moved (or didn't), so re-resolve the position and move the window
+            // without a re-blitting.
+            self.reposition();
         }
     }
 
@@ -2369,6 +2543,14 @@ pub(crate) fn show_sample(hwnd: HWND) {
 /// caller. Window creation is single-threaded on the UI thread, so a plain
 /// atomic flag per window class is race-free.
 static OVERLAY_STATE_CLAIMED: AtomicBool = AtomicBool::new(false);
+/// The overlay window handle the `EVENT_SYSTEM_FOREGROUND` hook callback
+/// forwards its message to. Written once in `create_window` (after the overlay
+/// window succeeds) and cleared in `WM_NCDESTROY`; a racing callback that fires
+/// during/after teardown reads `0` and no-ops (`PostMessageW` to `HWND(0)` is
+/// harmlessly ignored by the system). Relaxed reads are enough (a stale `0`
+/// only yields a missed, harmless no-op); `SeqCst` on the store matches
+/// `OVERLAY_STATE_CLAIMED`.
+static OVERLAY_FG_HWND: AtomicU64 = AtomicU64::new(0);
 
 /// Creates the passive WinGlance overlay window. It owns no message loop: the caller
 /// runs the loop and destroys the window at exit.
@@ -2399,7 +2581,36 @@ pub(crate) fn create_window(config: Config, queue: EventQueue, wake: Arc<AtomicB
         )
     };
     match hwnd {
-        Ok(hwnd) => Ok(hwnd),
+        Ok(hwnd) => {
+            // WM_NCCREATE ran synchronously inside CreateWindowExW and already
+            // claimed `state_ptr` (OVERLAY_STATE_CLAIMED) and set state.hwnd.
+            // Publish the handle to the foreground hook callback and arm the
+            // EVENT_SYSTEM_FOREGROUND hook. Best-effort: if the hook cannot be
+            // installed, foreground repositioning falls back to the 250 ms
+            // static tick (`tick_layout_check`) — never block startup over it.
+            OVERLAY_FG_HWND.store(hwnd.0 as u64, Ordering::SeqCst);
+            let hook = unsafe {
+                SetWinEventHook(
+                    EVENT_SYSTEM_FOREGROUND,
+                    EVENT_SYSTEM_FOREGROUND,
+                    HMODULE::default(),
+                    Some(foreground_hook_cb),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
+                )
+            };
+            if hook.0.is_null() {
+                warn!(
+                    "SetWinEventHook(EVENT_SYSTEM_FOREGROUND) failed; foreground repositioning falls back to the 250 ms static tick"
+                );
+            } else {
+                unsafe {
+                    (*state_ptr).hook = Some(hook);
+                }
+            }
+            Ok(hwnd)
+        }
         Err(error) => {
             // The state box is owned by the window from WM_NCCREATE onward and
             // freed in WM_NCDESTROY. WM_NCCREATE flips OVERLAY_STATE_CLAIMED
@@ -2415,6 +2626,31 @@ pub(crate) fn create_window(config: Config, queue: EventQueue, wake: Arc<AtomicB
             }
             Err(error.into())
         }
+    }
+}
+
+/// WinEvent callback for `EVENT_SYSTEM_FOREGROUND`. Runs on the calling (UI)
+/// thread under `WINEVENT_OUTOFCONTEXT` (the system delivers it there; it is
+/// never injected into another process), so it must not touch `OverlayState` or
+/// perform Win32 work itself. It only forwards a lightweight message to the
+/// overlay window and returns — the real re-resolve happens later in the
+/// `FOREGROUND_CHANGE_MSG` handler on the UI thread.
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe extern "system" fn foreground_hook_cb(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _dw_event_thread: u32,
+    _dw_ms_event_time: u32,
+) {
+    let target = OVERLAY_FG_HWND.load(Ordering::Relaxed);
+    if target != 0 {
+        // Post only — never SendMessageW (would block the system foreground
+        // dispatch). A null hwnd (teardown race) is harmless: PostMessageW to
+        // an invalid window simply returns FALSE, which we discard.
+        let _ = PostMessageW(HWND(target as *mut c_void), FOREGROUND_CHANGE_MSG, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -4833,6 +5069,28 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             LRESULT(0)
         }
+        FOREGROUND_CHANGE_MSG => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                // Collapse a burst of foreground switches (Alt-Tab chains, focus
+                // races, a fullscreen-source burst) into a single resolve: only
+                // the latest settled foreground matters. The hook callback posts
+                // one message per event, so drain the queued siblings before
+                // acting — the same coalescence the animation tick uses.
+                let mut pending = MSG::default();
+                while PeekMessageW(
+                    &mut pending,
+                    hwnd,
+                    FOREGROUND_CHANGE_MSG,
+                    FOREGROUND_CHANGE_MSG,
+                    PM_REMOVE,
+                )
+                .as_bool()
+                {}
+                state.on_foreground_change();
+            }
+            LRESULT(0)
+        }
         TIMER_ANIMATION_MSG => {
             // The timer-queue callback posts one tick message per period;
             // when the UI thread stalls, those accumulate. Drain the queue so
@@ -4852,6 +5110,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_NCDESTROY => {
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
+                // Tear down the foreground hook before releasing the state box:
+                // a racing callback after this point must see a null overlay
+                // handle (it no-ops), and the hook handle is freed here — so
+                // unhook, then clear the routing static, then drop the box.
+                if let Some(hook) = state.hook.take() {
+                    let unhooked = unsafe { UnhookWinEvent(hook) };
+                    if !unhooked.as_bool() {
+                        debug!("UnhookWinEvent failed");
+                    }
+                }
+                OVERLAY_FG_HWND.store(0, Ordering::SeqCst);
                 state.delete_anim_timer();
                 if let Some(scratch) = state.text_scratch.take() {
                     unsafe {
@@ -7503,6 +7772,13 @@ mod tests {
                 right: 1920,
                 bottom: 1080,
             },
+            // Fake displays have no taskbars/app bars, so rcMonitor == rcWork.
+            monitor: RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
             primary,
             name: format!(r"\\.\DISPLAY{handle}"),
         }
@@ -7654,5 +7930,468 @@ mod tests {
         };
         let point = placement(left_monitor, 400, 100, &custom, 0, 1.0);
         assert_eq!(point, POINT { x: -400, y: 200 }, "clamped to the target work area");
+    }
+
+    #[test]
+    fn placement_with_no_work_area_inset_uses_the_full_monitor() {
+        // Fullscreen or no taskbar: Windows reports rcWork == rcMonitor, so the
+        // pill sits at the configured margin from the physical monitor edges —
+        // never retaining a stale taskbar-sized gap.
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let bottom = anchor_pos(None, None);
+        assert_eq!(
+            placement(work, 400, 100, &bottom, 0, 1.0),
+            POINT {
+                x: (1920 - 400) / 2,
+                y: 1080 - 100 - 8
+            },
+            "bottom anchor uses the full-monitor bottom when there is no inset"
+        );
+        let top = OverlayPos {
+            vertical: VerticalPosition::Top,
+            ..anchor_pos(None, None)
+        };
+        assert_eq!(
+            placement(work, 400, 100, &top, 0, 1.0),
+            POINT {
+                x: (1920 - 400) / 2,
+                y: 8
+            }
+        );
+    }
+
+    #[test]
+    fn placement_top_inset_anchors_against_the_work_area_top() {
+        // Taskbar along the top edge: rcWork.top > rcMonitor.top. The top anchor
+        // must read the work-area top, not the physical monitor top.
+        let work = RECT {
+            left: 0,
+            top: 40,
+            right: 1920,
+            bottom: 1080,
+        };
+        let top_left = OverlayPos {
+            vertical: VerticalPosition::Top,
+            horizontal: HorizontalPosition::Left,
+            ..anchor_pos(None, None)
+        };
+        let point = placement(work, 400, 100, &top_left, 0, 1.0);
+        assert_eq!(
+            point,
+            POINT { x: 8, y: 48 },
+            "top-left pill sits margin from the work-area top-left"
+        );
+        // Anchoring on the physical monitor top (0) would land the pill at y = 8.
+        assert_ne!(point.y, 8);
+    }
+
+    #[test]
+    fn placement_left_inset_anchors_against_the_work_area_left() {
+        // Taskbar along the left edge: rcWork.left > rcMonitor.left.
+        let work = RECT {
+            left: 80,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let left = OverlayPos {
+            horizontal: HorizontalPosition::Left,
+            ..anchor_pos(None, None)
+        };
+        let point = placement(work, 400, 100, &left, 0, 1.0);
+        assert_eq!(
+            point,
+            POINT {
+                x: 88,
+                y: 1080 - 100 - 8
+            },
+            "left pill sits margin from the work-area left"
+        );
+        // Anchoring on the physical monitor left (0) would land the pill at x = 8.
+        assert_ne!(point.x, 8);
+    }
+
+    #[test]
+    fn placement_right_inset_anchors_against_the_work_area_right() {
+        // Taskbar along the right edge: rcWork.right < rcMonitor.right.
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1840,
+            bottom: 1080,
+        };
+        let right = OverlayPos {
+            horizontal: HorizontalPosition::Right,
+            ..anchor_pos(None, None)
+        };
+        let point = placement(work, 400, 100, &right, 0, 1.0);
+        assert_eq!(
+            point,
+            POINT {
+                x: 1840 - 400 - 8,
+                y: 1080 - 100 - 8
+            }
+        );
+        // Anchoring on the physical monitor right (1920) would land the pill at x = 1512.
+        assert_ne!(point.x, 1920 - 400 - 8);
+    }
+
+    #[test]
+    fn placement_bottom_inset_anchors_against_the_work_area_bottom() {
+        // Taskbar along the bottom edge: rcWork.bottom < rcMonitor.bottom.
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let bottom = anchor_pos(None, None);
+        let point = placement(work, 400, 100, &bottom, 0, 1.0);
+        assert_eq!(
+            point,
+            POINT {
+                x: 760,
+                y: 1040 - 100 - 8
+            }
+        );
+        // Anchoring on the physical monitor bottom (1080) would land the pill at y = 972.
+        assert_ne!(point.y, 1080 - 100 - 8);
+    }
+
+    #[test]
+    fn placement_respects_all_four_work_area_insets_at_once() {
+        // Synthetic geometry with an inset on every edge: each anchor reads its
+        // own work-area boundary, never a physical-monitor boundary.
+        let work = RECT {
+            left: 80,
+            top: 40,
+            right: 1840,
+            bottom: 1040,
+        };
+        let span_w = work.right - work.left;
+        let top_left = OverlayPos {
+            vertical: VerticalPosition::Top,
+            horizontal: HorizontalPosition::Left,
+            ..anchor_pos(None, None)
+        };
+        let bottom_right = OverlayPos {
+            vertical: VerticalPosition::Bottom,
+            horizontal: HorizontalPosition::Right,
+            ..anchor_pos(None, None)
+        };
+        let top_center = OverlayPos {
+            vertical: VerticalPosition::Top,
+            horizontal: HorizontalPosition::Center,
+            ..anchor_pos(None, None)
+        };
+        assert_eq!(placement(work, 400, 100, &top_left, 0, 1.0), POINT { x: 88, y: 48 });
+        assert_eq!(
+            placement(work, 400, 100, &bottom_right, 0, 1.0),
+            POINT {
+                x: 1840 - 400 - 8,
+                y: 1040 - 100 - 8
+            },
+        );
+        assert_eq!(
+            placement(work, 400, 100, &top_center, 0, 1.0),
+            POINT {
+                x: 80 + (span_w - 400) / 2,
+                y: 48
+            },
+        );
+    }
+
+    #[test]
+    fn placement_margin_runs_from_the_work_area_edge_exactly_once() {
+        // Doubling the configured margin shifts the pill by exactly the extra
+        // pixels, edge-relative — the margin is never compounded with a separate
+        // edge offset (section 17: no double application).
+        let work = RECT {
+            left: 80,
+            top: 40,
+            right: 1840,
+            bottom: 1040,
+        };
+        let near = OverlayPos {
+            vertical: VerticalPosition::Top,
+            horizontal: HorizontalPosition::Left,
+            margin: 8,
+            ..anchor_pos(None, None)
+        };
+        let far = OverlayPos {
+            vertical: VerticalPosition::Top,
+            horizontal: HorizontalPosition::Left,
+            margin: 28,
+            ..anchor_pos(None, None)
+        };
+        let near_pt = placement(work, 400, 100, &near, 0, 1.0);
+        let far_pt = placement(work, 400, 100, &far, 0, 1.0);
+        assert_eq!(
+            (far_pt.x - near_pt.x, far_pt.y - near_pt.y),
+            (20, 20),
+            "the margin is measured from the work-area edge, applied exactly once"
+        );
+    }
+
+    #[test]
+    fn compact_layout_shares_the_work_area_aware_placement() {
+        // Compact and Expanded never pick a different edge to anchor to: both
+        // flow through the same `placement` against the resolved work area, so a
+        // compact pill rests on the same work-area edge as its expanded twin.
+        let work = RECT {
+            left: 80,
+            top: 40,
+            right: 1840,
+            bottom: 1040,
+        };
+        let expanded = anchor_pos(None, None); // Bottom/Center, margin 8
+        let compact = OverlayPos {
+            vertical: VerticalPosition::Bottom,
+            horizontal: HorizontalPosition::Left,
+            margin: 4,
+            ..anchor_pos(None, None)
+        };
+        let expanded_pt = placement(work, 600, 120, &expanded, 0, 1.0);
+        let compact_pt = placement(work, 400, 100, &compact, 0, 1.0);
+        assert_eq!(
+            expanded_pt.y + 120,
+            work.bottom - 8,
+            "expanded pill bottom rests on the work-area bottom"
+        );
+        assert_eq!(
+            compact_pt.y + 100,
+            work.bottom - 4,
+            "compact pill bottom rests on the work-area bottom too"
+        );
+    }
+
+    #[test]
+    fn resolve_target_uses_the_selected_monitor_work_area_not_the_primary() {
+        // Two monitors with distinct, asymmetric work areas: the primary carries
+        // a bottom taskbar, the secondary a left taskbar and a negative virtual-
+        // screen origin. The resolved target must surface the *selected*
+        // monitor's work area, never the primary's.
+        // The handles are arbitrary (Primary/Index selection never compares
+        // handles), so reuse the existing `fake_display` helper rather than
+        // casting integer literals to raw pointers.
+        let mut primary = fake_display(1, true);
+        primary.work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let mut secondary = fake_display(2, false);
+        secondary.work = RECT {
+            left: -320,
+            top: 0,
+            right: 1840,
+            bottom: 1080,
+        };
+        let displays = vec![primary, secondary];
+        // Primary mode resolves the primary display and its work area.
+        let primary_index = resolve_target(MonitorMode::Primary, &displays, None).unwrap();
+        assert_eq!(primary_index, 0);
+        assert_eq!(
+            displays[primary_index].work,
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040
+            },
+        );
+        // Explicit index resolves THAT display's work area (the negative-origin one).
+        let secondary_index = resolve_target(MonitorMode::Index(1), &displays, None).unwrap();
+        assert_eq!(secondary_index, 1);
+        assert_eq!(
+            displays[secondary_index].work,
+            RECT {
+                left: -320,
+                top: 0,
+                right: 1840,
+                bottom: 1080
+            },
+        );
+        // The chosen monitor's work area is the secondary's, not the primary's.
+        assert_ne!(displays[secondary_index].work, displays[primary_index].work);
+    }
+
+    #[test]
+    fn rect_covers_monitor_detects_genuine_fullscreen_only() {
+        // A monitor's full physical bounds.
+        let monitor_rc = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        // A maximized window covers the work area (inset here by a 40px bottom
+        // taskbar) but NOT the full monitor, so it is not fullscreen-on-target.
+        let maximized = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        assert!(
+            !rect_covers_monitor(&maximized, &monitor_rc),
+            "maximized covers rcWork, not rcMonitor"
+        );
+        // A genuine fullscreen window covers the full monitor.
+        assert!(
+            rect_covers_monitor(&monitor_rc, &monitor_rc),
+            "fullscreen covers rcMonitor"
+        );
+        // A normal (smaller) window does not.
+        let normal = RECT {
+            left: 100,
+            top: 100,
+            right: 900,
+            bottom: 700,
+        };
+        assert!(!rect_covers_monitor(&normal, &monitor_rc));
+        // An empty/ambiguous rect does not.
+        let empty = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        assert!(!rect_covers_monitor(&empty, &monitor_rc));
+    }
+
+    #[test]
+    fn rect_covers_monitor_is_relative_to_the_target_monitor() {
+        // Foreground is fullscreen on monitor A (covers A entirely) but the
+        // target is monitor B: it must not read as fullscreen-on-target.
+        let monitor_a = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let monitor_b = RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1080,
+        };
+        assert!(
+            rect_covers_monitor(&monitor_a, &monitor_a),
+            "foreground is fullscreen on A"
+        );
+        assert!(
+            !rect_covers_monitor(&monitor_a, &monitor_b),
+            "fullscreen on another monitor does not override the target work area"
+        );
+    }
+
+    #[test]
+    fn effective_position_rect_collapses_to_rcmonitor_only_when_fullscreen() {
+        let monitor_rc = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let work_rc = RECT {
+            left: 0,
+            top: 40,
+            right: 1920,
+            bottom: 1080,
+        }; // top taskbar
+        assert_eq!(
+            effective_position_rect(monitor_rc, work_rc, false),
+            work_rc,
+            "no fullscreen -> work area"
+        );
+        assert_eq!(
+            effective_position_rect(monitor_rc, work_rc, true),
+            monitor_rc,
+            "fullscreen -> physical monitor"
+        );
+    }
+
+    #[test]
+    fn fullscreen_positioning_uses_the_physical_edge_with_no_stale_taskbar_gap() {
+        // A top taskbar insets rcWork.top, but a genuine fullscreen foreground
+        // on the target monitor collapses the effective rect to rcMonitor, so a
+        // top anchor drops to the physical edge instead of leaving the taskbar
+        // gap. Non-fullscreen keeps the work-area inset.
+        let monitor_rc = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let work_rc = RECT {
+            left: 0,
+            top: 40,
+            right: 1920,
+            bottom: 1080,
+        };
+        let top_left = OverlayPos {
+            vertical: VerticalPosition::Top,
+            horizontal: HorizontalPosition::Left,
+            ..anchor_pos(None, None)
+        };
+        let fullscreen_pt = placement(
+            effective_position_rect(monitor_rc, work_rc, true),
+            400,
+            100,
+            &top_left,
+            0,
+            1.0,
+        );
+        assert_eq!(
+            fullscreen_pt,
+            POINT { x: 8, y: 8 },
+            "fullscreen drops the work-area top inset"
+        );
+        let normal_pt = placement(
+            effective_position_rect(monitor_rc, work_rc, false),
+            400,
+            100,
+            &top_left,
+            0,
+            1.0,
+        );
+        assert_eq!(
+            normal_pt,
+            POINT { x: 8, y: 48 },
+            "non-fullscreen respects the work-area top inset"
+        );
+    }
+
+    #[test]
+    fn anchor_unchanged_skips_when_nothing_moved_and_renders_on_flip_or_change() {
+        let edge = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        // First resolve has no previous anchor: never skip.
+        assert!(!anchor_unchanged(None, edge, false));
+        // Same anchor, no layout flip: skip (Alt-Tab between two normal apps).
+        assert!(anchor_unchanged(Some(edge), edge, false));
+        // Same anchor but Auto layout flipped: do not skip (size/contents
+        // changed, e.g. fullscreen->normal flipping Auto Compact->Expanded).
+        assert!(!anchor_unchanged(Some(edge), edge, true));
+        // Anchor moved (rcWork<->rcMonitor, e.g. fullscreen enter/leave on the
+        // target monitor): do not skip even with no layout flip.
+        let moved = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert!(!anchor_unchanged(Some(edge), moved, false));
     }
 }
