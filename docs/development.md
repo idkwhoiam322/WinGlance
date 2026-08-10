@@ -83,7 +83,7 @@ WinGlance/
   Settings pane: lists running processes and open SMTC session sources,
   pre-checks the allow-list, and posts the confirmed patterns back to the main
   window via `PICKER_RESULT_MSG` (which applies them to
-  `behavior.allowed_sources`).
+  `behavior.media_sources`).
 
 ## Build and verify
 

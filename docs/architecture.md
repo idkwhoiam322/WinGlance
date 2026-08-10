@@ -242,7 +242,7 @@ visible windows' processes (one Toolhelp snapshot + one `EnumWindows` pass)
 plus every open SMTC session source, pre-checks the current allow-list with
 the same normalization the worker uses, and posts the confirmed patterns back
 to the main window via `PICKER_RESULT_MSG`, which applies them to
-`behavior.allowed_sources` — so allow-list changes apply to the live worker
+`behavior.media_sources` — so allow-list changes apply to the live worker
 without a restart.
 
 ## Configuration

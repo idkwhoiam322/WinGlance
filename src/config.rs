@@ -85,7 +85,7 @@ pub struct BehaviorConfig {
     /// its derived label) whose SMTC sessions are followed. When empty, all
     /// non-cooldown sources are allowed (default). When non-empty, only matching
     /// sources generate pill notifications.
-    pub allowed_sources: Vec<String>,
+    pub media_sources: Vec<String>,
     /// Unknown keys under `[behavior]`, preserved across saves.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -133,7 +133,7 @@ impl Default for BehaviorConfig {
             start_on_login: false,
             start_in_tray: true,
             close_to_tray: true,
-            allowed_sources: Vec::new(),
+            media_sources: Vec::new(),
             unknown: toml::Table::new(),
         }
     }

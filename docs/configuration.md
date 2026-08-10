@@ -34,7 +34,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `start_in_tray`                 | `true`  | bool   | Start silently: no window, only the tray icon + pill |
 | `start_on_login`                | `false` | bool   | Register a Windows startup entry to launch WinGlance at logon |
 | `close_to_tray`                 | `true`  | bool   | Hide (instead of close) the window when its X is pressed |
-| `allowed_sources`               | `[]`    | list   | Source apps (case-insensitive substrings) to allow; empty = all apps |
+| `media_sources`                 | `[]`    | list   | Media source apps (case-insensitive substrings) to allow; empty = all apps |
 
 ## [appearance]
 

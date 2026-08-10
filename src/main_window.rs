@@ -421,7 +421,7 @@ struct HistoryEntry {
     at_label: String,
     track: TrackInfo,
     state: PlaybackState,
-    /// Whether the source session passed the `allowed_sources` filter.
+    /// Whether the source session passed the `media_sources` filter.
     /// Accepted entries are highlighted; rejected ones render muted so every
     /// media source is visible in the history.
     accepted: bool,
@@ -1138,7 +1138,7 @@ impl MainWindowState {
     }
 
     /// Records a session that was seen but not tracked (filtered by
-    /// `allowed_sources` or on the churn cool-down). The row renders muted;
+    /// `media_sources` or on the churn cool-down). The row renders muted;
     /// it never becomes the "Now Playing" activity.
     fn add_session(&mut self, source_app: String, title: String, artist: String, state: PlaybackState, accepted: bool) {
         let track = TrackInfo {
@@ -1704,7 +1704,7 @@ impl MainWindowState {
         let duration_ms = cfg.overlay.duration_ms;
         let start_on_login = cfg.behavior.start_on_login;
         let close_to_tray = cfg.behavior.close_to_tray;
-        let allowed_sources = cfg.behavior.allowed_sources.join(", ");
+        let media_sources = cfg.behavior.media_sources.join(", ");
         let custom_position = cfg.overlay.position_x.is_some();
         let position_label = position_label(&cfg);
 
@@ -1822,10 +1822,10 @@ impl MainWindowState {
                         SettingId::Position => ("Position", position_label.clone(), SETTINGS_MUTED),
                         SettingId::AllowedApps => (
                             "Allowed apps",
-                            if allowed_sources.is_empty() {
+                            if media_sources.is_empty() {
                                 "All".to_string()
                             } else {
-                                allowed_sources.clone()
+                                media_sources.clone()
                             },
                             SETTINGS_MUTED,
                         ),
@@ -3221,7 +3221,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     if !process_picker::open(
                                         hwnd,
                                         &control_rect,
-                                        &state.cfg().behavior.allowed_sources,
+                                        &state.cfg().behavior.media_sources,
                                         state.picker_result.clone(),
                                     ) {
                                         debug!("process picker failed to open");
@@ -3330,7 +3330,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .take();
                 if let Some(patterns) = patterns {
-                    state.mutate_config(|cfg| cfg.behavior.allowed_sources = patterns);
+                    state.mutate_config(|cfg| cfg.behavior.media_sources = patterns);
                     state.invalidate();
                 }
             }

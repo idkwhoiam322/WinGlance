@@ -28,7 +28,7 @@ start_on_login = false
 close_to_tray = true
 # Source apps to allow (case-insensitive substrings against the
 # AUMID and its label). When empty, all apps generate notifications.
-# allowed_sources = ["spotify"]
+# media_sources = ["spotify"]
 
 [appearance]
 # Near-opaque dark-slate pill background (alpha 235 = ~92%): text, album art
