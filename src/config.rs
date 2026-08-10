@@ -1,4 +1,4 @@
-use log::warn;
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -206,6 +206,7 @@ impl Config {
             let mut config = Config::default();
             config.normalize();
             config.save_to(config_path)?;
+            info!("no config at {config_path:?}; wrote defaults");
             return Ok(config);
         }
         let content = match read_config_with_retry(config_path) {
@@ -220,6 +221,7 @@ impl Config {
         match toml::from_str::<Config>(&content) {
             Ok(mut config) => {
                 config.normalize();
+                debug!("config loaded from {config_path:?}");
                 Ok(config)
             }
             Err(error) => Ok(Self::defaults_in_memory(&format!("is not valid TOML ({error})"))),

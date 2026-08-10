@@ -1,6 +1,6 @@
 use crate::winutil::wide;
 use anyhow::{Context, Result};
-use log::warn;
+use log::{info, warn};
 use std::path::Path;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, WIN32_ERROR};
 use windows::Win32::System::Registry::{
@@ -93,6 +93,7 @@ pub fn apply(enabled: bool) -> Result<()> {
         // ERROR_FILE_NOT_FOUND: the value vanished between the read and the
         // delete; nothing to remove.
         if error.is_ok() || (!enabled && error == ERROR_FILE_NOT_FOUND) {
+            info!("start-on-login state applied: enabled={enabled}");
             Ok(())
         } else {
             anyhow::bail!("updating the start-on-login registry entry failed: {error:?}")

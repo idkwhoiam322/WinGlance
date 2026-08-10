@@ -16,7 +16,7 @@ mod winutil;
 
 use crate::config::Config;
 use anyhow::Result;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::VecDeque;
 use std::env;
 use std::ffi::c_void;
@@ -553,6 +553,7 @@ fn main() -> Result<()> {
     );
 
     let message_result = message_loop();
+    debug!("message loop exited; shutting down");
 
     // Stop the producers before destroying the windows: the forwarder must
     // not post to an HWND that teardown is about to free. The supervisor
