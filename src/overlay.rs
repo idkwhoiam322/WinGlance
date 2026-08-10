@@ -61,7 +61,7 @@ const STATIC_TICK_MS: u32 = 250;
 const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
 
 /// Samples the monitor's current refresh period in ms, so the animation timer
-/// ticks once per presented frame on any display (60 Hz → 16 ms, 120 Hz → 8 ms,
+/// can tick once per presented frame on any display (60 Hz → 16 ms, 120 Hz → 8 ms,
 /// 144 Hz → 7 ms, 240 Hz → 4 ms). The pill can target a display other than the
 /// foreground window's (see `MonitorMode`), so when a target was resolved the
 /// DWM query runs against the overlay window itself: DWM reports the compose
@@ -70,6 +70,9 @@ const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
 /// stays correct on variable-refresh-rate monitors; falls back to the display
 /// mode's nominal frequency of the target (resolved by device name, so no
 /// window is needed); last resort is 16 ms (60 Hz).
+///
+/// This returns the raw monitor period only. `sync_anim_timer` caps it to
+/// `config.overlay.max_tick_hz` (default 60 Hz) before arming the timer.
 fn refresh_period_ms(target: Option<&TargetMonitor>, overlay_hwnd: HWND) -> u32 {
     let dwm_hwnd = match target {
         Some(_) => overlay_hwnd,
@@ -649,8 +652,9 @@ struct OverlayState {
     /// window timer with `ANIM_TIMER_ID` drives the animation instead.
     anim_timer: HANDLE,
     anim_timer_fallback: bool,
-    /// Animation tick period in ms, matched to the monitor's refresh rate.
-    /// Re-detected on every show; the timer is recreated only when it changes.
+    /// Animation tick period in ms, capped to `config.overlay.max_tick_hz`
+    /// (default 60 Hz). Re-detected on every show; the timer is recreated only
+    /// when it changes.
     tick_period: u32,
     /// Cached decoded artwork for the current track (RGBA8 at the full art
     /// size), so animation frames never re-decode or re-convert the cover.
@@ -999,7 +1003,7 @@ impl OverlayState {
         let animating = !matches!(self.phase, Phase::Shown);
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
         let now = Instant::now();
-        let period = if animating || marquee_active {
+        let raw = if animating || marquee_active {
             // The monitor queries behind `refresh_period_ms` (DWM timing,
             // display-mode enumeration) are not free to run every tick; a
             // 1-second cache is far fresher than any real rate change. The
@@ -1015,6 +1019,17 @@ impl OverlayState {
             }
         } else {
             STATIC_TICK_MS
+        };
+        let period = if animating || marquee_active {
+            // `max_tick_hz` caps the repaint rate; the raw monitor period is
+            // raised to at least the cap's period so, e.g., a 144 Hz display
+            // still animates at most at the configured Hz. Motion is
+            // time-based (driven by `dt`), so only the frame count changes.
+            let hz = self.config.overlay.max_tick_hz.unwrap_or(60).clamp(60, 1000);
+            let cap_ms = (1000u32 / hz).max(1);
+            raw.max(cap_ms).clamp(1, 100)
+        } else {
+            raw
         };
         if period != self.tick_period {
             debug!(
