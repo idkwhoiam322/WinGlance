@@ -1244,22 +1244,26 @@ impl OverlayState {
                 MediaEvent::PlaybackStateChanged(state, source_app)
                     if self.config.behavior.enable_playback_state_change =>
                 {
-                    // Suppress a PlaybackStateChanged pill when:
+                    // Suppress a redundant PlaybackStateChanged pill when:
                     //  - A TrackChanged for the same source is in this batch
-                    //    (see the pre-scan above: the state pill would render
-                    //    the source's previously cached track) or already
-                    //    queued (a TrackChanged pill is about to show; a
-                    //    redundant PlaybackStateChanged would flash the same
-                    //    info).
-                    //  - The pill on screen is the source's track pill: the
-                    //    song announcement is still visible, so the state flip
-                    //    adds nothing.
-                    //  - It is Playing AND the same source's TrackChanged was
-                    //    recently shown (prevents the "replaying" pill after
-                    //    session recreation, or when a browser video triggers
-                    //    YTM to re-report "Playing").
-                    // Paused/Stopped pass through when they are a new state
-                    // from a source that is NOT currently shown.
+                    //    (see the pre-scan above: the state pill would render the
+                    //    source's previously cached track) or already queued (a
+                    //    TrackChanged pill is about to show; a redundant
+                    //    PlaybackStateChanged would flash the same info).
+                    //  - The pill on screen is this source's track pill AND the
+                    //    state is Playing: the track pill already carries the
+                    //    music-note "now playing" symbol, so re-announcing
+                    //    Playing adds nothing.
+                    //  - It is Playing from a source whose track was recently
+                    //    shown but whose track pill has already dismissed (the
+                    //    `replaying` guard below; prevents the "replaying" pill
+                    //    after session recreation, or when a browser video
+                    //    triggers YTM to re-report "Playing").
+                    // Paused/Stopped from a source whose track pill is currently
+                    // shown do NOT get dropped: they refresh that pill in place
+                    // (symbol ♪ -> ⏸/⏹) so a pause right after a track change is
+                    // still surfaced. Paused/Stopped from a not-currently-shown
+                    // source pass through as a fresh pill.
                     let track_wins = track_sources.iter().any(|s| s == &source_app)
                         || self
                             .pending
@@ -1269,10 +1273,36 @@ impl OverlayState {
                         self.content.as_ref(),
                         Some(MediaEvent::TrackChanged(t)) if t.source_app == source_app
                     );
-                    if track_wins || track_pill_shown {
+                    if track_wins {
+                        // A TrackChanged for this source is in this batch or
+                        // already queued behind the current pill: the upcoming
+                        // track announcement supersedes the state, so suppress
+                        // it (it would flash the source's previously cached
+                        // track before the track pill shows).
                         debug!(
-                            "playback state pill suppressed | reason=track shown for same source | source={source_app}"
+                            "playback state pill suppressed | reason=track wins for same source | source={source_app}"
                         );
+                        continue;
+                    }
+                    if track_pill_shown && matches!(state, PlaybackState::Playing) {
+                        // The track pill already carries the music-note "now playing"
+                        // symbol, so a Playing re-announcement for the same source
+                        // adds nothing the pill does not already show.
+                        debug!(
+                            "playback state pill suppressed | reason=now-playing re-announced | source={source_app}"
+                        );
+                        continue;
+                    }
+                    if track_pill_shown {
+                        // A genuine Paused/Stopped while the track announcement is
+                        // still on screen must not be lost to the dismiss timer:
+                        // refresh the current pill in place instead. The cached
+                        // track for this source supplies the title/artist; only
+                        // the symbol flips (♪ -> ⏸/⏹) and the dismiss clock
+                        // resets to the full configured duration from this change.
+                        let event = MediaEvent::PlaybackStateChanged(state, source_app);
+                        let full = Duration::from_millis(self.config.overlay.duration_ms.max(500));
+                        self.update_content(event, full);
                         continue;
                     }
                     // A new state from a source whose state pill is on screen
@@ -5277,9 +5307,64 @@ mod tests {
 
         assert!(
             state.pending.is_empty(),
-            "a state flip adds nothing while the source's track pill is still visible"
+            "a Playing re-announcement adds nothing while the source's track pill is still visible"
         );
-        assert!(matches!(state.content.as_ref(), Some(MediaEvent::TrackChanged(_))));
+        assert!(
+            matches!(state.content.as_ref(), Some(MediaEvent::TrackChanged(_))),
+            "the track pill must stay on screen (note symbol) for a redundant Playing"
+        );
+    }
+
+    #[test]
+    fn same_source_pause_or_stop_updates_the_track_pill_in_place() {
+        // Regression: a genuine Paused/Stopped that arrives while the source's
+        // TrackChanged pill is still on screen used to be dropped wholesale, so
+        // a pause right after a track change never showed — the event was lost
+        // to the dismiss timer. It now refreshes the shown pill in place
+        // (♪ -> ⏸/⏹) using the cached track's text.
+        for state_value in [PlaybackState::Paused, PlaybackState::Stopped] {
+            let mut state = OverlayState::new(Config::default(), EventQueue::default());
+            let track = track_for("youtube-music", "Song", "Artist");
+            // The track pill caches its track so the in-place state pill can
+            // resolve the title/artist without a new TrackChanged.
+            state
+                .track_cache
+                .insert("youtube-music".into(), (track.clone(), Instant::now()));
+            state.content = Some(MediaEvent::TrackChanged(track));
+            state.phase = Phase::Shown;
+            state.dismiss_at = Some(Instant::now() + Duration::from_secs(3));
+
+            state
+                .queue
+                .lock()
+                .unwrap()
+                .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                    state_value,
+                    "youtube-music".into(),
+                )));
+            state.receive_events();
+
+            assert!(
+                state.pending.is_empty(),
+                "a same-source state flip must not queue a second pill: {:?}",
+                state_value
+            );
+            assert!(
+                matches!(
+                    state.content.as_ref(),
+                    Some(MediaEvent::PlaybackStateChanged(s, source))
+                        if *s == state_value && source == "youtube-music"
+                ),
+                "the track pill must refresh in place to {:?}, got {:?}",
+                state_value,
+                state.content.as_ref().map(|e| format!("{e:?}")).unwrap_or_default()
+            );
+            let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
+            assert!(
+                remaining >= Duration::from_millis(2900),
+                "the refreshed pill must keep the full duration from this change, got {remaining:?} for {state_value:?}"
+            );
+        }
     }
 
     #[test]
