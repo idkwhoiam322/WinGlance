@@ -109,6 +109,7 @@ pub(crate) fn open(owner: HWND, overlay: HWND) -> bool {
                     *guard = (hwnd.0 as usize, overlay.0 as usize);
                 }
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                debug!("position adjustor opened");
                 true
             }
             Err(_) => {
@@ -171,6 +172,8 @@ pub(crate) fn reset_position() {
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         ) {
             debug!("positioner reset SetWindowPos failed: {error}");
+        } else {
+            debug!("position adjustor reset to the default spot");
         }
     }
 }
@@ -254,6 +257,7 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
         debug!("positioner PostMessageW failed: {error}");
     } else {
         state.last_commit = Some((log_x, log_y));
+        debug!("position adjustor committed ({log_x}, {log_y})");
     }
 }
 
@@ -398,6 +402,7 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
             LRESULT(0)
         }
         WM_NCDESTROY => {
+            debug!("position adjustor closed");
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 unsafe {
