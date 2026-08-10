@@ -137,6 +137,7 @@ enum SettingId {
     Position,
     ShowSample,
     CopyLogs,
+    OpenConfig,
 }
 
 enum SettingsItem {
@@ -1706,6 +1707,16 @@ impl MainWindowState {
                 bottom: y + row_h,
             },
         });
+        y += row_h + gap;
+        items.push(SettingsItem::Row {
+            id: SettingId::OpenConfig,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
         items
     }
 
@@ -1856,6 +1867,7 @@ impl MainWindowState {
                         ),
                         SettingId::ShowSample => ("Show sample", String::new(), SETTINGS_MUTED),
                         SettingId::CopyLogs => ("Logs", String::new(), SETTINGS_MUTED),
+                        SettingId::OpenConfig => ("Config", String::new(), SETTINGS_MUTED),
                     };
                     let mut lbl_rect = label_rect;
                     draw_string(
@@ -2076,6 +2088,21 @@ impl MainWindowState {
                                 if copied { "Copied" } else { "Copy logs" },
                                 accent,
                                 hovered_copy,
+                                scale,
+                                brushes,
+                            );
+                        }
+                        SettingId::OpenConfig => {
+                            // Whole-control button: opens config.toml in the
+                            // user's preferred editor (see open_config).
+                            let hovered = self.settings_hover == Some((current_row, SettingSub::None));
+                            draw_small_button(
+                                &self.fonts,
+                                hdc,
+                                &control_rect,
+                                "Open config",
+                                accent,
+                                hovered,
                                 scale,
                                 brushes,
                             );
@@ -2485,6 +2512,38 @@ impl MainWindowState {
         let code = result.0 as isize;
         if code <= 32 {
             debug!("open logs: ShellExecuteW failed (code {code}) for {path:?}");
+        }
+    }
+
+    /// Opens `config.toml` in the default application registered for its
+    /// extension (i.e. the user's preferred text editor), mirroring
+    /// `open_logs`. The path is resolved via `Config::config_path`, the same
+    /// path `save()` writes. The OS picks the handler; `ShellExecuteW` returns
+    /// a value <= 32 on failure, which is surfaced to the debug log rather
+    /// than the screen. Hand-edits apply on the next launch (no live reload).
+    fn open_config(&self) {
+        let path = match Config::config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                debug!("open config: resolving the config path failed: {error:#}");
+                return;
+            }
+        };
+        let file = wide(&path.to_string_lossy());
+        let verb = wide("open");
+        let result = unsafe {
+            ShellExecuteW(
+                self.hwnd,
+                PCWSTR(verb.as_ptr()),
+                PCWSTR(file.as_ptr()),
+                None,
+                None,
+                SW_SHOW,
+            )
+        };
+        let code = result.0 as isize;
+        if code <= 32 {
+            debug!("open config: ShellExecuteW failed (code {code}) for {path:?}");
         }
     }
 
@@ -3297,6 +3356,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     } else {
                                         state.copy_logs();
                                     }
+                                }
+                                SettingId::OpenConfig => {
+                                    state.open_config();
                                 }
                                 SettingId::AllowedApps => {
                                     if !process_picker::open(

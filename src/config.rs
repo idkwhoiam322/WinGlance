@@ -264,7 +264,10 @@ impl Config {
         Ok(())
     }
 
-    fn config_path() -> anyhow::Result<PathBuf> {
+    /// The on-disk location of `config.toml`, resolved the same way `save()`
+    /// writes it. Exposed so the Settings "Open config" button can hand the
+    /// exact file to the shell without guessing the data dir itself.
+    pub fn config_path() -> anyhow::Result<PathBuf> {
         Ok(Self::data_dir()?.join("config.toml"))
     }
 
