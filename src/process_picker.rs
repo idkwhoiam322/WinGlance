@@ -1,5 +1,5 @@
 use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
-use log::warn;
+use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -569,6 +569,7 @@ pub(crate) fn open(
         }
 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        debug!("process picker opened");
         true
     }
 }
@@ -607,16 +608,21 @@ fn post_result(hwnd: HWND, cancelled: bool) {
     // pointer in the message. The main window takes the slot on
     // PICKER_RESULT_MSG; if the post fails the slot is simply never read and
     // the next picker open overwrites it.
+    let patterns = if cancelled {
+        None
+    } else {
+        Some(read_checked(hwnd, state.listbox))
+    };
     if let Ok(mut slot) = state.result.lock() {
-        *slot = if cancelled {
-            None
-        } else {
-            Some(read_checked(hwnd, state.listbox))
-        };
+        *slot = patterns.clone();
     }
 
     if unsafe { PostMessageW(owner, PICKER_RESULT_MSG, WPARAM(0), LPARAM(0)) }.is_err() {
         warn!("posting the picker result failed");
+    } else if let Some(patterns) = patterns {
+        info!("media sources updated to {patterns:?}");
+    } else {
+        debug!("process picker cancelled; media sources unchanged");
     }
 }
 
