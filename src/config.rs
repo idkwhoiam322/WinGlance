@@ -1,5 +1,5 @@
 use log::{debug, info, warn};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -47,6 +47,8 @@ pub struct OverlayConfig {
     pub position_x: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position_y: Option<i32>,
+    /// Which display the pill is placed on (see `MonitorMode`).
+    pub monitor: MonitorMode,
     /// Unknown keys under `[overlay]`, preserved across saves.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -67,6 +69,56 @@ pub enum HorizontalPosition {
     Center,
     Left,
     Right,
+}
+
+/// Which display the overlay pill is placed on. Serialized as a string so a
+/// hand-edited `config.toml` stays readable and unambiguous:
+///
+/// ```toml
+/// monitor = "active-window"   # monitor of the foreground window (default)
+/// monitor = "primary"         # the display marked primary in Windows
+/// monitor = "index-2"         # the third active display (zero-based)
+/// ```
+///
+/// `Index(n)` is resolved against the *current* enumeration of active
+/// displays every time the pill is placed; an index that is temporarily
+/// out of range (a display unplugged or reordered after the config was
+/// saved) falls back to the primary display at placement time while the
+/// configured value is preserved, so it becomes valid again automatically
+/// when the display comes back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MonitorMode {
+    /// Preserves the behavior of configs written before the field existed.
+    #[default]
+    ActiveWindow,
+    Primary,
+    Index(u32),
+}
+
+impl Serialize for MonitorMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let text = match self {
+            Self::ActiveWindow => "active-window".to_string(),
+            Self::Primary => "primary".to_string(),
+            Self::Index(index) => format!("index-{index}"),
+        };
+        serializer.serialize_str(&text)
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        match text.as_str() {
+            "active-window" => Ok(Self::ActiveWindow),
+            "primary" => Ok(Self::Primary),
+            _ => text
+                .strip_prefix("index-")
+                .and_then(|digits| digits.parse::<u32>().ok())
+                .map(Self::Index)
+                .ok_or_else(|| serde::de::Error::custom(format!("invalid monitor mode {text:?}"))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +170,7 @@ impl Default for OverlayConfig {
             max_width: 340,
             position_x: None,
             position_y: None,
+            monitor: MonitorMode::default(),
             unknown: toml::Table::new(),
         }
     }
@@ -447,5 +500,86 @@ nested_appearance = [1, 2, 3]
             vec!["config.toml"],
             "no temp file may remain after the rename"
         );
+    }
+
+    #[test]
+    fn default_monitor_mode_is_active_window() {
+        let config = Config::default();
+        assert_eq!(config.overlay.monitor, MonitorMode::ActiveWindow);
+    }
+
+    #[test]
+    fn config_without_a_monitor_field_deserializes_to_active_window() {
+        // A config.toml written by a build before the monitor setting existed
+        // has no `[overlay] monitor` key and must keep today's behavior.
+        let config: Config = toml::from_str("[overlay]\nduration_ms = 4000\n").unwrap();
+        assert_eq!(config.overlay.monitor, MonitorMode::ActiveWindow);
+        assert_eq!(config.overlay.duration_ms, 4000);
+    }
+
+    #[test]
+    fn monitor_mode_round_trips_through_toml() {
+        // Round-trip direction: within a table, a mode serializes to a plain
+        // string value and parses back to the same variant.
+        #[derive(Serialize, Deserialize)]
+        struct Wrapper {
+            m: MonitorMode,
+        }
+        for mode in [
+            MonitorMode::ActiveWindow,
+            MonitorMode::Primary,
+            MonitorMode::Index(0),
+            MonitorMode::Index(3),
+        ] {
+            let text = toml::to_string_pretty(&Wrapper { m: mode }).unwrap();
+            let back: Wrapper = toml::from_str(&text).unwrap();
+            assert_eq!(back.m, mode, "round trip of {text:?} must preserve the mode");
+        }
+        // The exact on-disk forms, as a user would hand-edit them.
+        for (form, expected) in [
+            ("active-window", MonitorMode::ActiveWindow),
+            ("primary", MonitorMode::Primary),
+            ("index-0", MonitorMode::Index(0)),
+            ("index-2", MonitorMode::Index(2)),
+        ] {
+            let config: Config = toml::from_str(&format!("[overlay]\nmonitor = \"{form}\"\n")).unwrap();
+            assert_eq!(
+                config.overlay.monitor, expected,
+                "monitor = \"{form}\" in [overlay] must map to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_monitor_mode_is_rejected_not_reinterpreted() {
+        // Unknown strings and malformed indices are hard deserialization
+        // errors (the load path then applies defaults in memory and leaves
+        // the user's file untouched), never a silent reinterpretation.
+        for bad in [
+            "\"bogus\"",
+            "\"Index(1)\"",
+            "\"index\"",
+            "\"index-\"",
+            "\"index--1\"",
+            "\"index-abc\"",
+        ] {
+            assert!(
+                toml::from_str::<MonitorMode>(bad).is_err(),
+                "{bad} must not parse as a monitor mode"
+            );
+        }
+    }
+
+    #[test]
+    fn monitor_setting_survives_a_config_save_round_trip() {
+        let mut config = Config::default();
+        config.overlay.monitor = MonitorMode::Index(2);
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            saved.contains("monitor = \"index-2\""),
+            "the mode must serialize in its hand-editable string form:\n{saved}"
+        );
+        let reloaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded.overlay.monitor, MonitorMode::Index(2));
     }
 }

@@ -1,10 +1,10 @@
 use crate::autostart;
-use crate::config::{Config, HorizontalPosition, VerticalPosition};
+use crate::config::{Config, HorizontalPosition, MonitorMode, VerticalPosition};
 use crate::events::{
     MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo, media_event_into_owned,
 };
 use crate::gdi::{FontProvider, draw_string};
-use crate::overlay::{EventQueue, OverlayPos, set_duration, set_position, show_sample};
+use crate::overlay::{EventQueue, OverlayPos, enumerate_displays, set_duration, set_position, show_sample};
 use crate::process_picker;
 use crate::process_picker::PICKER_RESULT_MSG;
 use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
@@ -73,6 +73,11 @@ const MENU_DURATION_2S: usize = 1017;
 const MENU_DURATION_3S: usize = 1018;
 const MENU_DURATION_5S: usize = 1019;
 const MENU_DURATION_10S: usize = 1020;
+const MENU_MONITOR_ACTIVE: usize = 1021;
+const MENU_MONITOR_PRIMARY: usize = 1022;
+/// Display entries in the Monitor submenu use sequential ids starting here;
+/// display `i` gets `MENU_MONITOR_DISPLAY_BASE + i`.
+const MENU_MONITOR_DISPLAY_BASE: usize = 1023;
 const LISTBOX_ID: usize = 2;
 /// History rows are kept in the heap (as entries) and duplicated in the
 /// listbox as UTF-16 row strings, so the cap directly sizes the app's
@@ -135,6 +140,7 @@ enum SettingId {
     CloseToTray,
     AllowedApps,
     Position,
+    Monitor,
     ShowSample,
     CopyLogs,
     OpenConfig,
@@ -276,6 +282,49 @@ fn position_label(config: &Config) -> String {
                 HorizontalPosition::Right => "right",
             }
         )
+    }
+}
+
+/// The overlay's target display as a display string, e.g. "Active window",
+/// "Primary", "Display 2". An index beyond the currently attached displays
+/// still shows the configured intent, flagged as unavailable — the config is
+/// not rewritten on a hot-unplug, so the label must not lie about it.
+fn monitor_label(config: &Config, display_count: usize) -> String {
+    match config.overlay.monitor {
+        MonitorMode::ActiveWindow => "Active window".to_string(),
+        MonitorMode::Primary => "Primary".to_string(),
+        MonitorMode::Index(index) => {
+            let n = index as usize;
+            if n < display_count {
+                format!("Display {}", n + 1)
+            } else {
+                format!("Display {} (unavailable)", n + 1)
+            }
+        }
+    }
+}
+
+/// The next monitor mode when the settings row is clicked: Active window →
+/// Primary → Display 1 → Display 2 → … → back to Active window. With fewer
+/// than two displays the list degrades gracefully instead of offering an
+/// index that could never resolve.
+fn next_monitor_mode(current: MonitorMode, display_count: usize) -> MonitorMode {
+    match current {
+        MonitorMode::ActiveWindow => MonitorMode::Primary,
+        MonitorMode::Primary => {
+            if display_count > 1 {
+                MonitorMode::Index(0)
+            } else {
+                MonitorMode::ActiveWindow
+            }
+        }
+        MonitorMode::Index(index) => {
+            if (index as usize) + 1 < display_count {
+                MonitorMode::Index(index + 1)
+            } else {
+                MonitorMode::ActiveWindow
+            }
+        }
     }
 }
 
@@ -1684,6 +1733,16 @@ impl MainWindowState {
         });
         y += (70.0 * scale) as i32 + gap;
         items.push(SettingsItem::Row {
+            id: SettingId::Monitor,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        items.push(SettingsItem::Row {
             id: SettingId::ShowSample,
             rect: RECT {
                 left,
@@ -1749,6 +1808,7 @@ impl MainWindowState {
         let media_sources = cfg.behavior.media_sources.join(", ");
         let custom_position = cfg.overlay.position_x.is_some();
         let position_label = position_label(&cfg);
+        let display_count = enumerate_displays().len();
 
         let mut hdr = RECT {
             left: content_left + pad,
@@ -1862,6 +1922,7 @@ impl MainWindowState {
                         ),
                         SettingId::Duration => ("Duration", format!("{}s", duration_ms / 1000), SETTINGS_MUTED),
                         SettingId::Position => ("Position", position_label.clone(), SETTINGS_MUTED),
+                        SettingId::Monitor => ("Monitor", monitor_label(&cfg, display_count), SETTINGS_MUTED),
                         SettingId::AllowedApps => (
                             "Allowed apps",
                             if media_sources.is_empty() {
@@ -1891,7 +1952,8 @@ impl MainWindowState {
                         SettingId::Notifications
                         | SettingId::StartOnLogin
                         | SettingId::CloseToTray
-                        | SettingId::AllowedApps => {
+                        | SettingId::AllowedApps
+                        | SettingId::Monitor => {
                             let mut val_rect = control_rect;
                             draw_string(
                                 &self.fonts,
@@ -2620,6 +2682,15 @@ impl MainWindowState {
         // If the position adjustor is open, move it back to the default spot too.
         crate::positioner::reset_position();
     }
+
+    /// Sets the target display mode, persists it, and nudges the live overlay.
+    /// The overlay resolves the target against the current display layout
+    /// itself on every placement, so no display handles are exchanged here.
+    fn apply_monitor(&mut self, mode: MonitorMode) {
+        self.mutate_config(|cfg| cfg.overlay.monitor = mode);
+        info!("overlay monitor set: {mode:?}");
+        set_position(self.overlay_hwnd, OverlayPos::from_config(&self.cfg()));
+    }
 }
 
 /// Whether a state row for `current` would duplicate the newest history row
@@ -3019,6 +3090,66 @@ fn show_tray_menu(state: &mut MainWindowState) {
             PCWSTR(wide("Position").as_ptr()),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        // Monitor submenu: which display the pill is placed on. The display
+        // entries mirror the current enumeration (Display 1 is index 0), so
+        // the checkmarks line up with what the overlay resolves at placement.
+        let Ok(monitor_menu) = CreatePopupMenu() else {
+            let _ = DestroyMenu(menu);
+            return;
+        };
+        // Snapshot the configured mode (Copy type) so the read guard is
+        // released before the TrackPopupMenu loop below, which calls
+        // mutate_config on selection.
+        let monitor_mode = state.cfg().overlay.monitor;
+        let displays = enumerate_displays();
+        let monitor_flags = |mode: MonitorMode| {
+            if monitor_mode == mode {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            }
+        };
+        let _ = AppendMenuW(
+            monitor_menu,
+            monitor_flags(MonitorMode::ActiveWindow),
+            MENU_MONITOR_ACTIVE,
+            PCWSTR(wide("Active window").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            monitor_menu,
+            monitor_flags(MonitorMode::Primary),
+            MENU_MONITOR_PRIMARY,
+            PCWSTR(wide("Primary").as_ptr()),
+        );
+        if !displays.is_empty() {
+            let _ = AppendMenuW(monitor_menu, MF_SEPARATOR, 0, PCWSTR::null());
+            for (i, display) in displays.iter().enumerate() {
+                let label = if display.primary {
+                    format!("Display {} (primary)", i + 1)
+                } else {
+                    format!("Display {}", i + 1)
+                };
+                let label_wide = wide(&label);
+                let flags = if monitor_mode == MonitorMode::Index(i as u32) {
+                    MF_STRING | MF_CHECKED
+                } else {
+                    MF_STRING
+                };
+                let _ = AppendMenuW(
+                    monitor_menu,
+                    flags,
+                    MENU_MONITOR_DISPLAY_BASE + i,
+                    PCWSTR(label_wide.as_ptr()),
+                );
+            }
+        }
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            monitor_menu.0 as usize,
+            PCWSTR(wide("Monitor").as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         // Duration submenu
         let Ok(duration_menu) = CreatePopupMenu() else {
             let _ = DestroyMenu(menu);
@@ -3159,6 +3290,11 @@ fn show_tray_menu(state: &mut MainWindowState) {
                 MENU_DURATION_10S => {
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = 10000);
                     set_duration(state.overlay_hwnd, 10000);
+                }
+                MENU_MONITOR_ACTIVE => state.apply_monitor(MonitorMode::ActiveWindow),
+                MENU_MONITOR_PRIMARY => state.apply_monitor(MonitorMode::Primary),
+                _ if command >= MENU_MONITOR_DISPLAY_BASE && command < MENU_MONITOR_DISPLAY_BASE + displays.len() => {
+                    state.apply_monitor(MonitorMode::Index((command - MENU_MONITOR_DISPLAY_BASE) as u32));
                 }
                 _ => {}
             }
@@ -3414,6 +3550,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                 }
                                 SettingId::ShowSample => {
                                     show_sample(state.overlay_hwnd);
+                                }
+                                SettingId::Monitor => {
+                                    // One click steps to the next choice
+                                    // (Active window → Primary → Display 1 →
+                                    // … → back); the tray menu offers direct
+                                    // selection.
+                                    let displays = enumerate_displays();
+                                    let next = next_monitor_mode(state.cfg().overlay.monitor, displays.len());
+                                    state.apply_monitor(next);
+                                    state.invalidate();
                                 }
                                 SettingId::CopyLogs => {
                                     let gap = (4.0 * scale) as i32;

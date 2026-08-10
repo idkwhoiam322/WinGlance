@@ -22,6 +22,24 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `max_width`    | `340`   | 180–800 | Maximum pill width in logical pixels              |
 | `position_x`   | *(unset)* | integer | Absolute X override (96-DPI logical px); set by *Adjust position…* |
 | `position_y`   | *(unset)* | integer | Absolute Y override (96-DPI logical px); set by *Adjust position…* |
+| `monitor`      | `"active-window"` | string | Which display the pill is placed on (see below) |
+
+`monitor` accepts one of:
+
+- `"active-window"` — the display of the foreground window (the historical
+  behavior; also the default for configs written before this key existed).
+- `"primary"` — the display Windows marks as primary.
+- `"index-N"` — the (N+1)-th display in Windows' enumeration order, so
+  `"index-0"` is the first display, `"index-1"` the second, and so on.
+
+The index is resolved against the *current* display layout each time the pill
+is placed. If the configured display is temporarily unplugged or reordered,
+the pill falls back to the primary display while the setting stays untouched,
+so it reapplies automatically when the display returns. Custom
+`position_x`/`position_y` values keep their existing semantics: absolute
+virtual-screen coordinates in 96-DPI logical pixels — not relative to the
+selected display — and the resulting position is clamped into the selected
+display's work area.
 
 ## [behavior]
 

@@ -1,4 +1,4 @@
-use crate::config::{Config, HorizontalPosition, VerticalPosition};
+use crate::config::{Config, HorizontalPosition, MonitorMode, VerticalPosition};
 use crate::events::{
     MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo, artwork_same, media_event_into_owned,
 };
@@ -6,7 +6,7 @@ use crate::gdi::FontProvider;
 use crate::palette::Palette;
 use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
 use anyhow::{Context, Result};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -15,25 +15,26 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::BOOLEAN;
 use windows::Win32::Foundation::{
-    COLORREF, HANDLE, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    BOOL, COLORREF, HANDLE, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DEVMODEW, DIB_RGB_COLORS,
     DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
-    ENUM_CURRENT_SETTINGS, ETO_CLIPPED, EnumDisplaySettingsW, ExtTextOutW, GdiFlush, GetMonitorInfoW, HBITMAP, HDC,
-    HFONT, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT, ValidateRect,
+    ENUM_CURRENT_SETTINGS, ETO_CLIPPED, EnumDisplayMonitors, EnumDisplaySettingsW, ExtTextOutW, GdiFlush,
+    GetMonitorInfoW, HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW,
+    MonitorFromWindow, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, ValidateRect,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, GetCursorPos, GetForegroundWindow, HTTRANSPARENT, HWND_TOPMOST,
-    IsWindowVisible, KillTimer, MA_NOACTIVATE, MSG, PM_REMOVE, PeekMessageW, PostMessageW, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer,
-    SetWindowPos, ShowWindow, ULW_ALPHA, WM_APP, WM_DESTROY, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
-    WM_PAINT, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    IsWindowVisible, KillTimer, MA_NOACTIVATE, MONITORINFOF_PRIMARY, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SetTimer, SetWindowPos, ShowWindow, ULW_ALPHA, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -60,56 +61,291 @@ const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
 
 /// Samples the monitor's current refresh period in ms, so the animation timer
 /// ticks once per presented frame on any display (60 Hz → 16 ms, 120 Hz → 8 ms,
-/// 144 Hz → 7 ms, 240 Hz → 4 ms). The pill is positioned over the foreground
-/// window's monitor (see `position()`), so the query targets that same monitor:
-/// the primary display can run at a different rate on mixed-refresh setups.
-/// Prefers DWM's live compose rate, which stays correct on variable-refresh-rate
-/// monitors; falls back to the display mode's nominal frequency; last resort is
-/// 16 ms (60 Hz).
-fn refresh_period_ms() -> u32 {
-    let foreground = unsafe { GetForegroundWindow() };
+/// 144 Hz → 7 ms, 240 Hz → 4 ms). The pill can target a display other than the
+/// foreground window's (see `MonitorMode`), so when a target was resolved the
+/// DWM query runs against the overlay window itself: DWM reports the compose
+/// rate of the monitor the queried window is on, and while animating the
+/// overlay sits on the target display. Prefers DWM's live compose rate, which
+/// stays correct on variable-refresh-rate monitors; falls back to the display
+/// mode's nominal frequency of the target (resolved by device name, so no
+/// window is needed); last resort is 16 ms (60 Hz).
+fn refresh_period_ms(target: Option<&TargetMonitor>, overlay_hwnd: HWND) -> u32 {
+    let dwm_hwnd = match target {
+        Some(_) => overlay_hwnd,
+        None => unsafe { GetForegroundWindow() },
+    };
     let dwm_period = unsafe {
         let mut timing = std::mem::zeroed::<DWM_TIMING_INFO>();
         timing.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
-        DwmGetCompositionTimingInfo(foreground, &mut timing)
-            .ok()
-            .and_then(|()| {
-                let ratio = timing.rateRefresh;
-                // Refresh rate = numerator / denominator (Hz); 0/0 means DWM
-                // did not report a rate (e.g. composition paused).
-                if ratio.uiNumerator != 0 && ratio.uiDenominator != 0 {
-                    Some(1000 * ratio.uiDenominator / ratio.uiNumerator)
-                } else {
-                    None
-                }
-            })
+        DwmGetCompositionTimingInfo(dwm_hwnd, &mut timing).ok().and_then(|()| {
+            let ratio = timing.rateRefresh;
+            // Refresh rate = numerator / denominator (Hz); 0/0 means DWM
+            // did not report a rate (e.g. composition paused).
+            if ratio.uiNumerator != 0 && ratio.uiDenominator != 0 {
+                Some(1000 * ratio.uiDenominator / ratio.uiNumerator)
+            } else {
+                None
+            }
+        })
     };
     if let Some(period) = dwm_period {
         return period.clamp(1, 100);
     }
     // Fallback: the monitor's nominal frequency, resolved by device name so
-    // it hits the same monitor the pill will be shown on.
-    let mode_period = unsafe {
-        let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
-        if monitor.0.is_null() {
-            None
-        } else {
-            let mut info = MONITORINFOEXW::default();
-            // cbSize must cover the extended structure (with szDevice), or
-            // Windows may not populate the device name and the refresh-rate
-            // fallback below silently degrades to 16 ms.
-            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-            GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool().then(|| {
-                let mut devmode = std::mem::zeroed::<DEVMODEW>();
-                devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-                EnumDisplaySettingsW(PCWSTR(info.szDevice.as_ptr()), ENUM_CURRENT_SETTINGS, &mut devmode)
-                    .as_bool()
-                    .then(|| 1000u32.checked_div(devmode.dmDisplayFrequency as u32))
-                    .flatten()
-            })
+    // it hits the same display the pill will be shown on.
+    let mode_period = match target {
+        Some(target) => monitor_frequency_ms(target.handle),
+        None => {
+            let foreground = unsafe { GetForegroundWindow() };
+            let monitor = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
+            if monitor.0.is_null() {
+                None
+            } else {
+                monitor_frequency_ms(monitor)
+            }
         }
     };
-    mode_period.flatten().unwrap_or(16).clamp(1, 100)
+    mode_period.unwrap_or(16).clamp(1, 100)
+}
+
+/// The display's nominal frame period in ms from its current display mode;
+/// `None` when the mode cannot be read.
+fn monitor_frequency_ms(monitor: HMONITOR) -> Option<u32> {
+    if monitor.0.is_null() {
+        return None;
+    }
+    let mut info = MONITORINFOEXW::default();
+    // cbSize must cover the extended structure (with szDevice), or Windows
+    // may not populate the device name and the refresh-rate fallback below
+    // silently degrades to 16 ms.
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    if !unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+        return None;
+    }
+    let mut devmode = unsafe { std::mem::zeroed::<DEVMODEW>() };
+    devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+    let read =
+        unsafe { EnumDisplaySettingsW(PCWSTR(info.szDevice.as_ptr()), ENUM_CURRENT_SETTINGS, &mut devmode).as_bool() };
+    if !read {
+        return None;
+    }
+    1000u32.checked_div(devmode.dmDisplayFrequency as u32)
+}
+
+/// A snapshot of one active display, in `EnumDisplayMonitors` order — the
+/// same order Windows uses in display settings. Re-enumerated on every use
+/// (handles are never cached), so a hot-plugged or reordered display is
+/// picked up immediately.
+pub(crate) struct DisplayInfo {
+    pub handle: HMONITOR,
+    /// The display's work area (excludes taskbars and app bars) in virtual
+    /// screen coordinates.
+    pub work: RECT,
+    /// Whether Windows flags this as the primary display.
+    pub primary: bool,
+    /// The device name (`\\.\DISPLAY1`), as reported by the system.
+    pub name: String,
+}
+
+/// Enumerates every active display. Returns an empty vec only when the system
+/// currently reports no display (for example, a locked or disconnected
+/// session).
+pub(crate) fn enumerate_displays() -> Vec<DisplayInfo> {
+    let mut displays: Vec<DisplayInfo> = Vec::new();
+    unsafe extern "system" fn collect(monitor: HMONITOR, _hdc: HDC, _rect: *mut RECT, data: LPARAM) -> BOOL {
+        let displays = unsafe { &mut *(data.0 as *mut Vec<DisplayInfo>) };
+        let mut info = MONITORINFOEXW::default();
+        // cbSize must cover the extended structure (with szDevice) or the
+        // device name below is not populated.
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+            // Keep enumerating: one failed read must not drop the rest.
+            return true.into();
+        }
+        let name_len = info
+            .szDevice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(info.szDevice.len());
+        displays.push(DisplayInfo {
+            handle: monitor,
+            work: info.monitorInfo.rcWork,
+            primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            name: String::from_utf16_lossy(&info.szDevice[..name_len]),
+        });
+        true.into()
+    }
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect),
+            LPARAM(&mut displays as *mut Vec<DisplayInfo> as isize),
+        );
+    }
+    displays
+}
+
+/// Index of the monitor the foreground window is on, among `displays`.
+/// `None` when the foreground monitor cannot be determined (no foreground
+/// window, or it does not match the current snapshot).
+fn foreground_monitor_index(displays: &[DisplayInfo]) -> Option<usize> {
+    let foreground = unsafe { GetForegroundWindow() };
+    let monitor = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
+    if monitor.0.is_null() {
+        return None;
+    }
+    displays.iter().position(|display| display.handle == monitor)
+}
+
+/// Resolves which display the pill targets, per `mode`, against the current
+/// display snapshot:
+///
+/// - `ActiveWindow` — the monitor of the foreground window (given as its index
+///   in `displays`); when that cannot be determined, the primary display.
+/// - `Primary` — the display Windows flags as primary; when none is flagged
+///   (should not happen), the first enumerated.
+/// - `Index(n)` — the nth enumerated display; when out of range (the display
+///   was unplugged or reordered after the config was saved), the primary
+///   display. The configured index is preserved — nothing here mutates the
+///   config — so the setting reapplies automatically when the display
+///   comes back.
+///
+/// Returns `None` only when no display exists at all.
+pub(crate) fn resolve_target(
+    mode: MonitorMode,
+    displays: &[DisplayInfo],
+    foreground_nearest: Option<usize>,
+) -> Option<usize> {
+    if displays.is_empty() {
+        return None;
+    }
+    let primary = displays.iter().position(|display| display.primary).unwrap_or(0);
+    match mode {
+        MonitorMode::ActiveWindow => Some(
+            foreground_nearest
+                .filter(|index| *index < displays.len())
+                .unwrap_or(primary),
+        ),
+        MonitorMode::Primary => Some(primary),
+        MonitorMode::Index(index) => {
+            let in_range = (index as usize) < displays.len();
+            if in_range {
+                Some(index as usize)
+            } else {
+                warn_index_fallback(index);
+                Some(primary)
+            }
+        }
+    }
+}
+
+/// Warns about a configured-but-unattached display index, at most once per
+/// unique index every `INDEX_WARN_INTERVAL` — the pill re-resolves its target
+/// every frame, so an unthrottled warn would flood the log while a display is
+/// gone for a long time.
+const INDEX_WARN_INTERVAL: Duration = Duration::from_secs(10);
+static LAST_INDEX_WARN: Mutex<Option<(u32, Instant)>> = Mutex::new(None);
+
+fn warn_index_fallback(index: u32) {
+    let mut last = LAST_INDEX_WARN.lock().unwrap();
+    let now = Instant::now();
+    let due = match *last {
+        Some((last_index, at)) => last_index != index || now.duration_since(at) >= INDEX_WARN_INTERVAL,
+        None => true,
+    };
+    if due {
+        warn!("configured display index {index} is not attached; using the primary display (config untouched)");
+        *last = Some((index, now));
+    }
+}
+
+/// Logs the resolved target at most once every `TARGET_LOG_INTERVAL` per
+/// target, so a visible pill (which re-resolves its target every frame) does
+/// not log one line per animation frame. The throttled line is the log-based
+/// answer to "which display is the pill on, and why".
+const TARGET_LOG_INTERVAL: Duration = Duration::from_secs(5);
+static LAST_TARGET_LOG: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
+
+fn log_target_once(target: &TargetMonitor, name: &str) {
+    let mut last = LAST_TARGET_LOG.lock().unwrap();
+    let now = Instant::now();
+    let due = match *last {
+        Some((last_index, at)) => last_index != target.index || now.duration_since(at) >= TARGET_LOG_INTERVAL,
+        None => true,
+    };
+    if due {
+        debug!(
+            "overlay target: Display {} ({}){}",
+            target.index + 1,
+            name,
+            if target.primary { ", primary" } else { "" }
+        );
+        *last = Some((target.index, now));
+    }
+}
+
+/// A resolved placement target display. Re-derived from a fresh enumeration
+/// on every use (see `enumerate_displays`), so a hot-plugged or reordered
+/// display is picked up immediately.
+pub(crate) struct TargetMonitor {
+    pub handle: HMONITOR,
+    /// The display's work area in virtual screen coordinates — the pill's
+    /// anchors and clamping operate on this.
+    pub work: RECT,
+    /// Zero-based position in the enumeration.
+    pub index: usize,
+    /// Whether this is the display Windows flags as primary.
+    pub primary: bool,
+}
+
+/// Effective DPI of a display. `GetDpiForMonitor(MDT_EFFECTIVE_DPI)` reports
+/// the DPI Windows scales that display at; this process is per-monitor-v2
+/// aware (see `main.rs`), so the value matches what a window on that display
+/// gets. Falls back to 96 (100 %) when the API fails.
+pub(crate) fn monitor_dpi(handle: HMONITOR) -> u32 {
+    let mut dpi_x = 0u32;
+    let mut dpi_y = 0u32;
+    unsafe { GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
+        .map(|_| dpi_x.max(dpi_y).max(96))
+        .unwrap_or(96)
+}
+
+/// The pill's screen top-left for a `width`×`height` window on the target
+/// display's work area, from the config-derived placement. Pure math — the
+/// historical behavior of `OverlayState::position()` with the foreground
+/// monitor's work area, now parameterized by the resolved target.
+fn placement(work: RECT, width: i32, height: i32, position: &OverlayPos, inset: i32, scale: f32) -> POINT {
+    let margin = (position.margin as f32 * scale).round() as i32;
+    let span_w = work.right - work.left;
+    // The DIB is inflated by `aura_inset` on each side, but the PILL (not the
+    // window) must be centered/anchored. Subtract the inset so the pill lands
+    // where the user expects it.
+    let x = if let Some(px) = position.x {
+        (px as f32 * scale).round() as i32
+    } else {
+        match position.horizontal {
+            HorizontalPosition::Left => work.left + margin + inset,
+            HorizontalPosition::Center => work.left + (span_w - width) / 2 - inset,
+            HorizontalPosition::Right => work.right - width - margin - inset,
+        }
+    };
+    let y = if let Some(py) = position.y {
+        (py as f32 * scale).round() as i32
+    } else {
+        match position.vertical {
+            // The DIB extends `inset` beyond the pill on each side; shift the
+            // window so the PILL body (not the aura) sits at the configured
+            // margin from the work-area edge.
+            VerticalPosition::Top => work.top + margin + inset,
+            VerticalPosition::Bottom => work.bottom - height - margin - inset,
+        }
+    };
+    // Clamp to the current work area so absolute overrides stay usable after a
+    // resolution or monitor change.
+    let x = x.clamp(work.left, (work.right - width).max(work.left));
+    let y = y.clamp(work.top, (work.bottom - height).max(work.top));
+    POINT { x, y }
 }
 
 /// Reusable device context + DIB section for the pill's frames. The overlay
@@ -378,6 +614,7 @@ pub(crate) struct OverlayPos {
     margin: i32,
     x: Option<i32>,
     y: Option<i32>,
+    monitor: MonitorMode,
 }
 
 impl OverlayPos {
@@ -388,6 +625,7 @@ impl OverlayPos {
             margin: config.overlay.margin,
             x: config.overlay.position_x,
             y: config.overlay.position_y,
+            monitor: config.overlay.monitor,
         }
     }
 }
@@ -405,8 +643,8 @@ pub(crate) fn set_position(hwnd: HWND, pos: OverlayPos) {
         let state = &mut *state_ptr;
         state.position = pos;
         debug!(
-            "overlay position applied: vertical={:?} horizontal={:?} x={:?} y={:?}",
-            pos.vertical, pos.horizontal, pos.x, pos.y
+            "overlay position applied: vertical={:?} horizontal={:?} x={:?} y={:?} monitor={:?}",
+            pos.vertical, pos.horizontal, pos.x, pos.y, pos.monitor
         );
         if matches!(state.phase, Phase::Hidden) {
             state.show_sample();
@@ -549,11 +787,13 @@ impl OverlayState {
         let period = if animating || marquee_active {
             // The monitor queries behind `refresh_period_ms` (DWM timing,
             // display-mode enumeration) are not free to run every tick; a
-            // 1-second cache is far fresher than any real rate change.
+            // 1-second cache is far fresher than any real rate change. The
+            // target is re-resolved only when a fresh period is actually
+            // needed.
             match self.period_cache {
                 Some((cached_at, cached)) if now.duration_since(cached_at) < Duration::from_secs(1) => cached,
                 _ => {
-                    let fresh = refresh_period_ms();
+                    let fresh = refresh_period_ms(self.target().as_ref(), self.hwnd);
                     self.period_cache = Some((now, fresh));
                     fresh
                 }
@@ -1062,20 +1302,24 @@ impl OverlayState {
         let Some(content) = self.content.take() else {
             return;
         };
+        // Resolve the target display first: both the DPI and the work area
+        // must come from the display the pill is about to appear on, so the
+        // first frame after a display switch is already correct.
+        let Some(target) = self.target() else {
+            self.content = Some(content);
+            return;
+        };
         let (alpha, shape) = self.frame();
-        let raw_dpi = unsafe { GetDpiForWindow(self.hwnd) };
-        if raw_dpi != 0 && raw_dpi != self.fonts.dpi() {
+        let raw_dpi = monitor_dpi(target.handle);
+        if raw_dpi != self.fonts.dpi() {
             self.fonts = FontProvider::new(raw_dpi);
         }
-        let dpi = raw_dpi.max(96) as f32 / 96.0;
+        let dpi = raw_dpi as f32 / 96.0;
         let (logical_width, logical_height) = content_size_of(&self.config, &content);
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
         self.aura_inset = (AURA_HALO_LOGICAL * dpi * shape).round() as i32;
-        let Some(position) = self.position(width, height) else {
-            self.content = Some(content);
-            return;
-        };
+        let position = placement(target.work, width, height, &self.position, self.aura_inset, dpi);
         let result = render_layered(self, &content, width, height, dpi * shape, alpha, position);
         self.content = Some(content);
         if let Err(error) = result {
@@ -1112,62 +1356,39 @@ impl OverlayState {
         }
     }
 
+    /// Re-resolves the target display for the configured monitor mode. Fresh
+    /// on every call — the system monitor enumeration is cheap, and handles
+    /// are never cached, so a hot-plugged or reordered display takes effect
+    /// on the very next frame.
+    fn target(&self) -> Option<TargetMonitor> {
+        let displays = enumerate_displays();
+        let foreground_nearest = foreground_monitor_index(&displays);
+        let index = resolve_target(self.position.monitor, &displays, foreground_nearest)?;
+        let display = &displays[index];
+        let target = TargetMonitor {
+            handle: display.handle,
+            work: display.work,
+            index,
+            primary: display.primary,
+        };
+        log_target_once(&target, &display.name);
+        Some(target)
+    }
+
+    /// The pill's screen top-left for a `width`×`height` window on the
+    /// currently resolved target display, or `None` when no display is
+    /// available.
     fn position(&self, width: i32, height: i32) -> Option<POINT> {
-        let foreground = unsafe { GetForegroundWindow() };
-        let monitor = unsafe {
-            let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
-            if monitor.0.is_null() {
-                MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY)
-            } else {
-                monitor
-            }
-        };
-        if monitor.0.is_null() {
-            return None;
-        }
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-            return None;
-        }
-        let work = info.rcWork;
-        let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
-        let margin = (self.position.margin as f32 * scale).round() as i32;
-        let span_w = work.right - work.left;
-        // The DIB is inflated by `aura_inset` on each side, but the PILL
-        // (not the window) must be centered. Subtract the inset so the pill
-        // lands where the user expects it.
-        let inset = self.aura_inset;
-        let x = if let Some(px) = self.position.x {
-            (px as f32 * scale).round() as i32
-        } else {
-            match self.position.horizontal {
-                // The DIB extends `inset` beyond the pill on each side, so
-                // the glow reaches `margin` from the work-area edge — the
-                // pill itself sits `margin + inset` in.
-                HorizontalPosition::Left => work.left + margin + inset,
-                HorizontalPosition::Center => work.left + (span_w - width) / 2 - inset,
-                HorizontalPosition::Right => work.right - width - margin - inset,
-            }
-        };
-        let y = if let Some(py) = self.position.y {
-            (py as f32 * scale).round() as i32
-        } else {
-            match self.position.vertical {
-                // The DIB extends `inset` beyond the pill on each side; shift
-                // the window so the PILL body (not the aura) sits at the
-                // configured margin from the work-area edge.
-                VerticalPosition::Top => work.top + margin + inset,
-                VerticalPosition::Bottom => work.bottom - height - margin - inset,
-            }
-        };
-        // Clamp to the current work area so absolute overrides stay usable after a
-        // resolution or monitor change.
-        let x = x.clamp(work.left, (work.right - width).max(work.left));
-        let y = y.clamp(work.top, (work.bottom - height).max(work.top));
-        Some(POINT { x, y })
+        let target = self.target()?;
+        let scale = monitor_dpi(target.handle) as f32 / 96.0;
+        Some(placement(
+            target.work,
+            width,
+            height,
+            &self.position,
+            self.aura_inset,
+            scale,
+        ))
     }
 
     /// Whether the cursor currently sits over the pill body (not the aura
@@ -3687,6 +3908,22 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             LRESULT(0)
         }
+        WM_DISPLAYCHANGE => {
+            // A display was added, removed, or reordered (or its resolution
+            // changed). The per-frame target resolution picks the new layout
+            // up on its own; here, a visible pill is moved onto the re-resolved
+            // target immediately instead of waiting for the next tick, and the
+            // refresh-rate cache is dropped so the animation timer re-samples
+            // the target's rate.
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.period_cache = None;
+                if !matches!(state.phase, Phase::Hidden) {
+                    state.reposition();
+                }
+            }
+            LRESULT(0)
+        }
         TIMER_ANIMATION_MSG => {
             // The timer-queue callback posts one tick message per period;
             // when the UI thread stalls, those accumulate. Drain the queue so
@@ -5624,5 +5861,167 @@ mod tests {
         // The flat edge stays on the original edge: (5,5) lies on x+y=10.
         let flat = cov(5.0, 5.0, 2.0);
         assert!((flat - 0.5).abs() < 0.2, "expected ~0.5 on the flat edge, got {flat}");
+    }
+
+    fn fake_display(handle: usize, primary: bool) -> DisplayInfo {
+        DisplayInfo {
+            handle: HMONITOR(handle as *mut c_void),
+            work: RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            primary,
+            name: format!(r"\\.\DISPLAY{handle}"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_picks_the_foreground_monitor_for_active_window() {
+        let displays = vec![fake_display(1, true), fake_display(2, false)];
+        // The foreground window sits on the second display.
+        assert_eq!(
+            resolve_target(MonitorMode::ActiveWindow, &displays, Some(1)),
+            Some(1),
+            "ActiveWindow must target the foreground window's monitor"
+        );
+    }
+
+    #[test]
+    fn resolve_target_falls_back_to_primary_without_a_foreground_monitor() {
+        let displays = vec![fake_display(1, true), fake_display(2, false)];
+        // No foreground window (or its monitor is not in the snapshot).
+        assert_eq!(
+            resolve_target(MonitorMode::ActiveWindow, &displays, None),
+            Some(0),
+            "ActiveWindow without a foreground monitor must fall back to primary"
+        );
+        // A stale foreground index (defensive: the lookup never yields one)
+        // must not produce an out-of-bounds pick.
+        assert_eq!(
+            resolve_target(MonitorMode::ActiveWindow, &displays, Some(9)),
+            Some(0),
+            "an out-of-range foreground index must fall back to primary"
+        );
+    }
+
+    #[test]
+    fn resolve_target_uses_the_primary_flag_for_primary() {
+        // The primary display is not necessarily the first enumerated.
+        let displays = vec![fake_display(1, false), fake_display(2, true)];
+        assert_eq!(resolve_target(MonitorMode::Primary, &displays, Some(0)), Some(1));
+        // No display flagged primary (should not happen): first enumerated wins.
+        let unmarked = vec![fake_display(1, false), fake_display(2, false)];
+        assert_eq!(resolve_target(MonitorMode::Primary, &unmarked, None), Some(0));
+    }
+
+    #[test]
+    fn resolve_target_maps_an_index_onto_the_enumeration_order() {
+        let displays = vec![fake_display(1, true), fake_display(2, false), fake_display(3, false)];
+        assert_eq!(resolve_target(MonitorMode::Index(0), &displays, None), Some(0));
+        assert_eq!(resolve_target(MonitorMode::Index(2), &displays, None), Some(2));
+        // The foreground monitor is irrelevant to an explicit index.
+        assert_eq!(resolve_target(MonitorMode::Index(1), &displays, Some(2)), Some(1));
+    }
+
+    #[test]
+    fn resolve_target_falls_back_to_primary_for_an_out_of_range_index() {
+        let displays = vec![fake_display(1, true), fake_display(2, false)];
+        assert_eq!(
+            resolve_target(MonitorMode::Index(2), &displays, None),
+            Some(0),
+            "an unattached index must resolve to primary, never to a missing display"
+        );
+        assert_eq!(resolve_target(MonitorMode::Index(7), &displays, None), Some(0));
+    }
+
+    #[test]
+    fn resolve_target_returns_none_without_any_display() {
+        assert_eq!(resolve_target(MonitorMode::ActiveWindow, &[], None), None);
+        assert_eq!(resolve_target(MonitorMode::Primary, &[], None), None);
+        assert_eq!(resolve_target(MonitorMode::Index(0), &[], None), None);
+    }
+
+    fn anchor_pos(x: Option<i32>, y: Option<i32>) -> OverlayPos {
+        OverlayPos {
+            vertical: VerticalPosition::Bottom,
+            horizontal: HorizontalPosition::Center,
+            margin: 8,
+            x,
+            y,
+            monitor: MonitorMode::ActiveWindow,
+        }
+    }
+
+    #[test]
+    fn placement_anchors_against_the_target_work_area() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040, // 1080 minus a 40px taskbar
+        };
+        let pos = anchor_pos(None, None);
+        // Center anchor with the DIB inset subtracted; margin scaled by DPI.
+        let point = placement(work, 400, 100, &pos, 0, 1.0);
+        assert_eq!(point, POINT { x: 760, y: 932 }, "centered, 8px from the bottom edge");
+        let point = placement(work, 400, 100, &pos, 10, 1.0);
+        assert_eq!(
+            point,
+            POINT { x: 750, y: 922 },
+            "the inset shifts the window, not the pill"
+        );
+        // 150 % DPI scales the margin.
+        let point = placement(work, 600, 150, &pos, 10, 1.5);
+        assert_eq!(point, POINT { x: 650, y: 868 }, "margin scales with DPI");
+        // Left/top anchors.
+        let left_top = OverlayPos {
+            vertical: VerticalPosition::Top,
+            horizontal: HorizontalPosition::Left,
+            ..anchor_pos(None, None)
+        };
+        let point = placement(work, 400, 100, &left_top, 0, 1.0);
+        assert_eq!(point, POINT { x: 8, y: 8 });
+        // Right anchor.
+        let right = OverlayPos {
+            vertical: VerticalPosition::Bottom,
+            horizontal: HorizontalPosition::Right,
+            ..anchor_pos(None, None)
+        };
+        let point = placement(work, 400, 100, &right, 0, 1.0);
+        assert_eq!(point, POINT { x: 1512, y: 932 });
+    }
+
+    #[test]
+    fn placement_honors_absolute_overrides_and_clamps_them() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let custom = anchor_pos(Some(100), Some(200));
+        let point = placement(work, 400, 100, &custom, 0, 1.0);
+        assert_eq!(point, POINT { x: 100, y: 200 }, "absolute overrides win over anchors");
+        // A far-off override is clamped back into the work area.
+        let huge = anchor_pos(Some(10_000), Some(10_000));
+        let point = placement(work, 400, 100, &huge, 0, 1.0);
+        assert_eq!(
+            point,
+            POINT { x: 1520, y: 940 },
+            "clamped to the work-area bottom-right"
+        );
+        // Absolute overrides are virtual-screen coordinates: a value beyond
+        // the target's work area is clamped back into it (the pill on a
+        // monitor left of the origin still lands on that monitor).
+        let left_monitor = RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1040,
+        };
+        let point = placement(left_monitor, 400, 100, &custom, 0, 1.0);
+        assert_eq!(point, POINT { x: -400, y: 200 }, "clamped to the target work area");
     }
 }
