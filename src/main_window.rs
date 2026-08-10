@@ -185,6 +185,10 @@ enum SettingSub {
     Open,
     /// The right half of the Diagnostics row ("Copy logs" button).
     Copy,
+    /// The left half of the Config row ("Open config" button).
+    OpenConfig,
+    /// The right half of the Config row ("Reload config" button).
+    ReloadConfig,
 }
 
 /// Sub-rects of the Position row: value text, the six anchor segments, the
@@ -2093,16 +2097,33 @@ impl MainWindowState {
                             );
                         }
                         SettingId::OpenConfig => {
-                            // Whole-control button: opens config.toml in the
-                            // user's preferred editor (see open_config).
-                            let hovered = self.settings_hover == Some((current_row, SettingSub::None));
+                            // Config row hosts two side-by-side buttons: the
+                            // left half opens config.toml in the default editor
+                            // (see open_config); the right half relaunches the
+                            // app so the edited config.toml is reloaded (see
+                            // reload_config). Each button highlights only when
+                            // the cursor is over its own half.
+                            let gap = (4.0 * scale) as i32;
+                            let (open_rect, reload_rect) = halve(&control_rect, gap);
+                            let hovered_open = self.settings_hover == Some((current_row, SettingSub::OpenConfig));
+                            let hovered_reload = self.settings_hover == Some((current_row, SettingSub::ReloadConfig));
                             draw_small_button(
                                 &self.fonts,
                                 hdc,
-                                &control_rect,
+                                &open_rect,
                                 "Open config",
                                 accent,
-                                hovered,
+                                hovered_open,
+                                scale,
+                                brushes,
+                            );
+                            draw_small_button(
+                                &self.fonts,
+                                hdc,
+                                &reload_rect,
+                                "Reload config",
+                                accent,
+                                hovered_reload,
                                 scale,
                                 brushes,
                             );
@@ -2150,6 +2171,19 @@ impl MainWindowState {
                     }
                     if x >= copy_rect.left && x < copy_rect.right {
                         return Some((row_index, SettingSub::Copy));
+                    }
+                    return Some((row_index, SettingSub::None));
+                }
+                if *id == SettingId::OpenConfig {
+                    // Per-button hover for the two side-by-side buttons: the
+                    // left half is "Open config", the right half "Reload config".
+                    let gap = (4.0 * scale) as i32;
+                    let (open_rect, reload_rect) = halve(&control_rect, gap);
+                    if x >= open_rect.left && x < open_rect.right {
+                        return Some((row_index, SettingSub::OpenConfig));
+                    }
+                    if x >= reload_rect.left && x < reload_rect.right {
+                        return Some((row_index, SettingSub::ReloadConfig));
                     }
                     return Some((row_index, SettingSub::None));
                 }
@@ -2545,6 +2579,15 @@ impl MainWindowState {
         if code <= 32 {
             debug!("open config: ShellExecuteW failed (code {code}) for {path:?}");
         }
+    }
+
+    /// Relaunches the app so the on-disk `config.toml` is reloaded. The new
+    /// process re-acquires the single-instance mutex (released by
+    /// `crate::relaunch_self` before it spawns) and loads config from disk;
+    /// no app data is cleared, so any on-disk cache survives. See
+    /// `crate::relaunch_self`.
+    fn reload_config(&self) {
+        crate::relaunch_self();
     }
 
     /// Pins the overlay to a vertical/horizontal anchor: clears any absolute
@@ -3358,7 +3401,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     }
                                 }
                                 SettingId::OpenConfig => {
-                                    state.open_config();
+                                    let gap = (4.0 * scale) as i32;
+                                    let (open_rect, _reload_rect) = halve(&control_rect, gap);
+                                    if x >= open_rect.left && x < open_rect.right {
+                                        state.open_config();
+                                    } else {
+                                        state.reload_config();
+                                    }
                                 }
                                 SettingId::AllowedApps => {
                                     if !process_picker::open(
