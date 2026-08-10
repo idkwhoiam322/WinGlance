@@ -349,7 +349,7 @@ fn placement(work: RECT, width: i32, height: i32, position: &OverlayPos, inset: 
         (px as f32 * scale).round() as i32
     } else {
         match position.horizontal {
-            HorizontalPosition::Left => work.left + margin + inset,
+            HorizontalPosition::Left => work.left + margin - inset,
             HorizontalPosition::Center => work.left + (span_w - width) / 2 - inset,
             HorizontalPosition::Right => work.right - width - margin - inset,
         }
@@ -361,7 +361,7 @@ fn placement(work: RECT, width: i32, height: i32, position: &OverlayPos, inset: 
             // The DIB extends `inset` beyond the pill on each side; shift the
             // window so the PILL body (not the aura) sits at the configured
             // margin from the work-area edge.
-            VerticalPosition::Top => work.top + margin + inset,
+            VerticalPosition::Top => work.top + margin - inset,
             VerticalPosition::Bottom => work.bottom - height - margin - inset,
         }
     };
@@ -7988,6 +7988,106 @@ mod tests {
         );
         // Anchoring on the physical monitor top (0) would land the pill at y = 8.
         assert_ne!(point.y, 8);
+    }
+
+    #[test]
+    fn placement_top_inset_sits_the_pill_body_margin_from_the_work_edge() {
+        // With a non-zero aura (`inset`), the top anchor must place the PILL
+        // BODY (window.y + inset) at exactly `margin` from the work-area top —
+        // not `margin + inset`. The old `+ inset` sign shifted the pill down by
+        // a double inset (pill body sat at margin + 2*inset). A full-monitor work
+        // rect (no taskbar) isolates the sign from the fullscreen/aura logic.
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let top = OverlayPos {
+            vertical: VerticalPosition::Top,
+            ..anchor_pos(None, None)
+        };
+        let inset = 6;
+        let point = placement(work, 400, 100, &top, inset, 1.0);
+        // window.y = work.top + margin - inset = 0 + 8 - 6 = 2. The buggy `+ inset`
+        // sign would yield y = 14 here.
+        assert_eq!(
+            point,
+            POINT {
+                x: (1920 - 400) / 2 - inset,
+                y: 8 - inset
+            },
+            "top anchor window.y = work.top + margin - inset"
+        );
+        // Pill body top = window.y + inset = margin below the work-area top,
+        // matching the Bottom arm (vertical symmetry at this inset).
+        let pill_top = point.y + inset;
+        assert_eq!(
+            pill_top - work.top,
+            8,
+            "pill body sits exactly `margin` (8) from the work-area top edge"
+        );
+        let bottom = anchor_pos(None, None);
+        let bpoint = placement(work, 400, 100, &bottom, inset, 1.0);
+        let pill_bottom = bpoint.y + 100 + inset;
+        assert_eq!(
+            work.bottom - pill_bottom,
+            8,
+            "pill body sits exactly `margin` (8) from the work-area bottom edge"
+        );
+    }
+
+    #[test]
+    fn placement_left_inset_sits_the_pill_body_margin_from_the_work_edge() {
+        // Mirror of the Top-arm regression, for the left edge: with a non-zero
+        // aura (`inset`), the Left anchor must place the PILL BODY (window.x +
+        // inset) at exactly `margin` from the work-area left — not `margin + inset`.
+        // The old `+ inset` sign (identical to the former Top bug) shifted the pill
+        // right by a double inset. A full-monitor work rect (no taskbar) isolates
+        // the sign. (vertical defaults to Bottom via anchor_pos, the same
+        // convention `placement_left_inset_anchors_against_the_work_area_left`
+        // uses; only the horizontal Left arm is under test here.)
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let left = OverlayPos {
+            horizontal: HorizontalPosition::Left,
+            ..anchor_pos(None, None)
+        };
+        let inset = 6;
+        let point = placement(work, 400, 100, &left, inset, 1.0);
+        // window.x = work.left + margin - inset = 0 + 8 - 6 = 2. The buggy `+ inset`
+        // sign would yield x = 14 here.
+        assert_eq!(
+            point,
+            POINT {
+                x: 8 - inset,
+                y: 1080 - 100 - 8 - inset
+            },
+            "left anchor window.x = work.left + margin - inset"
+        );
+        // Pill body left = window.x + inset = margin from the work-area left,
+        // matching the Right arm (horizontal symmetry at this inset).
+        let pill_left = point.x + inset;
+        assert_eq!(
+            pill_left - work.left,
+            8,
+            "pill body sits exactly `margin` (8) from the work-area left edge"
+        );
+        let right = OverlayPos {
+            horizontal: HorizontalPosition::Right,
+            ..anchor_pos(None, None)
+        };
+        let rpoint = placement(work, 400, 100, &right, inset, 1.0);
+        let pill_right = rpoint.x + 400 + inset;
+        assert_eq!(
+            work.right - pill_right,
+            8,
+            "pill body sits exactly `margin` (8) from the work-area right edge"
+        );
     }
 
     #[test]
