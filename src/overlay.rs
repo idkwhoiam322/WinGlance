@@ -802,9 +802,7 @@ pub(crate) fn set_positions(hwnd: HWND, pos: OverlayPos, compact_pos: OverlayPos
             compact_pos.y,
             compact_pos.monitor
         );
-        if matches!(state.phase, Phase::Hidden) {
-            state.show_sample();
-        } else {
+        if !state.preview_if_hidden() {
             state.reposition();
         }
     }
@@ -824,6 +822,58 @@ pub(crate) fn set_duration(hwnd: HWND, duration_ms: u64) {
         let state = &mut *state_ptr;
         state.config.overlay.duration_ms = duration_ms.clamp(500, 60_000);
         info!("overlay duration set to {} ms", state.config.overlay.duration_ms);
+    }
+}
+
+/// Pushes a layout-mode change to the live overlay (which keeps its own config
+/// snapshot): the mode is stored and re-resolved from the current foreground,
+/// so a visible pill flips between Expanded and Compact immediately — with its
+/// size, content layout and placement recomputed — while a hidden pill shows a
+/// short sample so the new mode is previewable (same behavior position changes
+/// use).
+pub(crate) fn set_layout(hwnd: HWND, mode: LayoutMode) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = window_state::<OverlayState>(hwnd);
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        state.config.overlay.layout = mode;
+        // A hidden pill's sample re-resolves the layout from the foreground
+        // itself (show_sample → refresh_layout), so only the visible path
+        // refreshes here.
+        if !state.preview_if_hidden() {
+            state.refresh_layout();
+            state.render();
+        }
+        info!("overlay layout mode set: {mode:?} (resolved: {:?})", state.layout);
+    }
+}
+
+/// Pushes the compact-position separation flag to the live overlay, so the
+/// pill's placement follows `compact_effective` immediately (the positions
+/// themselves travel through `set_positions`).
+pub(crate) fn set_compact_separate(hwnd: HWND, separate: bool) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = window_state::<OverlayState>(hwnd);
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        state.config.overlay.compact_position_separate = separate;
+        info!(
+            "overlay compact_position_separate set to {separate} (display: {})",
+            if separate { "OFF" } else { "ON" }
+        );
+        if !state.preview_if_hidden() {
+            state.render();
+        }
     }
 }
 
@@ -1630,8 +1680,8 @@ impl OverlayState {
     }
 
     /// The position governing the current pill. A compact pill uses the
-    /// separate compact position only while `compact_position_separate` is
-    /// on; otherwise it sits exactly where the expanded pill would — the
+    /// independent compact position only while `compact_position_separate` is
+    /// set; otherwise it sits exactly where the expanded pill would — the
     /// same shared rule (`compact_effective`) the settings UI highlights,
     /// so the preview and the pill can never disagree.
     fn active_pos(&self) -> &OverlayPos {
@@ -1803,6 +1853,21 @@ impl OverlayState {
         let width = (logical_width * dpi * shape).round().max(1.0) as i32;
         let height = (logical_height * dpi * shape).round().max(1.0) as i32;
         Some((width, height))
+    }
+
+    /// Shows a short sample when the pill is currently hidden, so a settings
+    /// change that affects what the pill looks like or where it sits is
+    /// previewable even while nothing is playing. Returns whether a sample was
+    /// shown; the caller then knows the visible-pill path is not needed.
+    /// Shared by the position/layout/separation push functions instead of
+    /// duplicating the phase check at each site.
+    fn preview_if_hidden(&mut self) -> bool {
+        if matches!(self.phase, Phase::Hidden) {
+            self.show_sample();
+            true
+        } else {
+            false
+        }
     }
 
     /// Shows a short-lived preview of the overlay at its current position, used by
@@ -6303,6 +6368,27 @@ mod tests {
             "current_source must clear when the pill collapses"
         );
         assert!(matches!(state.phase, Phase::Hidden));
+    }
+
+    #[test]
+    fn preview_if_hidden_shows_a_sample_only_while_hidden() {
+        // Settings pushes (position/layout/separation) preview a hidden pill
+        // instead of silently deferring to the next show; a visible pill must
+        // be left alone so the caller repaints it in place.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        assert!(matches!(state.phase, Phase::Hidden));
+        assert!(state.preview_if_hidden(), "a hidden pill must show a sample");
+        assert!(
+            matches!(state.phase, Phase::Light(_)),
+            "the sample must take the light-up phase"
+        );
+
+        state.phase = Phase::Shown;
+        assert!(
+            !state.preview_if_hidden(),
+            "a visible pill must not be replaced by a sample"
+        );
+        assert!(matches!(state.phase, Phase::Shown));
     }
 
     #[test]

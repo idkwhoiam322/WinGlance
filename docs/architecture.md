@@ -234,11 +234,11 @@ while animating), falling back to the target's display-mode frequency.
 Because the 16 ms `WM_TIMER` recomputes geometry each tick while the pill is
 shown, a monitor removal or resolution change moves the pill back onto the
 new work area on the next frame; `WM_DISPLAYCHANGE` additionally repositions
-a visible pill immediately. The tray **Position → Adjust position…** command
-opens `src/positioner.rs`, a draggable sample that posts the chosen
+a visible pill immediately. The tray **Expanded Position → Adjust position…**
+command opens `src/positioner.rs`, a draggable sample that posts the chosen
 `position_x`/`position_y` to the main window via `POSITION_MSG`; the main
 window — the single owner of the config — applies and persists them, and
-nudges the live overlay via `overlay::set_position` (which calls
+nudges the live overlay via `overlay::set_positions` (which calls
 `reposition()` without a full redraw). `OverlayPos` carries the monitor mode,
 so anchor, custom-position and monitor changes all flow through the same
 push path.

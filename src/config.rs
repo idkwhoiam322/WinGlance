@@ -251,6 +251,27 @@ pub struct CompactPosition {
 }
 
 impl OverlayConfig {
+    /// Whether the independent Compact position fields are still at their
+    /// defaults — i.e. never customized. The settings UI uses this to decide
+    /// whether a first enable of `compact_position_separate` may initialize
+    /// them from the current Expanded position (Compact never starts from a
+    /// hard-coded spot); once any field deviates — including edits made from
+    /// the compact position row or tray submenu while the follow toggle is
+    /// still ON — re-enabling separation restores the previously customized
+    /// values instead.
+    pub fn compact_is_default(&self) -> bool {
+        // Derived from the struct's own defaults rather than hardcoded
+        // literals, so a future default change cannot silently break the
+        // copy-on-first-enable decision that leans on this.
+        let defaults = Self::default();
+        self.compact_vertical == defaults.compact_vertical
+            && self.compact_horizontal == defaults.compact_horizontal
+            && self.compact_margin == defaults.compact_margin
+            && self.compact_position_x == defaults.compact_position_x
+            && self.compact_position_y == defaults.compact_position_y
+            && self.compact_monitor == defaults.compact_monitor
+    }
+
     /// The position the Compact layout resolves to, per the separation rule:
     /// independent fields when `compact_position_separate` is set, otherwise
     /// the live Expanded position.
@@ -765,6 +786,14 @@ nested_appearance = [1, 2, 3]
         assert_eq!(config.overlay.compact_effective().x, Some(80));
         // The Expanded position itself is untouched by the separation flag.
         assert_eq!(config.overlay.vertical, VerticalPosition::Bottom);
+    }
+
+    #[test]
+    fn compact_is_default_tracks_customization() {
+        let mut config = Config::default();
+        assert!(config.overlay.compact_is_default());
+        config.overlay.compact_horizontal = HorizontalPosition::Right;
+        assert!(!config.overlay.compact_is_default());
     }
 
     #[test]

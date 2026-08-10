@@ -45,6 +45,9 @@ const BST_UNCHECKED: usize = 0;
 const CB_SIZE: i32 = 13;
 
 pub(crate) const PICKER_RESULT_MSG: u32 = WM_APP + 7;
+/// Result message for the Auto-compact sources picker (same contract as
+/// `PICKER_RESULT_MSG`, same picker window, different config field).
+pub(crate) const AUTO_SOURCES_RESULT_MSG: u32 = WM_APP + 11;
 
 /// Identifier for the listbox's Comctl32 subclass registration.
 const LISTBOX_SUBCLASS_ID: usize = 1;
@@ -80,6 +83,11 @@ struct PickerState {
     /// the result here and posts a bare `PICKER_RESULT_MSG`; the main window
     /// reads the slot. No pointers ever cross the message boundary.
     result: Arc<Mutex<Option<Vec<String>>>>,
+    /// The result message posted on confirm: `PICKER_RESULT_MSG` for the
+    /// media-sources picker, `AUTO_SOURCES_RESULT_MSG` for the Auto-compact
+    /// sources picker. The main window distinguishes the two by this message
+    /// and writes the matching config field.
+    result_msg: u32,
 }
 
 static OPEN_PICKER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
@@ -344,6 +352,7 @@ pub(crate) fn open(
     trigger_rect: &RECT,
     current: &[String],
     result: Arc<Mutex<Option<Vec<String>>>>,
+    result_msg: u32,
 ) -> bool {
     let list = build_picker_list(current, merge_smtc_sources(enumerate_app_processes()));
     if list.is_empty() {
@@ -421,6 +430,7 @@ pub(crate) fn open(
             row_brush: HBRUSH::default(),
             row_selected_brush: HBRUSH::default(),
             result,
+            result_msg,
         });
         let state_ptr = Box::into_raw(state);
         PICKER_STATE_CLAIMED.store(false, Ordering::SeqCst);
@@ -614,9 +624,10 @@ fn post_result(hwnd: HWND, cancelled: bool) {
     let owner = unsafe { GetParent(hwnd).unwrap_or_default() };
 
     // The selected patterns travel through the shared result slot, never as a
-    // pointer in the message. The main window takes the slot on
-    // PICKER_RESULT_MSG; if the post fails the slot is simply never read and
-    // the next picker open overwrites it.
+    // pointer in the message. The main window takes the slot on the posted
+    // result message (PICKER_RESULT_MSG / AUTO_SOURCES_RESULT_MSG); if the
+    // post fails the slot is simply never read and the next picker open
+    // overwrites it.
     let patterns = if cancelled {
         None
     } else {
@@ -626,12 +637,12 @@ fn post_result(hwnd: HWND, cancelled: bool) {
         *slot = patterns.clone();
     }
 
-    if unsafe { PostMessageW(owner, PICKER_RESULT_MSG, WPARAM(0), LPARAM(0)) }.is_err() {
+    if unsafe { PostMessageW(owner, state.result_msg, WPARAM(0), LPARAM(0)) }.is_err() {
         warn!("posting the picker result failed");
     } else if let Some(patterns) = patterns {
-        info!("media sources updated to {patterns:?}");
+        info!("picker result updated to {patterns:?}");
     } else {
-        debug!("process picker cancelled; media sources unchanged");
+        debug!("process picker cancelled; source list unchanged");
     }
 }
 
