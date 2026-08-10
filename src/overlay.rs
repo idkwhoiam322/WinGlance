@@ -2353,7 +2353,14 @@ fn draw_pixels(
     scale: f32,
     compact: bool,
 ) -> Result<()> {
-    let radius = state.config.appearance.corner_radius * scale;
+    // One radius per frame, selected by the effective layout (`compact` is
+    // the already-resolved layout: Auto has been decided into Expanded or
+    // Compact before rendering, so Auto automatically follows whatever is
+    // drawn). The same value feeds the aura, the pill body and the edge
+    // stroke, keeping the shadow, fill, border and clipped shape aligned.
+    // Oversized values are safe: every rounded-rect primitive clamps the
+    // radius to half the smaller pill dimension.
+    let radius = state.config.appearance.effective_corner_radius(compact) * scale;
     // Resolve the artwork that will be displayed and convert it (once per
     // unique cover) up front, so the aura palette below is ready and the
     // cover is never shown stale. Track pills carry the worker's decode
@@ -2503,7 +2510,8 @@ fn draw_pixels(
 /// rim. Shared by the track- and state-pill arms, which differ only in the
 /// art-size clamp the caller applies. The mask radius must match the one
 /// `draw_art_scaled` uses for the art bitmap itself, not the pill's
-/// `corner_radius` — otherwise the halo/rim are rounder than the art beneath
+/// `corner_radius` (either pill radius — this runs on the expanded-only
+/// path) — otherwise the halo/rim are rounder than the art beneath
 /// them and visibly don't hug its corners.
 #[allow(clippy::too_many_arguments)]
 fn draw_art_tile(

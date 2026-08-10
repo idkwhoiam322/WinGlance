@@ -93,6 +93,7 @@ display's work area.
 | `text_color`       | `[255, 255, 255, 255]` | RGBA 0–255 | Title and state-label color |
 | `accent_color`     | `[240, 110, 155, 255]` | RGBA 0–255 | Playback symbols, music note, album-art rim; aura fallback when the artwork palette has no vibrant color |
 | `corner_radius`    | `26.0`     | 4–48    | Corner rounding in logical pixels       |
+| `compact_corner_radius` | `12.0` | 4–48    | Corner rounding of the Compact layout, in logical pixels (independent of `corner_radius`; see below) |
 | `padding`          | `15.0`      | 4–32    | Gap between pill edge and content       |
 | `art_size`         | `48`       | 24–96   | Album-art square size (pill height is derived from this) |
 | `font_size_title`  | `16.0`     | 8–32    | Track title font size                   |
@@ -102,6 +103,16 @@ Colors are `[R, G, B, A]` with 0–255 components. The alpha channel is used
 for compositing; the default (235, ~92%) keeps the pill near-opaque while
 letting a hint of the backdrop through. Text, album art and symbols stay
 fully opaque regardless of the body alpha.
+
+`compact_corner_radius` rounds the Compact layout independently of
+`corner_radius` (which keeps controlling Expanded). The default of `12.0`
+makes the slim Compact pill a moderately rounded media card rather than a
+capsule; values near `6.0` read as a nearly square rectangle. Setting both
+keys to the same value makes the layouts look alike — e.g. both `26.0` —
+though on the shorter Compact pill a high radius visually approaches a
+capsule (the render clamps it to half the smaller pill dimension). Both
+radii use the same DPI scaling, aura, fill, border and clipping pipeline —
+only the corner amount differs.
 
 ## Per-track theming (not configurable)
 

@@ -201,6 +201,11 @@ pub struct AppearanceConfig {
     pub text_color: [u8; 4],
     pub accent_color: [u8; 4],
     pub corner_radius: f32,
+    /// Corner rounding of the Compact layout, in logical pixels. Independent
+    /// of `corner_radius` (which keeps controlling the Expanded layout), so
+    /// the two layouts can be rounded differently — the shipped default makes
+    /// Compact a moderately rounded media card rather than a capsule.
+    pub compact_corner_radius: f32,
     pub padding: f32,
     pub art_size: u32,
     pub font_size_title: f32,
@@ -331,11 +336,30 @@ impl Default for AppearanceConfig {
             // pill's white text.
             accent_color: [240, 110, 155, 255],
             corner_radius: 26.0,
+            // Moderately rounded so the slim Compact pill reads as a small
+            // media card, not a capsule (a 26 px radius would nearly round
+            // it end to end at the Compact height).
+            compact_corner_radius: 12.0,
             padding: 15.0,
             art_size: 48,
             font_size_title: 16.0,
             font_size_artist: 13.0,
             unknown: toml::Table::new(),
+        }
+    }
+}
+
+impl AppearanceConfig {
+    /// The corner radius (logical px) for the effective pill layout: the
+    /// Compact layout's own radius when the pill is Compact, the Expanded
+    /// radius otherwise. The caller passes the already-resolved effective
+    /// layout — Auto has been decided into Expanded/Compact before any
+    /// rendering — so the selected radius always matches what is drawn.
+    pub fn effective_corner_radius(&self, compact: bool) -> f32 {
+        if compact {
+            self.compact_corner_radius
+        } else {
+            self.corner_radius
         }
     }
 }
@@ -466,6 +490,7 @@ impl Config {
         self.overlay.compact_margin = self.overlay.compact_margin.clamp(0, 500);
         self.behavior.debounce_ms = self.behavior.debounce_ms.clamp(150, 250);
         self.appearance.corner_radius = self.appearance.corner_radius.clamp(4.0, 48.0);
+        self.appearance.compact_corner_radius = self.appearance.compact_corner_radius.clamp(4.0, 48.0);
         self.appearance.padding = self.appearance.padding.clamp(4.0, 32.0);
         self.appearance.art_size = self.appearance.art_size.clamp(24, 96);
         self.appearance.font_size_title = self.appearance.font_size_title.clamp(8.0, 32.0);
@@ -829,5 +854,63 @@ nested_appearance = [1, 2, 3]
         config.overlay.compact_margin = 10_000;
         config.normalize();
         assert_eq!(config.overlay.compact_margin, 500);
+    }
+
+    #[test]
+    fn compact_corner_radius_defaults_without_touching_the_expanded_radius() {
+        let config = Config::default();
+        assert_eq!(config.appearance.corner_radius, 26.0);
+        assert_eq!(config.appearance.compact_corner_radius, 12.0);
+    }
+
+    #[test]
+    fn missing_compact_corner_radius_loads_with_the_default() {
+        // A config written before this key existed must load successfully and
+        // use the new default, with the existing radius untouched.
+        let config: Config = toml::from_str("[appearance]\ncorner_radius = 26.0\n").unwrap();
+        assert_eq!(config.appearance.corner_radius, 26.0);
+        assert_eq!(config.appearance.compact_corner_radius, 12.0);
+    }
+
+    #[test]
+    fn compact_corner_radius_round_trips_and_stays_independent() {
+        // Expanded and Compact radii are independent knobs: any combination is
+        // valid, including equal values for both layouts.
+        for (corner, compact) in [(26.0, 12.0), (20.0, 8.0), (26.0, 26.0)] {
+            let config: Config = toml::from_str(&format!(
+                "[appearance]\ncorner_radius = {corner}\ncompact_corner_radius = {compact}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.appearance.corner_radius, corner);
+            assert_eq!(config.appearance.compact_corner_radius, compact);
+            let saved = toml::to_string_pretty(&config).unwrap();
+            assert!(saved.contains("compact_corner_radius"), "{saved}");
+            let reloaded: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(reloaded.appearance.corner_radius, corner);
+            assert_eq!(reloaded.appearance.compact_corner_radius, compact);
+        }
+    }
+
+    #[test]
+    fn effective_corner_radius_follows_the_effective_layout() {
+        let mut config = Config::default();
+        config.appearance.corner_radius = 20.0;
+        config.appearance.compact_corner_radius = 8.0;
+        // `compact` is the already-resolved effective layout, so Auto that
+        // resolved to Expanded/Compact selects the matching radius without
+        // any Auto-specific logic here.
+        assert_eq!(config.appearance.effective_corner_radius(false), 20.0);
+        assert_eq!(config.appearance.effective_corner_radius(true), 8.0);
+    }
+
+    #[test]
+    fn compact_corner_radius_is_bounded() {
+        let mut config = Config::default();
+        config.appearance.compact_corner_radius = 1000.0;
+        config.normalize();
+        assert_eq!(config.appearance.compact_corner_radius, 48.0);
+        config.appearance.compact_corner_radius = -5.0;
+        config.normalize();
+        assert_eq!(config.appearance.compact_corner_radius, 4.0);
     }
 }
