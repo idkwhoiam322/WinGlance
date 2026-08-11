@@ -4251,11 +4251,17 @@ fn draw_pill_text_rows(
         state.palette.map(|p| p.primary).unwrap_or(appearance.accent_color),
         content_alpha,
     );
+    // The muted tier's no-palette fallback follows the same rule as
+    // `accent` (a softened version of the configured accent), so the artist
+    // and app-name rows — the two rows styled as the same secondary-text
+    // tier — behave identically with and without artwork. A fixed gray here
+    // would split the tier: the artist row would track the user's accent
+    // while the app-name row two lines below ignored it.
     let muted = dim_color(
         state
             .palette
             .map(|p| muted_accent(p.primary))
-            .unwrap_or([0x77, 0x77, 0x77, 0xFF]),
+            .unwrap_or(muted_accent(appearance.accent_color)),
         content_alpha,
     );
     let padding = (appearance.padding * scale) as i32;
@@ -4367,7 +4373,7 @@ fn draw_pill_text_rows(
                 &artist_rect,
                 font_artist,
                 h_artist,
-                dim_color(muted_accent(accent), content_alpha * unveil),
+                dim_color(muted, unveil),
                 false,
                 scale,
                 Some(MarqueeCtx {
@@ -7898,8 +7904,13 @@ mod tests {
         // equality — not emptiness — is the contract.)
         let config = Config::default();
         let mut state = OverlayState::new(config, EventQueue::default());
-        // Synthetic 24x24 icon, solid premultiplied blue — distinguishable
-        // from the white title glyphs.
+        // Synthetic 24x24 icon, solid blue as BGRA (the pixel convention the
+        // icon pipeline consumes) — which reads as a pure-red square
+        // (255, 0, 0) in the RGBA buffer, detected below by that signature:
+        // zero green and blue at any alpha. No text or symbol color can
+        // match it — the app-name text is accent-tinted (the default accent
+        // is red-dominant but never pure red), so a red-dominance heuristic
+        // would count its glyphs as icon pixels.
         let mut icon = vec![0u8; 24 * 24 * 4];
         for px in icon.chunks_mut(4) {
             px.copy_from_slice(&[0, 0, 255, 255]);
@@ -7929,7 +7940,7 @@ mod tests {
                 .flat_map(|y| (x0..x1).map(move |x| (y, x)))
                 .filter(|&(y, x)| {
                     let p = &pixels[(y * buf_w + x) * 4..(y * buf_w + x) * 4 + 4];
-                    p[3] > 0 && p[2] > p[0] && p[2] > p[1]
+                    p[3] > 0 && p[1] == 0 && p[0] == 0
                 })
                 .count()
         };
