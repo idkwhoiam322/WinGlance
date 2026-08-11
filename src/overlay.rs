@@ -2683,6 +2683,23 @@ fn dim_color(color: [u8; 4], factor: f32) -> [u8; 4] {
     [color[0], color[1], color[2], (color[3] as f32 * factor).round() as u8]
 }
 
+/// A text row's opacity from the morph's reveal edge: the row's band ends at
+/// `band_bottom` (buffer coords), the pill's animated bottom edge is at
+/// `body_bottom`, and its rest position at `rest_body_bottom`. The row is
+/// drawn only once the edge has passed its band bottom (so no text ever
+/// renders outside the pill body), and fades in over the remaining sweep to
+/// the rest position — full opacity exactly at rest, and the same window
+/// fades the row back out as the edge returns. `band_bottom` is guaranteed
+/// to sit strictly above `rest_body_bottom` by the pill's constant-height
+/// layout (the `+ 8` slack in `content_size`); the guard keeps a band that
+/// somehow reaches the rest edge fully visible instead of invisible.
+fn row_unveil_alpha(body_bottom: i32, rest_body_bottom: i32, band_bottom: i32) -> f32 {
+    if band_bottom >= rest_body_bottom {
+        return 1.0;
+    }
+    ((body_bottom - band_bottom) as f32 / (rest_body_bottom - band_bottom) as f32).clamp(0.0, 1.0)
+}
+
 /// Logical (96-DPI) size of a pill: the configured max width and a constant
 /// height that always reserves all four row bands (title, artist, meta,
 /// source). A missing row leaves empty space at the bottom instead of
@@ -2906,6 +2923,16 @@ fn render_layered(
     let inset = state.aura_inset;
     let buf_w = (width + inset * 2).max(1);
     let buf_h = (height + inset * 2).max(1);
+    // Every morph resolves to the expanded pill, so its final body bottom is
+    // the rest edge the text rows unveil against (see `row_unveil_alpha`).
+    let rest_pill_h = (content_size_of(&state.config, content, false).1 * scale)
+        .round()
+        .max(1.0) as i32;
+    // The pill body's current and final bottom edges in buffer coordinates:
+    // rows are laid out at their final positions, so anything below the
+    // current edge would render outside the still-growing body.
+    let body_bottom = inset + height;
+    let rest_body_bottom = inset + rest_pill_h;
     // The DIB backing buffer may be larger than the requested frame (dib_for
     // allocates to a generous upper bound and reuses it across animation
     // frames instead of recreating it every tick). Its real scanline stride
@@ -2938,7 +2965,17 @@ fn render_layered(
         compact,
         morph,
     )?;
-    draw_text_pixels(state, &mut scratch[..needed], content, buf_w, scale, compact, morph);
+    draw_text_pixels(
+        state,
+        &mut scratch[..needed],
+        content,
+        buf_w,
+        scale,
+        compact,
+        morph,
+        body_bottom,
+        rest_body_bottom,
+    );
     // A single oversized metadata string (huge title/album) can inflate the
     // retained UTF-16 scratch far beyond any real row; shrink it back so the
     // capacity does not stay bloated for the rest of the run.
@@ -3839,6 +3876,14 @@ fn muted_accent(primary: [u8; 4]) -> [u8; 4] {
 /// present. When `playback` is `Some`, the title row reserves space on its
 /// right for the play/pause/stop symbol; track-change pills pass `None` and
 /// use the full width. Every row marquee-scrolls when it overflows.
+///
+/// `body_bottom`/`rest_body_bottom` are the current and final (expanded)
+/// pill body bottom edges in buffer coordinates. Rows are laid out at their
+/// final positions, so while a morph grows the pill each row below the
+/// current edge would render outside the body; `row_unveil_alpha` gates
+/// each row to the edge instead — nothing draws outside the pill, and every
+/// row fades in/out with the sweep of the growing/shrinking bottom edge
+/// (see `draw_text_pixels` for how this interacts with the cross-fade).
 #[allow(clippy::too_many_arguments)]
 fn draw_pill_text_rows(
     state: &mut OverlayState,
@@ -3848,6 +3893,8 @@ fn draw_pill_text_rows(
     pill: &PillText,
     playback: Option<PlaybackState>,
     content_alpha: f32,
+    body_bottom: i32,
+    rest_body_bottom: i32,
 ) {
     let inset = state.aura_inset;
     let appearance = &state.config.appearance;
@@ -3885,7 +3932,6 @@ fn draw_pill_text_rows(
         (fs_meta * ROW_HEIGHT, fs_meta),
         (fs_app * ROW_HEIGHT, fs_app),
     ];
-    let text_color = dim_color(appearance.text_color, content_alpha);
     let pad = appearance.padding;
     let (font_title, h_title) = state.fonts.font_for(rows[0].1 as i32, true);
     let (font_artist, h_artist) = state.fonts.font_for(rows[1].1 as i32, false);
@@ -3921,108 +3967,124 @@ fn draw_pill_text_rows(
     let label_w = (symbol_size + 16.0 * scale) as i32;
 
     let title_rect = next_band(0);
-    let title_narrow = if playback.is_some() {
-        RECT {
-            left: title_rect.left,
-            top: title_rect.top,
-            right: title_rect.right - label_w,
-            bottom: title_rect.bottom,
-        }
-    } else {
-        title_rect
-    };
-    draw_text_line_pixels(
-        &mut state.text_scratch,
-        &mut state.scratch_utf16,
-        pixels,
-        width as usize,
-        &pill.title,
-        &title_narrow,
-        font_title,
-        h_title,
-        text_color,
-        false,
-        scale,
-        Some(MarqueeCtx {
-            scroll: &mut state.scroll[0],
-            strip: &mut state.marquee_strips[0],
-        }),
-    );
-    if let Some(playback) = playback {
-        draw_symbol_pixels(
-            pixels,
-            width as usize,
-            title_rect.right,
-            title_rect.top,
-            symbol_size,
-            playback,
-            accent,
-        );
-    }
-
-    let artist_rect = next_band(1);
-    if artist_active {
+    let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, title_rect.bottom);
+    if unveil > 0.0 {
+        let title_narrow = if playback.is_some() {
+            RECT {
+                left: title_rect.left,
+                top: title_rect.top,
+                right: title_rect.right - label_w,
+                bottom: title_rect.bottom,
+            }
+        } else {
+            title_rect
+        };
         draw_text_line_pixels(
             &mut state.text_scratch,
             &mut state.scratch_utf16,
             pixels,
             width as usize,
-            &pill.artist,
-            &artist_rect,
-            font_artist,
-            h_artist,
-            dim_color(muted_accent(accent), content_alpha),
+            &pill.title,
+            &title_narrow,
+            font_title,
+            h_title,
+            dim_color(appearance.text_color, content_alpha * unveil),
             false,
             scale,
             Some(MarqueeCtx {
-                scroll: &mut state.scroll[1],
-                strip: &mut state.marquee_strips[1],
+                scroll: &mut state.scroll[0],
+                strip: &mut state.marquee_strips[0],
             }),
         );
+        if let Some(playback) = playback {
+            draw_symbol_pixels(
+                pixels,
+                width as usize,
+                title_rect.right,
+                title_rect.top,
+                symbol_size,
+                playback,
+                dim_color(accent, unveil),
+            );
+        }
+    }
+
+    let artist_rect = next_band(1);
+    if artist_active {
+        let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, artist_rect.bottom);
+        if unveil > 0.0 {
+            draw_text_line_pixels(
+                &mut state.text_scratch,
+                &mut state.scratch_utf16,
+                pixels,
+                width as usize,
+                &pill.artist,
+                &artist_rect,
+                font_artist,
+                h_artist,
+                dim_color(muted_accent(accent), content_alpha * unveil),
+                false,
+                scale,
+                Some(MarqueeCtx {
+                    scroll: &mut state.scroll[1],
+                    strip: &mut state.marquee_strips[1],
+                }),
+            );
+        }
     }
 
     if active[2] {
         let meta_rect = next_band(2);
-        draw_meta_line_pixels(
-            &mut state.text_scratch,
-            &mut state.scratch_utf16,
-            pixels,
-            width,
-            &meta_rect,
-            &pill.meta,
-            pill.meta_clock,
-            font_meta,
-            rows[2].1 as i32,
-            h_meta,
-            accent,
-            accent,
-            scale,
-            Some(MarqueeCtx {
-                scroll: &mut state.scroll[2],
-                strip: &mut state.marquee_strips[2],
-            }),
-        );
+        let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, meta_rect.bottom);
+        if unveil > 0.0 {
+            // `accent` here already carries the pass opacity; unveil is the
+            // row's share of it, so the clock icon and meta text fade with
+            // the row instead of popping at the edge.
+            let row_accent = dim_color(accent, unveil);
+            draw_meta_line_pixels(
+                &mut state.text_scratch,
+                &mut state.scratch_utf16,
+                pixels,
+                width,
+                &meta_rect,
+                &pill.meta,
+                pill.meta_clock,
+                font_meta,
+                rows[2].1 as i32,
+                h_meta,
+                row_accent,
+                row_accent,
+                scale,
+                Some(MarqueeCtx {
+                    scroll: &mut state.scroll[2],
+                    strip: &mut state.marquee_strips[2],
+                }),
+            );
+        }
     }
     if active[3] {
         let app_rect = next_band(3);
-        draw_source_app_row(
-            &mut state.text_scratch,
-            &mut state.scratch_utf16,
-            pixels,
-            width as usize,
-            &pill.source_app,
-            pill.app_icon.as_ref(),
-            &app_rect,
-            font_app,
-            h_app,
-            muted,
-            scale,
-            content_alpha,
-            Some(MarqueeCtx {
-                scroll: &mut state.scroll[3],
-                strip: &mut state.marquee_strips[3],
-            }),
-        );
+        let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, app_rect.bottom);
+        if unveil > 0.0 {
+            draw_source_app_row(
+                &mut state.text_scratch,
+                &mut state.scratch_utf16,
+                pixels,
+                width as usize,
+                &pill.source_app,
+                pill.app_icon.as_ref(),
+                &app_rect,
+                font_app,
+                h_app,
+                dim_color(muted, unveil),
+                scale,
+                content_alpha * unveil,
+                Some(MarqueeCtx {
+                    scroll: &mut state.scroll[3],
+                    strip: &mut state.marquee_strips[3],
+                }),
+            );
+        }
     }
 }
 
@@ -4052,7 +4114,10 @@ fn pill_text_from_track(track: &TrackInfo) -> PillText {
 /// compact content fades back in. The two fade windows (see `compact_alpha` /
 /// `expanded_alpha`) are disjoint in both directions, so the painter's order
 /// is irrelevant and each pass simply dims its own content over the opaque
-/// pill body.
+/// pill body. `body_bottom`/`rest_body_bottom` (the pill body's current and
+/// final bottom edges) additionally gate every expanded row to the animated
+/// edge via `row_unveil_alpha`: a row is not drawn until the edge has passed
+/// its band, so text can never render outside the growing/shrinking body.
 #[allow(clippy::too_many_arguments)]
 fn draw_text_pixels(
     state: &mut OverlayState,
@@ -4062,25 +4127,44 @@ fn draw_text_pixels(
     scale: f32,
     compact: bool,
     morph: Option<MorphProgress>,
+    body_bottom: i32,
+    rest_body_bottom: i32,
 ) {
     if let Some(progress) = morph {
         // The less-advanced axis: on expand the height (so content fades
         // with the geometry that is still arriving), on collapse the width
         // (so content fades with the geometry that is already leaving).
         let shape = progress.width.min(progress.height);
+        let expanded = expanded_alpha(shape);
         draw_compact_pill(state, pixels, content, width, scale, compact_alpha(shape));
-        draw_expanded_pill_text(state, pixels, content, width, scale, expanded_alpha(shape));
+        // The unveil gating keeps rows inside the body while the cross-fade
+        // alpha keeps the two passes from ever overlapping, so a visually
+        // empty window can occur between the passes on expand (compact gone
+        // by 0.35, rows not yet revealed) — that is the pill body alone,
+        // which reads as the content "catching up" with the growing shape.
+        draw_expanded_pill_text(
+            state,
+            pixels,
+            content,
+            width,
+            scale,
+            expanded,
+            body_bottom,
+            rest_body_bottom,
+        );
     } else if compact {
         draw_compact_pill(state, pixels, content, width, scale, 1.0);
     } else {
-        draw_expanded_pill_text(state, pixels, content, width, scale, 1.0);
+        draw_expanded_pill_text(state, pixels, content, width, scale, 1.0, body_bottom, rest_body_bottom);
     }
 }
 
 /// Draws the expanded layout's text rows (and the state-pill fallback) into
 /// the pixel buffer, at `content_alpha` (1.0 when no morph is running). The
 /// alpha multiplies every drawn color, so the whole content fades together
-/// as one pass of the morph's cross-fade.
+/// as one pass of the morph's cross-fade. `body_bottom`/`rest_body_bottom`
+/// (see `draw_pill_text_rows`) gate each row to the pill's animated bottom
+/// edge, so no text renders outside the body while it grows or shrinks.
 #[allow(clippy::too_many_arguments)]
 fn draw_expanded_pill_text(
     state: &mut OverlayState,
@@ -4089,6 +4173,8 @@ fn draw_expanded_pill_text(
     width: i32,
     scale: f32,
     content_alpha: f32,
+    body_bottom: i32,
+    rest_body_bottom: i32,
 ) {
     match content {
         MediaEvent::TrackChanged(track) => {
@@ -4105,6 +4191,8 @@ fn draw_expanded_pill_text(
                 &pill,
                 Some(PlaybackState::NowPlaying),
                 content_alpha,
+                body_bottom,
+                rest_body_bottom,
             );
             state.pill_text = Some(pill);
         }
@@ -4117,7 +4205,17 @@ fn draw_expanded_pill_text(
                 }
             });
             if let Some(pill) = pill {
-                draw_pill_text_rows(state, pixels, width, scale, &pill, Some(*playback), content_alpha);
+                draw_pill_text_rows(
+                    state,
+                    pixels,
+                    width,
+                    scale,
+                    &pill,
+                    Some(*playback),
+                    content_alpha,
+                    body_bottom,
+                    rest_body_bottom,
+                );
                 state.pill_text = Some(pill);
             } else {
                 // No cached track (the state change arrived before the first
@@ -4157,50 +4255,56 @@ fn draw_expanded_pill_text(
                 };
                 if let Some(name) = fallback_name {
                     let title_rect = next_band(fs_title * ROW_HEIGHT);
-                    let title_narrow = RECT {
-                        left: title_rect.left,
-                        top: title_rect.top,
-                        right: title_rect.right - label_w,
-                        bottom: title_rect.bottom,
-                    };
-                    draw_text_line_pixels(
-                        &mut state.text_scratch,
-                        &mut state.scratch_utf16,
-                        pixels,
-                        width as usize,
-                        name,
-                        &title_narrow,
-                        font_title,
-                        h_title,
-                        text_color,
-                        false,
-                        scale,
-                        None,
-                    );
-                    draw_symbol_pixels(
-                        pixels,
-                        width as usize,
-                        title_rect.right,
-                        title_rect.top,
-                        symbol_size,
-                        *playback,
-                        accent_color,
-                    );
-                    let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
-                    draw_text_line_pixels(
-                        &mut state.text_scratch,
-                        &mut state.scratch_utf16,
-                        pixels,
-                        width as usize,
-                        "Unknown",
-                        &artist_rect,
-                        font_artist,
-                        h_artist,
-                        dim_color([0xCC, 0xCC, 0xCC, 0xFF], content_alpha),
-                        false,
-                        scale,
-                        None,
-                    );
+                    let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, title_rect.bottom);
+                    if unveil > 0.0 {
+                        let title_narrow = RECT {
+                            left: title_rect.left,
+                            top: title_rect.top,
+                            right: title_rect.right - label_w,
+                            bottom: title_rect.bottom,
+                        };
+                        draw_text_line_pixels(
+                            &mut state.text_scratch,
+                            &mut state.scratch_utf16,
+                            pixels,
+                            width as usize,
+                            name,
+                            &title_narrow,
+                            font_title,
+                            h_title,
+                            dim_color(text_color, unveil),
+                            false,
+                            scale,
+                            None,
+                        );
+                        draw_symbol_pixels(
+                            pixels,
+                            width as usize,
+                            title_rect.right,
+                            title_rect.top,
+                            symbol_size,
+                            *playback,
+                            dim_color(accent_color, unveil),
+                        );
+                        let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
+                        let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, artist_rect.bottom);
+                        if unveil > 0.0 {
+                            draw_text_line_pixels(
+                                &mut state.text_scratch,
+                                &mut state.scratch_utf16,
+                                pixels,
+                                width as usize,
+                                "Unknown",
+                                &artist_rect,
+                                font_artist,
+                                h_artist,
+                                dim_color([0xCC, 0xCC, 0xCC, 0xFF], content_alpha * unveil),
+                                false,
+                                scale,
+                                None,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -7407,6 +7511,10 @@ mod tests {
             1.0,
             false,
             None,
+            // The buffer is the pill at its rest size: the body's bottom
+            // edges coincide, so every row is fully unveiled.
+            76,
+            76,
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 500, "expected text + art pixels, got {lit}");
@@ -7914,6 +8022,40 @@ mod tests {
         assert_eq!(dim_color([10, 20, 30, 255], 0.0), [10, 20, 30, 0]);
         // Out-of-range factors clamp.
         assert_eq!(dim_color([1, 2, 3, 128], 2.0), [1, 2, 3, 128]);
+    }
+
+    #[test]
+    fn row_unveil_is_full_at_rest_and_invisible_below_the_edge() {
+        // Rest body bottom 200, band bottom 160 (the row's final position
+        // inside the pill): at rest every row draws at full opacity.
+        assert_eq!(row_unveil_alpha(200, 200, 160), 1.0);
+        // While the edge is still above (or at) the band bottom the row must
+        // not draw at all: its band is not yet covered by the pill body.
+        assert_eq!(row_unveil_alpha(160, 200, 160), 0.0);
+        assert_eq!(row_unveil_alpha(120, 200, 160), 0.0);
+    }
+
+    #[test]
+    fn row_unveil_fades_with_the_sweep_of_the_edge() {
+        // The row fades in over the edge's travel from band bottom to rest
+        // bottom — halfway through that travel it is at half opacity — and
+        // the same window fades it back out on the way down (collapse).
+        let rest = 200;
+        let band = 160;
+        assert!((row_unveil_alpha(180, rest, band) - 0.5).abs() < 1e-5);
+        assert!((row_unveil_alpha(170, rest, band) - 0.25).abs() < 1e-5);
+        // Spring overshoot pushes the edge past the rest bottom: clamped.
+        assert_eq!(row_unveil_alpha(210, rest, band), 1.0);
+    }
+
+    #[test]
+    fn row_unveil_never_dims_a_band_at_the_rest_edge() {
+        // A band whose bottom reaches the rest edge is impossible with the
+        // constant-height pill layout (its `+ 8` slack), but must read as
+        // fully revealed rather than invisible if it ever occurs.
+        assert_eq!(row_unveil_alpha(200, 200, 200), 1.0);
+        // Any band bottom at or below the rest edge is drawable at rest.
+        assert_eq!(row_unveil_alpha(200, 200, 205), 1.0);
     }
 
     #[test]
