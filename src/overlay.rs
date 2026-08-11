@@ -2707,6 +2707,73 @@ fn contain_art(size: usize, y: usize, pill_h: usize, inset: usize) -> (usize, us
     (size, y)
 }
 
+/// The compact app icon's slot (side length and top-left corner, buffer px).
+/// Reproduces the exact rect `draw_compact_pill` draws at the 0 endpoint of
+/// an icon morph — `metrics.icon`, the title viewport's right edge, the 6 px
+/// gap and the integer centering are identical — so the morph's first frame
+/// is precisely the steady compact icon, not an approximation.
+fn compact_app_icon_rect(config: &Config, scale: f32, inset: i32) -> (i32, i32, i32) {
+    let metrics = compact_metrics(config);
+    let icon_size = (metrics.icon * scale).round() as i32;
+    let (_, title_vp_right) = compact_title_viewport(config);
+    let pill_h = compact_size(config).1 as i32;
+    let icon_x = inset + (title_vp_right * scale).round() as i32 + (6.0 * scale).round() as i32;
+    let icon_y = inset + (pill_h - icon_size) / 2;
+    (icon_x, icon_y, icon_size)
+}
+
+/// The expanded app icon's slot (the source-app row's icon), or `None` when
+/// the source-app row is inactive (no app name) — the expanded layout draws
+/// no icon then. The row rect reproduces `draw_pill_text_rows`'s band
+/// accumulation bit-for-bit (same f32 order, same truncation), so the 1
+/// endpoint of an icon morph is precisely the icon `draw_source_app_row`
+/// would draw in the steady expanded frame.
+fn expanded_app_icon_rect(config: &Config, scale: f32, pill: &PillText, inset: i32) -> Option<(i32, i32, i32)> {
+    if pill.source_app.trim().is_empty() {
+        return None;
+    }
+    let appearance = &config.appearance;
+    let pad = appearance.padding;
+    let fs_title = appearance.font_size_title * scale;
+    let fs_artist = appearance.font_size_artist * scale;
+    let fs_meta = fs_artist * 0.85;
+    let fs_app = fs_artist * 0.85;
+    // Same accumulation order as `draw_pill_text_rows`'s `next_band` closure.
+    let mut y = inset as f32 + pad * scale;
+    y += fs_title * ROW_HEIGHT;
+    if !pill.artist.trim().is_empty() {
+        y += fs_artist * ROW_HEIGHT;
+    }
+    if !pill.meta.is_empty() {
+        y += fs_meta * ROW_HEIGHT;
+    }
+    let band_h = (y + fs_app * ROW_HEIGHT) as i32 - y as i32;
+    let icon_size = ((16.0 * scale).round() as i32).min(band_h);
+    let padding = (pad * scale) as i32;
+    let art = (appearance.art_size as f32 * scale) as i32;
+    let icon_x = inset + padding + art + (12.0 * scale) as i32;
+    let icon_y = y as i32 + (band_h - icon_size) / 2;
+    Some((icon_x, icon_y, icon_size))
+}
+
+/// The app icon's slot during a morph: the compact and expanded slots lerped
+/// by the leading (width) axis's progress — the same axis `morph_radius` and
+/// `morph_art_rect` use, so the icon travels with the silhouette the eye is
+/// tracking. One continuously-moving icon replaces the two independently-
+/// drawn icons the cross-fade used to dissolve between; it renders at full
+/// opacity because the movement IS the animation (the compact and expanded
+/// passes skip their own icons while a morph is in flight, so it never
+/// doubles). Clamped between the endpoints, so a spring overshoot can never
+/// push it past either slot.
+fn morph_icon_rect(compact: (i32, i32, i32), expanded: (i32, i32, i32), progress: MorphProgress) -> (i32, i32, i32) {
+    let p = progress.width.clamp(0.0, 1.0);
+    (
+        (compact.0 as f32 + (expanded.0 - compact.0) as f32 * p).round() as i32,
+        (compact.1 as f32 + (expanded.1 - compact.1) as f32 * p).round() as i32,
+        (compact.2 as f32 + (expanded.2 - compact.2) as f32 * p).round() as i32,
+    )
+}
+
 /// The compact content's opacity during a morph, keyed to the shape
 /// progress — the LESS-advanced of the two axes (see `draw_text_pixels`):
 /// it holds fully visible while the pill stays compact-shaped, then
@@ -3998,6 +4065,7 @@ fn draw_pill_text_rows(
     content_alpha: f32,
     body_bottom: i32,
     rest_body_bottom: i32,
+    skip_app_icon: bool,
 ) {
     let inset = state.aura_inset;
     let appearance = &state.config.appearance;
@@ -4182,6 +4250,7 @@ fn draw_pill_text_rows(
                 dim_color(muted, unveil),
                 scale,
                 content_alpha * unveil,
+                skip_app_icon,
                 Some(MarqueeCtx {
                     scroll: &mut state.scroll[3],
                     strip: &mut state.marquee_strips[3],
@@ -4248,6 +4317,38 @@ fn draw_text_pixels(
             compact_alpha(shape),
             Some(progress),
         );
+        // The app icon is a second continuous element, drawn between the two
+        // cross-fade passes: one icon lerps between the compact inline slot
+        // and the expanded source-app-row slot (see `morph_icon_rect`) at
+        // full opacity — the movement IS the animation, exactly like the art
+        // tile — so both passes skip their own icon draws while a morph is
+        // in flight. The condition mirrors the compact-pass skip above and
+        // the row-4 skip below: the icon is continuous only when the
+        // expanded endpoint actually has one (the source-app row is active);
+        // otherwise it belongs to the compact content and dissolves with it.
+        let skip_app_icon = state
+            .pill_text
+            .as_ref()
+            .is_some_and(|p| p.app_icon.is_some() && !p.source_app.trim().is_empty());
+        if let Some(pill) = state.pill_text.as_ref()
+            && let (Some(icon), Some(end)) = (
+                pill.app_icon.as_ref(),
+                expanded_app_icon_rect(&state.config, scale, pill, state.aura_inset),
+            )
+        {
+            let start = compact_app_icon_rect(&state.config, scale, state.aura_inset);
+            let (x, y, size) = morph_icon_rect(start, end, progress);
+            draw_icon_scaled(
+                pixels,
+                width as usize,
+                icon,
+                24,
+                x as usize,
+                y as usize,
+                size as usize,
+                1.0,
+            );
+        }
         // The unveil gating keeps rows inside the body while the cross-fade
         // alpha keeps the two passes from ever overlapping, so a visually
         // empty window can occur between the passes on expand (compact gone
@@ -4262,11 +4363,22 @@ fn draw_text_pixels(
             expanded,
             body_bottom,
             rest_body_bottom,
+            skip_app_icon,
         );
     } else if compact {
         draw_compact_pill(state, pixels, content, width, scale, 1.0, None);
     } else {
-        draw_expanded_pill_text(state, pixels, content, width, scale, 1.0, body_bottom, rest_body_bottom);
+        draw_expanded_pill_text(
+            state,
+            pixels,
+            content,
+            width,
+            scale,
+            1.0,
+            body_bottom,
+            rest_body_bottom,
+            false,
+        );
     }
 }
 
@@ -4276,6 +4388,9 @@ fn draw_text_pixels(
 /// as one pass of the morph's cross-fade. `body_bottom`/`rest_body_bottom`
 /// (see `draw_pill_text_rows`) gate each row to the pill's animated bottom
 /// edge, so no text renders outside the body while it grows or shrinks.
+/// `skip_app_icon` (morphs only) suppresses the source-app row's own icon
+/// draw: the morphing frame's icon is the single continuously-lerped element
+/// drawn by `draw_text_pixels` (see `morph_icon_rect`).
 #[allow(clippy::too_many_arguments)]
 fn draw_expanded_pill_text(
     state: &mut OverlayState,
@@ -4286,6 +4401,7 @@ fn draw_expanded_pill_text(
     content_alpha: f32,
     body_bottom: i32,
     rest_body_bottom: i32,
+    skip_app_icon: bool,
 ) {
     match content {
         MediaEvent::TrackChanged(track) => {
@@ -4304,6 +4420,7 @@ fn draw_expanded_pill_text(
                 content_alpha,
                 body_bottom,
                 rest_body_bottom,
+                skip_app_icon,
             );
             state.pill_text = Some(pill);
         }
@@ -4326,6 +4443,7 @@ fn draw_expanded_pill_text(
                     content_alpha,
                     body_bottom,
                     rest_body_bottom,
+                    skip_app_icon,
                 );
                 state.pill_text = Some(pill);
             } else {
@@ -4437,7 +4555,10 @@ fn draw_expanded_pill_text(
 /// reads as the pill growing around it. While a morph is in flight
 /// (`morph.is_some()`) the art draw is skipped: the morphing frame's art is
 /// the single continuously-scaling tile drawn by `draw_pixels` (see
-/// `morph_art_rect`), so the halo, cover and rim composite exactly once.
+/// `morph_art_rect`), so the halo, cover and rim composite exactly once. The
+/// app icon draw is skipped the same way when the expanded endpoint shows
+/// one (see `morph_icon_rect`); otherwise it stays and dissolves with the
+/// compact content.
 #[allow(clippy::too_many_arguments)]
 fn draw_compact_pill(
     state: &mut OverlayState,
@@ -4502,12 +4623,12 @@ fn draw_compact_pill(
         bottom: band_top + row_h,
     };
 
-    let (title, app_icon, playback) = match content {
+    let (title, app_icon, source_app, playback) = match content {
         MediaEvent::TrackChanged(track) => {
             let pill = state.pill_text.take().unwrap_or_else(|| pill_text_from_track(track));
-            let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
+            let (title, app_icon, source_app) = (pill.title.clone(), pill.app_icon.clone(), pill.source_app.clone());
             state.pill_text = Some(pill);
-            (title, app_icon, PlaybackState::NowPlaying)
+            (title, app_icon, source_app, PlaybackState::NowPlaying)
         }
         MediaEvent::PlaybackStateChanged(playback, source_app) => {
             let pill = state.pill_text.take().or_else(|| {
@@ -4519,9 +4640,10 @@ fn draw_compact_pill(
             });
             match pill {
                 Some(pill) => {
-                    let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
+                    let (title, app_icon, source_app) =
+                        (pill.title.clone(), pill.app_icon.clone(), pill.source_app.clone());
                     state.pill_text = Some(pill);
-                    (title, app_icon, *playback)
+                    (title, app_icon, source_app, *playback)
                 }
                 // No cached track (the state change arrived before the first
                 // TrackChanged): the source name stands in for the title, and
@@ -4532,7 +4654,7 @@ fn draw_compact_pill(
                     } else {
                         state.current_source.clone().unwrap_or_default()
                     };
-                    (name, None, *playback)
+                    (name, None, String::new(), *playback)
                 }
             }
         }
@@ -4569,7 +4691,15 @@ fn draw_compact_pill(
     let viewport_right = inset + (title_vp_right * scale).round() as i32;
     let icon_x = viewport_right + gap;
     let icon_y = inset + (pill_h - icon_size) / 2;
-    if let Some(icon) = app_icon {
+    // While a morph is in flight the icon is the single continuously-lerped
+    // element drawn by `draw_text_pixels` (see `morph_icon_rect`) — but only
+    // when the expanded endpoint actually shows one (the source-app row is
+    // active). Otherwise the icon exists only in the compact layout, so this
+    // draw stays and dissolves with the compact content. The slot math is
+    // computed unconditionally: `symbol_right` below derives from it.
+    if (morph.is_none() || source_app.trim().is_empty())
+        && let Some(icon) = app_icon
+    {
         draw_icon_scaled(
             pixels,
             width as usize,
@@ -5234,7 +5364,10 @@ fn draw_icon_scaled(
 /// 16px base, DPI-scaled and capped at the row band, followed by the app-name
 /// text. The text glyphs sit centered in the band, so the icon is centered on
 /// the same midpoint to line up with them. Without an icon the text renders
-/// at the band's left edge, as before the icon was added.
+/// at the band's left edge, as before the icon was added. `skip_app_icon`
+/// (morphs only) suppresses the icon draw but keeps the text offset: the
+/// morphing frame's icon is the single continuously-lerped element drawn by
+/// `draw_text_pixels` (see `morph_icon_rect`), occupying the exact same slot.
 #[allow(clippy::too_many_arguments)]
 fn draw_source_app_row(
     text_scratch: &mut Option<TextScratch>,
@@ -5249,6 +5382,7 @@ fn draw_source_app_row(
     color: [u8; 4],
     scale: f32,
     content_alpha: f32,
+    skip_app_icon: bool,
     marquee: Option<MarqueeCtx<'_>>,
 ) {
     if let Some(icon) = app_icon {
@@ -5258,7 +5392,9 @@ fn draw_source_app_row(
         let icon_size = ((16.0 * scale).round() as usize).min(band_h);
         let icon_x = rect.left as usize;
         let icon_y = rect.top as usize + (band_h - icon_size) / 2;
-        draw_icon_scaled(pixels, width, icon, 24, icon_x, icon_y, icon_size, content_alpha);
+        if !skip_app_icon {
+            draw_icon_scaled(pixels, width, icon, 24, icon_x, icon_y, icon_size, content_alpha);
+        }
         let text_rect = RECT {
             left: rect.left + icon_size as i32 + 6,
             ..*rect
@@ -8240,6 +8376,117 @@ mod tests {
             contain_art(80, 100, pill_h, inset),
             (51, 15),
             "the bottom edge of the clamped tile touches the body's bottom edge"
+        );
+    }
+
+    #[test]
+    fn morph_icon_rect_lerps_between_the_two_slots_and_never_overshoots() {
+        // The morphing app icon lerps between the compact inline slot and
+        // the expanded source-app-row slot on the leading (width) axis —
+        // the same axis `morph_radius` and `morph_art_rect` use. The height
+        // axis never influences it, and a spring overshoot can never push
+        // it past either slot.
+        let compact = (235, 17, 16);
+        let expanded = (75, 69, 14);
+        let at = |width: f32, height: f32| MorphProgress { width, height };
+        assert_eq!(
+            morph_icon_rect(compact, expanded, at(0.0, 0.7)),
+            compact,
+            "the 0 endpoint is the compact slot"
+        );
+        assert_eq!(
+            morph_icon_rect(compact, expanded, at(1.0, 0.1)),
+            expanded,
+            "the 1 endpoint is the expanded slot"
+        );
+        assert_eq!(
+            morph_icon_rect(compact, expanded, at(0.5, 0.5)),
+            (155, 43, 15),
+            "mid-morph the icon must sit halfway"
+        );
+        assert_eq!(
+            morph_icon_rect(compact, expanded, at(0.5, 0.0)),
+            morph_icon_rect(compact, expanded, at(0.5, 1.0)),
+            "the height axis must not move the icon"
+        );
+        assert_eq!(
+            morph_icon_rect(compact, expanded, at(1.3, 0.0)),
+            expanded,
+            "an overshoot must clamp to the expanded slot"
+        );
+        assert_eq!(
+            morph_icon_rect(compact, expanded, at(-0.2, 0.0)),
+            compact,
+            "a below-zero reversal must clamp to the compact slot"
+        );
+    }
+
+    #[test]
+    fn compact_app_icon_rect_is_the_steady_inline_slot() {
+        // The 0 endpoint of the icon morph must be the exact slot the
+        // compact draw places the icon in when no morph is running: the
+        // 16 px icon, one 6 px gap past the title viewport's right edge,
+        // vertically centered in the compact pill height. The values are
+        // derived from the default config at scale 1.0 by hand (see
+        // `compact_size` / `compact_title_viewport`); the aura inset shifts
+        // both axes.
+        let config = Config::default();
+        assert_eq!(
+            compact_app_icon_rect(&config, 1.0, 0),
+            (235, 17, 16),
+            "default slot: 16 px, 6 px past the viewport, vertically centered"
+        );
+        assert_eq!(
+            compact_app_icon_rect(&config, 1.0, 15),
+            (250, 32, 16),
+            "the aura inset shifts both axes"
+        );
+    }
+
+    #[test]
+    fn expanded_app_icon_rect_reproduces_the_row_band_accumulation() {
+        // The 1 endpoint of the icon morph must be the exact icon
+        // `draw_source_app_row` draws in the steady expanded frame. The row
+        // rect comes from `draw_pill_text_rows`'s band accumulation, so the
+        // expected values below are computed from the default config's fonts
+        // by hand (title 16 * 1.35, artist 13 * 1.35, meta/app 13*0.85*1.35,
+        // stacked from the inset + padding top, truncated like the draw
+        // path). A missing artist or meta row moves the app row up by
+        // exactly that band; an empty source name means the row is inactive
+        // and the expanded layout draws no icon at all.
+        let pill = |artist: &str, meta: &str, source: &str| PillText {
+            title: "t".into(),
+            artist: artist.into(),
+            source_app: source.into(),
+            app_icon: None,
+            meta_clock: false,
+            meta: meta.into(),
+        };
+        let config = Config::default();
+        assert_eq!(
+            expanded_app_icon_rect(&config, 1.0, &pill("a", "m", "Spotify"), 0),
+            Some((75, 69, 14)),
+            "all rows: the icon is capped at the app band's height"
+        );
+        assert_eq!(
+            expanded_app_icon_rect(&config, 1.0, &pill("", "m", "Spotify"), 0),
+            Some((75, 51, 15)),
+            "without the artist row the icon sits one artist band higher"
+        );
+        assert_eq!(
+            expanded_app_icon_rect(&config, 1.0, &pill("a", "", "Spotify"), 0),
+            Some((75, 54, 15)),
+            "without the meta row the icon sits one meta band higher"
+        );
+        assert_eq!(
+            expanded_app_icon_rect(&config, 1.0, &pill("", "", "Spotify"), 0),
+            Some((75, 36, 15)),
+            "without both rows the icon sits two bands higher"
+        );
+        assert_eq!(
+            expanded_app_icon_rect(&config, 1.0, &pill("a", "m", ""), 0),
+            None,
+            "an empty source app means the row is inactive: no icon"
         );
     }
 
