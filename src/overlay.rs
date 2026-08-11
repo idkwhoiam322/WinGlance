@@ -4,7 +4,7 @@ use crate::events::{
 };
 use crate::gdi::FontProvider;
 use crate::palette::Palette;
-use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
+use crate::winutil::{StateClaim, clear_window_state, set_window_state, wide, window_state};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
@@ -3014,9 +3014,8 @@ pub(crate) fn show_sample(hwnd: HWND) {
 /// Set when this window's WM_NCCREATE claims the state box handed over in
 /// `lpCreateParams`, so a failed CreateWindowExW can tell whether the box was
 /// taken by the system (and freed in WM_NCDESTROY) or still belongs to the
-/// caller. Window creation is single-threaded on the UI thread, so a plain
-/// atomic flag per window class is race-free.
-static OVERLAY_STATE_CLAIMED: AtomicBool = AtomicBool::new(false);
+/// caller. See `winutil::StateClaim` for the shared mechanics.
+static OVERLAY_STATE_CLAIMED: StateClaim = StateClaim::new();
 /// The overlay window handle the `EVENT_SYSTEM_FOREGROUND` hook callback
 /// forwards its message to. Written once in `create_window` (after the overlay
 /// window succeeds) and cleared in `WM_NCDESTROY`; a racing callback that fires
@@ -3037,7 +3036,7 @@ pub(crate) fn create_window(config: Config, queue: EventQueue, wake: Arc<AtomicB
     let mut state = Box::new(OverlayState::new(config, queue));
     state.wake = wake;
     let state_ptr = Box::into_raw(state);
-    OVERLAY_STATE_CLAIMED.store(false, Ordering::SeqCst);
+    OVERLAY_STATE_CLAIMED.reset();
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
@@ -3093,10 +3092,8 @@ pub(crate) fn create_window(config: Config, queue: EventQueue, wake: Arc<AtomicB
             // be freed here — otherwise it leaks. When WM_NCCREATE did run,
             // the system tears the window down through WM_NCDESTROY first, so
             // freeing the box here would double-free it.
-            if !OVERLAY_STATE_CLAIMED.load(Ordering::SeqCst) {
-                unsafe {
-                    drop(Box::from_raw(state_ptr));
-                }
+            if let Some(state) = OVERLAY_STATE_CLAIMED.take_unclaimed(state_ptr) {
+                drop(state);
             }
             Err(error.into())
         }
@@ -5903,7 +5900,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if !state.is_null() {
                 set_window_state(hwnd, state);
                 (*state).hwnd = hwnd;
-                OVERLAY_STATE_CLAIMED.store(true, Ordering::SeqCst);
+                OVERLAY_STATE_CLAIMED.claim();
             }
         }
     }
