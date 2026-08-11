@@ -1491,6 +1491,20 @@ fn register_current_session_handler(
     Ok(manager.CurrentSessionChanged(&handler)?)
 }
 
+/// Maps a session to the identity key used across `subscriptions`, `states`
+/// and the dirty queues. The raw COM pointer is a sound key under three
+/// invariants:
+///
+/// - Identity: COM guarantees that, for one interface, two pointers are
+///   equal if and only if they refer to the same object (the identity rule),
+///   so pointer equality here *is* object identity.
+/// - Liveness: every key originates from a session object that is alive at
+///   the moment it is taken (fetched from the manager, or delivered by a
+///   handler), and `SessionSubscription` keeps a strong reference to it —
+///   the address cannot be freed and recycled while its key is stored.
+/// - Staleness: `sync_subscriptions` evicts every key whose object is no
+///   longer in the manager's session list, so a recycled address cannot be
+///   mistaken for a live session.
 fn session_key(session: &GlobalSystemMediaTransportControlsSession) -> usize {
     session.as_raw() as usize
 }
