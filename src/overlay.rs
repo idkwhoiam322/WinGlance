@@ -2662,7 +2662,14 @@ impl OverlayState {
         self.reset_scroll();
         let now = Instant::now();
         self.dismiss_at = Some(now + sample_duration(&self.config));
+        // A fresh pill must not inherit hover state from the previous one
+        // (same reset `show_with_duration` and `hide` perform): a stale
+        // `hover_expand` would render the sample already mid-morph or fully
+        // expanded with the cursor nowhere near it, and seed the sample's
+        // collapse from a velocity that belonged to a different hover.
         self.hover_dismiss_at = None;
+        self.hover_expand = None;
+        self.hover_expanded_once = false;
         self.hover_leave_at = None;
         self.phase = Phase::Light(now);
         self.sync_anim_timer();
@@ -8125,6 +8132,44 @@ mod tests {
             "a visible pill must not be replaced by a sample"
         );
         assert!(matches!(state.phase, Phase::Shown));
+    }
+
+    #[test]
+    fn show_sample_clears_stale_hover_state() {
+        // Regression: show_sample reset hover_dismiss_at/hover_leave_at but
+        // not hover_expand/hover_expanded_once — the one "new pill" entry
+        // point that didn't. A sample shown right after a hover morph (the
+        // collapse leg can still be in flight when the user opens Settings
+        // and hits "Show sample") would inherit the real pill's expansion:
+        // mid-morph or fully expanded with the cursor nowhere near it, and a
+        // bogus collapse seeded from another hover's velocity.
+        let mut config = Config::default();
+        config.overlay.compact_hover_action = CompactHoverAction::Expand;
+        config.overlay.layout = LayoutMode::Compact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.hover_expand = Some(HoverExpand {
+            start: Instant::now() - Duration::from_millis(50),
+            direction: MorphDirection::Expand,
+            from: 0.5,
+            velocity: 2.0,
+            done: false,
+        });
+        state.hover_expanded_once = true;
+
+        state.show_sample();
+
+        assert!(
+            state.hover_expand.is_none(),
+            "the sample must not inherit an in-flight hover morph"
+        );
+        assert!(
+            !state.hover_expanded_once,
+            "the sample must reset the expanded-once flag"
+        );
+        assert!(
+            matches!(state.phase, Phase::Light(_)),
+            "the sample must take the light-up phase"
+        );
     }
 
     #[test]
