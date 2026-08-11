@@ -2038,7 +2038,27 @@ impl OverlayState {
         }
         let dpi = raw_dpi as f32 / 96.0;
         let compact = self.layout == LayoutMode::Compact;
-        let morphing = self.hover_expand.is_some() || frame.morph.is_some();
+        // One morph per frame, resolved by construction: the hover leg and
+        // the entrance/exit grow are mutually exclusive — the hover morph is
+        // only ever started while the pill is fully shown (`Phase::Shown`,
+        // see the hover step in `tick`), where `frame.morph` is None, and it
+        // is cleared the moment the pill leaves Shown (dismiss, collapse,
+        // hide). Prefer the hover leg when both look present, the same rule
+        // the sizing below uses, so the progress that sizes the window is
+        // always the one that renders it. Without this the hover leg's
+        // progress was computed for sizing and then discarded: the render
+        // got `frame.morph` (None during Shown), so the corner radius
+        // snapped to the expanded value and the two art tiles never
+        // cross-faded on the very first hover frame.
+        let morph = if let Some(hover) = &self.hover_expand {
+            debug_assert!(
+                frame.morph.is_none(),
+                "the hover morph must not overlap the entrance/exit grow"
+            );
+            Some(hover_progress(hover, &self.config))
+        } else {
+            frame.morph
+        };
         // A hover morph lerps the window size between the compact and the
         // expanded pill, drawing the expanded content into the growing
         // window (a clip-reveal); the anchor stays the compact position, so
@@ -2068,8 +2088,11 @@ impl OverlayState {
             dpi,
             frame.alpha,
             position,
-            compact && !morphing,
-            frame.morph,
+            // A morphing frame always renders the expanded pass; `compact`
+            // and `morph` can never disagree about whether a morph is in
+            // flight (`compact` is derived from the same `morph`).
+            compact && morph.is_none(),
+            morph,
         );
         self.content = Some(content);
         if let Err(error) = result {
@@ -2647,6 +2670,41 @@ fn grow_size(config: &Config, content: &MediaEvent, progress: MorphProgress) -> 
 fn morph_radius(compact_radius: f32, expanded_radius: f32, progress: MorphProgress) -> f32 {
     let p = progress.width.clamp(0.0, 1.0);
     compact_radius + (expanded_radius - compact_radius) * p
+}
+
+/// The art tile's size and vertical position during a morph: the compact and
+/// expanded art tiles' values lerped by the leading (width) axis's progress —
+/// the same axis `morph_radius` uses, so the art square scales with the
+/// silhouette the eye is tracking. One continuously-scaling tile replaces the
+/// two independently-sized, independently-positioned tiles the cross-fade
+/// used to dissolve between. The axis choice is a starting point, not a
+/// certainty: the width leads both legs, so on expand the art reaches its
+/// expanded spot before the height has finished growing (and on collapse it
+/// shrinks back ahead of the height) — eyeball whether the height axis or a
+/// `min` of both tracks the pill better.
+fn morph_art_rect(
+    compact_art: f32,
+    compact_y: f32,
+    expanded_art: f32,
+    expanded_y: f32,
+    progress: MorphProgress,
+) -> (f32, f32) {
+    let p = progress.width.clamp(0.0, 1.0);
+    (
+        compact_art + (expanded_art - compact_art) * p,
+        compact_y + (expanded_y - compact_y) * p,
+    )
+}
+
+/// Clamps a morphing art tile inside the current pill body: the size to the
+/// body height (an interpolated value can briefly exceed the still-short
+/// pill very early in an expand when the configured art is unusually large)
+/// and the top so the tile never crosses the body's bottom edge. Neither
+/// clamp bites at the morph endpoints, so the seam stays exact.
+fn contain_art(size: usize, y: usize, pill_h: usize, inset: usize) -> (usize, usize) {
+    let size = size.min(pill_h);
+    let y = y.min(inset + pill_h - size);
+    (size, y)
 }
 
 /// The compact content's opacity during a morph, keyed to the shape
@@ -3305,18 +3363,48 @@ fn draw_pixels(
     // and the trailing icon/symbol) in `draw_compact_pill`; drawing it here
     // as well would composite the halo, the cover and the rim twice. The
     // expanded pills draw the art tile at the configured art size. During a
-    // morph this is the expanded-content pass of the cross-fade: it fades
-    // in keyed to the height axis (see `expanded_alpha`), while the compact
-    // pass fades out keyed to the width axis in `draw_text_pixels`.
+    // morph the art is a single continuously-scaling tile (see
+    // `morph_art_rect`): `draw_compact_pill` skips its own art draw while a
+    // morph is in flight, and this path draws the tile once, lerped between
+    // the compact and expanded rects at full opacity — the scaling IS the
+    // animation, so the art never dissolves between two squares and never
+    // fades with the cross-fade (the text rows still cross-fade on their
+    // own via `compact_alpha`/`expanded_alpha`).
     if !compact {
-        let content_alpha = morph.map_or(1.0, |m| expanded_alpha(m.height));
+        let padding = (state.config.appearance.padding * scale).round() as usize;
+        let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
+        // The compact endpoint of the art lerp — the exact rect
+        // `draw_compact_pill` draws when no morph is running (`inset` and the
+        // integer division/rounding are identical), so the 0 endpoint of a
+        // morph is precisely the compact tile, not an approximation of it.
+        let metrics = compact_metrics(&state.config);
+        let compact_art = (metrics.art * scale).round() as i32;
+        let compact_h = compact_size(&state.config).1 as i32;
+        let compact_y = inset as i32 + (compact_h - compact_art) / 2;
         match content {
             MediaEvent::TrackChanged(_) => {
-                let padding = (state.config.appearance.padding * scale).round() as usize;
-                let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
+                // The morphing frame draws one continuously-scaling tile
+                // between the compact and the expanded rect (see
+                // `morph_art_rect`) at full opacity: the scaling is the
+                // animation, and the halo, cover and rim composite exactly
+                // once (`draw_compact_pill` skips its own art draw while a
+                // morph is in flight). The text rows still cross-fade on
+                // their own via `compact_alpha`/`expanded_alpha`.
+                let (art_size, art_y) = match morph {
+                    Some(progress) => {
+                        let (size, y) = morph_art_rect(
+                            compact_art as f32,
+                            compact_y as f32,
+                            art_size as f32,
+                            (inset + pill_h.saturating_sub(art_size) / 2) as f32,
+                            progress,
+                        );
+                        contain_art(size.round() as usize, y.round() as usize, pill_h, inset)
+                    }
+                    None => (art_size, inset + pill_h.saturating_sub(art_size) / 2),
+                };
                 let art_radius = art_size as f32 * 0.2;
                 let art_x = inset + padding;
-                let art_y = inset + pill_h.saturating_sub(art_size) / 2;
                 draw_art_tile(
                     pixels,
                     width,
@@ -3328,7 +3416,7 @@ fn draw_pixels(
                     art_radius,
                     state.decoded_art.as_deref(),
                     scale,
-                    content_alpha,
+                    1.0,
                 );
             }
             MediaEvent::PlaybackStateChanged(_, _) => {
@@ -3336,13 +3424,28 @@ fn draw_pixels(
                 // produced the state change, so a pause/play pill still shows the
                 // right cover. Falls back to the accent placeholder when nothing
                 // has been cached for this source yet. The art size is clamped to
-                // the pill body: the state-pill layout reserves no extra rows.
-                let padding = (state.config.appearance.padding * scale).round() as usize;
-                let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
-                let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
+                // the pill body: the state-pill layout reserves no extra rows, and
+                // the morph's expanded endpoint reproduces the same clamp so it
+                // cannot diverge from the steady frame that follows.
+                let (art_size, art_y) = match morph {
+                    Some(progress) => {
+                        let expanded_size = art_size.min(pill_h.saturating_sub(2 * padding)) as f32;
+                        let (size, y) = morph_art_rect(
+                            compact_art as f32,
+                            compact_y as f32,
+                            expanded_size,
+                            (inset + pill_h.saturating_sub(expanded_size as usize) / 2) as f32,
+                            progress,
+                        );
+                        contain_art(size.round() as usize, y.round() as usize, pill_h, inset)
+                    }
+                    None => {
+                        let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
+                        (art_size, inset + pill_h.saturating_sub(art_size) / 2)
+                    }
+                };
                 let art_radius = art_size as f32 * 0.2;
                 let art_x = inset + padding;
-                let art_y = inset + pill_h.saturating_sub(art_size) / 2;
                 draw_art_tile(
                     pixels,
                     width,
@@ -3354,7 +3457,7 @@ fn draw_pixels(
                     art_radius,
                     state.decoded_art.as_deref(),
                     scale,
-                    content_alpha,
+                    1.0,
                 );
             }
             // Never rendered: SessionRejected is filtered out before enqueue.
@@ -4136,7 +4239,15 @@ fn draw_text_pixels(
         // (so content fades with the geometry that is already leaving).
         let shape = progress.width.min(progress.height);
         let expanded = expanded_alpha(shape);
-        draw_compact_pill(state, pixels, content, width, scale, compact_alpha(shape));
+        draw_compact_pill(
+            state,
+            pixels,
+            content,
+            width,
+            scale,
+            compact_alpha(shape),
+            Some(progress),
+        );
         // The unveil gating keeps rows inside the body while the cross-fade
         // alpha keeps the two passes from ever overlapping, so a visually
         // empty window can occur between the passes on expand (compact gone
@@ -4153,7 +4264,7 @@ fn draw_text_pixels(
             rest_body_bottom,
         );
     } else if compact {
-        draw_compact_pill(state, pixels, content, width, scale, 1.0);
+        draw_compact_pill(state, pixels, content, width, scale, 1.0, None);
     } else {
         draw_expanded_pill_text(state, pixels, content, width, scale, 1.0, body_bottom, rest_body_bottom);
     }
@@ -4323,7 +4434,10 @@ fn draw_expanded_pill_text(
 /// running) dims the whole content as one pass of the morph's cross-fade.
 /// The vertical centering anchors to the *compact* pill height, so while a
 /// morph grows the window the compact content stays put and the extra space
-/// reads as the pill growing around it.
+/// reads as the pill growing around it. While a morph is in flight
+/// (`morph.is_some()`) the art draw is skipped: the morphing frame's art is
+/// the single continuously-scaling tile drawn by `draw_pixels` (see
+/// `morph_art_rect`), so the halo, cover and rim composite exactly once.
 #[allow(clippy::too_many_arguments)]
 fn draw_compact_pill(
     state: &mut OverlayState,
@@ -4332,6 +4446,7 @@ fn draw_compact_pill(
     width: i32,
     scale: f32,
     content_alpha: f32,
+    morph: Option<MorphProgress>,
 ) {
     let inset = state.aura_inset;
     let appearance = &state.config.appearance;
@@ -4351,23 +4466,28 @@ fn draw_compact_pill(
     // vertically centered on the row. This is the only place the compact
     // art is drawn — `draw_pixels` skips its art arms in compact mode, so
     // the halo, cover and rim composite exactly once. The placeholder is
-    // drawn here too when no cover is available.
-    let art_size = (metrics.art * scale).round() as i32;
-    let art_x = inset + padding;
-    let art_y = inset + (pill_h - art_size) / 2;
-    draw_art_tile(
-        pixels,
-        width as usize,
-        state.palette,
-        appearance.accent_color,
-        art_x as usize,
-        art_y as usize,
-        art_size as usize,
-        art_size as f32 * 0.2,
-        state.decoded_art.as_deref(),
-        scale,
-        content_alpha,
-    );
+    // drawn here too when no cover is available. While a morph is in flight
+    // the art draw is skipped: the morphing frame draws the single
+    // continuously-scaling tile in `draw_pixels` (see `morph_art_rect`),
+    // which composites the halo, cover and rim exactly once there instead.
+    if morph.is_none() {
+        let art_size = (metrics.art * scale).round() as i32;
+        let art_x = inset + padding;
+        let art_y = inset + (pill_h - art_size) / 2;
+        draw_art_tile(
+            pixels,
+            width as usize,
+            state.palette,
+            appearance.accent_color,
+            art_x as usize,
+            art_y as usize,
+            art_size as usize,
+            art_size as f32 * 0.2,
+            state.decoded_art.as_deref(),
+            scale,
+            content_alpha,
+        );
+    }
 
     // Title row band: the title font's own row height, vertically centered
     // in the pill.
@@ -7965,6 +8085,162 @@ mod tests {
             },
         );
         assert_eq!(under, compact_r);
+    }
+
+    #[test]
+    fn hover_morph_radius_is_exactly_continuous_with_the_discrete_layout_radii() {
+        // Regression pin for the hover-morph wiring (see `render`): the
+        // hover leg's progress must reach the render, and the morphing
+        // radius it drives must equal the discrete layout radii bit-for-bit
+        // at the leg endpoints — otherwise the first/last hover frame snaps
+        // the corners. Both paths run through the real production chain:
+        // `hover_progress` -> `morph_radius` -> `effective_corner_radius`.
+        let config = Config::default();
+        let (compact_r, expanded_r) = (config.appearance.compact_corner_radius, config.appearance.corner_radius);
+        assert_eq!(
+            config.appearance.effective_corner_radius(true),
+            compact_r,
+            "precondition: the effective compact radius is the compact radius"
+        );
+        // The exit seam: a finished collapse leg pins both axes at exactly
+        // 0.0 (the springs pin at the leg end), so the frame that hands off
+        // to the steady compact render draws the compact radius exactly.
+        let finished_collapse = HoverExpand {
+            start: Instant::now() - morph_duration(&config, MorphDirection::Collapse),
+            direction: MorphDirection::Collapse,
+            from: 1.0,
+            velocity: 0.0,
+            done: true,
+        };
+        let progress = hover_progress(&finished_collapse, &config);
+        assert_eq!(
+            progress,
+            MorphProgress {
+                width: 0.0,
+                height: 0.0
+            },
+            "a finished collapse must land exactly on compact"
+        );
+        assert_eq!(
+            morph_radius(compact_r, expanded_r, progress),
+            config.appearance.effective_corner_radius(true),
+            "the 0 endpoint must equal the compact layout's discrete radius exactly"
+        );
+        // The entry seam, far end: a finished expand leg pins at exactly
+        // 1.0, matching the expanded discrete radius exactly.
+        let finished_expand = HoverExpand {
+            start: Instant::now() - morph_duration(&config, MorphDirection::Expand),
+            direction: MorphDirection::Expand,
+            from: 0.0,
+            velocity: 0.0,
+            done: true,
+        };
+        let progress = hover_progress(&finished_expand, &config);
+        assert_eq!(
+            progress,
+            MorphProgress {
+                width: 1.0,
+                height: 1.0
+            },
+            "a finished expand must land exactly on expanded"
+        );
+        assert_eq!(
+            morph_radius(compact_r, expanded_r, progress),
+            config.appearance.effective_corner_radius(false),
+            "the 1 endpoint must equal the expanded layout's discrete radius exactly"
+        );
+        // The entry seam, near end: a leg that has just begun drifts from
+        // exactly 0.0 only by the wall-clock dust between `Instant::now()`
+        // and the progress evaluation (the curve itself starts at exactly
+        // 0.0), so the radius stays within a sub-pixel of the compact
+        // radius — versus the full 14 px snap to the expanded radius the
+        // unwired render produced on the first hover frame.
+        let just_started = HoverExpand {
+            start: Instant::now(),
+            direction: MorphDirection::Expand,
+            from: 0.0,
+            velocity: 0.0,
+            done: false,
+        };
+        let progress = hover_progress(&just_started, &config);
+        let radius = morph_radius(compact_r, expanded_r, progress);
+        assert!(
+            (radius - compact_r).abs() < 5e-3,
+            "a fresh leg must render within sub-pixel of the compact radius, got {radius}"
+        );
+        assert!(
+            (radius - expanded_r).abs() > 1.0,
+            "a fresh leg must not snap toward the expanded radius, got {radius}"
+        );
+    }
+
+    #[test]
+
+    fn morph_art_rect_lerps_between_endpoints_and_never_overshoots() {
+        // The morphing art tile lerps its size and vertical position on the
+        // leading (width) axis — the same axis `morph_radius` uses — with
+        // the endpoints exactly the compact and expanded placements. The
+        // height axis never influences it (the width leads both legs; the
+        // height's job is the pill geometry and the text cross-fade).
+        let (c_size, c_y, e_size, e_y) = (21.6, 15.0, 48.0, 24.0);
+        let at = |width: f32, height: f32| MorphProgress { width, height };
+        assert_eq!(
+            morph_art_rect(c_size, c_y, e_size, e_y, at(0.0, 0.7)),
+            (c_size, c_y),
+            "the 0 endpoint is the compact placement"
+        );
+        assert_eq!(
+            morph_art_rect(c_size, c_y, e_size, e_y, at(1.0, 0.1)),
+            (e_size, e_y),
+            "the 1 endpoint is the expanded placement"
+        );
+        let mid = morph_art_rect(c_size, c_y, e_size, e_y, at(0.5, 0.5));
+        assert!(
+            (mid.0 - 34.8).abs() < 1e-5 && (mid.1 - 19.5).abs() < 1e-5,
+            "mid-morph the tile must sit halfway, got {mid:?}"
+        );
+        assert_eq!(
+            morph_art_rect(c_size, c_y, e_size, e_y, at(0.5, 0.0)),
+            morph_art_rect(c_size, c_y, e_size, e_y, at(0.5, 1.0)),
+            "the height axis must not move the tile"
+        );
+        // Overshoot: the same clamp `morph_radius` applies, so a spring
+        // bounce can never render the tile larger than the expanded art
+        // (or smaller than the compact art on a below-zero reversal seam).
+        assert_eq!(morph_art_rect(c_size, c_y, e_size, e_y, at(1.3, 0.0)), (e_size, e_y));
+        assert_eq!(morph_art_rect(c_size, c_y, e_size, e_y, at(-0.2, 0.0)), (c_size, c_y));
+    }
+
+    #[test]
+    fn contain_art_never_escapes_the_pill_body() {
+        // The morphing tile is containment-clamped to the current body: the
+        // size to the body height and the top so the tile never crosses the
+        // body's bottom edge. Values already inside the body pass through
+        // untouched, so the morph endpoints' exact placements survive.
+        let (pill_h, inset) = (51usize, 15usize);
+        assert_eq!(
+            contain_art(22, 14, pill_h, inset),
+            (22, 14),
+            "no clamp bites inside the body"
+        );
+        assert_eq!(
+            contain_art(60, 0, pill_h, inset),
+            (51, 0),
+            "an oversized tile clamps to the body height"
+        );
+        assert_eq!(
+            contain_art(22, 100, pill_h, inset),
+            (22, 15 + 51 - 22),
+            "a tile past the bottom edge clamps to it"
+        );
+        // A tile clamped on both axes at once: the size clamps first, and
+        // the top clamp is measured against the clamped size, so the tile's
+        // bottom edge lands exactly on the body's bottom edge.
+        assert_eq!(
+            contain_art(80, 100, pill_h, inset),
+            (51, 15),
+            "the bottom edge of the clamped tile touches the body's bottom edge"
+        );
     }
 
     #[test]
