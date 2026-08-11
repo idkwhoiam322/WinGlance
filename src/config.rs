@@ -251,7 +251,7 @@ pub struct AppearanceConfig {
 impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
-            duration_ms: 3000,
+            duration_ms: 5000,
             animation_ms: 280,
             vertical: VerticalPosition::Top,
             horizontal: HorizontalPosition::Center,

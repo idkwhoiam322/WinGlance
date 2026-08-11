@@ -14,7 +14,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 
 | Key            | Default | Range   | Effect                                            |
 |----------------|---------|---------|---------------------------------------------------|
-| `duration_ms`  | `3000`  | 500–60000 | How long the pill stays visible before collapsing |
+| `duration_ms`  | `5000`  | 500–60000 | How long the pill stays visible before collapsing |
 | `animation_ms` | `280`   | 100–500 | Expand/collapse animation length                  |
 | `layout`       | `"expanded"` | `expanded` \| `compact` \| `auto` | Which pill layout is used (see below) |
 | `vertical`     | `"top"` | `top` \| `bottom` | Which monitor edge the pill anchors to |
