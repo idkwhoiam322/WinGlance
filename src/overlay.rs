@@ -2072,6 +2072,23 @@ impl OverlayState {
         } else {
             content_size_of(&self.config, &content, compact)
         };
+        // The icon/art progress ceiling mirrors the sizing branch: the hover
+        // leg's window is clamped to the expanded size (`morph_size`), so
+        // the elements keep their hard 1.0 clamp; the entrance/exit grow
+        // shows its overshoot (`grow_size`), so the elements ride the same
+        // un-clamped curve, capped at the window's own overshoot cap in
+        // progress units (see `grow_overshoot_cap`). That is what keeps the
+        // icon and art settling in step with the body instead of freezing at
+        // their expanded slots while the window is still bouncing.
+        let element_cap = if self.hover_expand.is_some() {
+            1.0
+        } else if frame.morph.is_some() {
+            let (compact_w, _) = content_size_of(&self.config, &content, true);
+            let (expanded_w, _) = content_size_of(&self.config, &content, false);
+            grow_overshoot_cap(compact_w, expanded_w)
+        } else {
+            1.0
+        };
         let width = (logical_width * dpi).round().max(1.0) as i32;
         let height = (logical_height * dpi).round().max(1.0) as i32;
         self.aura_inset = (AURA_HALO_LOGICAL * dpi).round() as i32;
@@ -2093,6 +2110,7 @@ impl OverlayState {
             // flight (`compact` is derived from the same `morph`).
             compact && morph.is_none(),
             morph,
+            element_cap,
         );
         self.content = Some(content);
         if let Err(error) = result {
@@ -2652,8 +2670,8 @@ fn grow_size(config: &Config, content: &MediaEvent, progress: MorphProgress) -> 
     // The rendered size tracks the curve (no clamp), but the bounce amount
     // is capped: a 1 % overshoot past the expanded size is enough to read,
     // and below 1 % of a few-hundred-pixel pill it is invisible anyway.
-    let width = compact_w + (expanded_w - compact_w) * progress.width.clamp(0.0, 1.0);
-    let height = compact_h + (expanded_h - compact_h) * progress.height.clamp(0.0, 1.0);
+    let width = compact_w + (expanded_w - compact_w) * progress.width;
+    let height = compact_h + (expanded_h - compact_h) * progress.height;
     let width_cap = expanded_w * 0.01;
     let height_cap = expanded_h * 0.01;
     (
@@ -2662,13 +2680,35 @@ fn grow_size(config: &Config, content: &MediaEvent, progress: MorphProgress) -> 
     )
 }
 
+/// The progress ceiling for the icon and art lerps on the entrance/exit
+/// grow leg. `grow_size` shows its spring's overshoot, bounded in *size*
+/// units at 1 % past the expanded pill; this is that same cap expressed in
+/// progress units, so the elements overshoot exactly as far (in progress)
+/// as the window does and no further. The hover leg passes 1.0 instead:
+/// `morph_size` clamps the window at the expanded size there, so the
+/// elements matching that hard clamp is correct, not a second instance of
+/// the grow-leg mismatch.
+fn grow_overshoot_cap(compact_w: f32, expanded_w: f32) -> f32 {
+    let delta = expanded_w - compact_w;
+    if delta <= 0.0 {
+        1.0
+    } else {
+        1.0 + (expanded_w * 0.01) / delta
+    }
+}
+
 /// The pill's corner radius during a morph: the compact and expanded radii
 /// lerped by the leading (width) axis's progress, so the corner curvature
-/// follows the silhouette the eye is tracking. Clamped between both
-/// endpoints, so the shape never renders over-rounded or pinched while the
+/// follows the silhouette the eye is tracking. `overshoot_cap` is the
+/// progress ceiling the radius may pass 1.0 by: 1.0 on the hover leg, whose
+/// window `morph_size` clamps at the expanded size, and `grow_overshoot_cap`
+/// on the entrance/exit leg, whose window `grow_size` lets bounce — the
+/// rounding then settles in step with the body instead of freezing at the
+/// expanded radius while the window is still moving. The overshoot stays
+/// capped, so the shape never renders over-rounded or pinched while the
 /// width spring overshoots.
-fn morph_radius(compact_radius: f32, expanded_radius: f32, progress: MorphProgress) -> f32 {
-    let p = progress.width.clamp(0.0, 1.0);
+fn morph_radius(compact_radius: f32, expanded_radius: f32, progress: MorphProgress, overshoot_cap: f32) -> f32 {
+    let p = progress.width.clamp(0.0, overshoot_cap);
     compact_radius + (expanded_radius - compact_radius) * p
 }
 
@@ -2677,19 +2717,25 @@ fn morph_radius(compact_radius: f32, expanded_radius: f32, progress: MorphProgre
 /// the same axis `morph_radius` uses, so the art square scales with the
 /// silhouette the eye is tracking. One continuously-scaling tile replaces the
 /// two independently-sized, independently-positioned tiles the cross-fade
-/// used to dissolve between. The axis choice is a starting point, not a
-/// certainty: the width leads both legs, so on expand the art reaches its
-/// expanded spot before the height has finished growing (and on collapse it
-/// shrinks back ahead of the height) — eyeball whether the height axis or a
-/// `min` of both tracks the pill better.
+/// used to dissolve between. `overshoot_cap` is the progress ceiling the
+/// tile may pass 1.0 by: 1.0 on the hover leg, whose window `morph_size`
+/// clamps at the expanded size, and `grow_overshoot_cap` on the
+/// entrance/exit leg, whose window `grow_size` lets bounce — the art then
+/// settles in step with the body instead of freezing at the expanded slot
+/// while the window is still moving. The axis choice is a starting point,
+/// not a certainty: the width leads both legs, so on expand the art reaches
+/// its expanded spot before the height has finished growing (and on collapse
+/// it shrinks back ahead of the height) — eyeball whether the height axis or
+/// a `min` of both tracks the pill better.
 fn morph_art_rect(
     compact_art: f32,
     compact_y: f32,
     expanded_art: f32,
     expanded_y: f32,
     progress: MorphProgress,
+    overshoot_cap: f32,
 ) -> (f32, f32) {
-    let p = progress.width.clamp(0.0, 1.0);
+    let p = progress.width.clamp(0.0, overshoot_cap);
     (
         compact_art + (expanded_art - compact_art) * p,
         compact_y + (expanded_y - compact_y) * p,
@@ -2763,10 +2809,17 @@ fn expanded_app_icon_rect(config: &Config, scale: f32, pill: &PillText, inset: i
 /// drawn icons the cross-fade used to dissolve between; it renders at full
 /// opacity because the movement IS the animation (the compact and expanded
 /// passes skip their own icons while a morph is in flight, so it never
-/// doubles). Clamped between the endpoints, so a spring overshoot can never
-/// push it past either slot.
-fn morph_icon_rect(compact: (i32, i32, i32), expanded: (i32, i32, i32), progress: MorphProgress) -> (i32, i32, i32) {
-    let p = progress.width.clamp(0.0, 1.0);
+/// doubles). `overshoot_cap` bounds how far past 1.0 the icon may ride:
+/// 1.0 on the hover leg (the window `morph_size` clamps at the expanded
+/// size), `grow_overshoot_cap` on the entrance/exit leg (the window
+/// `grow_size` shows its bounce, so the icon settles in step with it).
+fn morph_icon_rect(
+    compact: (i32, i32, i32),
+    expanded: (i32, i32, i32),
+    progress: MorphProgress,
+    overshoot_cap: f32,
+) -> (i32, i32, i32) {
+    let p = progress.width.clamp(0.0, overshoot_cap);
     (
         (compact.0 as f32 + (expanded.0 - compact.0) as f32 * p).round() as i32,
         (compact.1 as f32 + (expanded.1 - compact.1) as f32 * p).round() as i32,
@@ -3044,6 +3097,7 @@ fn render_layered(
     position: POINT,
     compact: bool,
     morph: Option<MorphProgress>,
+    element_cap: f32,
 ) -> Result<()> {
     let inset = state.aura_inset;
     let buf_w = (width + inset * 2).max(1);
@@ -3089,6 +3143,7 @@ fn render_layered(
         scale,
         compact,
         morph,
+        element_cap,
     )?;
     draw_text_pixels(
         state,
@@ -3100,6 +3155,7 @@ fn render_layered(
         morph,
         body_bottom,
         rest_body_bottom,
+        element_cap,
     );
     // A single oversized metadata string (huge title/album) can inflate the
     // retained UTF-16 scratch far beyond any real row; shrink it back so the
@@ -3318,6 +3374,7 @@ fn draw_pixels(
     scale: f32,
     compact: bool,
     morph: Option<MorphProgress>,
+    element_cap: f32,
 ) -> Result<()> {
     // One radius per frame. A morph lerps the radius continuously between
     // the compact and the expanded radius (see `morph_radius`), so the
@@ -3335,6 +3392,7 @@ fn draw_pixels(
                 state.config.appearance.effective_corner_radius(true),
                 state.config.appearance.effective_corner_radius(false),
                 progress,
+                element_cap,
             ) * scale
         }
         None => state.config.appearance.effective_corner_radius(compact) * scale,
@@ -3465,6 +3523,7 @@ fn draw_pixels(
                             art_size as f32,
                             (inset + pill_h.saturating_sub(art_size) / 2) as f32,
                             progress,
+                            element_cap,
                         );
                         contain_art(size.round() as usize, y.round() as usize, pill_h, inset)
                     }
@@ -3503,6 +3562,7 @@ fn draw_pixels(
                             expanded_size,
                             (inset + pill_h.saturating_sub(expanded_size as usize) / 2) as f32,
                             progress,
+                            element_cap,
                         );
                         contain_art(size.round() as usize, y.round() as usize, pill_h, inset)
                     }
@@ -4301,6 +4361,7 @@ fn draw_text_pixels(
     morph: Option<MorphProgress>,
     body_bottom: i32,
     rest_body_bottom: i32,
+    element_cap: f32,
 ) {
     if let Some(progress) = morph {
         // The less-advanced axis: on expand the height (so content fades
@@ -4337,7 +4398,7 @@ fn draw_text_pixels(
             )
         {
             let start = compact_app_icon_rect(&state.config, scale, state.aura_inset);
-            let (x, y, size) = morph_icon_rect(start, end, progress);
+            let (x, y, size) = morph_icon_rect(start, end, progress, element_cap);
             draw_icon_scaled(
                 pixels,
                 width as usize,
@@ -7771,6 +7832,7 @@ mod tests {
             // edges coincide, so every row is fully unveiled.
             76,
             76,
+            1.0,
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 500, "expected text + art pixels, got {lit}");
@@ -8165,8 +8227,11 @@ mod tests {
     #[test]
     fn morph_radius_lerps_between_the_two_radii() {
         // The radius morphs continuously between the compact and expanded
-        // radii on the leading (width) axis, clamped so a spring overshoot
-        // can never render the shape over-rounded or pinched.
+        // radii on the leading (width) axis. `overshoot_cap` bounds how far
+        // past 1.0 the radius may ride: 1.0 on the hover leg (window
+        // clamped by `morph_size`) still hard-clamps; a grow cap lets the
+        // rounding overshoot with the window and no farther, so the corners
+        // settle in step with the body.
         let (compact_r, expanded_r) = (8.0, 16.0);
         assert_eq!(
             morph_radius(
@@ -8175,7 +8240,8 @@ mod tests {
                 MorphProgress {
                     width: 0.0,
                     height: 0.0
-                }
+                },
+                1.05
             ),
             compact_r
         );
@@ -8186,7 +8252,8 @@ mod tests {
                 MorphProgress {
                     width: 1.0,
                     height: 1.0
-                }
+                },
+                1.05
             ),
             expanded_r
         );
@@ -8197,12 +8264,14 @@ mod tests {
                 width: 0.5,
                 height: 0.5,
             },
+            1.0,
         );
         assert!(
             (mid - 12.0).abs() < 1e-5,
             "mid-morph radius must be the midpoint, got {mid}"
         );
-        // Overshoot and lagged-height states clamp to the width interval.
+        // Hover leg (cap 1.0): overshoot and lagged-height states clamp to
+        // the width interval, exactly as before.
         let over = morph_radius(
             compact_r,
             expanded_r,
@@ -8210,6 +8279,7 @@ mod tests {
                 width: 1.3,
                 height: 0.4,
             },
+            1.0,
         );
         assert_eq!(over, expanded_r);
         let under = morph_radius(
@@ -8219,8 +8289,46 @@ mod tests {
                 width: -0.2,
                 height: 0.9,
             },
+            1.0,
         );
         assert_eq!(under, compact_r);
+        // Grow leg (cap > 1): the overshoot is allowed through, capped at
+        // the window's own ceiling — the rounding rides the bounce and
+        // never beyond it.
+        let grown = morph_radius(
+            compact_r,
+            expanded_r,
+            MorphProgress {
+                width: 1.04,
+                height: 0.4,
+            },
+            1.05,
+        );
+        assert!(
+            (grown - (8.0 + 8.0 * 1.04)).abs() < 1e-4,
+            "mid-overshoot the radius must follow the window's curve, got {grown}"
+        );
+        assert_eq!(
+            morph_radius(
+                compact_r,
+                expanded_r,
+                MorphProgress {
+                    width: 1.07,
+                    height: 0.4,
+                },
+                1.05,
+            ),
+            morph_radius(
+                compact_r,
+                expanded_r,
+                MorphProgress {
+                    width: 1.05,
+                    height: 0.4,
+                },
+                1.05,
+            ),
+            "the radius must never pass the window's overshoot cap"
+        );
     }
 
     #[test]
@@ -8258,7 +8366,7 @@ mod tests {
             "a finished collapse must land exactly on compact"
         );
         assert_eq!(
-            morph_radius(compact_r, expanded_r, progress),
+            morph_radius(compact_r, expanded_r, progress, 1.0),
             config.appearance.effective_corner_radius(true),
             "the 0 endpoint must equal the compact layout's discrete radius exactly"
         );
@@ -8281,7 +8389,7 @@ mod tests {
             "a finished expand must land exactly on expanded"
         );
         assert_eq!(
-            morph_radius(compact_r, expanded_r, progress),
+            morph_radius(compact_r, expanded_r, progress, 1.0),
             config.appearance.effective_corner_radius(false),
             "the 1 endpoint must equal the expanded layout's discrete radius exactly"
         );
@@ -8299,7 +8407,7 @@ mod tests {
             done: false,
         };
         let progress = hover_progress(&just_started, &config);
-        let radius = morph_radius(compact_r, expanded_r, progress);
+        let radius = morph_radius(compact_r, expanded_r, progress, 1.0);
         assert!(
             (radius - compact_r).abs() < 5e-3,
             "a fresh leg must render within sub-pixel of the compact radius, got {radius}"
@@ -8311,40 +8419,122 @@ mod tests {
     }
 
     #[test]
+    fn morph_radius_rides_the_grow_curve_with_the_window() {
+        // On the entrance leg the window shows its spring's overshoot (see
+        // `grow_size`), so the radius must ride the same un-clamped progress
+        // the window does — the residual snap was exactly the decoupling:
+        // the radius froze at its expanded value at p = 1.0 while the window
+        // kept settling. Mid-bounce, the radius must equal the compact
+        // radius plus the same fraction of the delta the window's width
+        // covers — proportional tracking of `grow_size`'s output, not
+        // merely an independently bounded value.
+        let config = Config::default();
+        let content = MediaEvent::TrackChanged(TrackInfo {
+            title: "Everything, Everywhere".into(),
+            artist: "John Muirhead".into(),
+            source_app: "Spotify".into(),
+            ..TrackInfo::default()
+        });
+        let (compact_w, _) = content_size_of(&config, &content, true);
+        let (expanded_w, _) = content_size_of(&config, &content, false);
+        let cap = grow_overshoot_cap(compact_w, expanded_w);
+        let (compact_r, expanded_r) = (config.appearance.compact_corner_radius, config.appearance.corner_radius);
+        // Find the spring's peak, then sample around it.
+        let mut peak = 0.0f32;
+        let mut t_peak = 0.0f32;
+        for i in 0..=2000 {
+            let t = i as f32 / 2000.0;
+            let v = ENTRANCE_GROW.value_at(t, 0.0, 0.0);
+            if v > peak {
+                peak = v;
+                t_peak = t;
+            }
+        }
+        assert!(peak > 1.0, "precondition: the entrance spring overshoots, got {peak}");
+        for t in [t_peak - 0.08, t_peak - 0.04, t_peak, t_peak + 0.04, t_peak + 0.08] {
+            let p = ENTRANCE_GROW.value_at(t, 0.0, 0.0).clamp(0.0, cap);
+            let (w, _) = grow_size(&config, &content, MorphProgress { width: p, height: p });
+            let window_p = (w - compact_w) / (expanded_w - compact_w);
+            let radius = morph_radius(compact_r, expanded_r, MorphProgress { width: p, height: p }, cap);
+            let expected = compact_r + (expanded_r - compact_r) * window_p;
+            assert!(
+                (radius - expected).abs() < 1e-4,
+                "the radius must match the window's progress at t={t}: radius {radius} vs {expected}"
+            );
+        }
+        // Endpoint pin on the same leg: at exactly 1.0 the radius is the
+        // expanded discrete radius — only the approach changes, never the
+        // seam.
+        assert_eq!(
+            morph_radius(
+                compact_r,
+                expanded_r,
+                MorphProgress {
+                    width: 1.0,
+                    height: 1.0
+                },
+                cap
+            ),
+            expanded_r
+        );
+    }
 
-    fn morph_art_rect_lerps_between_endpoints_and_never_overshoots() {
+    #[test]
+    fn morph_art_rect_lerps_within_its_cap_and_pins_the_endpoints() {
         // The morphing art tile lerps its size and vertical position on the
         // leading (width) axis — the same axis `morph_radius` uses — with
         // the endpoints exactly the compact and expanded placements. The
         // height axis never influences it (the width leads both legs; the
         // height's job is the pill geometry and the text cross-fade).
+        // `overshoot_cap` bounds how far past 1.0 the tile may ride: 1.0 on
+        // the hover leg (window clamped by `morph_size`) still hard-clamps;
+        // a grow cap lets the tile overshoot with the window and no farther.
         let (c_size, c_y, e_size, e_y) = (21.6, 15.0, 48.0, 24.0);
         let at = |width: f32, height: f32| MorphProgress { width, height };
         assert_eq!(
-            morph_art_rect(c_size, c_y, e_size, e_y, at(0.0, 0.7)),
+            morph_art_rect(c_size, c_y, e_size, e_y, at(0.0, 0.7), 1.0),
             (c_size, c_y),
             "the 0 endpoint is the compact placement"
         );
         assert_eq!(
-            morph_art_rect(c_size, c_y, e_size, e_y, at(1.0, 0.1)),
+            morph_art_rect(c_size, c_y, e_size, e_y, at(1.0, 0.1), 1.05),
             (e_size, e_y),
-            "the 1 endpoint is the expanded placement"
+            "the 1 endpoint is the expanded placement, whatever the cap"
         );
-        let mid = morph_art_rect(c_size, c_y, e_size, e_y, at(0.5, 0.5));
+        let mid = morph_art_rect(c_size, c_y, e_size, e_y, at(0.5, 0.5), 1.0);
         assert!(
             (mid.0 - 34.8).abs() < 1e-5 && (mid.1 - 19.5).abs() < 1e-5,
             "mid-morph the tile must sit halfway, got {mid:?}"
         );
         assert_eq!(
-            morph_art_rect(c_size, c_y, e_size, e_y, at(0.5, 0.0)),
-            morph_art_rect(c_size, c_y, e_size, e_y, at(0.5, 1.0)),
+            morph_art_rect(c_size, c_y, e_size, e_y, at(0.5, 0.0), 1.0),
+            morph_art_rect(c_size, c_y, e_size, e_y, at(0.5, 1.0), 1.0),
             "the height axis must not move the tile"
         );
-        // Overshoot: the same clamp `morph_radius` applies, so a spring
-        // bounce can never render the tile larger than the expanded art
-        // (or smaller than the compact art on a below-zero reversal seam).
-        assert_eq!(morph_art_rect(c_size, c_y, e_size, e_y, at(1.3, 0.0)), (e_size, e_y));
-        assert_eq!(morph_art_rect(c_size, c_y, e_size, e_y, at(-0.2, 0.0)), (c_size, c_y));
+        // Hover leg (cap 1.0): a spring overshoot still hard-clamps, exactly
+        // as before — the window is clamped there, so the tile matching it
+        // is correct, not a second instance of the grow-leg mismatch.
+        assert_eq!(
+            morph_art_rect(c_size, c_y, e_size, e_y, at(1.3, 0.0), 1.0),
+            (e_size, e_y)
+        );
+        assert_eq!(
+            morph_art_rect(c_size, c_y, e_size, e_y, at(-0.2, 0.0), 1.0),
+            (c_size, c_y)
+        );
+        // Grow leg (cap > 1): the overshoot is allowed through, capped at
+        // the window's own ceiling — the tile rides the bounce and never
+        // beyond it.
+        let grown = morph_art_rect(c_size, c_y, e_size, e_y, at(1.04, 0.0), 1.05);
+        assert!(
+            (grown.0 - (21.6 + 26.4 * 1.04)).abs() < 1e-4 && (grown.1 - (15.0 + 9.0 * 1.04)).abs() < 1e-4,
+            "mid-overshoot the tile must follow the window's curve, got {grown:?}"
+        );
+        assert_eq!(
+            morph_art_rect(c_size, c_y, e_size, e_y, at(1.07, 1.3), 1.05),
+            morph_art_rect(c_size, c_y, e_size, e_y, at(1.05, 0.0), 1.05),
+            "the tile must never pass the window's overshoot cap"
+        );
     }
 
     #[test]
@@ -8380,44 +8570,159 @@ mod tests {
     }
 
     #[test]
-    fn morph_icon_rect_lerps_between_the_two_slots_and_never_overshoots() {
+    fn morph_icon_rect_lerps_within_its_cap_and_pins_the_endpoints() {
         // The morphing app icon lerps between the compact inline slot and
         // the expanded source-app-row slot on the leading (width) axis —
         // the same axis `morph_radius` and `morph_art_rect` use. The height
-        // axis never influences it, and a spring overshoot can never push
-        // it past either slot.
+        // axis never influences it. `overshoot_cap` bounds how far past 1.0
+        // the icon may ride: 1.0 on the hover leg (window clamped by
+        // `morph_size`) still hard-clamps; a grow cap lets the icon
+        // overshoot with the window and no farther.
         let compact = (235, 17, 16);
         let expanded = (75, 69, 14);
         let at = |width: f32, height: f32| MorphProgress { width, height };
         assert_eq!(
-            morph_icon_rect(compact, expanded, at(0.0, 0.7)),
+            morph_icon_rect(compact, expanded, at(0.0, 0.7), 1.0),
             compact,
             "the 0 endpoint is the compact slot"
         );
         assert_eq!(
-            morph_icon_rect(compact, expanded, at(1.0, 0.1)),
+            morph_icon_rect(compact, expanded, at(1.0, 0.1), 1.05),
             expanded,
-            "the 1 endpoint is the expanded slot"
+            "the 1 endpoint is the expanded slot, whatever the cap"
         );
         assert_eq!(
-            morph_icon_rect(compact, expanded, at(0.5, 0.5)),
+            morph_icon_rect(compact, expanded, at(0.5, 0.5), 1.0),
             (155, 43, 15),
             "mid-morph the icon must sit halfway"
         );
         assert_eq!(
-            morph_icon_rect(compact, expanded, at(0.5, 0.0)),
-            morph_icon_rect(compact, expanded, at(0.5, 1.0)),
+            morph_icon_rect(compact, expanded, at(0.5, 0.0), 1.0),
+            morph_icon_rect(compact, expanded, at(0.5, 1.0), 1.0),
             "the height axis must not move the icon"
         );
+        // Hover leg (cap 1.0): a spring overshoot still hard-clamps, exactly
+        // as before — the window is clamped there, so the icon matching it
+        // is correct, not a second instance of the grow-leg mismatch.
+        assert_eq!(morph_icon_rect(compact, expanded, at(1.3, 0.0), 1.0), expanded);
+        assert_eq!(morph_icon_rect(compact, expanded, at(-0.2, 0.0), 1.0), compact);
+        // Grow leg (cap > 1): the overshoot is allowed through, capped at
+        // the window's own ceiling — the icon rides the bounce and never
+        // beyond it.
+        let grown = morph_icon_rect(compact, expanded, at(1.1, 0.0), 1.2);
         assert_eq!(
-            morph_icon_rect(compact, expanded, at(1.3, 0.0)),
-            expanded,
-            "an overshoot must clamp to the expanded slot"
+            grown,
+            (59, 74, 14),
+            "mid-overshoot the icon must follow the window's curve"
         );
         assert_eq!(
-            morph_icon_rect(compact, expanded, at(-0.2, 0.0)),
-            compact,
-            "a below-zero reversal must clamp to the compact slot"
+            morph_icon_rect(compact, expanded, at(1.3, 0.0), 1.2),
+            morph_icon_rect(compact, expanded, at(1.2, 0.0), 1.2),
+            "the icon must never pass the window's overshoot cap"
+        );
+    }
+
+    #[test]
+    fn grow_overshoot_cap_is_the_window_overshoot_in_progress_units() {
+        // The entrance leg's element ceiling: `grow_size` bounds the window
+        // at 1 % past the expanded width, and this converts that size cap
+        // into progress units so the icon and art share the exact curve.
+        // With the default config the compact width is 303.2 (see
+        // `compact_size`) and the expanded width is 340 (`max_width`):
+        // 3.4 px over a 36.8 px morph delta is ~9.24 % of the delta.
+        assert!(
+            (grow_overshoot_cap(303.2, 340.0) - 1.0923913).abs() < 1e-5,
+            "the default cap must be 1 + 3.4/36.8, got {}",
+            grow_overshoot_cap(303.2, 340.0)
+        );
+        assert_eq!(
+            grow_overshoot_cap(100.0, 100.0),
+            1.0,
+            "a zero morph delta (no bounce possible) must not divide by zero"
+        );
+    }
+
+    #[test]
+    fn entrance_icon_and_art_track_the_grow_curve() {
+        // The entrance leg shows its spring's overshoot (see `grow_size`),
+        // so the icon and art must ride the same un-clamped progress the
+        // window does — the reported end-of-expand jump was exactly the
+        // decoupling: the elements froze at their expanded slots at p = 1.0
+        // while the window kept settling. Mid-bounce, the window's own size
+        // converted back to progress must equal the progress the element
+        // rects lerp with.
+        let config = Config::default();
+        let content = MediaEvent::TrackChanged(TrackInfo {
+            title: "Everything, Everywhere".into(),
+            artist: "John Muirhead".into(),
+            source_app: "Spotify".into(),
+            ..TrackInfo::default()
+        });
+        let (compact_w, _) = content_size_of(&config, &content, true);
+        let (expanded_w, _) = content_size_of(&config, &content, false);
+        let cap = grow_overshoot_cap(compact_w, expanded_w);
+        // Preconditions: the tuned spring really overshoots (else this test
+        // asserts nothing), and stays inside the window's own cap (the cap
+        // exists to bound pathological springs, not the tuned one).
+        let mut peak = 0.0f32;
+        let mut t_peak = 0.0f32;
+        for i in 0..=2000 {
+            let t = i as f32 / 2000.0;
+            let v = ENTRANCE_GROW.value_at(t, 0.0, 0.0);
+            if v > peak {
+                peak = v;
+                t_peak = t;
+            }
+        }
+        assert!(peak > 1.0, "precondition: the entrance spring overshoots, got {peak}");
+        assert!(peak < cap, "precondition: the tuned spring stays inside the window cap");
+        // Around the peak, the window's width (via `grow_size`) and the
+        // elements must be driven by the same progress.
+        for t in [t_peak - 0.08, t_peak - 0.04, t_peak, t_peak + 0.04, t_peak + 0.08] {
+            let p = ENTRANCE_GROW.value_at(t, 0.0, 0.0).clamp(0.0, cap);
+            let (w, _) = grow_size(&config, &content, MorphProgress { width: p, height: p });
+            let window_p = (w - compact_w) / (expanded_w - compact_w);
+            assert!(
+                (window_p - p).abs() < 1e-4,
+                "the window and the elements must ride the same progress at t={t}: window {window_p} vs elements {p}"
+            );
+            let (size, y) = morph_art_rect(21.0, 10.0, 48.0, 20.0, MorphProgress { width: p, height: p }, cap);
+            let expected = (21.0 + 27.0 * p, 10.0 + 10.0 * p);
+            assert!(
+                (size - expected.0).abs() < 1e-4 && (y - expected.1).abs() < 1e-4,
+                "the art tile must lerp with the window's progress at t={t}: got ({size}, {y}), expected ({}, {})",
+                expected.0,
+                expected.1
+            );
+        }
+        // Endpoint pin on the same leg: at exactly 1.0 the elements sit on
+        // the expanded discrete rects — only the approach changes, never
+        // the seam.
+        assert_eq!(
+            morph_art_rect(
+                21.0,
+                10.0,
+                48.0,
+                20.0,
+                MorphProgress {
+                    width: 1.0,
+                    height: 1.0
+                },
+                cap
+            ),
+            (48.0, 20.0)
+        );
+        assert_eq!(
+            morph_icon_rect(
+                (235, 17, 16),
+                (75, 69, 14),
+                MorphProgress {
+                    width: 1.0,
+                    height: 1.0
+                },
+                cap
+            ),
+            (75, 69, 14)
         );
     }
 
