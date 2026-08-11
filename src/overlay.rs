@@ -6022,18 +6022,22 @@ impl Spring {
     }
 }
 
-/// The hover-expand spring: a punchy attack (strong initial acceleration, so
-/// the card starts growing immediately), a controlled overshoot past 1.0, one
-/// visible settle-back, and an exact 1.0 endpoint — the pinned expanded state
-/// must render at the true expanded size. The mid-flight overshoot never
-/// reaches the geometry: `morph_size` clamps the rendered rectangle, the
-/// clipping region, and the hit-testing bounds to the Compact..Expanded
-/// interval, so the bounce reads as a quick settle, not a wobble. `ZETA` is
-/// the damping ratio (lower = more bounce; 0.5 is the iOS default), and
-/// `HALF_CYCLES` how many spring half-cycles fit into the leg (2.8 puts the
-/// overshoot peak at ~40 % in and the residual decay below 1 % at the end).
+/// The hover-expand spring: a firm attack (strong initial acceleration, so
+/// the card starts growing immediately), a modest overshoot past 1.0, and an
+/// exact 1.0 endpoint — the pinned expanded state must render at the true
+/// expanded size. The mid-flight overshoot never reaches the geometry:
+/// `morph_size` clamps the rendered rectangle, the clipping region, and the
+/// hit-testing bounds to the Compact..Expanded interval. `ZETA` is the
+/// damping ratio: 0.7 — the same as `ENTRANCE_GROW` — keeps both the
+/// overshoot (~5 %) and, crucially, the undershoot after it (~0.2 %) small
+/// enough that the clamp makes them invisible. The clamp hides values above
+/// 1.0, but values below 1.0 pass straight through, so a bouncier spring
+/// (ζ = 0.5 showed a ~5 % undershoot) visibly shrank the pill and regrew it
+/// in the last stretch of the leg — the end-of-morph reversal. `HALF_CYCLES`
+/// still fits 2.8 half-cycles into the leg (the overshoot peak around half
+/// the leg, the residual decay below 1 % at the end).
 const EXPAND_SPRING: Spring = Spring {
-    zeta: 0.5,
+    zeta: 0.7,
     omega: 2.8 * std::f32::consts::PI,
 };
 
@@ -9299,12 +9303,25 @@ mod tests {
             "out-of-range input clamps to the settle endpoint"
         );
         // The spring overshoots past 1.0 mid-flight — the geometry clamp in
-        // `morph_size` contains that — with a controlled amplitude.
+        // `morph_size` contains that — with a controlled amplitude (ζ = 0.7,
+        // the same damping the entrance spring uses).
         let samples: Vec<f32> = (0..=200).map(|i| spring_expand(i as f32 / 200.0)).collect();
         let peak = samples.iter().cloned().fold(0.0_f32, f32::max);
         assert!(
-            (1.05..1.30).contains(&peak),
+            (1.03..1.06).contains(&peak),
             "spring overshoot must be visible but controlled, got {peak}"
+        );
+        // The undershoot after the peak is what the clamp cannot hide: values
+        // below 1.0 pass straight through `morph_size`, so a large undershoot
+        // would visibly shrink the pill and regrow it in the last stretch of
+        // the leg (the end-of-morph reversal). ζ = 0.7 keeps it sub-pixel —
+        // the regression pin for the spring's damping choice. Measured from
+        // the peak onward (the pre-peak climb starts at 0 by design).
+        let peak_i = samples.iter().position(|v| *v == peak).unwrap_or(0);
+        let trough = samples[peak_i..].iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!(
+            trough >= 0.995,
+            "the undershoot must stay invisible to the clamp, got {trough}"
         );
         // Never negative, never wild.
         for v in &samples {
