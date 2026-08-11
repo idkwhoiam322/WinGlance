@@ -5371,14 +5371,28 @@ fn draw_icon_scaled(
                 fy,
             );
             if a > 0 {
-                composite_pm(
-                    pixels,
-                    width,
-                    x + dx,
-                    y + dy,
-                    [r, g, b],
-                    (a as f32 * content_alpha) as u32,
-                );
+                let alpha = (a as f32 * content_alpha) as u32;
+                if alpha > 0 {
+                    // Premultiply like the glyph composite: `composite_pm`
+                    // blends src + dst*(1 - src_a), so an unpremultiplied
+                    // color would bloom at full strength during fades and, at
+                    // alpha 0, ADD a full-color ghost with zero alpha into
+                    // the buffer. Later glyphs blend over that ghost, which
+                    // left a smudge of icon color on the expanded title at
+                    // the morph end (the compact icon never truly vanished).
+                    composite_pm(
+                        pixels,
+                        width,
+                        x + dx,
+                        y + dy,
+                        [
+                            (r as u32 * alpha / 255) as u8,
+                            (g as u32 * alpha / 255) as u8,
+                            (b as u32 * alpha / 255) as u8,
+                        ],
+                        alpha,
+                    );
+                }
             }
         }
     }
@@ -7884,6 +7898,11 @@ mod tests {
             height,
         );
         let mut without_icon = vec![0u8; buf_w * buf_h * 4];
+        // Reset the cached pill text: the first render stored the with-icon
+        // pill in `state.pill_text`, and the morph pass consumes that cache
+        // before rebuilding — without the reset this render would silently
+        // redraw the with-icon content and the comparison would be vacuous.
+        state.pill_text = None;
         draw_text_pixels(
             &mut state,
             &mut without_icon,
@@ -7898,12 +7917,35 @@ mod tests {
             height,
             height,
         );
+        // The compact slot region (where the compact icon sits at the morph
+        // start) must be pixel-identical with and without the icon. The
+        // buffers differ legally elsewhere: the expanded layout draws its own
+        // app-row icon and shifts the row-3 text right by its width.
+        let region = |buf: &[u8], x0: usize, y0: usize, x1: usize, y1: usize| -> Vec<u8> {
+            (y0..y1)
+                .flat_map(|y| (x0..x1).map(move |x| (y * buf_w + x) * 4))
+                .flat_map(|i| buf[i..i + 4].to_vec())
+                .collect()
+        };
         assert_eq!(
-            with_icon, without_icon,
-            "the compact icon must be completely gone at the morph end"
+            region(&with_icon, 235, 17, 251, 34),
+            region(&without_icon, 235, 17, 251, 34),
+            "the compact slot must be byte-identical with and without the icon at the morph end"
+        );
+        // The expanded app-row slot is the icon's only legal home: present
+        // with the icon, absent without.
+        assert!(
+            icon_lit(&with_icon, 75, 50, 92, 70) > 0,
+            "the expanded app-row must show the icon"
+        );
+        assert_eq!(
+            icon_lit(&without_icon, 75, 50, 92, 70),
+            0,
+            "the expanded app-row must not show the icon without one"
         );
         // Mid-fade: partially faded, still present.
         pixels.fill(0);
+        state.pill_text = None;
         draw_text_pixels(
             &mut state,
             &mut pixels,
