@@ -588,6 +588,7 @@ fn decide_layout(config: &Config, verdict: &ForegroundVerdict) -> LayoutMode {
 
 /// Reusable device context + DIB section for the pill's frames. The overlay
 /// redraws every animation tick; recreating the DIB per frame is pure waste.
+/// Freed automatically on drop (see `Drop` below).
 struct DibCache {
     hdc: HDC,
     bitmap: HBITMAP,
@@ -847,6 +848,31 @@ struct TextScratch {
     bits: *mut c_void,
     width: i32,
     height: i32,
+}
+
+/// Releases a scratch DC + DIB the way every teardown must: unselect the
+/// original bitmap, delete the DIB, then release the DC. Deleting a DC while
+/// a bitmap is selected (or a bitmap while it is selected into a DC) is
+/// undefined, so the order is the contract — shared by the `DibCache` and
+/// `TextScratch` `Drop` impls instead of being re-written at each free site.
+fn release_dib(hdc: HDC, bitmap: HBITMAP, old_bitmap: HGDIOBJ) {
+    unsafe {
+        let _ = SelectObject(hdc, old_bitmap);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(hdc);
+    }
+}
+
+impl Drop for DibCache {
+    fn drop(&mut self) {
+        release_dib(self.hdc, self.bitmap, self.old_bitmap);
+    }
+}
+
+impl Drop for TextScratch {
+    fn drop(&mut self) {
+        release_dib(self.hdc, self.bitmap, self.old_bitmap);
+    }
 }
 
 /// Pre-rendered text pieces of the pill currently on screen, built once per
@@ -2550,20 +2576,10 @@ impl OverlayState {
     /// creation), so the cost of a release is one CreateDIBSection round on
     /// the next pill, not on the release itself.
     fn release_idle_buffers(&mut self) {
-        if let Some(scratch) = self.text_scratch.take() {
-            unsafe {
-                let _ = SelectObject(scratch.hdc, scratch.old_bitmap);
-                let _ = DeleteObject(scratch.bitmap);
-                let _ = DeleteDC(scratch.hdc);
-            }
-        }
-        if let Some(dib) = self.dib.take() {
-            unsafe {
-                let _ = SelectObject(dib.hdc, dib.old_bitmap);
-                let _ = DeleteObject(dib.bitmap);
-                let _ = DeleteDC(dib.hdc);
-            }
-        }
+        // Dropping the buffers unselects the bitmaps and frees the DIBs and
+        // DCs via the `Drop` impls.
+        self.text_scratch = None;
+        self.dib = None;
         self.frame_scratch = Vec::new();
         debug!("released idle overlay buffers");
     }
@@ -3503,17 +3519,17 @@ fn create_dc_with_dib(width: i32, height: i32) -> Result<(HDC, HBITMAP, *mut c_v
 /// packed scratch buffer and blits into this one via `blit_packed_rows`
 /// instead).
 fn dib_for(state: &mut OverlayState, width: i32, height: i32) -> Result<(HDC, HBITMAP, *mut c_void)> {
-    if let Some(dib) = &state.dib {
-        if dib.width >= width && dib.height >= height {
-            return Ok((dib.hdc, dib.bitmap, dib.bits));
-        }
-        unsafe {
-            let _ = SelectObject(dib.hdc, dib.old_bitmap);
-            let _ = DeleteObject(dib.bitmap);
-            let _ = DeleteDC(dib.hdc);
-        }
-        state.dib = None;
+    if let Some(dib) = &state.dib
+        && dib.width >= width
+        && dib.height >= height
+    {
+        return Ok((dib.hdc, dib.bitmap, dib.bits));
     }
+    // Too small or absent: dropping the old cache unselects its bitmap and
+    // frees the DIB (see `Drop for DibCache`); a fresh buffer is created
+    // below. The backing allocation is reused for the rest of the process's
+    // life, so resizing happens at most once per DPI/config.
+    state.dib = None;
     let (bound_w, bound_h) = backing_upper_bound(&state.config, state.fonts.dpi());
     let alloc_w = width.max(bound_w).max(1);
     let alloc_h = height.max(bound_h).max(1);
@@ -5405,17 +5421,16 @@ fn text_scratch_for(
     width: i32,
     height: i32,
 ) -> Result<(HDC, *mut c_void, i32, i32)> {
-    if let Some(cached) = scratch {
-        if cached.width >= width && cached.height >= height {
-            return Ok((cached.hdc, cached.bits, cached.width, cached.height));
-        }
-        unsafe {
-            let _ = SelectObject(cached.hdc, cached.old_bitmap);
-            let _ = DeleteObject(cached.bitmap);
-            let _ = DeleteDC(cached.hdc);
-        }
-        *scratch = None;
+    if let Some(cached) = scratch
+        && cached.width >= width
+        && cached.height >= height
+    {
+        return Ok((cached.hdc, cached.bits, cached.width, cached.height));
     }
+    // Too small or absent: dropping the old scratch unselects its bitmap and
+    // frees the DIB (see `Drop for TextScratch`); a fresh buffer is created
+    // below.
+    *scratch = None;
     let width = width.max(1);
     let height = height.max(1);
     let (hdc, bitmap, bits) = create_dc_with_dib(width, height)?;
@@ -6018,20 +6033,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 }
                 OVERLAY_FG_HWND.store(0, Ordering::SeqCst);
                 state.delete_anim_timer();
-                if let Some(scratch) = state.text_scratch.take() {
-                    unsafe {
-                        let _ = SelectObject(scratch.hdc, scratch.old_bitmap);
-                        let _ = DeleteObject(scratch.bitmap);
-                        let _ = DeleteDC(scratch.hdc);
-                    }
-                }
-                if let Some(dib) = state.dib.take() {
-                    unsafe {
-                        let _ = SelectObject(dib.hdc, dib.old_bitmap);
-                        let _ = DeleteObject(dib.bitmap);
-                        let _ = DeleteDC(dib.hdc);
-                    }
-                }
+                // Dropping the scratch buffers unselects the bitmaps and
+                // frees the DIBs and DCs via the `Drop` impls; the state box
+                // is released right after.
+                state.text_scratch = None;
+                state.dib = None;
                 drop(Box::from_raw(state_ptr));
             }
             clear_window_state(hwnd);
