@@ -4,7 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{BOOL, COLORREF, CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    BOOL, COLORREF, CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BDR_SUNKENOUTER, BF_RECT, BeginPaint, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
     DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
@@ -15,7 +17,9 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
@@ -30,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCDESTROY, WM_PAINT, WM_SETFONT, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 const CLASS_NAME: &str = "WinGlanceProcessPicker";
 const WIDTH: i32 = 400;
@@ -172,13 +176,60 @@ fn process_names() -> HashMap<u32, String> {
     names
 }
 
-/// The executable name of a process, from a fresh Toolhelp snapshot. Used by
-/// the overlay to identify the foreground window's app for Auto-layout source
-/// matching. `None` when the process does not exist or cannot be read (e.g.
-/// an elevated process snapshot from a non-elevated instance) — callers treat
-/// that as "no match".
+/// The executable name of a process, resolved through a targeted handle
+/// query instead of a full process-table snapshot. Used by the overlay to
+/// identify the foreground window's app for Auto-layout source matching
+/// (it fires on each foreground switch; a `CreateToolhelp32Snapshot`
+/// enumeration per switch is O(process count) work for one answer).
+/// `PROCESS_QUERY_LIMITED_INFORMATION` is the documented minimum for
+/// `QueryFullProcessImageNameW` and is granted across elevation for the
+/// same user, so an elevated foreground app still resolves (the access-
+/// denied case is an elevated process of a *different* user, which cannot
+/// own the interactive foreground). `None` when the process does not exist
+/// or cannot be read — callers treat that as "no match".
 pub(crate) fn exe_name_for_pid(pid: u32) -> Option<String> {
-    process_names().remove(&pid)
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return None;
+        };
+        let handle = ProcessQueryGuard(handle);
+        // Long image paths need more than the 260-char MAX_PATH buffer;
+        // retry once at the 32,768-char Windows path limit, the canonical
+        // ceiling (the function does not report the required size).
+        let mut capacity = 260u32;
+        loop {
+            let mut buffer = vec![0u16; capacity as usize];
+            let mut size = capacity;
+            if QueryFullProcessImageNameW(handle.0, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
+                buffer.truncate(size as usize);
+                let path = String::from_utf16_lossy(&buffer);
+                return Some(
+                    std::path::Path::new(&path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&path)
+                        .to_string(),
+                );
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER.0 as i32) && capacity < 32768 {
+                capacity = 32768;
+            } else {
+                return None;
+            }
+        }
+    }
+}
+
+/// RAII guard for the process handle opened by `exe_name_for_pid`.
+struct ProcessQueryGuard(HANDLE);
+
+impl Drop for ProcessQueryGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
 }
 
 /// Scan state threaded through the EnumWindows callback: the accumulated
@@ -1067,6 +1118,23 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exe_name_for_pid_resolves_the_current_process() {
+        // The targeted query must resolve a live process to its executable
+        // name; under test that is the WinGlance test binary.
+        let name = exe_name_for_pid(unsafe { GetCurrentProcessId() });
+        assert!(
+            name.as_deref().is_some_and(|n| n.ends_with(".exe")),
+            "the current process must resolve to an .exe name, got {name:?}"
+        );
+    }
+
+    #[test]
+    fn exe_name_for_pid_returns_none_for_a_missing_process() {
+        // pid 0 is never a valid process handle target.
+        assert_eq!(exe_name_for_pid(0), None);
+    }
 
     fn entry(pattern: &str) -> ProcessEntry {
         ProcessEntry {
