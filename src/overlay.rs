@@ -3592,16 +3592,9 @@ fn draw_pixels(
     });
     // The pill fill picks up a hint of the cover's hue when a palette is
     // available; palette-less pills (e.g. the sample) keep the configured
-    // fill exactly.
-    let effective_bg = if state.palette.is_some() {
-        tinted_fill(
-            state.config.appearance.background_color,
-            aura_palette.primary,
-            FILL_TINT_WEIGHT,
-        )
-    } else {
-        state.config.appearance.background_color
-    };
+    // fill exactly. Single source shared with the text-row contrast checks
+    // (`pill_fill_bg`), so the checks always measure the painted backdrop.
+    let effective_bg = pill_fill_bg(state);
     draw_aura(
         pixels,
         width,
@@ -4216,6 +4209,95 @@ fn muted_accent(primary: [u8; 4]) -> [u8; 4] {
     [lift(primary[0]), lift(primary[1]), lift(primary[2]), 255]
 }
 
+/// WCAG 2.x AA contrast target for the palette-derived text rows (normal-
+/// sized text on the pill body). The meta row's clock icon shares the row's
+/// color and inherits the same floor.
+const TEXT_CONTRAST_AA: f32 = 4.5;
+
+/// The pill body fill actually painted behind the text rows: the configured
+/// background blended 16% toward the artwork's palette primary when a
+/// palette is available, otherwise the configured background exactly. Both
+/// the drawing (`render`) and the text contrast checks consume this single
+/// source, so the check cannot drift from what is actually painted.
+fn pill_fill_bg(state: &OverlayState) -> [u8; 4] {
+    match state.palette {
+        Some(palette) => tinted_fill(
+            state.config.appearance.background_color,
+            palette.primary,
+            FILL_TINT_WEIGHT,
+        ),
+        None => state.config.appearance.background_color,
+    }
+}
+
+/// Relative luminance of an sRGB color, linearized per the WCAG 2.x formula
+/// (gamma-encoded channel values are not weights). The palette guard's own
+/// luminance is a gamma-encoded approximation for candidate selection; the
+/// contrast guarantee uses the exact formula.
+fn relative_luminance([r, g, b]: [u8; 3]) -> f32 {
+    let linearize = |channel: u8| {
+        let s = channel as f32 / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b)
+}
+
+/// WCAG 2.x contrast ratio between two opaque colors, in 1..=21.
+fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
+    let la = relative_luminance(a);
+    let lb = relative_luminance(b);
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Brightens `text` toward white until its contrast against `bg` reaches
+/// `target`, or returns it unchanged when it already passes. The palette
+/// guard validates candidate colors against the pill's two fixed colors
+/// only; at render time the same primary does double duty — the fill blends
+/// 16% toward it (`pill_fill_bg`) while the text rows draw in the raw or
+/// 35%-lifted primary — so a guard-accepted color can still land at 1.4:1
+/// (raw primary) or ~4:1 (lifted) against the tinted fill. The check must
+/// therefore run here, against the actual backdrop. Blending toward white
+/// strictly raises luminance, so a bisection in the blend weight finds the
+/// smallest lift that passes. Even pure white is returned as the best
+/// effort when it cannot pass (a near-white fill).
+fn ensure_contrast(text: [u8; 4], bg: [u8; 4], target: f32) -> [u8; 4] {
+    let text_rgb = [text[0], text[1], text[2]];
+    let bg_rgb = [bg[0], bg[1], bg[2]];
+    if contrast_ratio(text_rgb, bg_rgb) >= target {
+        return text;
+    }
+    let blend = |w: f32| -> [u8; 3] {
+        [
+            (text[0] as f32 + (255.0 - text[0] as f32) * w).round() as u8,
+            (text[1] as f32 + (255.0 - text[1] as f32) * w).round() as u8,
+            (text[2] as f32 + (255.0 - text[2] as f32) * w).round() as u8,
+        ]
+    };
+    // Bisection on the blend weight, keeping `hi` the smallest weight seen
+    // so far that passes and `lo` the largest that fails; the initial
+    // `hi = 1.0` is only actually passing when pure white passes, so when
+    // even white cannot reach the target (a near-white fill) white is the
+    // best effort. Blending toward white strictly raises luminance, which
+    // makes the pass/fail boundary monotonic and the bisection exact.
+    let mut lo = 0.0f32;
+    let mut hi = 1.0f32;
+    for _ in 0..24 {
+        let mid = (lo + hi) / 2.0;
+        if contrast_ratio(blend(mid), bg_rgb) >= target {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let lifted = blend(hi);
+    [lifted[0], lifted[1], lifted[2], text[3]]
+}
+
 /// Draws the shared pill text layout used by every notification: title,
 /// artist, meta and source-app rows, fitted to the rows that are actually
 /// present. When `playback` is `Some`, the title row reserves space on its
@@ -4247,21 +4329,21 @@ fn draw_pill_text_rows(
     // available (gives the pill per-track theming), falling back to the
     // configured accent. Every color is dimmed by the cross-fade's
     // per-pass opacity, so the whole content fades as one.
-    let accent = dim_color(
-        state.palette.map(|p| p.primary).unwrap_or(appearance.accent_color),
-        content_alpha,
-    );
-    // The muted tier's no-palette fallback follows the same rule as
-    // `accent` (a softened version of the configured accent), so the artist
-    // and app-name rows — the two rows styled as the same secondary-text
-    // tier — behave identically with and without artwork. A fixed gray here
-    // would split the tier: the artist row would track the user's accent
-    // while the app-name row two lines below ignored it.
+    //
+    // The palette-derived text colors are re-checked against the actual
+    // painted fill (`pill_fill_bg`) at composite time, before dimming:
+    // the same primary both tints the fill 16% toward it and colors these
+    // rows, so the two move together and the palette guard's check against
+    // the untinted fixed colors cannot see the real pair. `ensure_contrast`
+    // brightens only the colors that fail the AA target — passing palettes
+    // render exactly as before. The muted tier ("muted_accent", used by the
+    // artist and app-name rows) and the meta row share `accent_base`, so a
+    // palette-less pill tracks the user's accent in both tiers alike.
+    let accent_base = state.palette.map(|p| p.primary).unwrap_or(appearance.accent_color);
+    let fill = pill_fill_bg(state);
+    let accent = dim_color(ensure_contrast(accent_base, fill, TEXT_CONTRAST_AA), content_alpha);
     let muted = dim_color(
-        state
-            .palette
-            .map(|p| muted_accent(p.primary))
-            .unwrap_or(muted_accent(appearance.accent_color)),
+        ensure_contrast(muted_accent(accent_base), fill, TEXT_CONTRAST_AA),
         content_alpha,
     );
     let padding = (appearance.padding * scale) as i32;
@@ -8782,6 +8864,75 @@ mod tests {
         assert_eq!(dim_color([10, 20, 30, 255], 0.0), [10, 20, 30, 0]);
         // Out-of-range factors clamp.
         assert_eq!(dim_color([1, 2, 3, 128], 2.0), [1, 2, 3, 128]);
+    }
+
+    #[test]
+    fn contrast_ratio_matches_wcag_reference_values() {
+        // Sanity anchors: black vs white is 21:1, identical colors 1:1.
+        assert!((contrast_ratio([0, 0, 0], [255, 255, 255]) - 21.0).abs() < 1e-3);
+        assert_eq!(contrast_ratio([80, 90, 100], [80, 90, 100]), 1.0);
+    }
+
+    #[test]
+    fn ensure_contrast_leaves_passing_colors_unchanged() {
+        // White title text on the default near-black fill passes already:
+        // the identity fast path must keep the exact color (bit-for-bit,
+        // including the alpha channel).
+        assert_eq!(
+            ensure_contrast([255, 255, 255, 255], [0x12, 0x14, 0x1C, 0xEB], TEXT_CONTRAST_AA),
+            [255, 255, 255, 255]
+        );
+        assert_eq!(
+            ensure_contrast([200, 200, 200, 128], [18, 20, 28, 235], TEXT_CONTRAST_AA),
+            [200, 200, 200, 128]
+        );
+    }
+
+    #[test]
+    fn ensure_contrast_brightens_the_reviewed_worst_case_colors() {
+        // The audit's concrete measured failure: a strict-guard-accepted
+        // palette primary (60, 45, 84) tints the fill to ~(25, 24, 37) and
+        // gives an artist-row text of ~(128, 118, 144) — 4.10:1 — while the
+        // raw primary as meta-row text lands at 1.40:1 against the same
+        // fill. Both must be lifted to the AA target by the composite-time
+        // check.
+        let bg = pill_fill_bg_test_bg(60, 45, 84);
+        let artist = muted_accent([60, 45, 84, 255]);
+        assert!(
+            contrast_ratio([artist[0], artist[1], artist[2]], [bg[0], bg[1], bg[2]]) < TEXT_CONTRAST_AA,
+            "precondition: the lifted artist color must start below the target"
+        );
+        let lifted_artist = ensure_contrast(artist, bg, TEXT_CONTRAST_AA);
+        assert!(
+            contrast_ratio(
+                [lifted_artist[0], lifted_artist[1], lifted_artist[2]],
+                [bg[0], bg[1], bg[2]]
+            ) >= TEXT_CONTRAST_AA,
+            "the artist color must be lifted to the AA target"
+        );
+        assert!(
+            contrast_ratio([60, 45, 84], [bg[0], bg[1], bg[2]]) < TEXT_CONTRAST_AA,
+            "precondition: the raw primary must start below the target"
+        );
+        let lifted_meta = ensure_contrast([60, 45, 84, 255], bg, TEXT_CONTRAST_AA);
+        assert!(
+            contrast_ratio([lifted_meta[0], lifted_meta[1], lifted_meta[2]], [bg[0], bg[1], bg[2]]) >= TEXT_CONTRAST_AA,
+            "the meta-row color must be lifted to the AA target"
+        );
+        // The lift brightens rather than darkens, and keeps the alpha.
+        assert!(lifted_meta[0] >= 60 && lifted_meta[1] >= 45 && lifted_meta[2] >= 84);
+        assert_eq!(lifted_meta[3], 255);
+    }
+
+    /// The tinted fill `pill_fill_bg` produces for a palette primary, built
+    /// through the same tinting math (used to keep the contrast tests
+    /// independent of `OverlayState` construction).
+    fn pill_fill_bg_test_bg(primary_r: u8, primary_g: u8, primary_b: u8) -> [u8; 4] {
+        tinted_fill(
+            [0x12, 0x14, 0x1C, 0xEB],
+            [primary_r, primary_g, primary_b, 255],
+            FILL_TINT_WEIGHT,
+        )
     }
 
     #[test]
