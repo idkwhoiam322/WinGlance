@@ -23,6 +23,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `max_width`    | `340`   | 180–800 | Maximum pill width in logical pixels              |
 | `position_x`   | *(unset)* | integer | Absolute X override (96-DPI logical px); set by *Adjust position…* |
 | `position_y`   | *(unset)* | integer | Absolute Y override (96-DPI logical px); set by *Adjust position…* |
+| `max_tick_hz`  | `60`    | 60–1000 | Animation tick-rate cap in Hz (config.toml only; see below) |
 | `monitor`      | `"active-window"` | string | Which display the pill is placed on (see below) |
 | `compact_position_separate` | `false` | bool | Give the Compact layout its own position (see below). The settings/tray toggle displays the *inverse* polarity: ON = Compact follows Expanded (`false`), OFF = independent (`true`) |
 | `compact_vertical` | `"top"` | `top` \| `bottom` | Compact layout's vertical anchor (only consulted while `compact_position_separate` is on) |
@@ -31,6 +32,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `compact_position_x` | *(unset)* | integer | Absolute X override for the Compact layout; set by the compact *Adjust position…* |
 | `compact_position_y` | *(unset)* | integer | Absolute Y override for the Compact layout        |
 | `compact_monitor` | `"active-window"` | string | Which display the Compact layout is placed on     |
+| `compact_hover_action` | `"dismiss"` | `dismiss` \| `expand` | What hovering over a Compact-layout pill does (see below) |
 
 `layout` accepts one of:
 
@@ -70,6 +72,26 @@ so it reapplies automatically when the display returns. Custom
 virtual-screen coordinates in 96-DPI logical pixels — not relative to the
 selected display — and the resulting position is clamped into the selected
 display's work area.
+
+`max_tick_hz` caps how often the pill's animation refreshes; on higher-refresh
+monitors the UI thread is throttled down to it. Motion stays time-based — the
+cap only limits repaint frequency. Values at or below 60 keep the default 60 Hz
+cap, and values above 1000 are clamped to 1000. It is configurable only via
+`config.toml`, not the Settings UI.
+
+`compact_hover_action` controls what hovering over a pill with the *compact*
+layout does:
+
+- `"dismiss"` — the hover shortens the dismiss delay to 500 ms (default).
+- `"expand"` — the hover morphs the compact pill in place to the expanded
+  layout, once per notification; the next hover entry dismisses it.
+
+An expanded pill under the cursor is never dismissed by its countdown: while
+the cursor stays on it, the dismiss clock is deferred (and updates refresh the
+pill in place), so the pill cannot disappear mid-read. Only pills whose layout
+mode is explicitly `Compact` expand — an Auto-resolved compact pill is a
+deliberate choice (fullscreen app, or a source on the auto-compact list) and
+always keeps the Dismiss behavior.
 
 ## [behavior]
 

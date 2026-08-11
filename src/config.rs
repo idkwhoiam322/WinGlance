@@ -1005,4 +1005,52 @@ nested_appearance = [1, 2, 3]
         config.normalize();
         assert_eq!(config.appearance.compact_corner_radius, 4.0);
     }
+
+    #[test]
+    fn docs_and_config_example_cover_every_config_field() {
+        // Every serializable field must be documented in both
+        // docs/configuration.md and config.example.toml. The key set is
+        // derived from a fully-populated default config, so no struct field
+        // can be added without this test failing until both files mention
+        // it — the schema drift the review found cannot recur.
+        let mut config = Config::default();
+        // Populate the Option fields that skip_serializing_if would omit.
+        config.overlay.position_x = Some(0);
+        config.overlay.position_y = Some(0);
+        config.overlay.compact_position_x = Some(0);
+        config.overlay.compact_position_y = Some(0);
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let keys: Vec<&str> = serialized
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim()))
+            .collect();
+        assert!(
+            keys.len() >= 30,
+            "the fully-populated default must expose the whole field set, got {keys:?}"
+        );
+        let example = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml"))
+            .expect("config.example.toml must exist at the crate root");
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/configuration.md"))
+            .expect("docs/configuration.md must exist at the crate root");
+
+        let missing_in_example: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| !example.contains(&format!("{key} =")))
+            .collect();
+        let missing_in_docs: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| !doc.contains(&format!("`{key}`")))
+            .collect();
+
+        assert!(
+            missing_in_example.is_empty(),
+            "config.example.toml does not cover: {missing_in_example:?}"
+        );
+        assert!(
+            missing_in_docs.is_empty(),
+            "docs/configuration.md does not cover: {missing_in_docs:?}"
+        );
+    }
 }

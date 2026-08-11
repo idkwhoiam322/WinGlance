@@ -8,10 +8,38 @@ horizontal = "center"
 # Logical-pixel margin from the chosen edge (after DPI scaling).
 margin = 8
 max_width = 340
+# Animation tick-rate cap in Hz; config.toml only (no Settings UI entry).
+# Values at or below 60 keep the default 60 Hz cap, values above 1000 clamp
+# to 1000.
+# max_tick_hz = 60
 # Optional absolute overrides (96-DPI logical pixels). When set, the pill is
 # placed here instead of the anchor above; set by the "Adjust position" drag.
 # position_x = 0
 # position_y = 0
+# Which display the pill is placed on: "active-window" (the foreground
+# window's monitor, default) | "primary" | "index-N" (the (N+1)-th display
+# in Windows' enumeration order).
+monitor = "active-window"
+# Which pill layout is used: "expanded" (default) | "compact" | "auto"
+# (compact while the foreground app is fullscreen or on the
+# auto_compact_sources list, expanded otherwise).
+layout = "expanded"
+# Give the Compact layout its own independent position. While false, the
+# Compact layout follows the Expanded position and the compact_* fields are
+# retained but ignored.
+compact_position_separate = false
+compact_vertical = "top"
+compact_horizontal = "center"
+compact_margin = 8
+# compact_position_x = 0
+# compact_position_y = 0
+compact_monitor = "active-window"
+# What hovering over a Compact-layout pill does: "dismiss" (dismiss after
+# 500 ms, default) | "expand" (morph the compact pill in place to the
+# expanded layout once per notification; the next hover entry dismisses).
+# Only pills whose layout is explicitly Compact expand; an Auto-resolved
+# compact pill always dismisses.
+compact_hover_action = "dismiss"
 
 [behavior]
 enable_track_change = true
@@ -29,6 +57,10 @@ close_to_tray = true
 # Source apps to allow (case-insensitive substrings against the
 # AUMID and its label). When empty, all apps generate notifications.
 # media_sources = ["spotify"]
+# Apps that force the Compact layout while layout = "auto" and one of them
+# is the foreground app (same matching rules as media_sources). When empty,
+# only fullscreen foregrounds compact.
+auto_compact_sources = []
 
 [appearance]
 # Near-opaque dark-slate pill background (alpha 235 = ~92%): text, album art
@@ -43,6 +75,9 @@ text_color = [255, 255, 255, 255]
 # palette color.
 accent_color = [240, 110, 155, 255]
 corner_radius = 26.0
+# Compact layout's own corner rounding (logical px), independent of
+# corner_radius.
+compact_corner_radius = 12.0
 padding = 15.0
 art_size = 48
 font_size_title = 16.0
