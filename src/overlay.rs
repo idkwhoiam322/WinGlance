@@ -980,6 +980,14 @@ struct OverlayState {
     /// each frame from `AURA_HALO_LOGICAL * dpi * shape`. The pill is
     /// drawn at `(aura_inset, aura_inset)` so the aura fills the outer ring.
     aura_inset: i32,
+    /// Test-only: forces `is_cursor_over_pill` to a fixed answer, so `tick()`
+    /// can be driven deterministically without polling the real cursor.
+    #[cfg(test)]
+    test_cursor_over: Option<bool>,
+    /// Test-only: counts `render()` entries, so a tick-level test can assert
+    /// that the tick which starts a hover morph renders on that same tick.
+    #[cfg(test)]
+    render_count: u32,
 }
 
 /// Resolved placement for the WinGlance pill, pulled from [overlay] config. `x`/`y`
@@ -1202,6 +1210,10 @@ impl OverlayState {
             scratch_utf16: Vec::new(),
             fonts: FontProvider::new(0),
             aura_inset: 0,
+            #[cfg(test)]
+            test_cursor_over: None,
+            #[cfg(test)]
+            render_count: 0,
         }
     }
 
@@ -2008,10 +2020,16 @@ impl OverlayState {
         // expand/collapse. A flipped layout forces a render (the pill's
         // size, content layout and placement all change with it).
         let layout_flipped = self.config.overlay.layout == LayoutMode::Auto && !animating && self.tick_layout_check();
-        // A fully-shown pill is static unless a marquee line is actually
-        // overflowing: skip the render (and its UpdateLayeredWindow) entirely
-        // when nothing changed. The animation phases still repaint every tick.
-        if layout_flipped || animating || marquee_active {
+        // The render gate must see the hover state as it stands AFTER this
+        // tick's hover-detection code ran: `animating` was computed at the
+        // top of the tick, before the cursor poll, so on the tick that
+        // starts a hover morph it still reflects the pre-morph state and
+        // would skip the morph's first frame — the first rendered frame
+        // would then sample the spring already into the leg (the
+        // tick-cadence gap). The phase half of the condition stays on the
+        // top-of-tick value, so a phase transition in this same tick still
+        // renders its rest frame, exactly as before.
+        if layout_flipped || animating || self.hover_expand.is_some() || marquee_active {
             self.render();
         }
         // Re-sync the timer to the phase: a static pill drops to the coarse
@@ -2021,6 +2039,10 @@ impl OverlayState {
     }
 
     fn render(&mut self) {
+        #[cfg(test)]
+        {
+            self.render_count += 1;
+        }
         let Some(content) = self.content.take() else {
             return;
         };
@@ -2253,6 +2275,10 @@ impl OverlayState {
     /// ring). The overlay window is `WS_EX_TRANSPARENT`, so it receives no
     /// mouse messages; the cursor is polled instead on the animation tick.
     fn is_cursor_over_pill(&self) -> bool {
+        #[cfg(test)]
+        if let Some(over) = self.test_cursor_over {
+            return over;
+        }
         let mut pt = POINT::default();
         if unsafe { GetCursorPos(&mut pt) }.is_err() {
             return false;
@@ -9125,6 +9151,45 @@ mod tests {
                 false
             ),
             HoverStep::None
+        );
+    }
+
+    #[test]
+    fn tick_that_starts_the_hover_morph_renders_on_that_same_tick() {
+        // Regression for the tick-cadence gap: `animating` is computed at the
+        // top of `tick` before the hover-detection code runs, so the tick
+        // that sets `hover_expand` from None to Some must not use the stale
+        // value in its render gate — the morph's first frame would be
+        // skipped and the first rendered frame would sample the spring
+        // already into the leg, reading as a jump from the still-compact
+        // pill. Exercises `tick()` itself (with a fixed cursor), since every
+        // isolated morph-math test passes regardless of this ordering bug.
+        let mut config = Config::default();
+        config.overlay.compact_hover_action = CompactHoverAction::Expand;
+        config.overlay.layout = LayoutMode::Compact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.phase = Phase::Shown;
+        state.layout = LayoutMode::Compact;
+        state.content = Some(MediaEvent::TrackChanged(TrackInfo {
+            title: "Everything, Everywhere".into(),
+            artist: "John Muirhead".into(),
+            source_app: "Spotify".into(),
+            ..TrackInfo::default()
+        }));
+        state.test_cursor_over = Some(true);
+        let before = state.render_count;
+        state.tick();
+        assert!(
+            state
+                .hover_expand
+                .as_ref()
+                .is_some_and(|m| m.direction == MorphDirection::Expand),
+            "precondition: this tick must start the hover morph"
+        );
+        assert_eq!(
+            state.render_count,
+            before + 1,
+            "the tick that starts the morph must render its first frame"
         );
     }
 
