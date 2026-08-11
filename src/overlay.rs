@@ -304,7 +304,10 @@ const INDEX_WARN_INTERVAL: Duration = Duration::from_secs(10);
 static LAST_INDEX_WARN: Mutex<Option<(u32, Instant)>> = Mutex::new(None);
 
 fn warn_index_fallback(index: u32) {
-    let mut last = LAST_INDEX_WARN.lock().unwrap();
+    // Poison-tolerant: a panicking holder must not take down the pill thread
+    // just to suppress a log throttle; losing the throttle at worst floods
+    // the log at INDEX_WARN_INTERVAL cadence.
+    let mut last = LAST_INDEX_WARN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = Instant::now();
     let due = match *last {
         Some((last_index, at)) => last_index != index || now.duration_since(at) >= INDEX_WARN_INTERVAL,
@@ -324,7 +327,10 @@ const TARGET_LOG_INTERVAL: Duration = Duration::from_secs(5);
 static LAST_TARGET_LOG: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
 
 fn log_target_once(target: &TargetMonitor, name: &str) {
-    let mut last = LAST_TARGET_LOG.lock().unwrap();
+    // Poison-tolerant for the same reason as warn_index_fallback: the
+    // throttle guards log volume only, and must not abort the pill thread
+    // when a panicking holder poisoned the mutex.
+    let mut last = LAST_TARGET_LOG.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = Instant::now();
     let due = match *last {
         Some((last_index, at)) => last_index != target.index || now.duration_since(at) >= TARGET_LOG_INTERVAL,
