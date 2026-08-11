@@ -2789,14 +2789,15 @@ fn morph_radius(compact_radius: f32, expanded_radius: f32, progress: MorphProgre
 
 /// The compact content's opacity during a morph, keyed to the shape
 /// progress — the LESS-advanced of the two axes (see `draw_text_pixels`):
-/// it holds fully visible while the pill stays compact-shaped, then
-/// dissolves out over 0.20..0.45. The windows deliberately OVERLAP
-/// `expanded_alpha`'s 0.30..0.60 (the fade model swaps the two layouts in
-/// place rather than moving elements between them), so the two contents
-/// briefly blend and the pill is never empty mid-morph.
+/// it holds fully visible only very briefly, then dissolves out over
+/// 0.05..0.20, so the compact-mode elements — the inline app icon included —
+/// clear early and are completely gone BEFORE the expanded content starts
+/// arriving (0.25). The windows are deliberately disjoint: the two layouts
+/// must never coexist, or the compact icon would visibly sit beside the
+/// expanding title row.
 fn compact_alpha(shape_progress: f32) -> f32 {
-    const HOLD_END: f32 = 0.20;
-    const FADE_OUT_END: f32 = 0.45;
+    const HOLD_END: f32 = 0.05;
+    const FADE_OUT_END: f32 = 0.20;
     1.0 - ease_out_quint(((shape_progress - HOLD_END) / (FADE_OUT_END - HOLD_END)).clamp(0.0, 1.0))
 }
 
@@ -2804,11 +2805,11 @@ fn compact_alpha(shape_progress: f32) -> f32 {
 /// progress — the less-advanced of the two axes: on expand that is the
 /// lagging height, so the expanded rows arrive only after the pill has
 /// grown tall enough to show them; on collapse it is the leading width, so
-/// the expanded rows leave as the pill narrows. The fade window (0.30 to
-/// 0.60) overlaps `compact_alpha`'s dissolve, so the two layouts blend
-/// instead of leaving an empty pill between them.
+/// the expanded rows leave as the pill narrows. The fade window (0.25 to
+/// 0.60) starts only where `compact_alpha`'s has ended — the compact layout
+/// is gone before the expanded one appears, so the two never blend.
 fn expanded_alpha(shape_progress: f32) -> f32 {
-    const FADE_IN_START: f32 = 0.30;
+    const FADE_IN_START: f32 = 0.25;
     const FADE_IN_END: f32 = 0.60;
     ease_out_quint(((shape_progress - FADE_IN_START) / (FADE_IN_END - FADE_IN_START)).clamp(0.0, 1.0))
 }
@@ -7798,6 +7799,132 @@ mod tests {
     }
 
     #[test]
+    fn compact_icon_leaves_no_trace_at_the_morph_end() {
+        // The cross-fade model: the compact-mode icon (inline, after the
+        // title, next to the playback symbol) must dissolve with the compact
+        // content and be completely gone by the time the morph reaches the
+        // expanded state — the expanded layout's icon lives only in the app
+        // row. Renders the morph-end frame twice, with and without an app
+        // icon, and asserts the buffers are pixel-identical: the icon
+        // contributes zero pixels to the expanded frame. (The compact slot
+        // region legitimately holds the expanded title's glyphs, so
+        // equality — not emptiness — is the contract.)
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+        // Synthetic 24x24 icon, solid premultiplied blue — distinguishable
+        // from the white title glyphs.
+        let mut icon = vec![0u8; 24 * 24 * 4];
+        for px in icon.chunks_mut(4) {
+            px.copy_from_slice(&[0, 0, 255, 255]);
+        }
+        let track_with_icon = TrackInfo {
+            title: "Everything, Everywhere".into(),
+            artist: "John Muirhead".into(),
+            source_app: "Spotify".into(),
+            app_icon: Some(Arc::<[u8]>::from(icon)),
+            ..TrackInfo::default()
+        };
+        let content_with_icon = MediaEvent::TrackChanged(track_with_icon);
+        let track_without = TrackInfo {
+            title: "Everything, Everywhere".into(),
+            artist: "John Muirhead".into(),
+            source_app: "Spotify".into(),
+            ..TrackInfo::default()
+        };
+        let content_without = MediaEvent::TrackChanged(track_without);
+        let (_, expanded_h) = content_size_of(&state.config, &content_with_icon, false);
+        let height = expanded_h as i32;
+        let buf_w = 400usize;
+        let buf_h = 120usize;
+        let mut pixels = vec![0u8; buf_w * buf_h * 4];
+        let icon_lit = |pixels: &[u8], x0: usize, y0: usize, x1: usize, y1: usize| {
+            (y0..y1)
+                .flat_map(|y| (x0..x1).map(move |x| (y, x)))
+                .filter(|&(y, x)| {
+                    let p = &pixels[(y * buf_w + x) * 4..(y * buf_w + x) * 4 + 4];
+                    p[3] > 0 && p[2] > p[0] && p[2] > p[1]
+                })
+                .count()
+        };
+        // Morph start: the compact icon is present at the compact slot
+        // (235, 17), 16 px, at the default config and scale 1.0.
+        draw_text_pixels(
+            &mut state,
+            &mut pixels,
+            &content_with_icon,
+            buf_w as i32,
+            1.0,
+            false,
+            Some(MorphProgress {
+                width: 0.0,
+                height: 0.0,
+            }),
+            height,
+            height,
+        );
+        assert!(
+            icon_lit(&pixels, 235, 17, 251, 33) > 0,
+            "the compact icon must show at the morph start"
+        );
+        // Morph end: the icon must leave no trace — the expanded frame is
+        // identical with and without it.
+        let mut with_icon = vec![0u8; buf_w * buf_h * 4];
+        draw_text_pixels(
+            &mut state,
+            &mut with_icon,
+            &content_with_icon,
+            buf_w as i32,
+            1.0,
+            false,
+            Some(MorphProgress {
+                width: 1.0,
+                height: 1.0,
+            }),
+            height,
+            height,
+        );
+        let mut without_icon = vec![0u8; buf_w * buf_h * 4];
+        draw_text_pixels(
+            &mut state,
+            &mut without_icon,
+            &content_without,
+            buf_w as i32,
+            1.0,
+            false,
+            Some(MorphProgress {
+                width: 1.0,
+                height: 1.0,
+            }),
+            height,
+            height,
+        );
+        assert_eq!(
+            with_icon, without_icon,
+            "the compact icon must be completely gone at the morph end"
+        );
+        // Mid-fade: partially faded, still present.
+        pixels.fill(0);
+        draw_text_pixels(
+            &mut state,
+            &mut pixels,
+            &content_with_icon,
+            buf_w as i32,
+            1.0,
+            false,
+            Some(MorphProgress {
+                width: 0.10,
+                height: 0.10,
+            }),
+            height,
+            height,
+        );
+        assert!(
+            icon_lit(&pixels, 235, 17, 251, 33) > 0,
+            "the compact icon must be mid-fade during the transition"
+        );
+    }
+
+    #[test]
     fn text_sits_inside_its_row_band() {
         // Regression guard for the glyph vertical placement: with a 40px-tall
         // row, glyph pixels must land in the upper two thirds, not below the
@@ -8334,17 +8461,18 @@ mod tests {
     }
 
     #[test]
-    fn morph_cross_fade_blends_the_two_contents_with_no_empty_gap() {
+    fn morph_cross_fade_never_shows_both_layouts_at_once() {
         // Both passes key to the shape progress — the less-advanced axis,
-        // min(width, height). The fade windows (compact: 0.20..0.45,
-        // expanded: 0.30..0.60) deliberately OVERLAP: the fade model swaps
-        // the two layouts in place, so the contents blend mid-morph and the
-        // pill is never empty. At no point may the SUM drop to zero (the
-        // old disjoint windows' empty-body gap), and each pass still pins to
-        // its endpoint outside the fade range.
-        assert_eq!(compact_alpha(0.20), 1.0);
-        assert_eq!(compact_alpha(1.0), 0.0);
-        assert_eq!(expanded_alpha(0.0), 0.0);
+        // min(width, height). The fade windows (compact: 0.05..0.20,
+        // expanded: 0.25..0.60) are deliberately DISJOINT: the compact
+        // layout — the inline app icon included — must be completely gone
+        // before the expanded layout starts arriving, or the icon would
+        // visibly sit beside the expanding title row. The assertion allows
+        // float dust at the window boundary — at no point can both passes be
+        // meaningfully visible.
+        assert_eq!(compact_alpha(0.05), 1.0);
+        assert_eq!(compact_alpha(0.20), 0.0);
+        assert_eq!(expanded_alpha(0.25), 0.0);
         assert_eq!(expanded_alpha(0.60), 1.0);
         for i in 0..=400 {
             let t = i as f32 / 400.0;
@@ -8353,13 +8481,13 @@ mod tests {
             let shape = width.min(height);
             let (compact, expanded) = (compact_alpha(shape), expanded_alpha(shape));
             assert!(
-                compact + expanded > 0.01,
-                "the passes must never leave the pill empty at t={t}: compact={compact} expanded={expanded}"
+                compact <= 0.01 || expanded <= 0.01,
+                "the passes must never overlap at t={t}: compact={compact} expanded={expanded}"
             );
         }
-        // The release direction (collapse) keeps the same blend: the compact
-        // content fades back in while the expanded content is still leaving,
-        // with the leading width as the limiting axis.
+        // The release direction (collapse) keeps the same disjointness, with
+        // the leading width as the limiting axis: the expanded content is
+        // gone before the compact content starts fading back in.
         for i in 0..=400 {
             let t = i as f32 / 400.0;
             let width = spring_collapse(t, 1.0, 0.0);
@@ -8367,8 +8495,8 @@ mod tests {
             let shape = width.min(height);
             let (compact, expanded) = (compact_alpha(shape), expanded_alpha(shape));
             assert!(
-                compact + expanded > 0.01,
-                "the passes must never leave the pill empty on collapse at t={t}: compact={compact} expanded={expanded}"
+                compact <= 0.01 || expanded <= 0.01,
+                "the passes must never overlap on collapse at t={t}: compact={compact} expanded={expanded}"
             );
         }
     }
