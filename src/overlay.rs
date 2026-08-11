@@ -66,17 +66,26 @@ const REVERSAL_MIN_PROGRESS: f32 = 0.05;
 /// detaches from the width.
 const MORPH_LAG: f32 = 0.12;
 
-/// The appended whole-pill settle-bounce: after the size spring pins at its
-/// endpoint, the entire pill scales about its anchor past the final size and
-/// back (expand: 1 -> 1.01 -> 1; compaction: 1 -> 0.99 -> 1.01 -> 1), so the
+/// The whole-pill settle-bounce: after the size spring passes its endpoint,
+/// the entire pill scales about its anchor past the final size and back
+/// (expand: 1 -> 1.01 -> 1; compaction: 1 -> 0.99 -> 1.01 -> 1), so the
 /// bounce reads as one 1:1 card settling instead of per-element overshoots.
-/// Both are the first tuning knobs if the bounce reads too weak or too wild.
-const BOUNCE_DURATION: Duration = Duration::from_millis(120);
-/// Over-bounce amplitude: the pill grows to (1 + OVER) of its final size.
+/// The amplitudes are the first tuning knobs if the bounce reads too weak or
+/// too wild.
 const BOUNCE_OVER: f32 = 0.01;
 /// Under-bounce amplitude (compaction only): the pill shrinks to
 /// (1 - UNDER) of its final size before the over-bounce.
 const BOUNCE_UNDER: f32 = 0.01;
+/// The expand spring's peak progress (ζ = 0.7, 2.8π, from rest): the
+/// bounce's excess is normalized against it, so the over-bounce peaks at
+/// exactly `BOUNCE_OVER` when the spring peaks. Pinned by
+/// `spring_expand_overshoots_then_settles_exactly`.
+const EXPAND_SPRING_PEAK: f32 = 1.045988;
+/// The collapse spring's undershoot below compact (ζ = 0.9, released from
+/// rest): the compaction's dip is normalized against it, so the pill shrinks
+/// to exactly (1 - `BOUNCE_UNDER`) at the trough. Pinned by
+/// `spring_collapse_release_from_expanded_settles_without_a_visible_bounce`.
+const COLLAPSE_TROUGH: f32 = -0.001524;
 /// Tick period while the pill is fully static (no animation, no marquee
 /// scrolling). The dismiss countdown and hover polling do not need frame
 /// rate; the refresh-rate timer is restored the moment the pill animates or
@@ -629,10 +638,6 @@ struct FrameState {
 struct MorphProgress {
     width: f32,
     height: f32,
-    /// The appended settle-bounce's local time: 0 while the size spring is
-    /// still running, then ramps to 1 over `BOUNCE_DURATION` after the
-    /// spring pins, driving the whole-pill scale (see `bounce_scale`).
-    bounce: f32,
 }
 
 /// Which way the in-place hover morph is going.
@@ -1991,7 +1996,7 @@ impl OverlayState {
         }
 
         match self.phase {
-            Phase::Expanding(start) if start.elapsed() >= animation_duration(&self.config) + BOUNCE_DURATION => {
+            Phase::Expanding(start) if start.elapsed() >= animation_duration(&self.config) => {
                 self.phase = Phase::Shown;
                 debug!("pill phase -> shown");
             }
@@ -1999,7 +2004,7 @@ impl OverlayState {
                 self.phase = Phase::Shown;
                 debug!("pill phase -> shown");
             }
-            Phase::Collapsing(start) if start.elapsed() >= collapse_duration(&self.config) + BOUNCE_DURATION => {
+            Phase::Collapsing(start) if start.elapsed() >= collapse_duration(&self.config) => {
                 self.hide();
                 return;
             }
@@ -2103,23 +2108,30 @@ impl OverlayState {
         // the pill grows in place. The entrance/exit grow uses the same
         // reveal. Every other frame uses the plain size of the applied
         // layout.
-        let (logical_width, logical_height, bounce) = if let Some(hover) = &self.hover_expand {
+        let (logical_width, logical_height, morph_progress) = if let Some(hover) = &self.hover_expand {
             let progress = hover_progress(hover, &self.config);
             let size = morph_size(&self.config, &content, progress);
-            (size.0, size.1, progress.bounce)
+            (size.0, size.1, progress)
         } else if let Some(progress) = frame.morph {
             let size = morph_size(&self.config, &content, progress);
-            (size.0, size.1, progress.bounce)
+            (size.0, size.1, progress)
         } else {
             let size = content_size_of(&self.config, &content, compact);
-            (size.0, size.1, 0.0)
+            (
+                size.0,
+                size.1,
+                MorphProgress {
+                    width: 0.0,
+                    height: 0.0,
+                },
+            )
         };
-        // The settle-bounce: after the size spring pins, the whole pill
-        // scales about its anchor past the final size and back (see
-        // `bounce_scale`), so the bounce reads as one 1:1 card settling
-        // instead of per-element overshoots. The scale multiplies the size
-        // (window and hitbox alike) and is applied to the rendered frame in
-        // `render_layered`.
+        // The settle-bounce: while the size spring passes its endpoint, the
+        // whole pill scales about its anchor past the final size and back
+        // (see `bounce_scale`) — the bounce rides the spring itself, so it
+        // starts the instant the size completes, with no still pause. The
+        // scale multiplies the size (window and hitbox alike) and is applied
+        // to the rendered frame in `render_layered`.
         let direction = if let Some(hover) = &self.hover_expand {
             hover.direction
         } else if matches!(self.phase, Phase::Collapsing(_)) {
@@ -2127,7 +2139,7 @@ impl OverlayState {
         } else {
             MorphDirection::Expand
         };
-        let scale_factor = bounce_scale(bounce, direction);
+        let scale_factor = bounce_scale(morph_progress, direction);
         let logical_width = logical_width * scale_factor;
         let logical_height = logical_height * scale_factor;
         let width = (logical_width * dpi).round().max(1.0) as i32;
@@ -2163,11 +2175,8 @@ impl OverlayState {
         match self.phase {
             Phase::Hidden => FrameState { alpha: 0, morph: None },
             Phase::Expanding(start) => {
-                let spring_dur = animation_duration(&self.config).as_secs_f32();
-                let bounce_dur = BOUNCE_DURATION.as_secs_f32();
-                let elapsed = start.elapsed().as_secs_f32();
-                let t = (elapsed / spring_dur).clamp(0.0, 1.0);
-                let bounce = ((elapsed - spring_dur) / bounce_dur).clamp(0.0, 1.0);
+                let total_dur = animation_duration(&self.config).as_secs_f32();
+                let t = (start.elapsed().as_secs_f32() / total_dur).clamp(0.0, 1.0);
                 // The live-pill reveal: the pill appears solid immediately
                 // (opacity lands within the first ~15 % of the leg — the
                 // geometry, not the fade, is the animation) and grows in
@@ -2185,7 +2194,6 @@ impl OverlayState {
                         Some(MorphProgress {
                             width: grow,
                             height: lagged_expand(&ENTRANCE_GROW, t, MORPH_LAG),
-                            bounce,
                         })
                     },
                 }
@@ -2202,22 +2210,18 @@ impl OverlayState {
                 morph: None,
             },
             Phase::Collapsing(start) => {
-                let spring_dur = collapse_duration(&self.config).as_secs_f32();
-                let bounce_dur = BOUNCE_DURATION.as_secs_f32();
-                let total = spring_dur + bounce_dur;
-                let elapsed = start.elapsed().as_secs_f32();
-                let t = (elapsed / spring_dur).clamp(0.0, 1.0);
-                let bounce = ((elapsed - spring_dur) / bounce_dur).clamp(0.0, 1.0);
+                let total_dur = collapse_duration(&self.config).as_secs_f32();
+                let t = (start.elapsed().as_secs_f32() / total_dur).clamp(0.0, 1.0);
                 // The exit runs the reveal backwards: the pill springs closed
                 // to its compact shape on the mirrored release curve — the
                 // width collapsing first, the height lingering behind it —
                 // and fades in the last stretch: a cubic fade across the
                 // final 75 % of the leg, so the exit stays readable while it
-                // closes and never disappears early (the appended bounce
+                // closes and never disappears early (the undershoot bounce
                 // still shows through the tail of the fade). A compact
                 // layout pill just fades out.
                 let shrink = spring_collapse(t, 1.0, 0.0);
-                let fade_t = ((elapsed - total * 0.25) / (total * 0.75)).clamp(0.0, 1.0);
+                let fade_t = (t / 0.75).min(1.0);
                 FrameState {
                     alpha: (255.0 * (1.0 - fade_t.powi(3))) as u8,
                     morph: if self.effective_compact() {
@@ -2226,7 +2230,6 @@ impl OverlayState {
                         Some(MorphProgress {
                             width: shrink,
                             height: lagged_collapse(t, MORPH_LAG, 1.0, 0.0),
-                            bounce,
                         })
                     },
                 }
@@ -2506,16 +2509,23 @@ impl OverlayState {
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         // The hitbox must track the morph, or the cursor would stop being
         // "over" the pill the moment it outgrows the compact size.
-        let (logical_width, logical_height, bounce) = if let Some(morph) = &self.hover_expand {
+        let (logical_width, logical_height, morph_progress) = if let Some(morph) = &self.hover_expand {
             let progress = hover_progress(morph, &self.config);
             let size = morph_size(&self.config, content, progress);
-            (size.0, size.1, progress.bounce)
+            (size.0, size.1, progress)
         } else if let Some(progress) = frame.morph {
             let size = morph_size(&self.config, content, progress);
-            (size.0, size.1, progress.bounce)
+            (size.0, size.1, progress)
         } else {
             let size = content_size_of(&self.config, content, self.layout == LayoutMode::Compact);
-            (size.0, size.1, 0.0)
+            (
+                size.0,
+                size.1,
+                MorphProgress {
+                    width: 0.0,
+                    height: 0.0,
+                },
+            )
         };
         // The settle-bounce scales the size too, so the hitbox matches the
         // visible pill (see `bounce_scale`).
@@ -2526,7 +2536,7 @@ impl OverlayState {
         } else {
             MorphDirection::Expand
         };
-        let scale_factor = bounce_scale(bounce, direction);
+        let scale_factor = bounce_scale(morph_progress, direction);
         let logical_width = logical_width * scale_factor;
         let logical_height = logical_height * scale_factor;
         let width = (logical_width * dpi).round().max(1.0) as i32;
@@ -2628,48 +2638,48 @@ fn content_size_of(config: &Config, content: &MediaEvent, compact: bool) -> (f32
 /// Duration of one hover-morph leg. The expand leg gets the full animation
 /// duration — room for the spring to play out — while the collapse leg runs
 /// shorter: a quick, confident return that still reads smooth. Shared by the
-/// The whole-pill scale factor of the settle-bounce, given the bounce's
-/// local time (see `MorphProgress::bounce`): exactly 1.0 at both ends, so
-/// the window and content hand off to the steady frame at the final size.
-/// The expand overshoots once to (1 + `BOUNCE_OVER`) at mid-bounce; the
-/// compaction dips to (1 - `BOUNCE_UNDER`) early, rises to (1 + OVER) later
-/// and settles — the shrink-below-minimum, grow-beyond-maximum return.
-fn bounce_scale(bounce: f32, direction: MorphDirection) -> f32 {
-    let t = bounce.clamp(0.0, 1.0);
+/// The whole-pill scale factor of the settle-bounce, as a pure function of
+/// the leg's progress — there is no appended phase, so the bounce starts the
+/// instant the size completes and there is never a still pause before it.
+/// Exactly 1.0 whenever the spring is inside its endpoints (and again at the
+/// pinned end), so the window and content hand off to the steady frame at
+/// the final size. The expand rides the spring's own overshoot past 1.0,
+/// normalized to peak at (1 + `BOUNCE_OVER`) when the spring peaks. The
+/// compaction dips to (1 - `BOUNCE_UNDER`) at the spring's undershoot
+/// trough, then the rise rides the dip's recovery — peaking at (1 + OVER)
+/// halfway back and landing exactly on 1.0 when the spring pins — the
+/// shrink-below-minimum, grow-beyond-maximum return.
+fn bounce_scale(progress: MorphProgress, direction: MorphDirection) -> f32 {
     match direction {
-        MorphDirection::Expand => 1.0 + BOUNCE_OVER * (std::f32::consts::PI * t).sin(),
+        MorphDirection::Expand => {
+            let excess = ((progress.width - 1.0) / (EXPAND_SPRING_PEAK - 1.0)).clamp(0.0, 1.0);
+            1.0 + BOUNCE_OVER * excess
+        }
         MorphDirection::Collapse => {
-            let dip = if t < 0.4 {
-                (std::f32::consts::PI * t / 0.4).sin()
+            let dip = if progress.width < 0.0 {
+                (progress.width / COLLAPSE_TROUGH).clamp(0.0, 1.0)
             } else {
                 0.0
             };
-            let rise = if (0.4..0.75).contains(&t) {
-                (std::f32::consts::PI * (t - 0.4) / 0.35).sin()
-            } else {
-                0.0
-            };
-            1.0 - BOUNCE_UNDER * dip + BOUNCE_OVER * rise
+            // The rise rides the dip's recovery: it peaks halfway back to 0
+            // and lands exactly on 1.0 when the spring pins — no appended
+            // time, no seam at the steady handoff. Its amplitude is
+            // OVER + UNDER/2 so the *net* peak is exactly 1 + OVER (the
+            // visible max stays the configured knob) while the min stays
+            // exactly 1 - UNDER at the trough.
+            1.0 - BOUNCE_UNDER * dip + (BOUNCE_OVER + BOUNCE_UNDER / 2.0) * (std::f32::consts::PI * (1.0 - dip)).sin()
         }
     }
 }
 
-/// Total duration of one hover-morph leg: the size spring (see
-/// `morph_duration_spring`) plus the appended settle-bounce
-/// (`BOUNCE_DURATION`). The expand leg gets the full animation duration —
-/// room for the spring to play out — while the collapse leg runs shorter: a
-/// quick, confident return that still reads smooth. Shared by the completion
-/// check in `tick` and the progress curve, so a leg always settles exactly
-/// when its animation is done.
+/// Duration of one hover-morph leg. The expand leg gets the full animation
+/// duration — room for the spring to play out — while the collapse leg runs
+/// shorter: a quick, confident return that still reads smooth. Shared by the
+/// completion check in `tick` and the progress curve, so a leg always
+/// settles exactly when its animation is done. The settle-bounce is not
+/// appended: it rides the spring's own overshoot/undershoot (see
+/// `bounce_scale`), so the leg duration is the spring duration.
 fn morph_duration(config: &Config, direction: MorphDirection) -> Duration {
-    morph_duration_spring(config, direction) + BOUNCE_DURATION
-}
-
-/// The size spring's own duration within a morph leg (the total minus the
-/// appended settle-bounce). The progress curves evaluate the spring against
-/// this, so the growth still completes in `animation_ms` regardless of the
-/// appended bounce.
-fn morph_duration_spring(config: &Config, direction: MorphDirection) -> Duration {
     match direction {
         MorphDirection::Expand => animation_duration(config),
         MorphDirection::Collapse => Duration::from_millis((animation_duration(config).as_millis() * 3 / 5) as u64),
@@ -2688,21 +2698,16 @@ fn morph_duration_spring(config: &Config, direction: MorphDirection) -> Duration
 /// pill may travel a little farther before turning — and both axes settle
 /// exactly at compact.
 fn hover_progress(morph: &HoverExpand, config: &Config) -> MorphProgress {
-    let spring_dur = morph_duration_spring(config, morph.direction).as_secs_f32();
     let total = morph_duration(config, morph.direction).as_secs_f32();
-    let elapsed = morph.start.elapsed().as_secs_f32();
-    let t = (elapsed / spring_dur).clamp(0.0, 1.0);
-    let bounce = ((elapsed - spring_dur) / (total - spring_dur)).clamp(0.0, 1.0);
+    let t = (morph.start.elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
     match morph.direction {
         MorphDirection::Expand => MorphProgress {
             width: spring_expand(t),
             height: lagged_expand(&EXPAND_SPRING, t, MORPH_LAG),
-            bounce,
         },
         MorphDirection::Collapse => MorphProgress {
             width: spring_collapse(t, morph.from, morph.velocity),
             height: lagged_collapse(t, MORPH_LAG, morph.from, morph.velocity),
-            bounce,
         },
     }
 }
@@ -2741,8 +2746,8 @@ fn lagged_collapse(t: f32, lag: f32, from: f32, velocity: f32) -> f32 {
 /// is passed in so the seed is a pure function of the state (callers tick at
 /// a fixed `now`, and tests get exact determinism).
 fn reversal_seed(morph: &HoverExpand, config: &Config, now: Instant) -> (f32, f32) {
-    let expand_leg = morph_duration_spring(config, MorphDirection::Expand).as_secs_f32();
-    let collapse_leg = morph_duration_spring(config, MorphDirection::Collapse).as_secs_f32();
+    let expand_leg = morph_duration(config, MorphDirection::Expand).as_secs_f32();
+    let collapse_leg = morph_duration(config, MorphDirection::Collapse).as_secs_f32();
     let t = (now.duration_since(morph.start).as_secs_f32() / expand_leg).clamp(0.0, 1.0);
     let from = spring_expand(t);
     let velocity = EXPAND_SPRING.velocity_at(t, 0.0, 0.0) * collapse_leg / expand_leg;
@@ -8192,8 +8197,7 @@ mod tests {
                 expanded_r,
                 MorphProgress {
                     width: 0.0,
-                    height: 0.0,
-                    bounce: 0.0
+                    height: 0.0
                 }
             ),
             compact_r
@@ -8204,8 +8208,7 @@ mod tests {
                 expanded_r,
                 MorphProgress {
                     width: 1.0,
-                    height: 1.0,
-                    bounce: 0.0
+                    height: 1.0
                 }
             ),
             expanded_r
@@ -8216,7 +8219,6 @@ mod tests {
             MorphProgress {
                 width: 0.5,
                 height: 0.5,
-                bounce: 0.0,
             },
         );
         assert!(
@@ -8230,7 +8232,6 @@ mod tests {
             MorphProgress {
                 width: 1.3,
                 height: 0.4,
-                bounce: 0.0,
             },
         );
         assert_eq!(over, expanded_r);
@@ -8240,7 +8241,6 @@ mod tests {
             MorphProgress {
                 width: -0.2,
                 height: 0.9,
-                bounce: 0.0,
             },
         );
         assert_eq!(under, compact_r);
@@ -8276,8 +8276,7 @@ mod tests {
             progress,
             MorphProgress {
                 width: 0.0,
-                height: 0.0,
-                bounce: 1.0
+                height: 0.0
             },
             "a finished collapse must land exactly on compact"
         );
@@ -8300,8 +8299,7 @@ mod tests {
             progress,
             MorphProgress {
                 width: 1.0,
-                height: 1.0,
-                bounce: 1.0
+                height: 1.0
             },
             "a finished expand must land exactly on expanded"
         );
@@ -8377,33 +8375,46 @@ mod tests {
 
     #[test]
     fn bounce_scale_pins_at_one_and_hits_the_configured_amplitudes() {
-        // The whole-pill settle-bounce: exactly 1.0 at both ends (the frame
-        // that hands off to the steady state is at the final size), an
-        // expand that overshoots once to 1 + BOUNCE_OVER, and a compaction
-        // that dips to 1 - BOUNCE_UNDER, rises to 1 + BOUNCE_OVER and
-        // settles — the shrink-below-minimum, grow-beyond-maximum return.
-        assert_eq!(bounce_scale(0.0, MorphDirection::Expand), 1.0);
-        assert_eq!(bounce_scale(1.0, MorphDirection::Expand), 1.0);
+        // The whole-pill settle-bounce, driven by the spring progress
+        // itself: exactly 1.0 whenever the spring is inside its endpoints
+        // (and at the pinned end), an expand that overshoots once to
+        // 1 + BOUNCE_OVER at the spring's peak, and a compaction that dips
+        // to 1 - BOUNCE_UNDER at the undershoot trough, rises to
+        // 1 + BOUNCE_OVER halfway back and lands on 1.0 at the pin — the
+        // shrink-below-minimum, grow-beyond-maximum return.
+        let at = |width: f32| MorphProgress { width, height: 0.0 };
+        // Expand: no scale inside the endpoints, exactly 1 + OVER at the
+        // spring's peak, clamped beyond it.
+        assert_eq!(bounce_scale(at(0.0), MorphDirection::Expand), 1.0);
+        assert_eq!(bounce_scale(at(0.5), MorphDirection::Expand), 1.0);
+        assert_eq!(bounce_scale(at(1.0), MorphDirection::Expand), 1.0);
         assert!(
-            (bounce_scale(0.5, MorphDirection::Expand) - (1.0 + BOUNCE_OVER)).abs() < 1e-5,
+            (bounce_scale(at(EXPAND_SPRING_PEAK), MorphDirection::Expand) - (1.0 + BOUNCE_OVER)).abs() < 1e-5,
             "the expand must peak at 1 + BOUNCE_OVER, got {}",
-            bounce_scale(0.5, MorphDirection::Expand)
+            bounce_scale(at(EXPAND_SPRING_PEAK), MorphDirection::Expand)
         );
-        assert_eq!(bounce_scale(0.0, MorphDirection::Collapse), 1.0);
-        assert_eq!(bounce_scale(1.0, MorphDirection::Collapse), 1.0);
+        assert_eq!(bounce_scale(at(1.3), MorphDirection::Expand), 1.0 + BOUNCE_OVER);
+        // Compaction: exactly 1.0 at the zero crossings (the pill reaches
+        // compact and the pin lands at compact), 1 - UNDER at the trough,
+        // and the net peak exactly 1 + OVER halfway back.
+        assert_eq!(bounce_scale(at(0.6), MorphDirection::Collapse), 1.0);
+        assert_eq!(bounce_scale(at(0.0), MorphDirection::Collapse), 1.0);
         assert!(
-            (bounce_scale(0.2, MorphDirection::Collapse) - (1.0 - BOUNCE_UNDER)).abs() < 1e-5,
+            (bounce_scale(at(COLLAPSE_TROUGH), MorphDirection::Collapse) - (1.0 - BOUNCE_UNDER)).abs() < 1e-5,
             "the compaction must dip to 1 - BOUNCE_UNDER, got {}",
-            bounce_scale(0.2, MorphDirection::Collapse)
+            bounce_scale(at(COLLAPSE_TROUGH), MorphDirection::Collapse)
         );
         assert!(
-            (bounce_scale(0.575, MorphDirection::Collapse) - (1.0 + BOUNCE_OVER)).abs() < 1e-5,
-            "the compaction must rise to 1 + BOUNCE_OVER, got {}",
-            bounce_scale(0.575, MorphDirection::Collapse)
+            (bounce_scale(at(COLLAPSE_TROUGH / 2.0), MorphDirection::Collapse) - (1.0 + BOUNCE_OVER)).abs() < 1e-5,
+            "the compaction must rise to 1 + BOUNCE_OVER mid-recovery, got {}",
+            bounce_scale(at(COLLAPSE_TROUGH / 2.0), MorphDirection::Collapse)
         );
-        // Out-of-range bounce times clamp to the pinned endpoints.
-        assert_eq!(bounce_scale(-1.0, MorphDirection::Expand), 1.0);
-        assert_eq!(bounce_scale(2.0, MorphDirection::Collapse), 1.0);
+        // The scale is a pure function of the progress: a below-trough dip
+        // clamps at the configured minimum rather than overshooting it.
+        assert_eq!(
+            bounce_scale(at(COLLAPSE_TROUGH * 2.0), MorphDirection::Collapse),
+            1.0 - BOUNCE_UNDER
+        );
     }
 
     #[test]
@@ -8552,11 +8563,9 @@ mod tests {
         // The reversal seed is the expand curve's value and velocity at the
         // reversal moment, the velocity converted to collapse-leg units so
         // the absolute (per-second) motion is unchanged across the flip.
-        // The conversion uses the springs' own durations (the appended
-        // settle-bounce is not part of the spring motion).
         let config = Config::default();
-        let expand_leg = morph_duration_spring(&config, MorphDirection::Expand);
-        let collapse_leg = morph_duration_spring(&config, MorphDirection::Collapse);
+        let expand_leg = morph_duration(&config, MorphDirection::Expand);
+        let collapse_leg = morph_duration(&config, MorphDirection::Collapse);
         let mid = expand_leg.as_millis() as u64 / 2;
         let morph = HoverExpand {
             start: Instant::now() - Duration::from_millis(mid),
@@ -8797,8 +8806,7 @@ mod tests {
                 &content,
                 MorphProgress {
                     width: 0.0,
-                    height: 0.0,
-                    bounce: 0.0
+                    height: 0.0
                 }
             ),
             (compact_w, compact_h)
@@ -8809,8 +8817,7 @@ mod tests {
                 &content,
                 MorphProgress {
                     width: 1.0,
-                    height: 1.0,
-                    bounce: 0.0
+                    height: 1.0
                 }
             ),
             (expanded_w, expanded_h)
@@ -8824,7 +8831,6 @@ mod tests {
                 MorphProgress {
                     width: progress,
                     height: progress,
-                    bounce: 0.0,
                 },
             );
             assert!(
@@ -8844,7 +8850,6 @@ mod tests {
             MorphProgress {
                 width: 0.9,
                 height: 0.3,
-                bounce: 0.0,
             },
         );
         assert!(
@@ -8860,7 +8865,6 @@ mod tests {
             let progress = MorphProgress {
                 width: spring_expand(t),
                 height: lagged_expand(&EXPAND_SPRING, t, MORPH_LAG),
-                bounce: 0.0,
             };
             let (width, height) = morph_size(&config, &content, progress);
             assert!(
@@ -9050,7 +9054,6 @@ mod tests {
             MorphProgress {
                 width: 0.0,
                 height: 0.0,
-                bounce: 0.0,
             },
         );
         let (expanded_w, expanded_h) = morph_size(
@@ -9059,7 +9062,6 @@ mod tests {
             MorphProgress {
                 width: 1.0,
                 height: 1.0,
-                bounce: 0.0,
             },
         );
         assert!(
@@ -9133,8 +9135,7 @@ mod tests {
             hover_progress(&finished, &config),
             MorphProgress {
                 width: 1.0,
-                height: 1.0,
-                bounce: 1.0
+                height: 1.0
             }
         );
         // A collapse leg starts from the progress it reversed at and settles
@@ -9164,8 +9165,7 @@ mod tests {
             hover_progress(&collapse_done, &config),
             MorphProgress {
                 width: 0.0,
-                height: 0.0,
-                bounce: 1.0
+                height: 0.0
             }
         );
     }
