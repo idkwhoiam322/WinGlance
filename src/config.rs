@@ -138,9 +138,13 @@ pub enum LayoutMode {
 ///                                    # dismisses
 /// ```
 ///
-/// Only pills whose layout mode is explicitly `Compact` expand: an
-/// Auto-resolved compact pill is a deliberate choice (fullscreen app, or a
-/// source on the auto-compact list) and always keeps the Dismiss behavior.
+/// An expanded pill under the cursor is never dismissed by its countdown:
+/// while the cursor stays on it, the dismiss clock is deferred (and updates
+/// refresh the pill in place), so the pill cannot disappear mid-read. It
+/// only dismisses once the cursor leaves. Only pills whose layout mode is
+/// explicitly `Compact` expand: an Auto-resolved compact pill is a
+/// deliberate choice (fullscreen app, or a source on the auto-compact list)
+/// and always keeps the Dismiss behavior.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CompactHoverAction {
