@@ -29,6 +29,7 @@ use windows::Win32::Graphics::Gdi::{
     HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SelectObject, SetBkColor,
     SetTextColor,
 };
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
@@ -2900,6 +2901,33 @@ impl MainWindowState {
         self.invalidate();
     }
 
+    /// Opens `path` with the OS's default handler, from the UI thread, with a
+    /// COM apartment active for the call: the shell's documentation requires
+    /// COM initialized before `ShellExecuteW`, and the UI thread otherwise
+    /// has none. `CoUninitialize` runs only when this call's own init
+    /// succeeded, so a thread that already initialized COM (either apartment
+    /// model) is left exactly as it was found. Returns the raw
+    /// `ShellExecuteW` result; callers treat values <= 32 as failure.
+    fn shell_open(&self, path: &std::path::Path) -> i32 {
+        let file = wide(&path.to_string_lossy());
+        let verb = wide("open");
+        unsafe {
+            let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+            let result = ShellExecuteW(
+                self.hwnd,
+                PCWSTR(verb.as_ptr()),
+                PCWSTR(file.as_ptr()),
+                None,
+                None,
+                SW_SHOW,
+            );
+            if initialized {
+                CoUninitialize();
+            }
+            result.0 as i32
+        }
+    }
+
     /// Opens the current run's log file (`log-Live.log`) in the default
     /// application registered for its extension (i.e. the user's preferred
     /// text editor), mirroring `copy_logs`, which reads the same path. The OS
@@ -2907,19 +2935,7 @@ impl MainWindowState {
     /// which is surfaced to the debug log rather than the screen.
     fn open_logs(&self) {
         let path = self.cfg().logs_dir().join("log-Live.log");
-        let file = wide(&path.to_string_lossy());
-        let verb = wide("open");
-        let result = unsafe {
-            ShellExecuteW(
-                self.hwnd,
-                PCWSTR(verb.as_ptr()),
-                PCWSTR(file.as_ptr()),
-                None,
-                None,
-                SW_SHOW,
-            )
-        };
-        let code = result.0 as isize;
+        let code = self.shell_open(&path);
         if code <= 32 {
             debug!("open logs: ShellExecuteW failed (code {code}) for {path:?}");
         } else {
@@ -2941,19 +2957,7 @@ impl MainWindowState {
                 return;
             }
         };
-        let file = wide(&path.to_string_lossy());
-        let verb = wide("open");
-        let result = unsafe {
-            ShellExecuteW(
-                self.hwnd,
-                PCWSTR(verb.as_ptr()),
-                PCWSTR(file.as_ptr()),
-                None,
-                None,
-                SW_SHOW,
-            )
-        };
-        let code = result.0 as isize;
+        let code = self.shell_open(&path);
         if code <= 32 {
             debug!("open config: ShellExecuteW failed (code {code}) for {path:?}");
         } else {
