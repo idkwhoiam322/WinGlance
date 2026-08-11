@@ -5933,7 +5933,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
 }
 
 fn animation_duration(config: &Config) -> Duration {
-    Duration::from_millis(config.overlay.animation_ms.clamp(100, 500))
+    Duration::from_millis(config.overlay.animation_ms.clamp(100, 1000))
 }
 
 /// The exit leg's duration: shorter than the entrance — a quick, confident
