@@ -68,14 +68,14 @@ const MORPH_LAG: f32 = 0.12;
 
 /// The whole-pill settle-bounce: after the size spring passes its endpoint,
 /// the entire pill scales about its anchor past the final size and back
-/// (expand: 1 -> 1.01 -> 1; compaction: 1 -> 0.99 -> 1.01 -> 1), so the
+/// (expand: 1 -> 1.05 -> 1; compaction: 1 -> 0.95 -> 1.05 -> 1), so the
 /// bounce reads as one 1:1 card settling instead of per-element overshoots.
 /// The amplitudes are the first tuning knobs if the bounce reads too weak or
 /// too wild.
-const BOUNCE_OVER: f32 = 0.01;
+const BOUNCE_OVER: f32 = 0.05;
 /// Under-bounce amplitude (compaction only): the pill shrinks to
 /// (1 - UNDER) of its final size before the over-bounce.
-const BOUNCE_UNDER: f32 = 0.01;
+const BOUNCE_UNDER: f32 = 0.05;
 /// The expand spring's peak progress (ζ = 0.7, 2.8π, from rest): the
 /// bounce's excess is normalized against it, so the over-bounce peaks at
 /// exactly `BOUNCE_OVER` when the spring peaks. Pinned by
