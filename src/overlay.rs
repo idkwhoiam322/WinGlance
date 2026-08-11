@@ -65,6 +65,27 @@ const REVERSAL_MIN_PROGRESS: f32 = 0.05;
 /// 0.10–0.15 reads as a connected chase; beyond ~0.2 the height visibly
 /// detaches from the width.
 const MORPH_LAG: f32 = 0.12;
+
+/// The whole-pill settle-bounce: after the size spring passes its endpoint,
+/// the entire pill scales about its anchor past the final size and back
+/// (expand: 1 -> 1.05 -> 1; compaction: 1 -> 0.95 -> 1), so the
+/// bounce reads as one 1:1 card settling instead of per-element overshoots.
+/// The amplitudes are the first tuning knobs if the bounce reads too weak or
+/// too wild.
+const BOUNCE_OVER: f32 = 0.05;
+/// Under-bounce amplitude (compaction only): the pill shrinks to
+/// (1 - UNDER) of its final size before the over-bounce.
+const BOUNCE_UNDER: f32 = 0.05;
+/// The expand spring's peak progress (ζ = 0.7, 2.8π, from rest): the
+/// bounce's excess is normalized against it, so the over-bounce peaks at
+/// exactly `BOUNCE_OVER` when the spring peaks. Pinned by
+/// `spring_expand_overshoots_then_settles_exactly`.
+const EXPAND_SPRING_PEAK: f32 = 1.045988;
+/// The collapse spring's undershoot below compact (ζ = 0.9, released from
+/// rest): the compaction's dip is normalized against it, so the pill shrinks
+/// to exactly (1 - `BOUNCE_UNDER`) at the trough. Pinned by
+/// `spring_collapse_release_from_expanded_settles_without_a_visible_bounce`.
+const COLLAPSE_TROUGH: f32 = -0.001524;
 /// Tick period while the pill is fully static (no animation, no marquee
 /// scrolling). The dismiss countdown and hover polling do not need frame
 /// rate; the refresh-rate timer is restored the moment the pill animates or
@@ -2085,32 +2106,42 @@ impl OverlayState {
         // expanded pill, drawing the expanded content into the growing
         // window (a clip-reveal); the anchor stays the compact position, so
         // the pill grows in place. The entrance/exit grow uses the same
-        // reveal, but its spring overshoot is shown (see `grow_size`). Every
-        // other frame uses the plain size of the applied layout.
-        let (logical_width, logical_height) = if let Some(morph) = &self.hover_expand {
-            morph_size(&self.config, &content, hover_progress(morph, &self.config))
+        // reveal. Every other frame uses the plain size of the applied
+        // layout.
+        let (logical_width, logical_height, morph_progress) = if let Some(hover) = &self.hover_expand {
+            let progress = hover_progress(hover, &self.config);
+            let size = morph_size(&self.config, &content, progress);
+            (size.0, size.1, progress)
         } else if let Some(progress) = frame.morph {
-            grow_size(&self.config, &content, progress)
+            let size = morph_size(&self.config, &content, progress);
+            (size.0, size.1, progress)
         } else {
-            content_size_of(&self.config, &content, compact)
+            let size = content_size_of(&self.config, &content, compact);
+            (
+                size.0,
+                size.1,
+                MorphProgress {
+                    width: 0.0,
+                    height: 0.0,
+                },
+            )
         };
-        // The icon/art progress ceiling mirrors the sizing branch: the hover
-        // leg's window is clamped to the expanded size (`morph_size`), so
-        // the elements keep their hard 1.0 clamp; the entrance/exit grow
-        // shows its overshoot (`grow_size`), so the elements ride the same
-        // un-clamped curve, capped at the window's own overshoot cap in
-        // progress units (see `grow_overshoot_cap`). That is what keeps the
-        // icon and art settling in step with the body instead of freezing at
-        // their expanded slots while the window is still bouncing.
-        let element_cap = if self.hover_expand.is_some() {
-            1.0
-        } else if frame.morph.is_some() {
-            let (compact_w, _) = content_size_of(&self.config, &content, true);
-            let (expanded_w, _) = content_size_of(&self.config, &content, false);
-            grow_overshoot_cap(compact_w, expanded_w)
+        // The settle-bounce: while the size spring passes its endpoint, the
+        // whole pill scales about its anchor past the final size and back
+        // (see `bounce_scale`) — the bounce rides the spring itself, so it
+        // starts the instant the size completes, with no still pause. The
+        // scale multiplies the size (window and hitbox alike) and is applied
+        // to the rendered frame in `render_layered`.
+        let direction = if let Some(hover) = &self.hover_expand {
+            hover.direction
+        } else if matches!(self.phase, Phase::Collapsing(_)) {
+            MorphDirection::Collapse
         } else {
-            1.0
+            MorphDirection::Expand
         };
+        let scale_factor = bounce_scale(morph_progress, direction);
+        let logical_width = logical_width * scale_factor;
+        let logical_height = logical_height * scale_factor;
         let width = (logical_width * dpi).round().max(1.0) as i32;
         let height = (logical_height * dpi).round().max(1.0) as i32;
         self.aura_inset = (AURA_HALO_LOGICAL * dpi).round() as i32;
@@ -2132,7 +2163,7 @@ impl OverlayState {
             // flight (`compact` is derived from the same `morph`).
             compact && morph.is_none(),
             morph,
-            element_cap,
+            scale_factor,
         );
         self.content = Some(content);
         if let Err(error) = result {
@@ -2186,8 +2217,9 @@ impl OverlayState {
                 // width collapsing first, the height lingering behind it —
                 // and fades in the last stretch: a cubic fade across the
                 // final 75 % of the leg, so the exit stays readable while it
-                // closes and never disappears early. A compact layout pill
-                // just fades out.
+                // closes and never disappears early (the undershoot bounce
+                // still shows through the tail of the fade). A compact
+                // layout pill just fades out.
                 let shrink = spring_collapse(t, 1.0, 0.0);
                 let fade_t = (t / 0.75).min(1.0);
                 FrameState {
@@ -2477,13 +2509,36 @@ impl OverlayState {
         let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         // The hitbox must track the morph, or the cursor would stop being
         // "over" the pill the moment it outgrows the compact size.
-        let (logical_width, logical_height) = if let Some(morph) = &self.hover_expand {
-            morph_size(&self.config, content, hover_progress(morph, &self.config))
+        let (logical_width, logical_height, morph_progress) = if let Some(morph) = &self.hover_expand {
+            let progress = hover_progress(morph, &self.config);
+            let size = morph_size(&self.config, content, progress);
+            (size.0, size.1, progress)
         } else if let Some(progress) = frame.morph {
-            grow_size(&self.config, content, progress)
+            let size = morph_size(&self.config, content, progress);
+            (size.0, size.1, progress)
         } else {
-            content_size_of(&self.config, content, self.layout == LayoutMode::Compact)
+            let size = content_size_of(&self.config, content, self.layout == LayoutMode::Compact);
+            (
+                size.0,
+                size.1,
+                MorphProgress {
+                    width: 0.0,
+                    height: 0.0,
+                },
+            )
         };
+        // The settle-bounce scales the size too, so the hitbox matches the
+        // visible pill (see `bounce_scale`).
+        let direction = if let Some(morph) = &self.hover_expand {
+            morph.direction
+        } else if matches!(self.phase, Phase::Collapsing(_)) {
+            MorphDirection::Collapse
+        } else {
+            MorphDirection::Expand
+        };
+        let scale_factor = bounce_scale(morph_progress, direction);
+        let logical_width = logical_width * scale_factor;
+        let logical_height = logical_height * scale_factor;
         let width = (logical_width * dpi).round().max(1.0) as i32;
         let height = (logical_height * dpi).round().max(1.0) as i32;
         Some((width, height))
@@ -2583,8 +2638,44 @@ fn content_size_of(config: &Config, content: &MediaEvent, compact: bool) -> (f32
 /// Duration of one hover-morph leg. The expand leg gets the full animation
 /// duration — room for the spring to play out — while the collapse leg runs
 /// shorter: a quick, confident return that still reads smooth. Shared by the
+/// The whole-pill scale factor of the settle-bounce, as a pure function of
+/// the leg's progress — there is no appended phase, so the bounce starts the
+/// instant the size completes and there is never a still pause before it.
+/// Exactly 1.0 whenever the spring is inside its endpoints (and again at the
+/// pinned end), so the window and content hand off to the steady frame at
+/// the final size. The expand rides the spring's own overshoot past 1.0,
+/// normalized to peak at (1 + `BOUNCE_OVER`) when the spring peaks. The
+/// compaction dips to (1 - `BOUNCE_UNDER`) at the spring's undershoot
+/// trough and recovers straight to exactly 1.0 when the spring pins — the
+/// shrink-below-minimum return, with no over-bounce past the final size.
+fn bounce_scale(progress: MorphProgress, direction: MorphDirection) -> f32 {
+    match direction {
+        MorphDirection::Expand => {
+            let excess = ((progress.width - 1.0) / (EXPAND_SPRING_PEAK - 1.0)).clamp(0.0, 1.0);
+            1.0 + BOUNCE_OVER * excess
+        }
+        MorphDirection::Collapse => {
+            let dip = if progress.width < 0.0 {
+                (progress.width / COLLAPSE_TROUGH).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            // The dip rides the spring's undershoot straight back to 1.0 —
+            // the pill shrinks below the compact minimum and returns, with
+            // no over-bounce past the steady size. Exactly 1.0 when the
+            // spring pins, so there is no seam at the steady handoff.
+            1.0 - BOUNCE_UNDER * dip
+        }
+    }
+}
+
+/// Duration of one hover-morph leg. The expand leg gets the full animation
+/// duration — room for the spring to play out — while the collapse leg runs
+/// shorter: a quick, confident return that still reads smooth. Shared by the
 /// completion check in `tick` and the progress curve, so a leg always
-/// settles exactly when its animation is done.
+/// settles exactly when its animation is done. The settle-bounce is not
+/// appended: it rides the spring's own overshoot/undershoot (see
+/// `bounce_scale`), so the leg duration is the spring duration.
 fn morph_duration(config: &Config, direction: MorphDirection) -> Duration {
     match direction {
         MorphDirection::Expand => animation_duration(config),
@@ -2682,186 +2773,28 @@ fn morph_size(config: &Config, content: &MediaEvent, progress: MorphProgress) ->
     )
 }
 
-/// The entrance/exit grow: like `morph_size`, but the overshoot is shown.
-/// The spring's ~5 % overshoot on a few-pixel morph delta reads as a quick,
-/// live-pill settle — nowhere near the ~25 % of the hover spring, and
-/// clamped to a few percent of the expanded size so even a long pill keeps
-/// the bounce subtle. Each axis clamps independently, so the width bounce
-/// and the lagging height bounce stay contained even while the axes are
-/// apart. A compact pill has no morph (grow of 0 == its plain size) and
-/// only appears.
-fn grow_size(config: &Config, content: &MediaEvent, progress: MorphProgress) -> (f32, f32) {
-    let (compact_w, compact_h) = content_size_of(config, content, true);
-    let (expanded_w, expanded_h) = content_size_of(config, content, false);
-    // The rendered size tracks the curve (no clamp), but the bounce amount
-    // is capped: a 1 % overshoot past the expanded size is enough to read,
-    // and below 1 % of a few-hundred-pixel pill it is invisible anyway.
-    let width = compact_w + (expanded_w - compact_w) * progress.width;
-    let height = compact_h + (expanded_h - compact_h) * progress.height;
-    let width_cap = expanded_w * 0.01;
-    let height_cap = expanded_h * 0.01;
-    (
-        width.clamp(compact_w - width_cap, expanded_w + width_cap),
-        height.clamp(compact_h - height_cap, expanded_h + height_cap),
-    )
-}
-
-/// The progress ceiling for the icon and art lerps on the entrance/exit
-/// grow leg. `grow_size` shows its spring's overshoot, bounded in *size*
-/// units at 1 % past the expanded pill; this is that same cap expressed in
-/// progress units, so the elements overshoot exactly as far (in progress)
-/// as the window does and no further. The hover leg passes 1.0 instead:
-/// `morph_size` clamps the window at the expanded size there, so the
-/// elements matching that hard clamp is correct, not a second instance of
-/// the grow-leg mismatch.
-fn grow_overshoot_cap(compact_w: f32, expanded_w: f32) -> f32 {
-    let delta = expanded_w - compact_w;
-    if delta <= 0.0 {
-        1.0
-    } else {
-        1.0 + (expanded_w * 0.01) / delta
-    }
-}
-
 /// The pill's corner radius during a morph: the compact and expanded radii
 /// lerped by the leading (width) axis's progress, so the corner curvature
-/// follows the silhouette the eye is tracking. `overshoot_cap` is the
-/// progress ceiling the radius may pass 1.0 by: 1.0 on the hover leg, whose
-/// window `morph_size` clamps at the expanded size, and `grow_overshoot_cap`
-/// on the entrance/exit leg, whose window `grow_size` lets bounce — the
-/// rounding then settles in step with the body instead of freezing at the
-/// expanded radius while the window is still moving. The overshoot stays
-/// capped, so the shape never renders over-rounded or pinched while the
-/// width spring overshoots.
-fn morph_radius(compact_radius: f32, expanded_radius: f32, progress: MorphProgress, overshoot_cap: f32) -> f32 {
-    let p = progress.width.clamp(0.0, overshoot_cap);
+/// follows the silhouette the eye is tracking. Clamped between both
+/// endpoints; the appended settle-bounce scales the rendered frame as a
+/// whole (`render_layered`), so the corners ride it without this lerp
+/// overshooting.
+fn morph_radius(compact_radius: f32, expanded_radius: f32, progress: MorphProgress) -> f32 {
+    let p = progress.width.clamp(0.0, 1.0);
     compact_radius + (expanded_radius - compact_radius) * p
-}
-
-/// The art tile's size and vertical position during a morph: the compact and
-/// expanded art tiles' values lerped by the leading (width) axis's progress —
-/// the same axis `morph_radius` uses, so the art square scales with the
-/// silhouette the eye is tracking. One continuously-scaling tile replaces the
-/// two independently-sized, independently-positioned tiles the cross-fade
-/// used to dissolve between. `overshoot_cap` is the progress ceiling the
-/// tile may pass 1.0 by: 1.0 on the hover leg, whose window `morph_size`
-/// clamps at the expanded size, and `grow_overshoot_cap` on the
-/// entrance/exit leg, whose window `grow_size` lets bounce — the art then
-/// settles in step with the body instead of freezing at the expanded slot
-/// while the window is still moving. The axis choice is a starting point,
-/// not a certainty: the width leads both legs, so on expand the art reaches
-/// its expanded spot before the height has finished growing (and on collapse
-/// it shrinks back ahead of the height) — eyeball whether the height axis or
-/// a `min` of both tracks the pill better.
-fn morph_art_rect(
-    compact_art: f32,
-    compact_y: f32,
-    expanded_art: f32,
-    expanded_y: f32,
-    progress: MorphProgress,
-    overshoot_cap: f32,
-) -> (f32, f32) {
-    let p = progress.width.clamp(0.0, overshoot_cap);
-    (
-        compact_art + (expanded_art - compact_art) * p,
-        compact_y + (expanded_y - compact_y) * p,
-    )
-}
-
-/// Clamps a morphing art tile inside the current pill body: the size to the
-/// body height (an interpolated value can briefly exceed the still-short
-/// pill very early in an expand when the configured art is unusually large)
-/// and the top so the tile never crosses the body's bottom edge. Neither
-/// clamp bites at the morph endpoints, so the seam stays exact.
-fn contain_art(size: usize, y: usize, pill_h: usize, inset: usize) -> (usize, usize) {
-    let size = size.min(pill_h);
-    let y = y.min(inset + pill_h - size);
-    (size, y)
-}
-
-/// The compact app icon's slot (side length and top-left corner, buffer px).
-/// Reproduces the exact rect `draw_compact_pill` draws at the 0 endpoint of
-/// an icon morph — `metrics.icon`, the title viewport's right edge, the 6 px
-/// gap and the integer centering are identical — so the morph's first frame
-/// is precisely the steady compact icon, not an approximation.
-fn compact_app_icon_rect(config: &Config, scale: f32, inset: i32) -> (i32, i32, i32) {
-    let metrics = compact_metrics(config);
-    let icon_size = (metrics.icon * scale).round() as i32;
-    let (_, title_vp_right) = compact_title_viewport(config);
-    let pill_h = compact_size(config).1 as i32;
-    let icon_x = inset + (title_vp_right * scale).round() as i32 + (6.0 * scale).round() as i32;
-    let icon_y = inset + (pill_h - icon_size) / 2;
-    (icon_x, icon_y, icon_size)
-}
-
-/// The expanded app icon's slot (the source-app row's icon), or `None` when
-/// the source-app row is inactive (no app name) — the expanded layout draws
-/// no icon then. The row rect reproduces `draw_pill_text_rows`'s band
-/// accumulation bit-for-bit (same f32 order, same truncation), so the 1
-/// endpoint of an icon morph is precisely the icon `draw_source_app_row`
-/// would draw in the steady expanded frame.
-fn expanded_app_icon_rect(config: &Config, scale: f32, pill: &PillText, inset: i32) -> Option<(i32, i32, i32)> {
-    if pill.source_app.trim().is_empty() {
-        return None;
-    }
-    let appearance = &config.appearance;
-    let pad = appearance.padding;
-    let fs_title = appearance.font_size_title * scale;
-    let fs_artist = appearance.font_size_artist * scale;
-    let fs_meta = fs_artist * 0.85;
-    let fs_app = fs_artist * 0.85;
-    // Same accumulation order as `draw_pill_text_rows`'s `next_band` closure.
-    let mut y = inset as f32 + pad * scale;
-    y += fs_title * ROW_HEIGHT;
-    if !pill.artist.trim().is_empty() {
-        y += fs_artist * ROW_HEIGHT;
-    }
-    if !pill.meta.is_empty() {
-        y += fs_meta * ROW_HEIGHT;
-    }
-    let band_h = (y + fs_app * ROW_HEIGHT) as i32 - y as i32;
-    let icon_size = ((16.0 * scale).round() as i32).min(band_h);
-    let padding = (pad * scale) as i32;
-    let art = (appearance.art_size as f32 * scale) as i32;
-    let icon_x = inset + padding + art + (12.0 * scale) as i32;
-    let icon_y = y as i32 + (band_h - icon_size) / 2;
-    Some((icon_x, icon_y, icon_size))
-}
-
-/// The app icon's slot during a morph: the compact and expanded slots lerped
-/// by the leading (width) axis's progress — the same axis `morph_radius` and
-/// `morph_art_rect` use, so the icon travels with the silhouette the eye is
-/// tracking. One continuously-moving icon replaces the two independently-
-/// drawn icons the cross-fade used to dissolve between; it renders at full
-/// opacity because the movement IS the animation (the compact and expanded
-/// passes skip their own icons while a morph is in flight, so it never
-/// doubles). `overshoot_cap` bounds how far past 1.0 the icon may ride:
-/// 1.0 on the hover leg (the window `morph_size` clamps at the expanded
-/// size), `grow_overshoot_cap` on the entrance/exit leg (the window
-/// `grow_size` shows its bounce, so the icon settles in step with it).
-fn morph_icon_rect(
-    compact: (i32, i32, i32),
-    expanded: (i32, i32, i32),
-    progress: MorphProgress,
-    overshoot_cap: f32,
-) -> (i32, i32, i32) {
-    let p = progress.width.clamp(0.0, overshoot_cap);
-    (
-        (compact.0 as f32 + (expanded.0 - compact.0) as f32 * p).round() as i32,
-        (compact.1 as f32 + (expanded.1 - compact.1) as f32 * p).round() as i32,
-        (compact.2 as f32 + (expanded.2 - compact.2) as f32 * p).round() as i32,
-    )
 }
 
 /// The compact content's opacity during a morph, keyed to the shape
 /// progress — the LESS-advanced of the two axes (see `draw_text_pixels`):
-/// it holds fully visible while the pill stays compact-shaped, then
-/// dissolves out by the time the shape progress reaches 0.35, before the
-/// expanded content starts arriving (shape progress 0.45), so the two
-/// contents never blend.
+/// it holds fully visible only very briefly, then dissolves out over
+/// 0.05..0.20, so the compact-mode elements — the inline app icon included —
+/// clear early and are completely gone BEFORE the expanded content starts
+/// arriving (0.25). The windows are deliberately disjoint: the two layouts
+/// must never coexist, or the compact icon would visibly sit beside the
+/// expanding title row.
 fn compact_alpha(shape_progress: f32) -> f32 {
-    const HOLD_END: f32 = 0.20;
-    const FADE_OUT_END: f32 = 0.35;
+    const HOLD_END: f32 = 0.05;
+    const FADE_OUT_END: f32 = 0.20;
     1.0 - ease_out_quint(((shape_progress - HOLD_END) / (FADE_OUT_END - HOLD_END)).clamp(0.0, 1.0))
 }
 
@@ -2869,10 +2802,11 @@ fn compact_alpha(shape_progress: f32) -> f32 {
 /// progress — the less-advanced of the two axes: on expand that is the
 /// lagging height, so the expanded rows arrive only after the pill has
 /// grown tall enough to show them; on collapse it is the leading width, so
-/// the expanded rows leave as the pill narrows. Either way the fade window
-/// (0.45 to 0.60) starts only where `compact_alpha`'s has ended.
+/// the expanded rows leave as the pill narrows. The fade window (0.25 to
+/// 0.60) starts only where `compact_alpha`'s has ended — the compact layout
+/// is gone before the expanded one appears, so the two never blend.
 fn expanded_alpha(shape_progress: f32) -> f32 {
-    const FADE_IN_START: f32 = 0.45;
+    const FADE_IN_START: f32 = 0.25;
     const FADE_IN_END: f32 = 0.60;
     ease_out_quint(((shape_progress - FADE_IN_START) / (FADE_IN_END - FADE_IN_START)).clamp(0.0, 1.0))
 }
@@ -3123,11 +3057,28 @@ fn render_layered(
     position: POINT,
     compact: bool,
     morph: Option<MorphProgress>,
-    element_cap: f32,
+    scale_factor: f32,
 ) -> Result<()> {
     let inset = state.aura_inset;
     let buf_w = (width + inset * 2).max(1);
     let buf_h = (height + inset * 2).max(1);
+    // The settle-bounce renders the final layout at its true size and scales
+    // the composed frame about the anchor into the window-sized buffer (see
+    // `scale_frame_about`); the content's own pill size is the window size
+    // divided by the scale factor. Outside the bounce (`scale_factor == 1`)
+    // the content size is the window size, as always.
+    let content_w = if scale_factor == 1.0 {
+        width
+    } else {
+        (width as f32 / scale_factor).round().max(1.0) as i32
+    };
+    let content_h = if scale_factor == 1.0 {
+        height
+    } else {
+        (height as f32 / scale_factor).round().max(1.0) as i32
+    };
+    let content_buf_w = (content_w + inset * 2).max(1);
+    let content_buf_h = (content_h + inset * 2).max(1);
     // Every morph resolves to the expanded pill, so its final body bottom is
     // the rest edge the text rows unveil against (see `row_unveil_alpha`).
     let rest_pill_h = (content_size_of(&state.config, content, false).1 * scale)
@@ -3136,7 +3087,7 @@ fn render_layered(
     // The pill body's current and final bottom edges in buffer coordinates:
     // rows are laid out at their final positions, so anything below the
     // current edge would render outside the still-growing body.
-    let body_bottom = inset + height;
+    let body_bottom = inset + content_h;
     let rest_body_bottom = inset + rest_pill_h;
     // The DIB backing buffer may be larger than the requested frame (dib_for
     // allocates to a generous upper bound and reuses it across animation
@@ -3148,40 +3099,41 @@ fn render_layered(
     // parameter through every pixel-writing function, render into a
     // tightly-packed scratch buffer at the *requested* size instead — the
     // stride `draw_pixels`/`draw_text_pixels` have always assumed — and
-    // blit the result into the real DIB at its real stride right before the
-    // GDI call. The scratch buffer is grown across frames (and shrunk back
-    // below only when an oversized frame inflates it), so after warm-up this
-    // performs no per-frame heap allocation, matching the existing
-    // `text_scratch` buffer's pattern elsewhere in this file.
+    // blit (or scale, during the bounce) the result into the real DIB at its
+    // real stride right before the GDI call. The scratch buffer is grown
+    // across frames (and shrunk back below only when an oversized frame
+    // inflates it), so after warm-up this performs no per-frame heap
+    // allocation, matching the existing `text_scratch` buffer's pattern
+    // elsewhere in this file.
     let (hdc, _bitmap, bits) = dib_for(state, buf_w, buf_h)?;
     let alloc_w = state.dib.as_ref().map(|dib| dib.width).unwrap_or(buf_w) as usize;
     let alloc_h = state.dib.as_ref().map(|dib| dib.height).unwrap_or(buf_h) as usize;
 
-    let needed = buf_w as usize * buf_h as usize * 4;
+    let needed = content_buf_w as usize * content_buf_h as usize * 4;
     let mut scratch = std::mem::take(&mut state.frame_scratch);
     clear_frame_scratch(&mut scratch, needed);
     draw_pixels(
         state,
         &mut scratch[..needed],
         content,
-        buf_w as usize,
-        buf_h as usize,
-        scale,
-        compact,
-        morph,
-        element_cap,
-    )?;
-    draw_text_pixels(
-        state,
-        &mut scratch[..needed],
-        content,
-        buf_w,
+        content_buf_w as usize,
+        content_buf_h as usize,
         scale,
         compact,
         morph,
         body_bottom,
         rest_body_bottom,
-        element_cap,
+    )?;
+    draw_text_pixels(
+        state,
+        &mut scratch[..needed],
+        content,
+        content_buf_w,
+        scale,
+        compact,
+        morph,
+        body_bottom,
+        rest_body_bottom,
     );
     // A single oversized metadata string (huge title/album) can inflate the
     // retained UTF-16 scratch far beyond any real row; shrink it back so the
@@ -3201,13 +3153,45 @@ fn render_layered(
     // (`alloc_w * alloc_h * 4`).
     let dib_len = alloc_w * buf_h as usize * 4;
     let dib_slice = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), dib_len.min(alloc_w * alloc_h * 4)) };
-    blit_packed_rows(
-        dib_slice,
-        alloc_w * 4,
-        &state.frame_scratch,
-        buf_w as usize * 4,
-        buf_h as usize,
-    );
+    if scale_factor == 1.0 {
+        blit_packed_rows(
+            dib_slice,
+            alloc_w * 4,
+            &state.frame_scratch,
+            content_buf_w as usize * 4,
+            content_buf_h as usize,
+        );
+    } else {
+        // The settle-bounce: scale the composed final-layout frame about the
+        // anchor into the window-sized DIB region, so the whole pill — body,
+        // aura, rows, art, icon — grows and shrinks 1:1.
+        let pos = state.active_pos();
+        let anchor_frac_x = match pos.horizontal {
+            HorizontalPosition::Left => 0.0,
+            HorizontalPosition::Center => 0.5,
+            HorizontalPosition::Right => 1.0,
+        };
+        let anchor_frac_y = match pos.vertical {
+            VerticalPosition::Top => 0.0,
+            VerticalPosition::Bottom => 1.0,
+        };
+        scale_frame_about(
+            dib_slice,
+            alloc_w * 4,
+            buf_w as usize,
+            buf_h as usize,
+            &state.frame_scratch,
+            content_buf_w as usize * 4,
+            content_buf_w as usize,
+            content_buf_h as usize,
+            content_w as usize,
+            content_h as usize,
+            inset as usize,
+            anchor_frac_x,
+            anchor_frac_y,
+            scale_factor,
+        );
+    }
 
     let size = SIZE { cx: buf_w, cy: buf_h };
     let source = POINT { x: 0, y: 0 };
@@ -3285,6 +3269,83 @@ fn blit_packed_rows(dst: &mut [u8], dst_stride_bytes: usize, src: &[u8], row_byt
         let src_off = row * row_bytes;
         let dst_off = row * dst_stride_bytes;
         dst[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
+    }
+}
+
+/// Scales the composed final-layout frame about the pill's anchor point into
+/// the window-sized DIB region: the settle-bounce's whole-pill motion (see
+/// `bounce_scale`). The anchor is the fixed screen point `placement` keeps
+/// anchored — the pill's anchored edge/center, expressed as a fraction of the
+/// pill's width/height (`anchor_frac_x`/`anchor_frac_y`: 0 = left/top edge,
+/// 0.5 = center, 1 = right/bottom edge) — so the pill grows and shrinks 1:1
+/// about the same point the window position pivots around. Every dst pixel
+/// bilinearly samples the src at `anchor + (dst - dst_anchor) / scale`;
+/// premultiplied BGRA interpolates correctly, so the scaled frame stays
+/// alpha-correct, and out-of-range samples (the window's outer ring during
+/// the over-bounce) write transparent. Pure and GDI-free so it can be unit
+/// tested directly.
+#[allow(clippy::too_many_arguments)]
+fn scale_frame_about(
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_w: usize,
+    dst_h: usize,
+    src: &[u8],
+    src_stride: usize,
+    src_w: usize,
+    src_h: usize,
+    content_w: usize,
+    content_h: usize,
+    inset: usize,
+    anchor_frac_x: f32,
+    anchor_frac_y: f32,
+    scale: f32,
+) {
+    let anchor_x = inset as f32 + content_w as f32 * anchor_frac_x;
+    let anchor_y = inset as f32 + content_h as f32 * anchor_frac_y;
+    let dst_anchor_x = inset as f32 + content_w as f32 * scale * anchor_frac_x;
+    let dst_anchor_y = inset as f32 + content_h as f32 * scale * anchor_frac_y;
+    for y in 0..dst_h {
+        let sy = anchor_y + (y as f32 - dst_anchor_y) / scale;
+        for x in 0..dst_w {
+            let sx = anchor_x + (x as f32 - dst_anchor_x) / scale;
+            let off = y * dst_stride + x * 4;
+            if sx < 0.0 || sy < 0.0 || sx >= src_w as f32 || sy >= src_h as f32 {
+                dst[off..off + 4].fill(0);
+                continue;
+            }
+            let x0 = sx as usize;
+            let y0 = sy as usize;
+            let x1 = (x0 + 1).min(src_w - 1);
+            let y1 = (y0 + 1).min(src_h - 1);
+            let fx = sx - x0 as f32;
+            let fy = sy - y0 as f32;
+            let p00 = y0 * src_stride + x0 * 4;
+            let p10 = y0 * src_stride + x1 * 4;
+            let p01 = y1 * src_stride + x0 * 4;
+            let p11 = y1 * src_stride + x1 * 4;
+            let blend = |a: u8, b: u8, f: f32| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
+            let b = blend(blend(src[p00], src[p10], fx), blend(src[p01], src[p11], fx), fy);
+            let g = blend(
+                blend(src[p00 + 1], src[p10 + 1], fx),
+                blend(src[p01 + 1], src[p11 + 1], fx),
+                fy,
+            );
+            let r = blend(
+                blend(src[p00 + 2], src[p10 + 2], fx),
+                blend(src[p01 + 2], src[p11 + 2], fx),
+                fy,
+            );
+            let a = blend(
+                blend(src[p00 + 3], src[p10 + 3], fx),
+                blend(src[p01 + 3], src[p11 + 3], fx),
+                fy,
+            );
+            dst[off] = b;
+            dst[off + 1] = g;
+            dst[off + 2] = r;
+            dst[off + 3] = a;
+        }
     }
 }
 
@@ -3400,7 +3461,8 @@ fn draw_pixels(
     scale: f32,
     compact: bool,
     morph: Option<MorphProgress>,
-    element_cap: f32,
+    body_bottom: i32,
+    rest_body_bottom: i32,
 ) -> Result<()> {
     // One radius per frame. A morph lerps the radius continuously between
     // the compact and the expanded radius (see `morph_radius`), so the
@@ -3418,7 +3480,6 @@ fn draw_pixels(
                 state.config.appearance.effective_corner_radius(true),
                 state.config.appearance.effective_corner_radius(false),
                 progress,
-                element_cap,
             ) * scale
         }
         None => state.config.appearance.effective_corner_radius(compact) * scale,
@@ -3514,107 +3575,59 @@ fn draw_pixels(
     // and the trailing icon/symbol) in `draw_compact_pill`; drawing it here
     // as well would composite the halo, the cover and the rim twice. The
     // expanded pills draw the art tile at the configured art size. During a
-    // morph the art is a single continuously-scaling tile (see
-    // `morph_art_rect`): `draw_compact_pill` skips its own art draw while a
-    // morph is in flight, and this path draws the tile once, lerped between
-    // the compact and expanded rects at full opacity — the scaling IS the
-    // animation, so the art never dissolves between two squares and never
-    // fades with the cross-fade (the text rows still cross-fade on their
-    // own via `compact_alpha`/`expanded_alpha`).
+    // morph the two tiles cross-fade like every other element: the compact
+    // art fades out with `compact_alpha` (in `draw_compact_pill`) while this
+    // expanded tile fades in with `expanded_alpha`, revealed by the body
+    // edge like the rows — nothing travels, the layouts swap in place.
     if !compact {
         let padding = (state.config.appearance.padding * scale).round() as usize;
         let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
-        // The compact endpoint of the art lerp — the exact rect
-        // `draw_compact_pill` draws when no morph is running (`inset` and the
-        // integer division/rounding are identical), so the 0 endpoint of a
-        // morph is precisely the compact tile, not an approximation of it.
-        let metrics = compact_metrics(&state.config);
-        let compact_art = (metrics.art * scale).round() as i32;
-        let compact_h = compact_size(&state.config).1 as i32;
-        let compact_y = inset as i32 + (compact_h - compact_art) / 2;
-        match content {
-            MediaEvent::TrackChanged(_) => {
-                // The morphing frame draws one continuously-scaling tile
-                // between the compact and the expanded rect (see
-                // `morph_art_rect`) at full opacity: the scaling is the
-                // animation, and the halo, cover and rim composite exactly
-                // once (`draw_compact_pill` skips its own art draw while a
-                // morph is in flight). The text rows still cross-fade on
-                // their own via `compact_alpha`/`expanded_alpha`.
-                let (art_size, art_y) = match morph {
-                    Some(progress) => {
-                        let (size, y) = morph_art_rect(
-                            compact_art as f32,
-                            compact_y as f32,
-                            art_size as f32,
-                            (inset + pill_h.saturating_sub(art_size) / 2) as f32,
-                            progress,
-                            element_cap,
-                        );
-                        contain_art(size.round() as usize, y.round() as usize, pill_h, inset)
-                    }
-                    None => (art_size, inset + pill_h.saturating_sub(art_size) / 2),
-                };
-                let art_radius = art_size as f32 * 0.2;
-                let art_x = inset + padding;
-                draw_art_tile(
-                    pixels,
-                    width,
-                    state.palette,
-                    state.config.appearance.accent_color,
-                    art_x,
-                    art_y,
-                    art_size,
-                    art_radius,
-                    state.decoded_art.as_deref(),
-                    scale,
-                    1.0,
-                );
+        let (art_size, art_y, content_alpha) = match (content, morph) {
+            (MediaEvent::TrackChanged(_), Some(progress)) => {
+                // The expanded tile at its final rect, gated by the body
+                // edge (it is vertically centered in the tall pill, so it
+                // would render below the still-short body early in the
+                // lerp) and faded with the expanded content.
+                let shape = progress.width.min(progress.height);
+                let art_y = inset + pill_h.saturating_sub(art_size) / 2;
+                let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, (art_y + art_size) as i32);
+                (art_size, art_y, expanded_alpha(shape) * unveil)
             }
-            MediaEvent::PlaybackStateChanged(_, _) => {
-                // State pills reuse the cached track's artwork for the source that
-                // produced the state change, so a pause/play pill still shows the
-                // right cover. Falls back to the accent placeholder when nothing
-                // has been cached for this source yet. The art size is clamped to
-                // the pill body: the state-pill layout reserves no extra rows, and
-                // the morph's expanded endpoint reproduces the same clamp so it
-                // cannot diverge from the steady frame that follows.
-                let (art_size, art_y) = match morph {
-                    Some(progress) => {
-                        let expanded_size = art_size.min(pill_h.saturating_sub(2 * padding)) as f32;
-                        let (size, y) = morph_art_rect(
-                            compact_art as f32,
-                            compact_y as f32,
-                            expanded_size,
-                            (inset + pill_h.saturating_sub(expanded_size as usize) / 2) as f32,
-                            progress,
-                            element_cap,
-                        );
-                        contain_art(size.round() as usize, y.round() as usize, pill_h, inset)
-                    }
-                    None => {
-                        let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
-                        (art_size, inset + pill_h.saturating_sub(art_size) / 2)
-                    }
-                };
-                let art_radius = art_size as f32 * 0.2;
-                let art_x = inset + padding;
-                draw_art_tile(
-                    pixels,
-                    width,
-                    state.palette,
-                    state.config.appearance.accent_color,
-                    art_x,
-                    art_y,
-                    art_size,
-                    art_radius,
-                    state.decoded_art.as_deref(),
-                    scale,
-                    1.0,
-                );
+            (MediaEvent::TrackChanged(_), None) => (art_size, inset + pill_h.saturating_sub(art_size) / 2, 1.0),
+            (MediaEvent::PlaybackStateChanged(_, _), Some(progress)) => {
+                // State pills reuse the cached track's artwork for the source
+                // that produced the state change, so a pause/play pill still
+                // shows the right cover. The art size is clamped to the pill
+                // body: the state-pill layout reserves no extra rows.
+                let shape = progress.width.min(progress.height);
+                let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
+                let art_y = inset + pill_h.saturating_sub(art_size) / 2;
+                let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, (art_y + art_size) as i32);
+                (art_size, art_y, expanded_alpha(shape) * unveil)
+            }
+            (MediaEvent::PlaybackStateChanged(_, _), None) => {
+                let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
+                (art_size, inset + pill_h.saturating_sub(art_size) / 2, 1.0)
             }
             // Never rendered: SessionRejected is filtered out before enqueue.
-            MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => {}
+            (MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. }, _) => return Ok(()),
+        };
+        if content_alpha > 0.0 {
+            let art_radius = art_size as f32 * 0.2;
+            let art_x = inset + padding;
+            draw_art_tile(
+                pixels,
+                width,
+                state.palette,
+                state.config.appearance.accent_color,
+                art_x,
+                art_y,
+                art_size,
+                art_radius,
+                state.decoded_art.as_deref(),
+                scale,
+                content_alpha,
+            );
         }
     }
     Ok(())
@@ -4151,7 +4164,6 @@ fn draw_pill_text_rows(
     content_alpha: f32,
     body_bottom: i32,
     rest_body_bottom: i32,
-    skip_app_icon: bool,
 ) {
     let inset = state.aura_inset;
     let appearance = &state.config.appearance;
@@ -4336,7 +4348,6 @@ fn draw_pill_text_rows(
                 dim_color(muted, unveil),
                 scale,
                 content_alpha * unveil,
-                skip_app_icon,
                 Some(MarqueeCtx {
                     scroll: &mut state.scroll[3],
                     strip: &mut state.marquee_strips[3],
@@ -4370,12 +4381,12 @@ fn pill_text_from_track(track: &TrackInfo) -> PillText {
 /// while the expanded rows arrive as the height rises. On collapse it is the
 /// leading width, so the expanded rows leave as the pill narrows, before the
 /// compact content fades back in. The two fade windows (see `compact_alpha` /
-/// `expanded_alpha`) are disjoint in both directions, so the painter's order
-/// is irrelevant and each pass simply dims its own content over the opaque
-/// pill body. `body_bottom`/`rest_body_bottom` (the pill body's current and
-/// final bottom edges) additionally gate every expanded row to the animated
-/// edge via `row_unveil_alpha`: a row is not drawn until the edge has passed
-/// its band, so text can never render outside the growing/shrinking body.
+/// `expanded_alpha`) overlap, so the layouts blend in place — nothing moves
+/// between them — and the pill is never empty mid-morph.
+/// `body_bottom`/`rest_body_bottom` (the pill body's current and final bottom
+/// edges) additionally gate every expanded row to the animated edge via
+/// `row_unveil_alpha`: a row is not drawn until the edge has passed its band,
+/// so text can never render outside the growing/shrinking body.
 #[allow(clippy::too_many_arguments)]
 fn draw_text_pixels(
     state: &mut OverlayState,
@@ -4387,7 +4398,6 @@ fn draw_text_pixels(
     morph: Option<MorphProgress>,
     body_bottom: i32,
     rest_body_bottom: i32,
-    element_cap: f32,
 ) {
     if let Some(progress) = morph {
         // The less-advanced axis: on expand the height (so content fades
@@ -4395,52 +4405,10 @@ fn draw_text_pixels(
         // (so content fades with the geometry that is already leaving).
         let shape = progress.width.min(progress.height);
         let expanded = expanded_alpha(shape);
-        draw_compact_pill(
-            state,
-            pixels,
-            content,
-            width,
-            scale,
-            compact_alpha(shape),
-            Some(progress),
-        );
-        // The app icon is a second continuous element, drawn between the two
-        // cross-fade passes: one icon lerps between the compact inline slot
-        // and the expanded source-app-row slot (see `morph_icon_rect`) at
-        // full opacity — the movement IS the animation, exactly like the art
-        // tile — so both passes skip their own icon draws while a morph is
-        // in flight. The condition mirrors the compact-pass skip above and
-        // the row-4 skip below: the icon is continuous only when the
-        // expanded endpoint actually has one (the source-app row is active);
-        // otherwise it belongs to the compact content and dissolves with it.
-        let skip_app_icon = state
-            .pill_text
-            .as_ref()
-            .is_some_and(|p| p.app_icon.is_some() && !p.source_app.trim().is_empty());
-        if let Some(pill) = state.pill_text.as_ref()
-            && let (Some(icon), Some(end)) = (
-                pill.app_icon.as_ref(),
-                expanded_app_icon_rect(&state.config, scale, pill, state.aura_inset),
-            )
-        {
-            let start = compact_app_icon_rect(&state.config, scale, state.aura_inset);
-            let (x, y, size) = morph_icon_rect(start, end, progress, element_cap);
-            draw_icon_scaled(
-                pixels,
-                width as usize,
-                icon,
-                24,
-                x as usize,
-                y as usize,
-                size as usize,
-                1.0,
-            );
-        }
-        // The unveil gating keeps rows inside the body while the cross-fade
-        // alpha keeps the two passes from ever overlapping, so a visually
-        // empty window can occur between the passes on expand (compact gone
-        // by 0.35, rows not yet revealed) — that is the pill body alone,
-        // which reads as the content "catching up" with the growing shape.
+        draw_compact_pill(state, pixels, content, width, scale, compact_alpha(shape));
+        // The unveil gating keeps rows inside the body; the overlapping
+        // cross-fade keeps the compact and expanded content blending in
+        // place, so the pill is never empty between the passes.
         draw_expanded_pill_text(
             state,
             pixels,
@@ -4450,22 +4418,11 @@ fn draw_text_pixels(
             expanded,
             body_bottom,
             rest_body_bottom,
-            skip_app_icon,
         );
     } else if compact {
-        draw_compact_pill(state, pixels, content, width, scale, 1.0, None);
+        draw_compact_pill(state, pixels, content, width, scale, 1.0);
     } else {
-        draw_expanded_pill_text(
-            state,
-            pixels,
-            content,
-            width,
-            scale,
-            1.0,
-            body_bottom,
-            rest_body_bottom,
-            false,
-        );
+        draw_expanded_pill_text(state, pixels, content, width, scale, 1.0, body_bottom, rest_body_bottom);
     }
 }
 
@@ -4475,9 +4432,6 @@ fn draw_text_pixels(
 /// as one pass of the morph's cross-fade. `body_bottom`/`rest_body_bottom`
 /// (see `draw_pill_text_rows`) gate each row to the pill's animated bottom
 /// edge, so no text renders outside the body while it grows or shrinks.
-/// `skip_app_icon` (morphs only) suppresses the source-app row's own icon
-/// draw: the morphing frame's icon is the single continuously-lerped element
-/// drawn by `draw_text_pixels` (see `morph_icon_rect`).
 #[allow(clippy::too_many_arguments)]
 fn draw_expanded_pill_text(
     state: &mut OverlayState,
@@ -4488,7 +4442,6 @@ fn draw_expanded_pill_text(
     content_alpha: f32,
     body_bottom: i32,
     rest_body_bottom: i32,
-    skip_app_icon: bool,
 ) {
     match content {
         MediaEvent::TrackChanged(track) => {
@@ -4507,7 +4460,6 @@ fn draw_expanded_pill_text(
                 content_alpha,
                 body_bottom,
                 rest_body_bottom,
-                skip_app_icon,
             );
             state.pill_text = Some(pill);
         }
@@ -4530,7 +4482,6 @@ fn draw_expanded_pill_text(
                     content_alpha,
                     body_bottom,
                     rest_body_bottom,
-                    skip_app_icon,
                 );
                 state.pill_text = Some(pill);
             } else {
@@ -4636,16 +4587,12 @@ fn draw_expanded_pill_text(
 /// — and the trailing icon and symbol reuse the shared app-icon and
 /// playback-symbol drawing. The take/put-back of the resolved pill text
 /// mirrors `draw_pill_text_rows`. `content_alpha` (1.0 when no morph is
-/// running) dims the whole content as one pass of the morph's cross-fade.
-/// The vertical centering anchors to the *compact* pill height, so while a
-/// morph grows the window the compact content stays put and the extra space
-/// reads as the pill growing around it. While a morph is in flight
-/// (`morph.is_some()`) the art draw is skipped: the morphing frame's art is
-/// the single continuously-scaling tile drawn by `draw_pixels` (see
-/// `morph_art_rect`), so the halo, cover and rim composite exactly once. The
-/// app icon draw is skipped the same way when the expanded endpoint shows
-/// one (see `morph_icon_rect`); otherwise it stays and dissolves with the
-/// compact content.
+/// running) dims the whole content as one pass of the morph's cross-fade —
+/// during a morph the compact content (art, icon and all) dissolves out in
+/// place while the expanded content fades in; nothing travels between the
+/// layouts. The vertical centering anchors to the *compact* pill height, so
+/// while a morph grows the window the compact content stays put and the
+/// extra space reads as the pill growing around it.
 #[allow(clippy::too_many_arguments)]
 fn draw_compact_pill(
     state: &mut OverlayState,
@@ -4654,7 +4601,6 @@ fn draw_compact_pill(
     width: i32,
     scale: f32,
     content_alpha: f32,
-    morph: Option<MorphProgress>,
 ) {
     let inset = state.aura_inset;
     let appearance = &state.config.appearance;
@@ -4674,28 +4620,25 @@ fn draw_compact_pill(
     // vertically centered on the row. This is the only place the compact
     // art is drawn — `draw_pixels` skips its art arms in compact mode, so
     // the halo, cover and rim composite exactly once. The placeholder is
-    // drawn here too when no cover is available. While a morph is in flight
-    // the art draw is skipped: the morphing frame draws the single
-    // continuously-scaling tile in `draw_pixels` (see `morph_art_rect`),
-    // which composites the halo, cover and rim exactly once there instead.
-    if morph.is_none() {
-        let art_size = (metrics.art * scale).round() as i32;
-        let art_x = inset + padding;
-        let art_y = inset + (pill_h - art_size) / 2;
-        draw_art_tile(
-            pixels,
-            width as usize,
-            state.palette,
-            appearance.accent_color,
-            art_x as usize,
-            art_y as usize,
-            art_size as usize,
-            art_size as f32 * 0.2,
-            state.decoded_art.as_deref(),
-            scale,
-            content_alpha,
-        );
-    }
+    // drawn here too when no cover is available. During a morph this tile
+    // fades out with the compact content while the expanded tile fades in
+    // (in `draw_pixels`), so the two cross-fade like every other element.
+    let art_size = (metrics.art * scale).round() as i32;
+    let art_x = inset + padding;
+    let art_y = inset + (pill_h - art_size) / 2;
+    draw_art_tile(
+        pixels,
+        width as usize,
+        state.palette,
+        appearance.accent_color,
+        art_x as usize,
+        art_y as usize,
+        art_size as usize,
+        art_size as f32 * 0.2,
+        state.decoded_art.as_deref(),
+        scale,
+        content_alpha,
+    );
 
     // Title row band: the title font's own row height, vertically centered
     // in the pill.
@@ -4710,12 +4653,12 @@ fn draw_compact_pill(
         bottom: band_top + row_h,
     };
 
-    let (title, app_icon, source_app, playback) = match content {
+    let (title, app_icon, playback) = match content {
         MediaEvent::TrackChanged(track) => {
             let pill = state.pill_text.take().unwrap_or_else(|| pill_text_from_track(track));
-            let (title, app_icon, source_app) = (pill.title.clone(), pill.app_icon.clone(), pill.source_app.clone());
+            let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
             state.pill_text = Some(pill);
-            (title, app_icon, source_app, PlaybackState::NowPlaying)
+            (title, app_icon, PlaybackState::NowPlaying)
         }
         MediaEvent::PlaybackStateChanged(playback, source_app) => {
             let pill = state.pill_text.take().or_else(|| {
@@ -4727,10 +4670,9 @@ fn draw_compact_pill(
             });
             match pill {
                 Some(pill) => {
-                    let (title, app_icon, source_app) =
-                        (pill.title.clone(), pill.app_icon.clone(), pill.source_app.clone());
+                    let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
                     state.pill_text = Some(pill);
-                    (title, app_icon, source_app, *playback)
+                    (title, app_icon, *playback)
                 }
                 // No cached track (the state change arrived before the first
                 // TrackChanged): the source name stands in for the title, and
@@ -4741,7 +4683,7 @@ fn draw_compact_pill(
                     } else {
                         state.current_source.clone().unwrap_or_default()
                     };
-                    (name, None, String::new(), *playback)
+                    (name, None, *playback)
                 }
             }
         }
@@ -4778,15 +4720,7 @@ fn draw_compact_pill(
     let viewport_right = inset + (title_vp_right * scale).round() as i32;
     let icon_x = viewport_right + gap;
     let icon_y = inset + (pill_h - icon_size) / 2;
-    // While a morph is in flight the icon is the single continuously-lerped
-    // element drawn by `draw_text_pixels` (see `morph_icon_rect`) — but only
-    // when the expanded endpoint actually shows one (the source-app row is
-    // active). Otherwise the icon exists only in the compact layout, so this
-    // draw stays and dissolves with the compact content. The slot math is
-    // computed unconditionally: `symbol_right` below derives from it.
-    if (morph.is_none() || source_app.trim().is_empty())
-        && let Some(icon) = app_icon
-    {
+    if let Some(icon) = app_icon {
         draw_icon_scaled(
             pixels,
             width as usize,
@@ -5434,14 +5368,28 @@ fn draw_icon_scaled(
                 fy,
             );
             if a > 0 {
-                composite_pm(
-                    pixels,
-                    width,
-                    x + dx,
-                    y + dy,
-                    [r, g, b],
-                    (a as f32 * content_alpha) as u32,
-                );
+                let alpha = (a as f32 * content_alpha) as u32;
+                if alpha > 0 {
+                    // Premultiply like the glyph composite: `composite_pm`
+                    // blends src + dst*(1 - src_a), so an unpremultiplied
+                    // color would bloom at full strength during fades and, at
+                    // alpha 0, ADD a full-color ghost with zero alpha into
+                    // the buffer. Later glyphs blend over that ghost, which
+                    // left a smudge of icon color on the expanded title at
+                    // the morph end (the compact icon never truly vanished).
+                    composite_pm(
+                        pixels,
+                        width,
+                        x + dx,
+                        y + dy,
+                        [
+                            (r as u32 * alpha / 255) as u8,
+                            (g as u32 * alpha / 255) as u8,
+                            (b as u32 * alpha / 255) as u8,
+                        ],
+                        alpha,
+                    );
+                }
             }
         }
     }
@@ -5451,10 +5399,7 @@ fn draw_icon_scaled(
 /// 16px base, DPI-scaled and capped at the row band, followed by the app-name
 /// text. The text glyphs sit centered in the band, so the icon is centered on
 /// the same midpoint to line up with them. Without an icon the text renders
-/// at the band's left edge, as before the icon was added. `skip_app_icon`
-/// (morphs only) suppresses the icon draw but keeps the text offset: the
-/// morphing frame's icon is the single continuously-lerped element drawn by
-/// `draw_text_pixels` (see `morph_icon_rect`), occupying the exact same slot.
+/// at the band's left edge, as before the icon was added.
 #[allow(clippy::too_many_arguments)]
 fn draw_source_app_row(
     text_scratch: &mut Option<TextScratch>,
@@ -5469,7 +5414,6 @@ fn draw_source_app_row(
     color: [u8; 4],
     scale: f32,
     content_alpha: f32,
-    skip_app_icon: bool,
     marquee: Option<MarqueeCtx<'_>>,
 ) {
     if let Some(icon) = app_icon {
@@ -5479,9 +5423,7 @@ fn draw_source_app_row(
         let icon_size = ((16.0 * scale).round() as usize).min(band_h);
         let icon_x = rect.left as usize;
         let icon_y = rect.top as usize + (band_h - icon_size) / 2;
-        if !skip_app_icon {
-            draw_icon_scaled(pixels, width, icon, 24, icon_x, icon_y, icon_size, content_alpha);
-        }
+        draw_icon_scaled(pixels, width, icon, 24, icon_x, icon_y, icon_size, content_alpha);
         let text_rect = RECT {
             left: rect.left + icon_size as i32 + 6,
             ..*rect
@@ -5933,7 +5875,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
 }
 
 fn animation_duration(config: &Config) -> Duration {
-    Duration::from_millis(config.overlay.animation_ms.clamp(100, 500))
+    Duration::from_millis(config.overlay.animation_ms.clamp(100, 1000))
 }
 
 /// The exit leg's duration: shorter than the entrance — a quick, confident
@@ -7862,10 +7804,163 @@ mod tests {
             // edges coincide, so every row is fully unveiled.
             76,
             76,
-            1.0,
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 500, "expected text + art pixels, got {lit}");
+    }
+
+    #[test]
+    fn compact_icon_leaves_no_trace_at_the_morph_end() {
+        // The cross-fade model: the compact-mode icon (inline, after the
+        // title, next to the playback symbol) must dissolve with the compact
+        // content and be completely gone by the time the morph reaches the
+        // expanded state — the expanded layout's icon lives only in the app
+        // row. Renders the morph-end frame twice, with and without an app
+        // icon, and asserts the buffers are pixel-identical: the icon
+        // contributes zero pixels to the expanded frame. (The compact slot
+        // region legitimately holds the expanded title's glyphs, so
+        // equality — not emptiness — is the contract.)
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+        // Synthetic 24x24 icon, solid premultiplied blue — distinguishable
+        // from the white title glyphs.
+        let mut icon = vec![0u8; 24 * 24 * 4];
+        for px in icon.chunks_mut(4) {
+            px.copy_from_slice(&[0, 0, 255, 255]);
+        }
+        let track_with_icon = TrackInfo {
+            title: "Everything, Everywhere".into(),
+            artist: "John Muirhead".into(),
+            source_app: "Spotify".into(),
+            app_icon: Some(Arc::<[u8]>::from(icon)),
+            ..TrackInfo::default()
+        };
+        let content_with_icon = MediaEvent::TrackChanged(track_with_icon);
+        let track_without = TrackInfo {
+            title: "Everything, Everywhere".into(),
+            artist: "John Muirhead".into(),
+            source_app: "Spotify".into(),
+            ..TrackInfo::default()
+        };
+        let content_without = MediaEvent::TrackChanged(track_without);
+        let (_, expanded_h) = content_size_of(&state.config, &content_with_icon, false);
+        let height = expanded_h as i32;
+        let buf_w = 400usize;
+        let buf_h = 120usize;
+        let mut pixels = vec![0u8; buf_w * buf_h * 4];
+        let icon_lit = |pixels: &[u8], x0: usize, y0: usize, x1: usize, y1: usize| {
+            (y0..y1)
+                .flat_map(|y| (x0..x1).map(move |x| (y, x)))
+                .filter(|&(y, x)| {
+                    let p = &pixels[(y * buf_w + x) * 4..(y * buf_w + x) * 4 + 4];
+                    p[3] > 0 && p[2] > p[0] && p[2] > p[1]
+                })
+                .count()
+        };
+        // Morph start: the compact icon is present at the compact slot
+        // (235, 17), 16 px, at the default config and scale 1.0.
+        draw_text_pixels(
+            &mut state,
+            &mut pixels,
+            &content_with_icon,
+            buf_w as i32,
+            1.0,
+            false,
+            Some(MorphProgress {
+                width: 0.0,
+                height: 0.0,
+            }),
+            height,
+            height,
+        );
+        assert!(
+            icon_lit(&pixels, 235, 17, 251, 33) > 0,
+            "the compact icon must show at the morph start"
+        );
+        // Morph end: the icon must leave no trace — the expanded frame is
+        // identical with and without it.
+        let mut with_icon = vec![0u8; buf_w * buf_h * 4];
+        draw_text_pixels(
+            &mut state,
+            &mut with_icon,
+            &content_with_icon,
+            buf_w as i32,
+            1.0,
+            false,
+            Some(MorphProgress {
+                width: 1.0,
+                height: 1.0,
+            }),
+            height,
+            height,
+        );
+        let mut without_icon = vec![0u8; buf_w * buf_h * 4];
+        // Reset the cached pill text: the first render stored the with-icon
+        // pill in `state.pill_text`, and the morph pass consumes that cache
+        // before rebuilding — without the reset this render would silently
+        // redraw the with-icon content and the comparison would be vacuous.
+        state.pill_text = None;
+        draw_text_pixels(
+            &mut state,
+            &mut without_icon,
+            &content_without,
+            buf_w as i32,
+            1.0,
+            false,
+            Some(MorphProgress {
+                width: 1.0,
+                height: 1.0,
+            }),
+            height,
+            height,
+        );
+        // The compact slot region (where the compact icon sits at the morph
+        // start) must be pixel-identical with and without the icon. The
+        // buffers differ legally elsewhere: the expanded layout draws its own
+        // app-row icon and shifts the row-3 text right by its width.
+        let region = |buf: &[u8], x0: usize, y0: usize, x1: usize, y1: usize| -> Vec<u8> {
+            (y0..y1)
+                .flat_map(|y| (x0..x1).map(move |x| (y * buf_w + x) * 4))
+                .flat_map(|i| buf[i..i + 4].to_vec())
+                .collect()
+        };
+        assert_eq!(
+            region(&with_icon, 235, 17, 251, 34),
+            region(&without_icon, 235, 17, 251, 34),
+            "the compact slot must be byte-identical with and without the icon at the morph end"
+        );
+        // The expanded app-row slot is the icon's only legal home: present
+        // with the icon, absent without.
+        assert!(
+            icon_lit(&with_icon, 75, 50, 92, 70) > 0,
+            "the expanded app-row must show the icon"
+        );
+        assert_eq!(
+            icon_lit(&without_icon, 75, 50, 92, 70),
+            0,
+            "the expanded app-row must not show the icon without one"
+        );
+        // Mid-fade: partially faded, still present.
+        pixels.fill(0);
+        state.pill_text = None;
+        draw_text_pixels(
+            &mut state,
+            &mut pixels,
+            &content_with_icon,
+            buf_w as i32,
+            1.0,
+            false,
+            Some(MorphProgress {
+                width: 0.10,
+                height: 0.10,
+            }),
+            height,
+            height,
+        );
+        assert!(
+            icon_lit(&pixels, 235, 17, 251, 33) > 0,
+            "the compact icon must be mid-fade during the transition"
+        );
     }
 
     #[test]
@@ -8257,11 +8352,10 @@ mod tests {
     #[test]
     fn morph_radius_lerps_between_the_two_radii() {
         // The radius morphs continuously between the compact and expanded
-        // radii on the leading (width) axis. `overshoot_cap` bounds how far
-        // past 1.0 the radius may ride: 1.0 on the hover leg (window
-        // clamped by `morph_size`) still hard-clamps; a grow cap lets the
-        // rounding overshoot with the window and no farther, so the corners
-        // settle in step with the body.
+        // radii on the leading (width) axis, clamped so the eased spring can
+        // never render the shape over-rounded or pinched. The settle-bounce
+        // scales the composed frame as a whole (see `scale_frame_about`), so
+        // the corners ride it without this lerp overshooting.
         let (compact_r, expanded_r) = (8.0, 16.0);
         assert_eq!(
             morph_radius(
@@ -8270,8 +8364,7 @@ mod tests {
                 MorphProgress {
                     width: 0.0,
                     height: 0.0
-                },
-                1.05
+                }
             ),
             compact_r
         );
@@ -8282,8 +8375,7 @@ mod tests {
                 MorphProgress {
                     width: 1.0,
                     height: 1.0
-                },
-                1.05
+                }
             ),
             expanded_r
         );
@@ -8294,14 +8386,12 @@ mod tests {
                 width: 0.5,
                 height: 0.5,
             },
-            1.0,
         );
         assert!(
             (mid - 12.0).abs() < 1e-5,
             "mid-morph radius must be the midpoint, got {mid}"
         );
-        // Hover leg (cap 1.0): overshoot and lagged-height states clamp to
-        // the width interval, exactly as before.
+        // Overshoot and lagged-height states clamp to the width interval.
         let over = morph_radius(
             compact_r,
             expanded_r,
@@ -8309,7 +8399,6 @@ mod tests {
                 width: 1.3,
                 height: 0.4,
             },
-            1.0,
         );
         assert_eq!(over, expanded_r);
         let under = morph_radius(
@@ -8319,46 +8408,8 @@ mod tests {
                 width: -0.2,
                 height: 0.9,
             },
-            1.0,
         );
         assert_eq!(under, compact_r);
-        // Grow leg (cap > 1): the overshoot is allowed through, capped at
-        // the window's own ceiling — the rounding rides the bounce and
-        // never beyond it.
-        let grown = morph_radius(
-            compact_r,
-            expanded_r,
-            MorphProgress {
-                width: 1.04,
-                height: 0.4,
-            },
-            1.05,
-        );
-        assert!(
-            (grown - (8.0 + 8.0 * 1.04)).abs() < 1e-4,
-            "mid-overshoot the radius must follow the window's curve, got {grown}"
-        );
-        assert_eq!(
-            morph_radius(
-                compact_r,
-                expanded_r,
-                MorphProgress {
-                    width: 1.07,
-                    height: 0.4,
-                },
-                1.05,
-            ),
-            morph_radius(
-                compact_r,
-                expanded_r,
-                MorphProgress {
-                    width: 1.05,
-                    height: 0.4,
-                },
-                1.05,
-            ),
-            "the radius must never pass the window's overshoot cap"
-        );
     }
 
     #[test]
@@ -8396,7 +8447,7 @@ mod tests {
             "a finished collapse must land exactly on compact"
         );
         assert_eq!(
-            morph_radius(compact_r, expanded_r, progress, 1.0),
+            morph_radius(compact_r, expanded_r, progress),
             config.appearance.effective_corner_radius(true),
             "the 0 endpoint must equal the compact layout's discrete radius exactly"
         );
@@ -8419,7 +8470,7 @@ mod tests {
             "a finished expand must land exactly on expanded"
         );
         assert_eq!(
-            morph_radius(compact_r, expanded_r, progress, 1.0),
+            morph_radius(compact_r, expanded_r, progress),
             config.appearance.effective_corner_radius(false),
             "the 1 endpoint must equal the expanded layout's discrete radius exactly"
         );
@@ -8437,7 +8488,7 @@ mod tests {
             done: false,
         };
         let progress = hover_progress(&just_started, &config);
-        let radius = morph_radius(compact_r, expanded_r, progress, 1.0);
+        let radius = morph_radius(compact_r, expanded_r, progress);
         assert!(
             (radius - compact_r).abs() < 5e-3,
             "a fresh leg must render within sub-pixel of the compact radius, got {radius}"
@@ -8449,405 +8500,24 @@ mod tests {
     }
 
     #[test]
-    fn morph_radius_rides_the_grow_curve_with_the_window() {
-        // On the entrance leg the window shows its spring's overshoot (see
-        // `grow_size`), so the radius must ride the same un-clamped progress
-        // the window does — the residual snap was exactly the decoupling:
-        // the radius froze at its expanded value at p = 1.0 while the window
-        // kept settling. Mid-bounce, the radius must equal the compact
-        // radius plus the same fraction of the delta the window's width
-        // covers — proportional tracking of `grow_size`'s output, not
-        // merely an independently bounded value.
-        let config = Config::default();
-        let content = MediaEvent::TrackChanged(TrackInfo {
-            title: "Everything, Everywhere".into(),
-            artist: "John Muirhead".into(),
-            source_app: "Spotify".into(),
-            ..TrackInfo::default()
-        });
-        let (compact_w, _) = content_size_of(&config, &content, true);
-        let (expanded_w, _) = content_size_of(&config, &content, false);
-        let cap = grow_overshoot_cap(compact_w, expanded_w);
-        let (compact_r, expanded_r) = (config.appearance.compact_corner_radius, config.appearance.corner_radius);
-        // Find the spring's peak, then sample around it.
-        let mut peak = 0.0f32;
-        let mut t_peak = 0.0f32;
-        for i in 0..=2000 {
-            let t = i as f32 / 2000.0;
-            let v = ENTRANCE_GROW.value_at(t, 0.0, 0.0);
-            if v > peak {
-                peak = v;
-                t_peak = t;
-            }
-        }
-        assert!(peak > 1.0, "precondition: the entrance spring overshoots, got {peak}");
-        for t in [t_peak - 0.08, t_peak - 0.04, t_peak, t_peak + 0.04, t_peak + 0.08] {
-            let p = ENTRANCE_GROW.value_at(t, 0.0, 0.0).clamp(0.0, cap);
-            let (w, _) = grow_size(&config, &content, MorphProgress { width: p, height: p });
-            let window_p = (w - compact_w) / (expanded_w - compact_w);
-            let radius = morph_radius(compact_r, expanded_r, MorphProgress { width: p, height: p }, cap);
-            let expected = compact_r + (expanded_r - compact_r) * window_p;
-            assert!(
-                (radius - expected).abs() < 1e-4,
-                "the radius must match the window's progress at t={t}: radius {radius} vs {expected}"
-            );
-        }
-        // Endpoint pin on the same leg: at exactly 1.0 the radius is the
-        // expanded discrete radius — only the approach changes, never the
-        // seam.
-        assert_eq!(
-            morph_radius(
-                compact_r,
-                expanded_r,
-                MorphProgress {
-                    width: 1.0,
-                    height: 1.0
-                },
-                cap
-            ),
-            expanded_r
-        );
-    }
-
-    #[test]
-    fn morph_art_rect_lerps_within_its_cap_and_pins_the_endpoints() {
-        // The morphing art tile lerps its size and vertical position on the
-        // leading (width) axis — the same axis `morph_radius` uses — with
-        // the endpoints exactly the compact and expanded placements. The
-        // height axis never influences it (the width leads both legs; the
-        // height's job is the pill geometry and the text cross-fade).
-        // `overshoot_cap` bounds how far past 1.0 the tile may ride: 1.0 on
-        // the hover leg (window clamped by `morph_size`) still hard-clamps;
-        // a grow cap lets the tile overshoot with the window and no farther.
-        let (c_size, c_y, e_size, e_y) = (21.6, 15.0, 48.0, 24.0);
-        let at = |width: f32, height: f32| MorphProgress { width, height };
-        assert_eq!(
-            morph_art_rect(c_size, c_y, e_size, e_y, at(0.0, 0.7), 1.0),
-            (c_size, c_y),
-            "the 0 endpoint is the compact placement"
-        );
-        assert_eq!(
-            morph_art_rect(c_size, c_y, e_size, e_y, at(1.0, 0.1), 1.05),
-            (e_size, e_y),
-            "the 1 endpoint is the expanded placement, whatever the cap"
-        );
-        let mid = morph_art_rect(c_size, c_y, e_size, e_y, at(0.5, 0.5), 1.0);
-        assert!(
-            (mid.0 - 34.8).abs() < 1e-5 && (mid.1 - 19.5).abs() < 1e-5,
-            "mid-morph the tile must sit halfway, got {mid:?}"
-        );
-        assert_eq!(
-            morph_art_rect(c_size, c_y, e_size, e_y, at(0.5, 0.0), 1.0),
-            morph_art_rect(c_size, c_y, e_size, e_y, at(0.5, 1.0), 1.0),
-            "the height axis must not move the tile"
-        );
-        // Hover leg (cap 1.0): a spring overshoot still hard-clamps, exactly
-        // as before — the window is clamped there, so the tile matching it
-        // is correct, not a second instance of the grow-leg mismatch.
-        assert_eq!(
-            morph_art_rect(c_size, c_y, e_size, e_y, at(1.3, 0.0), 1.0),
-            (e_size, e_y)
-        );
-        assert_eq!(
-            morph_art_rect(c_size, c_y, e_size, e_y, at(-0.2, 0.0), 1.0),
-            (c_size, c_y)
-        );
-        // Grow leg (cap > 1): the overshoot is allowed through, capped at
-        // the window's own ceiling — the tile rides the bounce and never
-        // beyond it.
-        let grown = morph_art_rect(c_size, c_y, e_size, e_y, at(1.04, 0.0), 1.05);
-        assert!(
-            (grown.0 - (21.6 + 26.4 * 1.04)).abs() < 1e-4 && (grown.1 - (15.0 + 9.0 * 1.04)).abs() < 1e-4,
-            "mid-overshoot the tile must follow the window's curve, got {grown:?}"
-        );
-        assert_eq!(
-            morph_art_rect(c_size, c_y, e_size, e_y, at(1.07, 1.3), 1.05),
-            morph_art_rect(c_size, c_y, e_size, e_y, at(1.05, 0.0), 1.05),
-            "the tile must never pass the window's overshoot cap"
-        );
-    }
-
-    #[test]
-    fn contain_art_never_escapes_the_pill_body() {
-        // The morphing tile is containment-clamped to the current body: the
-        // size to the body height and the top so the tile never crosses the
-        // body's bottom edge. Values already inside the body pass through
-        // untouched, so the morph endpoints' exact placements survive.
-        let (pill_h, inset) = (51usize, 15usize);
-        assert_eq!(
-            contain_art(22, 14, pill_h, inset),
-            (22, 14),
-            "no clamp bites inside the body"
-        );
-        assert_eq!(
-            contain_art(60, 0, pill_h, inset),
-            (51, 0),
-            "an oversized tile clamps to the body height"
-        );
-        assert_eq!(
-            contain_art(22, 100, pill_h, inset),
-            (22, 15 + 51 - 22),
-            "a tile past the bottom edge clamps to it"
-        );
-        // A tile clamped on both axes at once: the size clamps first, and
-        // the top clamp is measured against the clamped size, so the tile's
-        // bottom edge lands exactly on the body's bottom edge.
-        assert_eq!(
-            contain_art(80, 100, pill_h, inset),
-            (51, 15),
-            "the bottom edge of the clamped tile touches the body's bottom edge"
-        );
-    }
-
-    #[test]
-    fn morph_icon_rect_lerps_within_its_cap_and_pins_the_endpoints() {
-        // The morphing app icon lerps between the compact inline slot and
-        // the expanded source-app-row slot on the leading (width) axis —
-        // the same axis `morph_radius` and `morph_art_rect` use. The height
-        // axis never influences it. `overshoot_cap` bounds how far past 1.0
-        // the icon may ride: 1.0 on the hover leg (window clamped by
-        // `morph_size`) still hard-clamps; a grow cap lets the icon
-        // overshoot with the window and no farther.
-        let compact = (235, 17, 16);
-        let expanded = (75, 69, 14);
-        let at = |width: f32, height: f32| MorphProgress { width, height };
-        assert_eq!(
-            morph_icon_rect(compact, expanded, at(0.0, 0.7), 1.0),
-            compact,
-            "the 0 endpoint is the compact slot"
-        );
-        assert_eq!(
-            morph_icon_rect(compact, expanded, at(1.0, 0.1), 1.05),
-            expanded,
-            "the 1 endpoint is the expanded slot, whatever the cap"
-        );
-        assert_eq!(
-            morph_icon_rect(compact, expanded, at(0.5, 0.5), 1.0),
-            (155, 43, 15),
-            "mid-morph the icon must sit halfway"
-        );
-        assert_eq!(
-            morph_icon_rect(compact, expanded, at(0.5, 0.0), 1.0),
-            morph_icon_rect(compact, expanded, at(0.5, 1.0), 1.0),
-            "the height axis must not move the icon"
-        );
-        // Hover leg (cap 1.0): a spring overshoot still hard-clamps, exactly
-        // as before — the window is clamped there, so the icon matching it
-        // is correct, not a second instance of the grow-leg mismatch.
-        assert_eq!(morph_icon_rect(compact, expanded, at(1.3, 0.0), 1.0), expanded);
-        assert_eq!(morph_icon_rect(compact, expanded, at(-0.2, 0.0), 1.0), compact);
-        // Grow leg (cap > 1): the overshoot is allowed through, capped at
-        // the window's own ceiling — the icon rides the bounce and never
-        // beyond it.
-        let grown = morph_icon_rect(compact, expanded, at(1.1, 0.0), 1.2);
-        assert_eq!(
-            grown,
-            (59, 74, 14),
-            "mid-overshoot the icon must follow the window's curve"
-        );
-        assert_eq!(
-            morph_icon_rect(compact, expanded, at(1.3, 0.0), 1.2),
-            morph_icon_rect(compact, expanded, at(1.2, 0.0), 1.2),
-            "the icon must never pass the window's overshoot cap"
-        );
-    }
-
-    #[test]
-    fn grow_overshoot_cap_is_the_window_overshoot_in_progress_units() {
-        // The entrance leg's element ceiling: `grow_size` bounds the window
-        // at 1 % past the expanded width, and this converts that size cap
-        // into progress units so the icon and art share the exact curve.
-        // With the default config the compact width is 303.2 (see
-        // `compact_size`) and the expanded width is 340 (`max_width`):
-        // 3.4 px over a 36.8 px morph delta is ~9.24 % of the delta.
-        assert!(
-            (grow_overshoot_cap(303.2, 340.0) - 1.0923913).abs() < 1e-5,
-            "the default cap must be 1 + 3.4/36.8, got {}",
-            grow_overshoot_cap(303.2, 340.0)
-        );
-        assert_eq!(
-            grow_overshoot_cap(100.0, 100.0),
-            1.0,
-            "a zero morph delta (no bounce possible) must not divide by zero"
-        );
-    }
-
-    #[test]
-    fn entrance_icon_and_art_track_the_grow_curve() {
-        // The entrance leg shows its spring's overshoot (see `grow_size`),
-        // so the icon and art must ride the same un-clamped progress the
-        // window does — the reported end-of-expand jump was exactly the
-        // decoupling: the elements froze at their expanded slots at p = 1.0
-        // while the window kept settling. Mid-bounce, the window's own size
-        // converted back to progress must equal the progress the element
-        // rects lerp with.
-        let config = Config::default();
-        let content = MediaEvent::TrackChanged(TrackInfo {
-            title: "Everything, Everywhere".into(),
-            artist: "John Muirhead".into(),
-            source_app: "Spotify".into(),
-            ..TrackInfo::default()
-        });
-        let (compact_w, _) = content_size_of(&config, &content, true);
-        let (expanded_w, _) = content_size_of(&config, &content, false);
-        let cap = grow_overshoot_cap(compact_w, expanded_w);
-        // Preconditions: the tuned spring really overshoots (else this test
-        // asserts nothing), and stays inside the window's own cap (the cap
-        // exists to bound pathological springs, not the tuned one).
-        let mut peak = 0.0f32;
-        let mut t_peak = 0.0f32;
-        for i in 0..=2000 {
-            let t = i as f32 / 2000.0;
-            let v = ENTRANCE_GROW.value_at(t, 0.0, 0.0);
-            if v > peak {
-                peak = v;
-                t_peak = t;
-            }
-        }
-        assert!(peak > 1.0, "precondition: the entrance spring overshoots, got {peak}");
-        assert!(peak < cap, "precondition: the tuned spring stays inside the window cap");
-        // Around the peak, the window's width (via `grow_size`) and the
-        // elements must be driven by the same progress.
-        for t in [t_peak - 0.08, t_peak - 0.04, t_peak, t_peak + 0.04, t_peak + 0.08] {
-            let p = ENTRANCE_GROW.value_at(t, 0.0, 0.0).clamp(0.0, cap);
-            let (w, _) = grow_size(&config, &content, MorphProgress { width: p, height: p });
-            let window_p = (w - compact_w) / (expanded_w - compact_w);
-            assert!(
-                (window_p - p).abs() < 1e-4,
-                "the window and the elements must ride the same progress at t={t}: window {window_p} vs elements {p}"
-            );
-            let (size, y) = morph_art_rect(21.0, 10.0, 48.0, 20.0, MorphProgress { width: p, height: p }, cap);
-            let expected = (21.0 + 27.0 * p, 10.0 + 10.0 * p);
-            assert!(
-                (size - expected.0).abs() < 1e-4 && (y - expected.1).abs() < 1e-4,
-                "the art tile must lerp with the window's progress at t={t}: got ({size}, {y}), expected ({}, {})",
-                expected.0,
-                expected.1
-            );
-        }
-        // Endpoint pin on the same leg: at exactly 1.0 the elements sit on
-        // the expanded discrete rects — only the approach changes, never
-        // the seam.
-        assert_eq!(
-            morph_art_rect(
-                21.0,
-                10.0,
-                48.0,
-                20.0,
-                MorphProgress {
-                    width: 1.0,
-                    height: 1.0
-                },
-                cap
-            ),
-            (48.0, 20.0)
-        );
-        assert_eq!(
-            morph_icon_rect(
-                (235, 17, 16),
-                (75, 69, 14),
-                MorphProgress {
-                    width: 1.0,
-                    height: 1.0
-                },
-                cap
-            ),
-            (75, 69, 14)
-        );
-    }
-
-    #[test]
-    fn compact_app_icon_rect_is_the_steady_inline_slot() {
-        // The 0 endpoint of the icon morph must be the exact slot the
-        // compact draw places the icon in when no morph is running: the
-        // 16 px icon, one 6 px gap past the title viewport's right edge,
-        // vertically centered in the compact pill height. The values are
-        // derived from the default config at scale 1.0 by hand (see
-        // `compact_size` / `compact_title_viewport`); the aura inset shifts
-        // both axes.
-        let config = Config::default();
-        assert_eq!(
-            compact_app_icon_rect(&config, 1.0, 0),
-            (235, 17, 16),
-            "default slot: 16 px, 6 px past the viewport, vertically centered"
-        );
-        assert_eq!(
-            compact_app_icon_rect(&config, 1.0, 15),
-            (250, 32, 16),
-            "the aura inset shifts both axes"
-        );
-    }
-
-    #[test]
-    fn expanded_app_icon_rect_reproduces_the_row_band_accumulation() {
-        // The 1 endpoint of the icon morph must be the exact icon
-        // `draw_source_app_row` draws in the steady expanded frame. The row
-        // rect comes from `draw_pill_text_rows`'s band accumulation, so the
-        // expected values below are computed from the default config's fonts
-        // by hand (title 16 * 1.35, artist 13 * 1.35, meta/app 13*0.85*1.35,
-        // stacked from the inset + padding top, truncated like the draw
-        // path). A missing artist or meta row moves the app row up by
-        // exactly that band; an empty source name means the row is inactive
-        // and the expanded layout draws no icon at all.
-        let pill = |artist: &str, meta: &str, source: &str| PillText {
-            title: "t".into(),
-            artist: artist.into(),
-            source_app: source.into(),
-            app_icon: None,
-            meta_clock: false,
-            meta: meta.into(),
-        };
-        let config = Config::default();
-        assert_eq!(
-            expanded_app_icon_rect(&config, 1.0, &pill("a", "m", "Spotify"), 0),
-            Some((75, 69, 14)),
-            "all rows: the icon is capped at the app band's height"
-        );
-        assert_eq!(
-            expanded_app_icon_rect(&config, 1.0, &pill("", "m", "Spotify"), 0),
-            Some((75, 51, 15)),
-            "without the artist row the icon sits one artist band higher"
-        );
-        assert_eq!(
-            expanded_app_icon_rect(&config, 1.0, &pill("a", "", "Spotify"), 0),
-            Some((75, 54, 15)),
-            "without the meta row the icon sits one meta band higher"
-        );
-        assert_eq!(
-            expanded_app_icon_rect(&config, 1.0, &pill("", "", "Spotify"), 0),
-            Some((75, 36, 15)),
-            "without both rows the icon sits two bands higher"
-        );
-        assert_eq!(
-            expanded_app_icon_rect(&config, 1.0, &pill("a", "m", ""), 0),
-            None,
-            "an empty source app means the row is inactive: no icon"
-        );
-    }
-
-    #[test]
-    fn morph_cross_fade_never_overlaps_the_two_contents() {
+    fn morph_cross_fade_never_shows_both_layouts_at_once() {
         // Both passes key to the shape progress — the less-advanced axis,
-        // min(width, height) — so the fade windows (compact: 0.20..0.35,
-        // expanded: 0.45..0.60) are disjoint at every t in both directions.
-        // The assertion allows float dust at the window boundary — at no
-        // point can both passes be meaningfully visible.
-        assert_eq!(compact_alpha(0.20), 1.0);
-        assert_eq!(compact_alpha(0.35), 0.0);
-        assert_eq!(expanded_alpha(0.45), 0.0);
+        // min(width, height). The fade windows (compact: 0.05..0.20,
+        // expanded: 0.25..0.60) are deliberately DISJOINT: the compact
+        // layout — the inline app icon included — must be completely gone
+        // before the expanded layout starts arriving, or the icon would
+        // visibly sit beside the expanding title row. The assertion allows
+        // float dust at the window boundary — at no point can both passes be
+        // meaningfully visible.
+        assert_eq!(compact_alpha(0.05), 1.0);
+        assert_eq!(compact_alpha(0.20), 0.0);
+        assert_eq!(expanded_alpha(0.25), 0.0);
         assert_eq!(expanded_alpha(0.60), 1.0);
         for i in 0..=400 {
             let t = i as f32 / 400.0;
             let width = EXPAND_SPRING.value_at(t, 0.0, 0.0);
             let height = lagged_expand(&EXPAND_SPRING, t, MORPH_LAG);
             let shape = width.min(height);
-            // In the fade-relevant range the limiting axis is the lagging
-            // height: the expanded rows arrive as the pill grows tall.
-            // (Past the fades, near the leg end, both axes sit in the
-            // spring's sub-percent settle dust, where the order may flip.)
-            if shape > 0.15 && shape < 0.65 {
-                assert!(shape == height, "the height must limit the fades on expand at t={t}");
-            }
             let (compact, expanded) = (compact_alpha(shape), expanded_alpha(shape));
             assert!(
                 compact <= 0.01 || expanded <= 0.01,
@@ -8862,15 +8532,100 @@ mod tests {
             let width = spring_collapse(t, 1.0, 0.0);
             let height = lagged_collapse(t, MORPH_LAG, 1.0, 0.0);
             let shape = width.min(height);
-            if shape > 0.15 && shape < 0.65 {
-                assert!(shape == width, "the width must limit the fades on collapse at t={t}");
-            }
             let (compact, expanded) = (compact_alpha(shape), expanded_alpha(shape));
             assert!(
                 compact <= 0.01 || expanded <= 0.01,
                 "the passes must never overlap on collapse at t={t}: compact={compact} expanded={expanded}"
             );
         }
+    }
+
+    #[test]
+    fn bounce_scale_pins_at_one_and_hits_the_configured_amplitudes() {
+        // The whole-pill settle-bounce, driven by the spring progress
+        // itself: exactly 1.0 whenever the spring is inside its endpoints
+        // (and at the pinned end), an expand that overshoots once to
+        // 1 + BOUNCE_OVER at the spring's peak, and a compaction that dips
+        // to 1 - BOUNCE_UNDER at the undershoot trough and recovers
+        // straight to 1.0 at the pin — the shrink-below-minimum return.
+        let at = |width: f32| MorphProgress { width, height: 0.0 };
+        // Expand: no scale inside the endpoints, exactly 1 + OVER at the
+        // spring's peak, clamped beyond it.
+        assert_eq!(bounce_scale(at(0.0), MorphDirection::Expand), 1.0);
+        assert_eq!(bounce_scale(at(0.5), MorphDirection::Expand), 1.0);
+        assert_eq!(bounce_scale(at(1.0), MorphDirection::Expand), 1.0);
+        assert!(
+            (bounce_scale(at(EXPAND_SPRING_PEAK), MorphDirection::Expand) - (1.0 + BOUNCE_OVER)).abs() < 1e-5,
+            "the expand must peak at 1 + BOUNCE_OVER, got {}",
+            bounce_scale(at(EXPAND_SPRING_PEAK), MorphDirection::Expand)
+        );
+        assert_eq!(bounce_scale(at(1.3), MorphDirection::Expand), 1.0 + BOUNCE_OVER);
+        // Compaction: exactly 1.0 at the zero crossings (the pill reaches
+        // compact and the pin lands at compact), 1 - UNDER at the trough,
+        // and a straight recovery (1 - UNDER/2) mid-way back — no over-bounce.
+        assert_eq!(bounce_scale(at(0.6), MorphDirection::Collapse), 1.0);
+        assert_eq!(bounce_scale(at(0.0), MorphDirection::Collapse), 1.0);
+        assert!(
+            (bounce_scale(at(COLLAPSE_TROUGH), MorphDirection::Collapse) - (1.0 - BOUNCE_UNDER)).abs() < 1e-5,
+            "the compaction must dip to 1 - BOUNCE_UNDER, got {}",
+            bounce_scale(at(COLLAPSE_TROUGH), MorphDirection::Collapse)
+        );
+        assert!(
+            (bounce_scale(at(COLLAPSE_TROUGH / 2.0), MorphDirection::Collapse) - (1.0 - BOUNCE_UNDER / 2.0)).abs()
+                < 1e-5,
+            "the compaction must recover to 1 - BOUNCE_UNDER/2 mid-recovery, got {}",
+            bounce_scale(at(COLLAPSE_TROUGH / 2.0), MorphDirection::Collapse)
+        );
+        // The scale is a pure function of the progress: a below-trough dip
+        // clamps at the configured minimum rather than overshooting it.
+        assert_eq!(
+            bounce_scale(at(COLLAPSE_TROUGH * 2.0), MorphDirection::Collapse),
+            1.0 - BOUNCE_UNDER
+        );
+    }
+
+    #[test]
+    fn scale_frame_about_is_a_true_uniform_scale_about_the_anchor() {
+        // A 4x4 src with one solid premultiplied pixel; scaling by 0.5 about
+        // the bottom-center anchor must map the src's center pixel (2, 2) to
+        // the dst's center pixel (1, 1) — the bottom-anchored shrink pulls
+        // everything down toward the anchor — with every other dst pixel
+        // transparent.
+        let src_w = 4usize;
+        let src_h = 4usize;
+        let mut src = vec![0u8; src_w * src_h * 4];
+        // Solid red, fully opaque, at the src's center pixel (2, 2).
+        let p = (2 * src_w + 2) * 4;
+        src[p..p + 4].copy_from_slice(&[0, 0, 255, 255]);
+        let dst_w = 2usize;
+        let dst_h = 2usize;
+        let mut dst = vec![0u8; dst_w * dst_h * 4];
+        scale_frame_about(
+            &mut dst,
+            dst_w * 4,
+            dst_w,
+            dst_h,
+            &src,
+            src_w * 4,
+            src_w,
+            src_h,
+            4,
+            4,
+            0,
+            0.5,
+            1.0,
+            0.5,
+        );
+        // The dst's center pixel (1, 1) samples the src's center exactly.
+        let q = (dst_w + 1) * 4;
+        assert_eq!(
+            &dst[q..q + 4],
+            &[0, 0, 255, 255],
+            "the scaled pixel must land at the dst center"
+        );
+        // The dst's top-left pixel samples the src's top-left area, which is
+        // transparent.
+        assert_eq!(&dst[0..4], &[0, 0, 0, 0], "the rest of the dst stays transparent");
     }
 
     #[test]

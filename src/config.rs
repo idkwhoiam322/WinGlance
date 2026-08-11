@@ -252,7 +252,7 @@ impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             duration_ms: 5000,
-            animation_ms: 280,
+            animation_ms: 500,
             vertical: VerticalPosition::Top,
             horizontal: HorizontalPosition::Center,
             margin: 8,
@@ -519,7 +519,7 @@ impl Config {
 
     fn normalize(&mut self) {
         self.overlay.duration_ms = self.overlay.duration_ms.clamp(500, 60_000);
-        self.overlay.animation_ms = self.overlay.animation_ms.clamp(100, 500);
+        self.overlay.animation_ms = self.overlay.animation_ms.clamp(100, 1000);
         self.overlay.max_width = self.overlay.max_width.clamp(180, 800);
         self.overlay.max_tick_hz = self.overlay.max_tick_hz.map(|hz| hz.clamp(60, 1000));
         self.overlay.margin = self.overlay.margin.clamp(0, 500);
