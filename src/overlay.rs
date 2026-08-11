@@ -68,7 +68,7 @@ const MORPH_LAG: f32 = 0.12;
 
 /// The whole-pill settle-bounce: after the size spring passes its endpoint,
 /// the entire pill scales about its anchor past the final size and back
-/// (expand: 1 -> 1.05 -> 1; compaction: 1 -> 0.95 -> 1.05 -> 1), so the
+/// (expand: 1 -> 1.05 -> 1; compaction: 1 -> 0.95 -> 1), so the
 /// bounce reads as one 1:1 card settling instead of per-element overshoots.
 /// The amplitudes are the first tuning knobs if the bounce reads too weak or
 /// too wild.
@@ -2646,9 +2646,8 @@ fn content_size_of(config: &Config, content: &MediaEvent, compact: bool) -> (f32
 /// the final size. The expand rides the spring's own overshoot past 1.0,
 /// normalized to peak at (1 + `BOUNCE_OVER`) when the spring peaks. The
 /// compaction dips to (1 - `BOUNCE_UNDER`) at the spring's undershoot
-/// trough, then the rise rides the dip's recovery — peaking at (1 + OVER)
-/// halfway back and landing exactly on 1.0 when the spring pins — the
-/// shrink-below-minimum, grow-beyond-maximum return.
+/// trough and recovers straight to exactly 1.0 when the spring pins — the
+/// shrink-below-minimum return, with no over-bounce past the final size.
 fn bounce_scale(progress: MorphProgress, direction: MorphDirection) -> f32 {
     match direction {
         MorphDirection::Expand => {
@@ -2661,13 +2660,11 @@ fn bounce_scale(progress: MorphProgress, direction: MorphDirection) -> f32 {
             } else {
                 0.0
             };
-            // The rise rides the dip's recovery: it peaks halfway back to 0
-            // and lands exactly on 1.0 when the spring pins — no appended
-            // time, no seam at the steady handoff. Its amplitude is
-            // OVER + UNDER/2 so the *net* peak is exactly 1 + OVER (the
-            // visible max stays the configured knob) while the min stays
-            // exactly 1 - UNDER at the trough.
-            1.0 - BOUNCE_UNDER * dip + (BOUNCE_OVER + BOUNCE_UNDER / 2.0) * (std::f32::consts::PI * (1.0 - dip)).sin()
+            // The dip rides the spring's undershoot straight back to 1.0 —
+            // the pill shrinks below the compact minimum and returns, with
+            // no over-bounce past the steady size. Exactly 1.0 when the
+            // spring pins, so there is no seam at the steady handoff.
+            1.0 - BOUNCE_UNDER * dip
         }
     }
 }
@@ -8549,9 +8546,8 @@ mod tests {
         // itself: exactly 1.0 whenever the spring is inside its endpoints
         // (and at the pinned end), an expand that overshoots once to
         // 1 + BOUNCE_OVER at the spring's peak, and a compaction that dips
-        // to 1 - BOUNCE_UNDER at the undershoot trough, rises to
-        // 1 + BOUNCE_OVER halfway back and lands on 1.0 at the pin — the
-        // shrink-below-minimum, grow-beyond-maximum return.
+        // to 1 - BOUNCE_UNDER at the undershoot trough and recovers
+        // straight to 1.0 at the pin — the shrink-below-minimum return.
         let at = |width: f32| MorphProgress { width, height: 0.0 };
         // Expand: no scale inside the endpoints, exactly 1 + OVER at the
         // spring's peak, clamped beyond it.
@@ -8566,7 +8562,7 @@ mod tests {
         assert_eq!(bounce_scale(at(1.3), MorphDirection::Expand), 1.0 + BOUNCE_OVER);
         // Compaction: exactly 1.0 at the zero crossings (the pill reaches
         // compact and the pin lands at compact), 1 - UNDER at the trough,
-        // and the net peak exactly 1 + OVER halfway back.
+        // and a straight recovery (1 - UNDER/2) mid-way back — no over-bounce.
         assert_eq!(bounce_scale(at(0.6), MorphDirection::Collapse), 1.0);
         assert_eq!(bounce_scale(at(0.0), MorphDirection::Collapse), 1.0);
         assert!(
@@ -8575,8 +8571,9 @@ mod tests {
             bounce_scale(at(COLLAPSE_TROUGH), MorphDirection::Collapse)
         );
         assert!(
-            (bounce_scale(at(COLLAPSE_TROUGH / 2.0), MorphDirection::Collapse) - (1.0 + BOUNCE_OVER)).abs() < 1e-5,
-            "the compaction must rise to 1 + BOUNCE_OVER mid-recovery, got {}",
+            (bounce_scale(at(COLLAPSE_TROUGH / 2.0), MorphDirection::Collapse) - (1.0 - BOUNCE_UNDER / 2.0)).abs()
+                < 1e-5,
+            "the compaction must recover to 1 - BOUNCE_UNDER/2 mid-recovery, got {}",
             bounce_scale(at(COLLAPSE_TROUGH / 2.0), MorphDirection::Collapse)
         );
         // The scale is a pure function of the progress: a below-trough dip
