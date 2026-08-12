@@ -20,8 +20,8 @@ use std::sync::Arc;
 use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DT_CALCRECT,
-    DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DrawTextW, ETO_CLIPPED, ExtTextOutW,
-    GdiFlush, HBITMAP, HDC, HFONT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DrawTextW, ETO_CLIPPED, ExtTextOutW, GdiFlush,
+    HBITMAP, HDC, HFONT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowPos, ULW_ALPHA};
 use windows::core::PCWSTR;
@@ -1358,7 +1358,6 @@ pub(super) fn draw_pill_text_rows(
                 font_title,
                 h_title,
                 dim_color(appearance.text_color, content_alpha * unveil),
-                false,
                 scale,
                 Some(MarqueeCtx {
                     scroll: &mut state.scroll[0],
@@ -1393,7 +1392,6 @@ pub(super) fn draw_pill_text_rows(
                 font_artist,
                 h_artist,
                 dim_color(muted, unveil),
-                false,
                 scale,
                 Some(MarqueeCtx {
                     scroll: &mut state.scroll[1],
@@ -1650,7 +1648,6 @@ pub(super) fn draw_expanded_pill_text(
                                 font_title,
                                 h_title,
                                 dim_color(text_color, unveil),
-                                false,
                                 scale,
                                 None,
                             );
@@ -1678,7 +1675,6 @@ pub(super) fn draw_expanded_pill_text(
                             font_artist,
                             h_artist,
                             dim_color([0xCC, 0xCC, 0xCC, 0xFF], content_alpha * unveil),
-                            false,
                             scale,
                             None,
                         );
@@ -1815,7 +1811,6 @@ pub(super) fn draw_compact_pill(
         font_title,
         h_title,
         dim_color(appearance.text_color, content_alpha),
-        false,
         scale,
         Some(MarqueeCtx {
             scroll: &mut state.scroll[0],
@@ -1961,7 +1956,6 @@ pub(super) fn draw_morph_content(
             font_title,
             h_title,
             appearance.text_color,
-            false,
             scale,
             Some(MarqueeCtx {
                 scroll: &mut state.scroll[0],
@@ -2038,7 +2032,6 @@ pub(super) fn draw_meta_line_pixels(
             font,
             tm_height,
             color,
-            false,
             scale,
             marquee,
         );
@@ -2063,7 +2056,6 @@ pub(super) fn draw_meta_line_pixels(
         font,
         tm_height,
         color,
-        false,
         scale,
         marquee,
     );
@@ -2087,7 +2079,6 @@ pub(super) fn draw_text_line_pixels(
     font: HFONT,
     font_height: i32,
     color: [u8; 4],
-    centered: bool,
     scale: f32,
     marquee: Option<MarqueeCtx<'_>>,
 ) {
@@ -2124,10 +2115,7 @@ pub(super) fn draw_text_line_pixels(
         // static path. `font_height` is the font's tmHeight, cached with the
         // font instead of re-read per row per frame.
         let y = ((rh - font_height) / 2).max(0);
-        let mut flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
-        if centered {
-            flags |= DT_CENTER;
-        }
+        let flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
         let mut local = RECT {
             left: 0,
             top: 0,
@@ -2184,7 +2172,6 @@ pub(super) fn draw_text_line_pixels(
                     font,
                     font_height,
                     color,
-                    centered,
                     y,
                     text_w,
                 );
@@ -2255,7 +2242,6 @@ pub(super) fn build_marquee_strip(
     font: HFONT,
     font_height: i32,
     color: [u8; 4],
-    centered: bool,
     y: i32,
     text_w: i32,
 ) {
@@ -2268,7 +2254,6 @@ pub(super) fn build_marquee_strip(
                 && cached.font.0 == font.0
                 && cached.font_height == font_height
                 && cached.color == color
-                && cached.centered == centered
                 && cached.text_w == text_w
     );
     if cache_hit {
@@ -2338,7 +2323,6 @@ pub(super) fn build_marquee_strip(
         font,
         font_height,
         color,
-        centered,
         text_w,
         pixels,
     });
@@ -2696,7 +2680,6 @@ pub(super) fn draw_source_app_row(
             font,
             tm_height,
             color,
-            false,
             scale,
             marquee,
         );
@@ -2711,7 +2694,6 @@ pub(super) fn draw_source_app_row(
             font,
             tm_height,
             color,
-            false,
             scale,
             marquee,
         );

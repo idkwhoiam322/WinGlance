@@ -252,7 +252,6 @@ struct MarqueeStrip {
     font: HFONT,
     font_height: i32,
     color: [u8; 4],
-    centered: bool,
     text_w: i32,
     pixels: Vec<u8>,
 }
@@ -3592,7 +3591,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             None,
         );
@@ -3628,7 +3626,6 @@ mod tests {
             font,
             h,
             [0x80, 0x80, 0x80, 0xFF],
-            false,
             1.0,
             None,
         );
@@ -3679,7 +3676,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -3716,7 +3712,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -3763,7 +3758,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -3786,7 +3780,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -3831,7 +3824,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -3849,7 +3841,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -3875,7 +3866,6 @@ mod tests {
             font: HFONT(std::ptr::null_mut()),
             font_height: 10,
             color: [0, 0, 255, 255],
-            centered: false,
             text_w: 10,
             pixels: [255u8, 0, 0, 255].repeat(10 * 20), // solid premultiplied blue (BGRA)
         };
@@ -3978,7 +3968,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             None,
         );
@@ -3995,7 +3984,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -4047,7 +4035,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -4076,7 +4063,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -4176,7 +4162,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -4226,7 +4211,6 @@ mod tests {
             font: HFONT(std::ptr::null_mut()),
             font_height: 10,
             color: [0, 0, 255, 255],
-            centered: false,
             text_w: 40,
             pixels: [255u8, 0, 0, 255].repeat(40 * 20), // solid premultiplied blue (BGRA)
         };
@@ -4608,7 +4592,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             None,
         );
