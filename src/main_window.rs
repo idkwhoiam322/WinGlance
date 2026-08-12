@@ -891,7 +891,14 @@ impl MainWindowState {
         // (a settings repaint previously created ~40 brushes).
         self.black_brush = unsafe { CreateSolidBrush(COLORREF(0)) };
         self.sidebar_bg_brush = unsafe { CreateSolidBrush(COLORREF(0x0A0A0A)) };
-        self.sidebar_highlight_brush = unsafe { CreateSolidBrush(COLORREF(0x1A1A2E)) };
+        // The highlight surfaces (sidebar active pane, history selection) are
+        // dark tints of the configured accent — the whole default theme is
+        // accent-based, with no fixed blue/green tones.
+        let highlight = |weight: f32| -> HBRUSH {
+            let c = mix(accent, [0x0A, 0x0A, 0x0A, 0xFF], weight);
+            unsafe { CreateSolidBrush(colorref(c[0], c[1], c[2])) }
+        };
+        self.sidebar_highlight_brush = highlight(0.15);
         self.settings_border_brush =
             unsafe { CreateSolidBrush(colorref(SETTINGS_BORDER[0], SETTINGS_BORDER[1], SETTINGS_BORDER[2])) };
         self.settings_surface_brush =
@@ -914,7 +921,7 @@ impl MainWindowState {
         // History-row brushes: a fixed four-color set, created once instead of
         // per owner-draw row (every scroll tick repaints every visible row).
         self.history_header_brush = unsafe { CreateSolidBrush(COLORREF(0x00141414)) };
-        self.history_selected_brush = unsafe { CreateSolidBrush(COLORREF(0x001D2B26)) };
+        self.history_selected_brush = highlight(0.20);
         self.history_row_even_brush = unsafe { CreateSolidBrush(COLORREF(0)) };
         self.history_row_odd_brush = unsafe { CreateSolidBrush(COLORREF(0x000E0E0E)) };
 
