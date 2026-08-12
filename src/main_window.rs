@@ -164,6 +164,14 @@ const SETTINGS_TEXT: [u8; 4] = [0xF0, 0xF0, 0xF0, 0xFF];
 const SETTINGS_MUTED: [u8; 4] = [0xC8, 0xC8, 0xC8, 0xFF];
 const SETTINGS_FAINT: [u8; 4] = [0x7A, 0x7A, 0x7A, 0xFF];
 
+/// Mix weights (toward `SETTINGS_SURFACE`) for the accent soft fills. Kept
+/// as named constants so the brush rebuild and the render-time contrast guard
+/// below stay in lockstep — a drift between the two would silently recompute
+/// the wrong backdrop for the label guard.
+const SETTINGS_ACCENT_SOFT_WEIGHT: f32 = 0.28;
+const SETTINGS_NEAR_WEIGHT: f32 = 0.55;
+const SETTINGS_ADJUST_HOVER_WEIGHT: f32 = 0.45;
+
 /// Blends `a` over `b` (0.0 = b, 1.0 = a).
 fn mix(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
     [
@@ -1178,9 +1186,9 @@ impl MainWindowState {
                 let c = mix(accent, SETTINGS_SURFACE, weight);
                 CreateSolidBrush(colorref(c[0], c[1], c[2]))
             };
-            self.settings_accent_soft_brush = soft(0.28);
-            self.settings_near_brush = soft(0.55);
-            self.settings_adjust_hover_brush = soft(0.45);
+            self.settings_accent_soft_brush = soft(SETTINGS_ACCENT_SOFT_WEIGHT);
+            self.settings_near_brush = soft(SETTINGS_NEAR_WEIGHT);
+            self.settings_adjust_hover_brush = soft(SETTINGS_ADJUST_HOVER_WEIGHT);
             self.settings_small_hover_brush = soft(0.35);
             let highlight = |weight: f32| -> HBRUSH {
                 let c = mix(self.accent_secondary, [0x0A, 0x0A, 0x0A, 0xFF], weight);
@@ -2279,6 +2287,17 @@ impl MainWindowState {
                                 }
                                 let mut t = s_inner;
                                 let tc = if active || near { SETTINGS_TEXT } else { SETTINGS_MUTED };
+                                // The near-segment fill is a tint of the accent;
+                                // for a light accent that tint can sit too close
+                                // to white text. Clamp the label against the
+                                // actual fill color — a no-op for accents dark
+                                // enough to already pass AA.
+                                let tc = if near {
+                                    let fill = mix(accent, SETTINGS_SURFACE, SETTINGS_NEAR_WEIGHT);
+                                    crate::overlay::ensure_contrast(tc, fill, crate::overlay::TEXT_CONTRAST_AA)
+                                } else {
+                                    tc
+                                };
                                 let label = if near {
                                     format!("≈{}s", values[i] / 1000)
                                 } else {
@@ -2404,6 +2423,21 @@ impl MainWindowState {
                                     },
                                 );
                             }
+                            // Clamp the accent label against the Adjust button's
+                            // soft fill so a light accent stays readable on hover
+                            // (no-op for accents that already pass AA). The fill
+                            // color mirrors `brushes.adjust_hover` / `accent_soft`
+                            // so the guard targets the exact backdrop being drawn.
+                            let fill_weight = if adjust_hovered {
+                                SETTINGS_ADJUST_HOVER_WEIGHT
+                            } else {
+                                SETTINGS_ACCENT_SOFT_WEIGHT
+                            };
+                            let label_color = crate::overlay::ensure_contrast(
+                                accent,
+                                mix(accent, SETTINGS_SURFACE, fill_weight),
+                                crate::overlay::TEXT_CONTRAST_AA,
+                            );
                             let mut bt = parts.adjust;
                             draw_string(
                                 &self.fonts,
@@ -2411,7 +2445,7 @@ impl MainWindowState {
                                 "Adjust…",
                                 &mut bt,
                                 (10.0 * scale) as i32,
-                                accent,
+                                label_color,
                                 true,
                                 true,
                             );
@@ -2492,6 +2526,21 @@ impl MainWindowState {
                                     },
                                 );
                             }
+                            // Clamp the accent label against the Adjust button's
+                            // soft fill so a light accent stays readable on hover
+                            // (no-op for accents that already pass AA). The fill
+                            // color mirrors `brushes.adjust_hover` / `accent_soft`
+                            // so the guard targets the exact backdrop being drawn.
+                            let fill_weight = if adjust_hovered {
+                                SETTINGS_ADJUST_HOVER_WEIGHT
+                            } else {
+                                SETTINGS_ACCENT_SOFT_WEIGHT
+                            };
+                            let label_color = crate::overlay::ensure_contrast(
+                                accent,
+                                mix(accent, SETTINGS_SURFACE, fill_weight),
+                                crate::overlay::TEXT_CONTRAST_AA,
+                            );
                             let mut bt = parts.adjust;
                             draw_string(
                                 &self.fonts,
@@ -2499,7 +2548,7 @@ impl MainWindowState {
                                 "Adjust…",
                                 &mut bt,
                                 (10.0 * scale) as i32,
-                                accent,
+                                label_color,
                                 true,
                                 true,
                             );
