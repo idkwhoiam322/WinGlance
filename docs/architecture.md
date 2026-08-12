@@ -317,8 +317,8 @@ while animating), falling back to the target's display-mode frequency.
 Because the 16 ms `WM_TIMER` recomputes geometry each tick while the pill is
 shown, a monitor removal or resolution change moves the pill back onto the
 new work area on the next frame; `WM_DISPLAYCHANGE` additionally repositions
-a visible pill immediately. The tray **Expanded Position → Adjust position…**
-command opens `src/positioner.rs`, a draggable sample that posts the chosen
+a visible pill immediately. The **Adjust position…** command in the Settings
+pane opens `src/positioner.rs`, a draggable sample that posts the chosen
 `position_x`/`position_y` to the main window via `POSITION_MSG`; the main
 window — the single owner of the config — applies and persists them, and
 nudges the live overlay via `overlay::set_positions` (which calls
@@ -367,7 +367,8 @@ switching between two panes:
 
 - **Now Playing** — the current activity (art, state, title/artist/album,
   meta) and the per-session history listbox (newest first, capped at 400
-  rows). A native `TOOLTIPS_CLASSW` control shows full row details on hover,
+  rows, auto-pinned to the newest entry via `LB_SETTOPINDEX` on every insert —
+  intended). A native `TOOLTIPS_CLASSW` control shows full row details on hover,
   synced to the visible row band on a 1 Hz timer while the window is visible.
 - **Settings** — cards mirroring the tray menu and `[behavior]`/`[overlay]`
   config: notifications toggle, duration presets, start-on-login, close-to-

@@ -25,7 +25,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `position_y`   | *(unset)* | integer | Absolute Y override (96-DPI logical px); set by *Adjust position…* |
 | `max_tick_hz`  | `60`    | 60–1000 | Animation tick-rate cap in Hz (config.toml only; see below) |
 | `monitor`      | `"active-window"` | string | Which display the pill is placed on (see below) |
-| `compact_position_separate` | `false` | bool | Give the Compact layout its own position (see below). The settings/tray toggle displays the *inverse* polarity: ON = Compact follows Expanded (`false`), OFF = independent (`true`) |
+| `compact_position_separate` | `false` | bool | Give the Compact layout its own position (see below). The settings toggle displays the *inverse* polarity: ON = Compact follows Expanded (`false`), OFF = independent (`true`) |
 | `compact_vertical` | `"top"` | `top` \| `bottom` | Compact layout's vertical anchor (only consulted while `compact_position_separate` is on) |
 | `compact_horizontal` | `"center"` | `left` \| `center` \| `right` | Compact layout's horizontal anchor (same condition) |
 | `compact_margin` | `8`   | 0–500   | Compact layout's edge distance (same condition)   |
@@ -190,27 +190,42 @@ The tray menu mirrors the `[behavior]` toggles in real time:
 - **Toggle notifications** — enable/disable SMTC track-change + state-change events.
 - **Start with Windows** — write/remove the `%APPDATA%\...\Run` registry entry.
 - **Close window to tray** — on-off (mirrors `close_to_tray`).
-- **Expanded Position** — anchor the pill (`top-left` … `bottom-right`), open
-  the *Adjust position…* drag adjustor, show a sample, or reset to top-center.
-  A nested **Compact position** submenu offers the same controls for the
-  Compact layout; its entries are always clickable. While the follow toggle
-  below is ON they show the live effective placement (the Expanded position)
-  and edits are stored, taking visible effect once the toggle is OFF.
-- **Monitor** — which display the pill is placed on.
+- **Monitor** — which display the pill is placed on (Active window, Primary, or
+  a numbered Display).
 - **Duration** — 2 s / 3 s / 5 s / 10 s.
 - **Layout** — Expanded / Compact / Auto (mirrors `overlay.layout`).
-- **Compact Position follows Expanded Position** — on-off. The displayed
-  polarity is inverted from the `compact_position_separate` key: ON (checked)
-  means the Compact pill follows the Expanded position (`false`), OFF means
-  independent (`true`). The first switch to OFF copies the current Expanded
-  position into the compact fields.
+  Pill placement — the edge anchor, the custom coordinates, and the per-layout
+  Compact position — is edited in the **Settings** pane, not the tray: the
+  **Position** row offers edge anchors and **Adjust position…** opens the drag
+  sample; the **Compact Position follows Expanded Position** toggle sets the
+  `compact_position_separate` polarity (ON = follow).
 - **Quit** — stop the process and remove the tray icon.
 
 ## Compact WinGlance defaults
 
-The shipped defaults produce a slim pill: up to 340 px wide, height derived
-from `art_size` (48 px) plus padding — about 110 px tall — anchored 8 px from
-the top of the work area, near-opaque dark-slate background tinted per track with a
-pink aura, 48 px
-artwork with a palette-tinted glow and rim, and compact title/artist text with
-per-track accent colors. All of these can be widened or recolored here.
+The shipped `[overlay]`/`[appearance]` defaults (`config.rs`:
+`OverlayConfig::default`/`AppearanceConfig::default`) produce a slim card-sized
+pill:
+
+- **Width** is capped at `max_width` (340 logical px). The compact body is one
+  title row wide — art tile + title viewport (half `max_width`, floored at 180)
+  + app icon + playback symbol + padding — so the pill never exceeds `max_width`
+  and a long title marquees in place rather than truncating.
+- **Height** is one title row (`font_size_title` × `ROW_HEIGHT`, 16 × 1.35 ≈ 22
+  px) plus padding top and bottom (15 px each) — about 52 px at the shipped
+  defaults. (The 48 px `art_size` tile clamps to the row-band height on the
+  default font, so the art does not set the compact height.)
+- **Anchor** `vertical = top`, `horizontal = center`, `margin = 8`, on the
+  `monitor` display (`active-window` by default). With
+  `compact_position_separate = false`, Compact tracks the live Expanded
+  placement; enabling separation copies the current Expanded position in and
+  lets the compact anchor diverge.
+- **Visuals**: rounded rect at `compact_corner_radius` (12 px), filled with
+  `background_color` (`[0x12, 0x14, 0x1C]`, alpha 235 ≈ 92 % opaque) so a hint of
+  the backdrop shows through; a palette aura ring in the DIB margin (the cover's
+  primary/secondary hues, falling back to the hardcoded pink `accent_color`
+  `[240, 110, 155]` when no palette is extracted) brighter on the artwork side,
+  and a white top-left→bottom-right directional edge highlight. Title and meta
+  text render white with per-track accent coloring.
+
+All of these can be widened or recolored here.
