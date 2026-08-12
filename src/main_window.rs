@@ -39,7 +39,10 @@ use windows::Win32::UI::Controls::{
     TTM_SETMAXTIPWIDTH, TTM_SETTOOLINFOW, TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_DOWN, VK_LEFT, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     Shell_NotifyIconW, ShellExecuteW,
@@ -52,9 +55,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos,
     ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER,
-    WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT,
+    WM_SIZE, WM_TIMER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -155,6 +158,18 @@ enum SettingId {
 enum SettingsItem {
     Header { text: &'static str, rect: RECT },
     Row { id: SettingId, rect: RECT },
+}
+
+/// A keyboard-focusable Settings-pane control. `cx`/`cy` is the window client
+/// coordinate at the control's center — the keyboard handler activates a control
+/// by posting a synthetic `WM_LBUTTONDOWN` there, so it reuses the existing mouse
+/// click path verbatim. The list order (top-to-bottom, left-to-right within a
+/// row) is what Tab/arrows walk.
+struct SettingsFocus {
+    row_index: usize,
+    sub: SettingSub,
+    cx: i32,
+    cy: i32,
 }
 
 const SETTINGS_SURFACE: [u8; 4] = [0x1B, 0x1B, 0x1B, 0xFF];
@@ -2738,6 +2753,126 @@ impl MainWindowState {
         None
     }
 
+    /// Enumerates every keyboard-focusable control in the Settings pane, in the
+    /// same top-to-bottom, left-to-right order `settings_hover_at` would visit
+    /// them, each with the client coordinate a click on its center carries. The
+    /// keyboard handler reuses the mouse click path by posting `WM_LBUTTONDOWN`
+    /// at `(cx, cy)`, so this enumeration must stay in lockstep with the hover
+    /// geometry in `settings_hover_at`.
+    fn settings_focus_targets(&self, content_left: i32, client_w: i32, pad: i32, scale: f32) -> Vec<SettingsFocus> {
+        let items = self.settings_items(content_left, client_w, pad, scale);
+        let mut out = Vec::new();
+        let gap = (4.0 * scale) as i32;
+        let mut row_index = 0usize;
+        for item in &items {
+            if let SettingsItem::Row { id, rect } = item {
+                let control_rect = row_split(rect, scale).control;
+                match *id {
+                    SettingId::Duration => {
+                        for (i, s) in segment_rects(&control_rect, 4, gap).iter().enumerate() {
+                            out.push(SettingsFocus {
+                                row_index,
+                                sub: SettingSub::Seg(i),
+                                cx: (s.left + s.right) / 2,
+                                cy: (s.top + s.bottom) / 2,
+                            });
+                        }
+                    }
+                    SettingId::Layout => {
+                        for (i, s) in segment_rects(&control_rect, 3, gap).iter().enumerate() {
+                            out.push(SettingsFocus {
+                                row_index,
+                                sub: SettingSub::Seg(i),
+                                cx: (s.left + s.right) / 2,
+                                cy: (s.top + s.bottom) / 2,
+                            });
+                        }
+                    }
+                    SettingId::CopyLogs => {
+                        let (open_rect, copy_rect) = halve(&control_rect, gap);
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::Open,
+                            cx: (open_rect.left + open_rect.right) / 2,
+                            cy: (open_rect.top + open_rect.bottom) / 2,
+                        });
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::Copy,
+                            cx: (copy_rect.left + copy_rect.right) / 2,
+                            cy: (copy_rect.top + copy_rect.bottom) / 2,
+                        });
+                    }
+                    SettingId::OpenConfig => {
+                        let (open_rect, reload_rect) = halve(&control_rect, gap);
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::OpenConfig,
+                            cx: (open_rect.left + open_rect.right) / 2,
+                            cy: (open_rect.top + open_rect.bottom) / 2,
+                        });
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::ReloadConfig,
+                            cx: (reload_rect.left + reload_rect.right) / 2,
+                            cy: (reload_rect.top + reload_rect.bottom) / 2,
+                        });
+                    }
+                    SettingId::Position | SettingId::CompactPosition => {
+                        let parts = position_parts(rect, scale);
+                        for (i, a) in parts.anchors.iter().enumerate() {
+                            out.push(SettingsFocus {
+                                row_index,
+                                sub: SettingSub::Anchor(i),
+                                cx: (a.left + a.right) / 2,
+                                cy: (a.top + a.bottom) / 2,
+                            });
+                        }
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::Reset,
+                            cx: (parts.reset.left + parts.reset.right) / 2,
+                            cy: (parts.reset.top + parts.reset.bottom) / 2,
+                        });
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::Adjust,
+                            cx: (parts.adjust.left + parts.adjust.right) / 2,
+                            cy: (parts.adjust.top + parts.adjust.bottom) / 2,
+                        });
+                    }
+                    _ => {
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::None,
+                            cx: (control_rect.left + control_rect.right) / 2,
+                            cy: (control_rect.top + control_rect.bottom) / 2,
+                        });
+                    }
+                }
+            }
+            // Row index counts rows only, matching `settings_hover_at` and
+            // `paint_settings`; headers are skipped here.
+            if matches!(item, SettingsItem::Row { .. }) {
+                row_index += 1;
+            }
+        }
+        out
+    }
+
+    /// Moves the keyboard focus cursor onto `targets[idx]` and repaints the rows
+    /// that changed. The cursor reuses `settings_hover`, so the existing hover
+    /// highlight doubles as the focus ring — no separate paint path.
+    fn focus_settings_target(&mut self, targets: &[SettingsFocus], idx: usize, client_w: i32) {
+        let t = &targets[idx];
+        let new_hover = Some((t.row_index, t.sub));
+        if new_hover != self.settings_hover {
+            let old = self.settings_hover;
+            self.settings_hover = new_hover;
+            self.invalidate_hover_rows(client_w, old, new_hover);
+        }
+    }
+
     fn layout(&self) {
         if self.listbox.0.is_null() {
             return;
@@ -3899,6 +4034,72 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                         info.hinst = HINSTANCE::default();
                     }
                 }
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                let k = VIRTUAL_KEY(wparam.0 as u16);
+                // From the Activity pane, Tab / Enter / Down / Right steps into
+                // the Settings pane and focuses its first control.
+                if state.active_pane != Pane::Settings {
+                    if matches!(k, VK_TAB | VK_RETURN | VK_SPACE | VK_DOWN | VK_RIGHT) {
+                        state.active_pane = Pane::Settings;
+                        state.apply_pane();
+                        let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+                        let (client_w, _) = client_size(hwnd);
+                        let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+                        let pad = (PAD * scale) as i32;
+                        let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
+                        if let Some(first) = targets.first() {
+                            let new_hover = Some((first.row_index, first.sub));
+                            let old = state.settings_hover;
+                            state.settings_hover = new_hover;
+                            state.invalidate_hover_rows(client_w, old, new_hover);
+                        }
+                        state.invalidate();
+                    }
+                    return LRESULT(0);
+                }
+                // Settings pane: walk focusable controls and activate one.
+                let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+                let (client_w, _) = client_size(hwnd);
+                let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+                let pad = (PAD * scale) as i32;
+                let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
+                if targets.is_empty() {
+                    return LRESULT(0);
+                }
+                let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 };
+                let idx = state
+                    .settings_hover
+                    .and_then(|(r, s)| targets.iter().position(|t| t.row_index == r && t.sub == s))
+                    .unwrap_or(0);
+                match k {
+                    VK_TAB => {
+                        let next = if shift {
+                            (idx + targets.len() - 1) % targets.len()
+                        } else {
+                            (idx + 1) % targets.len()
+                        };
+                        state.focus_settings_target(&targets, next, client_w);
+                    }
+                    VK_DOWN | VK_RIGHT => {
+                        state.focus_settings_target(&targets, (idx + 1) % targets.len(), client_w);
+                    }
+                    VK_UP | VK_LEFT => {
+                        state.focus_settings_target(&targets, (idx + targets.len() - 1) % targets.len(), client_w);
+                    }
+                    VK_RETURN | VK_SPACE => {
+                        if let Some(t) = targets.get(idx) {
+                            let lp = LPARAM(t.cx as isize | (t.cy as isize) << 16);
+                            let _ = unsafe { PostMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp) };
+                        }
+                    }
+                    _ => {}
+                }
+                return LRESULT(0);
             }
             LRESULT(0)
         }
