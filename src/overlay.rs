@@ -658,6 +658,44 @@ enum MorphDirection {
     Collapse,
 }
 
+/// How long an in-place content swap dissolves the previous frame into the
+/// new one (see `ContentFade`).
+const CONTENT_FADE_DURATION: Duration = Duration::from_millis(200);
+
+/// An in-place content cross-fade: the previous frame (the last rendered
+/// pixels) blends into the new content's frames over `CONTENT_FADE_DURATION`,
+/// so a track swap reads as a dissolve instead of a hard cut. Only valid
+/// while the pill renders the same static frame size (Phase::Shown, no hover
+/// morph, no bounce); `render_layered` ends the fade the moment any of those
+/// change, and the next frame renders the new content plainly.
+struct ContentFade {
+    /// When the fade started.
+    start: Instant,
+    /// The previous frame's premultiplied BGRA pixels, tightly packed.
+    from: Vec<u8>,
+    /// The previous frame's dimensions.
+    from_w: usize,
+    from_h: usize,
+}
+
+/// The cross-fade's blend weight from the fade's elapsed time: a smoothstep
+/// (a symmetric ease reads best for a dissolve), pinned at 1.0 past the
+/// duration.
+fn fade_progress(fade: &ContentFade) -> f32 {
+    let t = (fade.start.elapsed().as_secs_f32() / CONTENT_FADE_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Premultiplied per-pixel blend of `from` into `to` at `weight` (0.0 =
+/// from, 1.0 = to): the cross-fade's frame composition. The frames are
+/// tightly packed BGRA with the alpha channel included, so all four bytes
+/// lerp.
+fn blend_frames(to: &mut [u8], from: &[u8], weight: f32) {
+    for (dst, src) in to.iter_mut().zip(from.iter()) {
+        *dst = (*dst as f32 * weight + *src as f32 * (1.0 - weight)).round() as u8;
+    }
+}
+
 /// The in-place compact→expanded hover morph (see `expand_compact_on_hover`).
 /// Render sub-state only: the pill's `layout` stays Compact and its position
 /// stays the compact anchor for the whole morph, so the pill grows in place
@@ -936,6 +974,13 @@ struct OverlayState {
     /// it has held for the window, so boundary jitter cannot cancel a morph
     /// the moment it starts; re-entering clears it.
     hover_leave_at: Option<Instant>,
+    /// The in-place content cross-fade, while one is in flight (see
+    /// `ContentFade`).
+    content_fade: Option<ContentFade>,
+    /// Dimensions of the last rendered frame — the cross-fade snapshots the
+    /// frame buffer at exactly this size.
+    last_frame_w: usize,
+    last_frame_h: usize,
     position: OverlayPos,
     /// The compact pill's resolved placement (independent of `position` only
     /// while `compact_position_separate` is on; see `active_pos`).
@@ -1183,10 +1228,12 @@ pub(crate) fn set_layout(hwnd: HWND, mode: LayoutMode) {
         let state = &mut *state_ptr;
         state.config.overlay.layout = mode;
         // A layout change redefines what the pill is mid-morph: drop any
-        // in-flight hover expansion so the render (and the next hover) start
-        // from the newly applied layout.
+        // in-flight hover expansion (and the content cross-fade, whose
+        // snapshot no longer matches) so the render starts from the newly
+        // applied layout.
         state.hover_expand = None;
         state.hover_expanded_once = false;
+        state.content_fade = None;
         // A hidden pill's sample re-resolves the layout from the foreground
         // itself (show_sample → refresh_layout), so only the visible path
         // refreshes here.
@@ -1277,6 +1324,9 @@ impl OverlayState {
             hover_expand: None,
             hover_expanded_once: false,
             hover_leave_at: None,
+            content_fade: None,
+            last_frame_w: 0,
+            last_frame_h: 0,
             position,
             compact_position,
             // Every show path re-resolves the layout before the first frame
@@ -1386,7 +1436,8 @@ impl OverlayState {
     /// polling do not need frame rate, so a shown pill stops waking the UI
     /// thread at monitor refresh rate.
     fn sync_anim_timer(&mut self) {
-        let animating = !matches!(self.phase, Phase::Shown) || self.hover_expand.is_some();
+        let animating =
+            !matches!(self.phase, Phase::Shown) || self.hover_expand.is_some() || self.content_fade.is_some();
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
         let now = Instant::now();
         let raw = if animating || marquee_active {
@@ -1775,6 +1826,23 @@ impl OverlayState {
         // the layout so a foreground change since the pill appeared takes
         // effect with the update rather than on the next static tick.
         self.refresh_layout();
+        // A swap on a fully-static pill dissolves the previous frame into
+        // the new content (see `ContentFade`) — the snapshot is the last
+        // rendered frame, and the animation timer keeps the dissolve
+        // ticking. Any animated state (entrance, collapse, hover morph)
+        // swaps instantly instead.
+        if matches!(self.phase, Phase::Shown) && self.hover_expand.is_none() && !self.frame_scratch.is_empty() {
+            let from = std::mem::take(&mut self.frame_scratch);
+            self.content_fade = Some(ContentFade {
+                start: Instant::now(),
+                from,
+                from_w: self.last_frame_w,
+                from_h: self.last_frame_h,
+            });
+            self.sync_anim_timer();
+        } else {
+            self.content_fade = None;
+        }
         self.content = Some(event);
         self.resolve_pill_text();
         self.reset_scroll();
@@ -1838,6 +1906,7 @@ impl OverlayState {
         self.hover_expand = None;
         self.hover_expanded_once = false;
         self.hover_leave_at = None;
+        self.content_fade = None;
         self.phase = if full_animation {
             Phase::Expanding(now)
         } else {
@@ -1939,7 +2008,8 @@ impl OverlayState {
         // ShowWindow calls; re-assert visibility and topmost z-order while a
         // pill should be up. While the pill is fully shown this is throttled
         // to 1 Hz — the window state cannot meaningfully change every 4 ms.
-        let animating = !matches!(self.phase, Phase::Shown) || self.hover_expand.is_some();
+        let animating =
+            !matches!(self.phase, Phase::Shown) || self.hover_expand.is_some() || self.content_fade.is_some();
         if !matches!(self.phase, Phase::Hidden)
             && (animating || self.last_reassert.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)))
         {
@@ -2560,6 +2630,7 @@ impl OverlayState {
         self.hover_expand = None;
         self.hover_expanded_once = false;
         self.hover_leave_at = None;
+        self.content_fade = None;
         self.phase = Phase::Hidden;
         // Release the per-show render state: the next show re-converts the
         // artwork and rebuilds the marquee rasters from the cached track, so
@@ -2733,6 +2804,7 @@ impl OverlayState {
         self.hover_expand = None;
         self.hover_expanded_once = false;
         self.hover_leave_at = None;
+        self.content_fade = None;
         self.phase = Phase::Light(now);
         self.sync_anim_timer();
         unsafe {
@@ -3379,6 +3451,22 @@ fn render_layered(
         body_bottom,
         rest_body_bottom,
     );
+    // Record the composed frame's dimensions, so the next in-place content
+    // swap can snapshot it for its cross-fade (see `update_content`).
+    state.last_frame_w = content_buf_w as usize;
+    state.last_frame_h = content_buf_h as usize;
+    // The in-place content cross-fade: blend the previous frame into this
+    // one. Valid only while both frames are the same static size (Phase
+    // Shown with no hover morph or bounce); any change ends the fade here,
+    // and this frame renders the new content plainly.
+    if let Some(fade) = &mut state.content_fade {
+        let progress = fade_progress(fade);
+        if progress >= 1.0 || fade.from_w != content_buf_w as usize || fade.from_h != content_buf_h as usize {
+            state.content_fade = None;
+        } else {
+            blend_frames(&mut scratch[..needed], &fade.from, progress);
+        }
+    }
     // A single oversized metadata string (huge title/album) can inflate the
     // retained UTF-16 scratch far beyond any real row; shrink it back so the
     // capacity does not stay bloated for the rest of the run.
@@ -8350,6 +8438,81 @@ mod tests {
             Some(expected),
             "the art tile must be centered in the scaled body"
         );
+    }
+
+    #[test]
+    fn blend_frames_lerps_premultiplied_pixels() {
+        // The cross-fade's frame composition: all four bytes (the alpha
+        // channel included) lerp from the old frame to the new one.
+        let to = vec![200u8, 100, 50, 255, 10, 20, 30, 128];
+        let from = vec![0u8, 0, 0, 0, 100, 100, 100, 255];
+        let mut at0 = to.clone();
+        blend_frames(&mut at0, &from, 0.0);
+        assert_eq!(at0, from, "weight 0 must show the old frame");
+        let mut at1 = to.clone();
+        blend_frames(&mut at1, &from, 1.0);
+        assert_eq!(at1, to, "weight 1 must show the new frame unchanged");
+        let mut half = to.clone();
+        blend_frames(&mut half, &from, 0.5);
+        assert_eq!(
+            half,
+            vec![100, 50, 25, 128, 55, 60, 65, 192],
+            "weight 0.5 must blend both frames"
+        );
+    }
+
+    #[test]
+    fn update_content_cross_fades_in_place_while_shown() {
+        // A track swap on a fully-shown pill snapshots the previous frame at
+        // the last rendered size and dissolves into the new content; the
+        // first blended frame still shows the old content, and the fade
+        // clears once its duration expires (or when the pill is animating).
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.layout = LayoutMode::Expanded;
+        state.phase = Phase::Shown;
+        state.content = Some(MediaEvent::TrackChanged(TrackInfo {
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        }));
+        state.render();
+        let (w, h) = (state.last_frame_w, state.last_frame_h);
+        assert!(w > 0 && h > 0, "the render must record its frame size");
+        assert!(!state.frame_scratch.is_empty());
+        state.update_content(
+            MediaEvent::TrackChanged(TrackInfo {
+                source_app: "youtube-music".into(),
+                title: "Next Song".into(),
+                ..TrackInfo::default()
+            }),
+            Duration::from_secs(5),
+        );
+        let fade = state.content_fade.as_ref().expect("a shown pill must fade the swap");
+        assert_eq!(
+            (fade.from_w, fade.from_h),
+            (w, h),
+            "the snapshot must match the rendered size"
+        );
+        assert_eq!(fade.from.len(), w * h * 4);
+        // The fade clears once its duration expires.
+        state.content_fade.as_mut().unwrap().start = Instant::now() - CONTENT_FADE_DURATION;
+        state.render();
+        assert!(state.content_fade.is_none(), "the expired fade must clear");
+        // An animating pill (entrance) swaps instantly instead.
+        state.phase = Phase::Expanding(Instant::now());
+        state.content = Some(MediaEvent::TrackChanged(TrackInfo {
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        }));
+        state.render();
+        state.update_content(
+            MediaEvent::TrackChanged(TrackInfo {
+                source_app: "youtube-music".into(),
+                title: "Next Song".into(),
+                ..TrackInfo::default()
+            }),
+            Duration::from_secs(5),
+        );
+        assert!(state.content_fade.is_none(), "an animating pill must not fade the swap");
     }
 
     #[test]
