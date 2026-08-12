@@ -9,7 +9,7 @@ use super::{
     CONTENT_FADE_DURATION, ContentFade, DibCache, MARQUEE_FADE, MARQUEE_GAP, MARQUEE_HOLD, MarqueeCtx, MarqueeStrip,
     OverlayState, PillText, ROW_HEIGHT, TextScratch,
 };
-use crate::config::{Config, HorizontalPosition, VerticalPosition};
+use crate::config::Config;
 use crate::events::{MediaEvent, PlaybackState, TrackInfo};
 use crate::palette::Palette;
 use anyhow::{Context, Result};
@@ -175,19 +175,10 @@ pub(super) fn render_layered(
             content_buf_h as usize,
         );
     } else {
-        // The settle-bounce: scale the composed final-layout frame about the
-        // anchor into the window-sized DIB region, so the whole pill — body,
-        // aura, rows, art, icon — grows and shrinks 1:1.
-        let pos = state.active_pos();
-        let anchor_frac_x = match pos.horizontal {
-            HorizontalPosition::Left => 0.0,
-            HorizontalPosition::Center => 0.5,
-            HorizontalPosition::Right => 1.0,
-        };
-        let anchor_frac_y = match pos.vertical {
-            VerticalPosition::Top => 0.0,
-            VerticalPosition::Bottom => 1.0,
-        };
+        // The settle-bounce: scale the composed final-layout frame into the
+        // window-sized DIB region, so the whole pill scales 1:1. The on-screen
+        // anchor is produced by `placement()` repositioning the window as the
+        // size changes — not by the resample pivot here.
         scale_frame_about(
             dib_slice,
             alloc_w * 4,
@@ -197,11 +188,7 @@ pub(super) fn render_layered(
             content_buf_w as usize * 4,
             content_buf_w as usize,
             content_buf_h as usize,
-            content_w as usize,
-            content_h as usize,
             inset as usize,
-            anchor_frac_x,
-            anchor_frac_y,
             scale_factor,
         );
     }
@@ -292,11 +279,13 @@ pub(super) fn blit_packed_rows(dst: &mut [u8], dst_stride_bytes: usize, src: &[u
 /// pill's width/height (`anchor_frac_x`/`anchor_frac_y`: 0 = left/top edge,
 /// 0.5 = center, 1 = right/bottom edge) — so the pill grows and shrinks 1:1
 /// about the same point the window position pivots around. Every dst pixel
-/// bilinearly samples the src at `anchor + (dst - dst_anchor) / scale`;
-/// premultiplied BGRA interpolates correctly, so the scaled frame stays
-/// alpha-correct, and out-of-range samples (the window's outer ring during
-/// the over-bounce) write transparent. Pure and GDI-free so it can be unit
-/// tested directly.
+/// Uniformly scales the composed frame into the window-sized DIB region, so the
+/// whole pill — body, aura, rows, art, icon — grows and shrinks 1:1. The pivot
+/// is the content's top-left corner (`inset`, `inset`): for any anchor fraction
+/// the `content_w`/`content_h` terms cancel, so the resample is scale-about-corner
+/// and the on-screen anchor is produced entirely by `placement()` repositioning the
+/// window top-left as the size changes (see `fullscreen.rs::placement`). Pure and
+/// GDI-free so it can be unit tested directly.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scale_frame_about(
     dst: &mut [u8],
@@ -307,21 +296,14 @@ pub(super) fn scale_frame_about(
     src_stride: usize,
     src_w: usize,
     src_h: usize,
-    content_w: usize,
-    content_h: usize,
     inset: usize,
-    anchor_frac_x: f32,
-    anchor_frac_y: f32,
     scale: f32,
 ) {
-    let anchor_x = inset as f32 + content_w as f32 * anchor_frac_x;
-    let anchor_y = inset as f32 + content_h as f32 * anchor_frac_y;
-    let dst_anchor_x = inset as f32 + content_w as f32 * scale * anchor_frac_x;
-    let dst_anchor_y = inset as f32 + content_h as f32 * scale * anchor_frac_y;
+    let inset_f = inset as f32;
     for y in 0..dst_h {
-        let sy = anchor_y + (y as f32 - dst_anchor_y) / scale;
+        let sy = inset_f + (y as f32 - inset_f) / scale;
         for x in 0..dst_w {
-            let sx = anchor_x + (x as f32 - dst_anchor_x) / scale;
+            let sx = inset_f + (x as f32 - inset_f) / scale;
             let off = y * dst_stride + x * 4;
             if sx < 0.0 || sy < 0.0 || sx >= src_w as f32 || sy >= src_h as f32 {
                 dst[off..off + 4].fill(0);

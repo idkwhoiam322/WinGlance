@@ -1553,9 +1553,6 @@ impl OverlayState {
                     debug!("pill hover-dismiss armed");
                 }
             }
-        } else {
-            self.hover_dismiss_at = None;
-            self.dismiss_at = None;
         }
         // A newer notification is waiting: while the pill is held under the
         // cursor the queue waits (the user is reading it), but once the hold
@@ -5476,12 +5473,14 @@ mod tests {
     }
 
     #[test]
-    fn scale_frame_about_is_a_true_uniform_scale_about_the_anchor() {
+    fn scale_frame_about_is_a_uniform_scale_about_the_content_corner() {
         // A 4x4 src with one solid premultiplied pixel; scaling by 0.5 about
-        // the bottom-center anchor must map the src's center pixel (2, 2) to
-        // the dst's center pixel (1, 1) — the bottom-anchored shrink pulls
-        // everything down toward the anchor — with every other dst pixel
-        // transparent.
+        // the content corner (inset 0) must map the src's center pixel (2, 2)
+        // to the dst's center pixel (1, 1) — the shrink pulls everything toward
+        // the top-left corner — with every other dst pixel transparent. The
+        // function has no anchor parameter (the on-screen anchor is produced by
+        // `placement()` repositioning the window), so the result must be
+        // identical for any hypothetical anchor value.
         let src_w = 4usize;
         let src_h = 4usize;
         let mut src = vec![0u8; src_w * src_h * 4];
@@ -5491,22 +5490,7 @@ mod tests {
         let dst_w = 2usize;
         let dst_h = 2usize;
         let mut dst = vec![0u8; dst_w * dst_h * 4];
-        scale_frame_about(
-            &mut dst,
-            dst_w * 4,
-            dst_w,
-            dst_h,
-            &src,
-            src_w * 4,
-            src_w,
-            src_h,
-            4,
-            4,
-            0,
-            0.5,
-            1.0,
-            0.5,
-        );
+        scale_frame_about(&mut dst, dst_w * 4, dst_w, dst_h, &src, src_w * 4, src_w, src_h, 0, 0.5);
         // The dst's center pixel (1, 1) samples the src's center exactly.
         let q = (dst_w + 1) * 4;
         assert_eq!(
