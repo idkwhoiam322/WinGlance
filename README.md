@@ -89,7 +89,10 @@ loop), `-NoThrottle` / `-Jobs N` (parallelism). Direct checks:
 - `src/smtc.rs` — the SMTC worker thread: subscribes to every session,
   reads metadata/artwork, extracts app icons, and deduplicates (content
   diff, session-recreation, churn cool-down, artwork-change time-gate).
-- `src/overlay.rs` — the raw Win32 layered pill: expand/light/collapse
+- `src/overlay/` — the raw Win32 layered pill, split into `mod` (state,
+  tick, window glue), `morph` (springs, hover decisions, geometry),
+  `render` (frame composition, text, vector primitives) and `fullscreen`
+  (display enumeration and fullscreen detection): expand/light/collapse
   animation, palette + aura rendering, vector glyphs, marquee rows,
   hover-dismiss.
 - `src/palette.rs` / `src/icon.rs` — the color quantizer and the shell icon
