@@ -32,7 +32,8 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `compact_position_x` | *(unset)* | integer | Absolute X override for the Compact layout; set by the compact *Adjust position…* |
 | `compact_position_y` | *(unset)* | integer | Absolute Y override for the Compact layout        |
 | `compact_monitor` | `"active-window"` | string | Which display the Compact layout is placed on     |
-| `compact_hover_action` | `"dismiss"` | `dismiss` \| `expand` | What hovering over a Compact-layout pill does (see below) |
+| `dismiss_on_hover` | `true` | bool | Hovering a pill in the Expanded layout arms its dismissal (remaining time capped at 500 ms, one-way). For Compact pills it makes the second hover dismiss (see below) |
+| `expand_compact_on_hover` | `true` | bool | Hovering a pill in the Compact layout expands it in place; with `dismiss_on_hover` on, the second hover dismisses (see below) |
 
 `layout` accepts one of:
 
@@ -79,19 +80,25 @@ cap only limits repaint frequency. Values at or below 60 keep the default 60 Hz
 cap, and values above 1000 are clamped to 1000. It is configurable only via
 `config.toml`, not the Settings UI.
 
-`compact_hover_action` controls what hovering over a pill with the *compact*
-layout does:
+Hovering behavior follows the pill's *effective* layout (for `"auto"`, the
+layout currently in effect — an Auto pill in the expanded layout follows the
+Expanded rules, in the compact layout the Compact rules):
 
-- `"dismiss"` — the hover shortens the dismiss delay to 500 ms (default).
-- `"expand"` — the hover morphs the compact pill in place to the expanded
-  layout, once per notification; the next hover entry dismisses it.
-
-An expanded pill under the cursor is never dismissed by its countdown: while
-the cursor stays on it, the dismiss clock is deferred (and updates refresh the
-pill in place), so the pill cannot disappear mid-read. Only pills whose layout
-mode is explicitly `Compact` expand — an Auto-resolved compact pill is a
-deliberate choice (fullscreen app, or a source on the auto-compact list) and
-always keeps the Dismiss behavior.
+- **Expanded layout, `dismiss_on_hover = true`** — hovering arms the
+  dismissal: the remaining time is capped at 500 ms, one-way (leaving before
+  that does not cancel it). The countdown is never deferred for the cursor.
+  With `dismiss_on_hover = false`, hovering does nothing.
+- **Compact layout, `expand_compact_on_hover = true`** — the first hover of
+  a showing expands the pill in place and resets the countdown to the full
+  duration. The expanded state is an interaction: while the cursor stays on
+  it, the countdown is deferred and the pill is never dismissed. Leaving
+  collapses it back to compact and resets the countdown again. With
+  `dismiss_on_hover` enabled (default), later hovers over the compact pill
+  dismiss instead — the second hover dismisses (one-way 500 ms arm);
+  without it, every hover re-expands and resets, and the pill leaves only
+  when the countdown expires with no hover interaction.
+- **Compact layout, `expand_compact_on_hover = false`** — the pill behaves
+  exactly like an Expanded one: `dismiss_on_hover` applies.
 
 ## [behavior]
 

@@ -1,4 +1,4 @@
-use crate::config::{CompactHoverAction, Config, HorizontalPosition, LayoutMode, MonitorMode, VerticalPosition};
+use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, VerticalPosition};
 use crate::events::{
     MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo, artwork_same, media_event_into_owned,
 };
@@ -658,7 +658,7 @@ enum MorphDirection {
     Collapse,
 }
 
-/// The in-place compact→expanded hover morph (see `CompactHoverAction`).
+/// The in-place compact→expanded hover morph (see `expand_compact_on_hover`).
 /// Render sub-state only: the pill's `layout` stays Compact and its position
 /// stays the compact anchor for the whole morph, so the pill grows in place
 /// instead of jumping to the expanded position. `Phase` stays `Shown`; the
@@ -715,22 +715,24 @@ enum HoverStep {
     None,
 }
 
-/// Decides the tick's hover handling from the pure snapshot. With the
-/// default `Dismiss` action this reproduces the plain hover-to-dismiss; with
-/// `Expand` the first hover over an explicitly-Compact pill morphs it in
-/// place, and every later hover (or a non-explicit Compact, e.g. an
-/// Auto-resolved one) falls back to hover-to-dismiss. An expanded pill under
-/// the cursor is held instead: no arm fires while the user reads it (`held`
-/// in `tick` also defers its dismissal), and the arm only returns once the
-/// cursor leaves.
+/// Decides the tick's hover handling from the pure snapshot. Hovering follows
+/// the pill's *effective* layout (see `expanded`): an Expanded-layout pill
+/// arms the one-way 500 ms dismiss only while `dismiss_on_hover` is enabled,
+/// and a Compact-layout pill expands on hover while `expand_compact_on_hover`
+/// is enabled (falling back to the Expanded rules otherwise) — the first
+/// hover of a showing expands, and with `dismiss_on_hover` enabled later
+/// hovers dismiss instead (the second hover dismisses), while without it
+/// every hover re-expands. The compact→expanded morph itself is an
+/// interaction: while it is in flight or pinned, hovering never arms
+/// anything — the expanded state is held (see `held` in `tick`), so it is
+/// never dismissed mid-read.
 fn hover_step(
     hover: HoverTick,
-    action: CompactHoverAction,
-    explicit_compact: bool,
+    dismiss_on_hover: bool,
+    expand_compact_on_hover: bool,
     expanded_once: bool,
     expanded: bool,
 ) -> HoverStep {
-    let expand_wanted = action == CompactHoverAction::Expand && explicit_compact && !expanded_once;
     if hover.morphing {
         // A collapse leg always runs to completion on its own.
         if !hover.morph_expanding {
@@ -747,15 +749,21 @@ fn hover_step(
     if !hover.cursor_over {
         return HoverStep::None;
     }
-    // An expanded pill is held while the cursor is on it: arming the 500ms
-    // hover-dismiss would kill the pill mid-read. The hold ends when the
-    // cursor leaves (the pill then collapses and resumes its countdown).
     if expanded {
-        return HoverStep::None;
-    }
-    if expand_wanted {
+        // A laid-out expanded pill: hover arms the dismiss only while
+        // dismiss-on-hover is enabled. The morph-origin expanded state never
+        // reaches this arm — the morphing branch above holds it.
+        if dismiss_on_hover && !hover.dismiss_armed {
+            HoverStep::ArmDismiss
+        } else {
+            HoverStep::None
+        }
+    } else if expand_compact_on_hover && (!dismiss_on_hover || !expanded_once) {
+        // The first hover over a Compact pill expands it; with
+        // dismiss-on-hover enabled a later hover dismisses instead (the
+        // second hover), while without it every hover re-expands.
         HoverStep::StartExpand
-    } else if !hover.dismiss_armed {
+    } else if dismiss_on_hover && !hover.dismiss_armed {
         HoverStep::ArmDismiss
     } else {
         HoverStep::None
@@ -916,9 +924,11 @@ struct OverlayState {
     /// expanded pill after the animation; `hide`, a fresh show, and a layout
     /// push clear it.
     hover_expand: Option<HoverExpand>,
-    /// Whether the one expansion per notification was already used (or is
-    /// currently in flight). The next hover entry then falls back to the
-    /// plain hover-to-dismiss. Reset on every show, so each notification
+    /// Whether the pill already expanded via hover during this showing. With
+    /// `dismiss_on_hover` enabled, the first hover over the compact pill
+    /// expands and later hovers dismiss instead (the second hover
+    /// dismisses); while dismiss-on-hover is off the flag is ignored and
+    /// every hover re-expands. Reset on every show, so each notification
     /// gets its own expansion.
     hover_expanded_once: bool,
     /// When the cursor left the pill, while the leave is still within the
@@ -1212,10 +1222,10 @@ pub(crate) fn set_compact_separate(hwnd: HWND, separate: bool) {
     }
 }
 
-/// Pushes the compact-hover-action setting to the live overlay (which keeps
-/// its own config snapshot). Nothing visual changes until the next hover
-/// tick, so no re-render or preview is needed here.
-pub(crate) fn set_compact_hover_action(hwnd: HWND, action: CompactHoverAction) {
+/// Pushes the dismiss-on-hover setting to the live overlay (which keeps its
+/// own config snapshot). Nothing visual changes until the next hover tick,
+/// so no re-render or preview is needed here.
+pub(crate) fn set_dismiss_on_hover(hwnd: HWND, enabled: bool) {
     if hwnd.0.is_null() {
         return;
     }
@@ -1225,8 +1235,26 @@ pub(crate) fn set_compact_hover_action(hwnd: HWND, action: CompactHoverAction) {
             return;
         }
         let state = &mut *state_ptr;
-        state.config.overlay.compact_hover_action = action;
-        info!("overlay compact_hover_action set to {action:?}");
+        state.config.overlay.dismiss_on_hover = enabled;
+        info!("overlay dismiss_on_hover set to {enabled}");
+    }
+}
+
+/// Pushes the expand-compact-on-hover setting to the live overlay (which
+/// keeps its own config snapshot). Nothing visual changes until the next
+/// hover tick, so no re-render or preview is needed here.
+pub(crate) fn set_expand_compact_on_hover(hwnd: HWND, enabled: bool) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = window_state::<OverlayState>(hwnd);
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        state.config.overlay.expand_compact_on_hover = enabled;
+        info!("overlay expand_compact_on_hover set to {enabled}");
     }
 }
 
@@ -1805,7 +1833,7 @@ impl OverlayState {
         self.dismiss_at = Some(now + Duration::from_millis(duration_ms));
         // A fresh pill must not inherit hover state from the previous one:
         // re-arm hover-dismiss only if the cursor is still over the new pill,
-        // and grant the new notification its own hover expansion.
+        // and grant the new notification its own first expansion.
         self.hover_dismiss_at = None;
         self.hover_expand = None;
         self.hover_expanded_once = false;
@@ -1933,19 +1961,18 @@ impl OverlayState {
                 }
             }
         }
-        // Hover handling. With the default compact_hover_action = "dismiss"
-        // this is the plain hover-to-dismiss: the first tick that finds the
-        // cursor over an (effectively) compact pill caps the remaining time
-        // at 500ms, one-way (leaving before that does not cancel the early
-        // dismissal). With "expand", the first hover over an explicitly-
-        // Compact pill morphs it in place to the expanded layout and resets
-        // the dismissal clock to the full duration; leaving mid-morph
-        // reverses it immediately, and after that one expansion (or for a
-        // pill whose Compact comes from Auto, which never expands) hover-to-
-        // dismiss applies again — but only while the pill is compact. An
-        // expanded pill under the cursor is *held*: its dismissal is deferred
-        // (see the `held` gate on the dismissal below), so the countdown can
-        // never run out while the user is reading it.
+        // Hover handling. The rules follow the pill's *effective* layout
+        // (see `hover_step`): an Expanded-layout pill arms the one-way 500ms
+        // hover-dismiss only while `dismiss_on_hover` is enabled — the
+        // countdown is never deferred for the cursor — and a Compact-layout
+        // pill expands on hover while `expand_compact_on_hover` is enabled,
+        // falling back to the Expanded rules otherwise. The compact→expanded
+        // morph itself is an interaction: while it is in flight or pinned,
+        // hovering never arms anything, and the `held` gate below defers the
+        // countdown, so the expanded state is never dismissed mid-read.
+        // Leaving the morph collapses it back to compact and resets the
+        // countdown to the full duration; every re-entry re-expands and
+        // resets again.
         //
         // Cursor state with the leave debounce: a leave is only trusted
         // after the cursor has stayed away for the debounce window, so
@@ -1960,16 +1987,15 @@ impl OverlayState {
             self.hover_leave_at = Some(now);
         }
         let engaged = hover_engaged(cursor_over, self.hover_leave_at, now);
-        // An expanded pill (a hover-pinned morph, a morph in flight, or a
-        // laid-out expanded pill) is held while the cursor is engaged. The
-        // hold is stateless math over the cursor inputs — no flag to clear —
-        // so the instant it drops (leave past the debounce) the dismissal
-        // applies again with whatever deadline the pill has. Queued
-        // notifications wait with the hold (their EARLY_EXIT cap is
+        // Only the morph-origin expanded state is held — it is an
+        // interaction, so its countdown is deferred while the cursor stays
+        // on it. The hold is stateless math over the cursor inputs — no flag
+        // to clear — so the instant it drops (leave past the debounce) the
+        // dismissal applies again with whatever deadline the pill has.
+        // Queued notifications wait with the hold (their EARLY_EXIT cap is
         // suppressed below) and updates route in place (see `held_expanded`
-        // in `receive_events`).
-        let expanded = self.hover_expand.is_some() || self.layout == LayoutMode::Expanded;
-        let held = engaged && expanded;
+        // in `receive_events`). A laid-out expanded pill is never held.
+        let held = engaged && self.hover_expand.is_some();
         if !matches!(self.phase, Phase::Hidden) {
             // A morph leg completes first so the same tick sees `done`. The
             // leg duration is per-direction (the collapse leg is shorter).
@@ -1991,7 +2017,7 @@ impl OverlayState {
             }
             // The morph decisions only apply to a fully-shown pill: a hover
             // during the entrance/collapse animation keeps the plain
-            // hover-to-dismiss arming below.
+            // Expanded-rule arming below.
             if matches!(self.phase, Phase::Shown) {
                 let step = hover_step(
                     HoverTick {
@@ -2000,10 +2026,10 @@ impl OverlayState {
                         morph_expanding: matches!(&self.hover_expand, Some(m) if m.direction == MorphDirection::Expand),
                         dismiss_armed: self.hover_dismiss_at.is_some(),
                     },
-                    self.config.overlay.compact_hover_action,
-                    self.config.overlay.layout == LayoutMode::Compact,
+                    self.config.overlay.dismiss_on_hover,
+                    self.config.overlay.expand_compact_on_hover,
                     self.hover_expanded_once,
-                    expanded,
+                    self.layout == LayoutMode::Expanded,
                 );
                 match step {
                     HoverStep::StartExpand => {
@@ -2017,13 +2043,17 @@ impl OverlayState {
                         // The morph replaces the hover-to-dismiss deadline
                         // with the full configured duration: the user is
                         // reading the expanded pill, so it must not be cut
-                        // short at 500ms.
+                        // short at 500ms. Every re-entry resets it again.
                         self.dismiss_at = Some(now + Duration::from_millis(self.config.overlay.duration_ms.max(500)));
                         debug!("pill hover expand started");
                     }
                     HoverStep::ArmDismiss => {
                         self.hover_dismiss_at = Some(now);
-                        self.dismiss_at = Some(now + Duration::from_millis(EARLY_EXIT_MS));
+                        // The arm caps the remaining time at 500ms; it must
+                        // never extend an already-sooner deadline (e.g. an
+                        // earlier hover arm or the queued-notification cap).
+                        let early = now + Duration::from_millis(EARLY_EXIT_MS);
+                        self.dismiss_at = Some(self.dismiss_at.map_or(early, |d| d.min(early)));
                         debug!("pill hover-dismiss armed");
                     }
                     HoverStep::ReverseMorph => {
@@ -2032,6 +2062,9 @@ impl OverlayState {
                             .as_ref()
                             .map(|morph| reversal_seed(morph, &self.config, now))
                             .unwrap_or((0.0, 0.0));
+                        // Leaving the interaction resets the countdown: the
+                        // collapsed pill gets its full duration again.
+                        self.dismiss_at = Some(now + Duration::from_millis(self.config.overlay.duration_ms.max(500)));
                         if from < REVERSAL_MIN_PROGRESS {
                             // Reversed from (nearly) compact: drop the morph
                             // instead of running a spring release — a seeded
@@ -2052,10 +2085,15 @@ impl OverlayState {
                     }
                     HoverStep::None => {}
                 }
-            } else if cursor_over && self.hover_dismiss_at.is_none() {
-                self.hover_dismiss_at = Some(now);
-                self.dismiss_at = Some(now + Duration::from_millis(EARLY_EXIT_MS));
-                debug!("pill hover-dismiss armed");
+            } else if cursor_over && self.hover_dismiss_at.is_none() && self.config.overlay.dismiss_on_hover {
+                // Hover during the entrance/collapse animation: only an
+                // Expanded-layout pill arms (Compact pills only ever expand
+                // on hover, which the Shown path handles).
+                if self.layout == LayoutMode::Expanded {
+                    self.hover_dismiss_at = Some(now);
+                    self.dismiss_at = Some(now + Duration::from_millis(EARLY_EXIT_MS));
+                    debug!("pill hover-dismiss armed");
+                }
             }
         } else {
             self.hover_dismiss_at = None;
@@ -2421,14 +2459,14 @@ impl OverlayState {
             && pt.y <= pos.y + height + inset
     }
 
-    /// Whether an expanded pill is currently held by the cursor (the deferred
-    /// dismissal). Same inputs as the tick's hold decision, so an event that
-    /// lands between ticks routes the same way the next tick resolves it.
-    /// `hover_expand` covers a pinned or in-flight hover expansion; `layout`
-    /// covers a laid-out expanded pill.
+    /// Whether a morph-origin expanded pill is currently held by the cursor
+    /// (the deferred dismissal). Same inputs as the tick's hold decision, so
+    /// an event that lands between ticks routes the same way the next tick
+    /// resolves it. Only the compact→expanded hover morph is an interaction
+    /// and gets held — a laid-out expanded pill is never held.
     fn held_expanded(&self) -> bool {
         let engaged = hover_engaged(self.is_cursor_over_pill(), self.hover_leave_at, Instant::now());
-        engaged && (self.hover_expand.is_some() || self.layout == LayoutMode::Expanded)
+        engaged && self.hover_expand.is_some()
     }
 
     /// Moves the live overlay window to its resolved position without a full redraw.
@@ -8510,14 +8548,13 @@ mod tests {
     #[test]
     fn show_sample_clears_stale_hover_state() {
         // Regression: show_sample reset hover_dismiss_at/hover_leave_at but
-        // not hover_expand/hover_expanded_once — the one "new pill" entry
-        // point that didn't. A sample shown right after a hover morph (the
-        // collapse leg can still be in flight when the user opens Settings
-        // and hits "Show sample") would inherit the real pill's expansion:
-        // mid-morph or fully expanded with the cursor nowhere near it, and a
-        // bogus collapse seeded from another hover's velocity.
+        // not hover_expand — the one "new pill" entry point that didn't. A
+        // sample shown right after a hover morph (the collapse leg can still
+        // be in flight when the user opens Settings and hits "Show sample")
+        // would inherit the real pill's expansion: mid-morph or fully
+        // expanded with the cursor nowhere near it, and a bogus collapse
+        // seeded from another hover's velocity.
         let mut config = Config::default();
-        config.overlay.compact_hover_action = CompactHoverAction::Expand;
         config.overlay.layout = LayoutMode::Compact;
         let mut state = OverlayState::new(config, EventQueue::default());
         state.hover_expand = Some(HoverExpand {
@@ -8527,17 +8564,12 @@ mod tests {
             velocity: 2.0,
             done: false,
         });
-        state.hover_expanded_once = true;
 
         state.show_sample();
 
         assert!(
             state.hover_expand.is_none(),
             "the sample must not inherit an in-flight hover morph"
-        );
-        assert!(
-            !state.hover_expanded_once,
-            "the sample must reset the expanded-once flag"
         );
         assert!(
             matches!(state.phase, Phase::Light(_)),
@@ -8555,9 +8587,8 @@ mod tests {
         }));
         state.phase = Phase::Shown;
         state.dismiss_at = Some(Instant::now() + Duration::from_secs(5));
-        // The pill is not held (no cursor over it), so the tick applies the
-        // cap. A held pill would wait instead (see
-        // `expanded_pill_is_held_while_the_cursor_stays`).
+        // The pill is not held (no morph-origin expansion), so the tick
+        // applies the cap — the cursor is irrelevant for a laid-out pill.
         state.test_cursor_over = Some(false);
 
         // A newer event arrives from another source (not an in-place update).
@@ -8571,17 +8602,8 @@ mod tests {
                 ..TrackInfo::default()
             })));
         state.receive_events();
-        // The cap lives in `tick` (so the hold can suppress it), and a
-        // leave counts as engaged through the 60ms debounce — so the first
-        // tick after the arrival still defers the cap...
-        state.tick();
-        let held_remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
-        assert!(
-            held_remaining > Duration::from_millis(EARLY_EXIT_MS + 500),
-            "the debounce window must still defer the cap, got {held_remaining:?}"
-        );
-        // ...and once the leave debounce expires, the cap applies.
-        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+        // The cap lives in `tick` (so a morph-origin hold can suppress it);
+        // a laid-out pill is never held, so the very next tick caps it.
         state.tick();
 
         assert!(!state.pending.is_empty(), "the update must be queued for the next pill");
@@ -8615,10 +8637,8 @@ mod tests {
                 ..TrackInfo::default()
             })));
         state.receive_events();
-        // Same as the sibling test: the leave debounce defers the cap for
-        // its window, then the cap must not extend the earlier deadline.
-        state.tick();
-        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+        // Same as the sibling test: the cap applies on the first tick and
+        // must not extend the earlier deadline.
         state.tick();
 
         let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
@@ -9608,8 +9628,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_step_dismiss_default_arms_the_one_way_dismiss() {
-        let dismiss = CompactHoverAction::Dismiss;
+    fn hover_step_arms_dismiss_only_with_dismiss_on_hover() {
         let idle = HoverTick {
             cursor_over: false,
             morphing: false,
@@ -9617,21 +9636,13 @@ mod tests {
             dismiss_armed: false,
         };
         // No hover, no morph: nothing to do.
-        assert_eq!(hover_step(idle, dismiss, true, false, false), HoverStep::None);
-        // First hover over an explicitly-Compact pill arms the dismiss.
-        assert_eq!(
-            hover_step(
-                HoverTick {
-                    cursor_over: true,
-                    ..idle
-                },
-                dismiss,
-                true,
-                false,
-                false
-            ),
-            HoverStep::ArmDismiss
-        );
+        assert_eq!(hover_step(idle, true, true, false, false), HoverStep::None);
+        // First hover over a laid-out expanded pill arms the dismiss.
+        let over = HoverTick {
+            cursor_over: true,
+            ..idle
+        };
+        assert_eq!(hover_step(over, true, true, false, true), HoverStep::ArmDismiss);
         // The arm is one-way: an already-armed tick does nothing, so the
         // 500ms deadline keeps counting down while the cursor stays put.
         assert_eq!(
@@ -9641,47 +9652,38 @@ mod tests {
                     dismiss_armed: true,
                     ..idle
                 },
-                dismiss,
+                true,
                 true,
                 false,
-                false
+                true
             ),
             HoverStep::None
         );
-        // The arming does not depend on the layout being explicit Compact
-        // (an Auto-resolved compact pill also hover-dismisses).
-        assert_eq!(
-            hover_step(
-                HoverTick {
-                    cursor_over: true,
-                    ..idle
-                },
-                dismiss,
-                false,
-                false,
-                false
-            ),
-            HoverStep::ArmDismiss
-        );
+        // Without dismiss-on-hover the laid-out expanded pill is untouched.
+        assert_eq!(hover_step(over, false, true, false, true), HoverStep::None);
+        // A Compact pill with expand-off behaves exactly like an Expanded
+        // one: the dismiss arms only while dismiss-on-hover is enabled.
+        assert_eq!(hover_step(over, true, false, false, false), HoverStep::ArmDismiss);
+        assert_eq!(hover_step(over, false, false, false, false), HoverStep::None);
     }
 
     #[test]
-    fn hover_step_expand_morphs_once_then_falls_back_to_dismiss() {
-        let expand = CompactHoverAction::Expand;
+    fn hover_step_first_hover_expands_then_dismisses_with_dismiss_on_hover() {
         let idle = HoverTick {
             cursor_over: true,
             morphing: false,
             morph_expanding: false,
             dismiss_armed: false,
         };
-        // First hover over an explicitly-Compact pill starts the morph.
-        assert_eq!(hover_step(idle, expand, true, false, false), HoverStep::StartExpand);
-        // The one expansion per notification is used up: the next hover on a
-        // compact pill falls back to the plain 500ms dismiss.
-        assert_eq!(hover_step(idle, expand, true, true, false), HoverStep::ArmDismiss);
-        // A pill whose Compact comes from Auto never expands — hover keeps
-        // dismissing (the deliberate fullscreen/listed-app compact choice).
-        assert_eq!(hover_step(idle, expand, false, false, false), HoverStep::ArmDismiss);
+        // First hover over a Compact pill starts the morph — regardless of
+        // the dismiss toggle.
+        assert_eq!(hover_step(idle, true, true, false, false), HoverStep::StartExpand);
+        assert_eq!(hover_step(idle, false, true, false, false), HoverStep::StartExpand);
+        // With dismiss-on-hover the expansion has been used: the next hover
+        // over the compact pill dismisses (the second hover dismisses).
+        assert_eq!(hover_step(idle, true, true, true, false), HoverStep::ArmDismiss);
+        // Without dismiss-on-hover every hover re-expands instead.
+        assert_eq!(hover_step(idle, false, true, true, false), HoverStep::StartExpand);
         // No cursor, no morph: nothing to do.
         assert_eq!(
             hover_step(
@@ -9689,7 +9691,7 @@ mod tests {
                     cursor_over: false,
                     ..idle
                 },
-                expand,
+                true,
                 true,
                 false,
                 false
@@ -9700,7 +9702,6 @@ mod tests {
 
     #[test]
     fn hover_step_morph_legs_reverse_on_leave() {
-        let expand = CompactHoverAction::Expand;
         let base = HoverTick {
             cursor_over: false,
             morphing: true,
@@ -9711,15 +9712,16 @@ mod tests {
         // finished behaves identically — the release from the pinned state
         // (from = 1.0, velocity ≈ 0) runs the same collapse leg back to
         // compact instead of snapping.
-        assert_eq!(hover_step(base, expand, true, false, false), HoverStep::ReverseMorph);
-        // Staying over the pill mid-expand keeps the morph running.
+        assert_eq!(hover_step(base, true, true, false, false), HoverStep::ReverseMorph);
+        // Staying over the pill mid-expand keeps the morph running — the
+        // morph-origin expanded state is an interaction, never armed.
         assert_eq!(
             hover_step(
                 HoverTick {
                     cursor_over: true,
                     ..base
                 },
-                expand,
+                true,
                 true,
                 false,
                 false
@@ -9731,14 +9733,14 @@ mod tests {
             morph_expanding: false,
             ..base
         };
-        assert_eq!(hover_step(collapsing, expand, true, false, false), HoverStep::None);
+        assert_eq!(hover_step(collapsing, true, true, false, false), HoverStep::None);
         assert_eq!(
             hover_step(
                 HoverTick {
                     cursor_over: true,
                     ..collapsing
                 },
-                expand,
+                true,
                 true,
                 false,
                 false
@@ -9748,48 +9750,38 @@ mod tests {
     }
 
     #[test]
-    fn hover_step_holds_an_expanded_pill_under_the_cursor() {
-        // An expanded pill is held: arming the 500ms hover-dismiss would
-        // kill the pill mid-read, so nothing arms while the cursor is on it
-        // — for either action, whether the one expansion was used or not.
-        let expand = CompactHoverAction::Expand;
-        let dismiss = CompactHoverAction::Dismiss;
+    fn hover_step_never_arms_the_morph_expanded_state() {
+        // The compact→expanded morph is an interaction: while it is in
+        // flight or pinned, hovering never arms anything — only the laid-out
+        // expanded pill arms (and only with dismiss-on-hover).
         let over = HoverTick {
             cursor_over: true,
-            morphing: false,
-            morph_expanding: false,
+            morphing: true,
+            morph_expanding: true,
             dismiss_armed: false,
         };
-        assert_eq!(hover_step(over, expand, false, true, true), HoverStep::None);
-        assert_eq!(hover_step(over, dismiss, false, false, true), HoverStep::None);
-        // Without the cursor there is nothing to hold (and no arm either).
-        assert_eq!(
-            hover_step(
-                HoverTick {
-                    cursor_over: false,
-                    ..over
-                },
-                expand,
-                false,
-                true,
-                true
-            ),
-            HoverStep::None
-        );
-        // A compact pill under the same actions still arms: the hold only
-        // governs the expanded layout.
-        assert_eq!(hover_step(over, dismiss, true, false, false), HoverStep::ArmDismiss);
-        assert_eq!(hover_step(over, expand, true, true, false), HoverStep::ArmDismiss);
+        // Pinned/in-flight morph under the cursor: nothing, regardless of
+        // the toggles.
+        assert_eq!(hover_step(over, true, true, false, false), HoverStep::None);
+        assert_eq!(hover_step(over, true, false, false, false), HoverStep::None);
+        assert_eq!(hover_step(over, false, true, false, false), HoverStep::None);
+        // A laid-out expanded pill (no morph) arms with dismiss-on-hover...
+        let laid_out = HoverTick {
+            morphing: false,
+            ..over
+        };
+        assert_eq!(hover_step(laid_out, true, true, false, true), HoverStep::ArmDismiss);
+        // ...and is untouched without it.
+        assert_eq!(hover_step(laid_out, false, true, false, true), HoverStep::None);
     }
 
     #[test]
-    fn expanded_pill_is_held_while_the_cursor_stays() {
-        // The reported derangement: an expanded pill's countdown ran out
-        // under the cursor that was reading it. An expanded pill never
-        // dismisses while the cursor is engaged, and queued notifications
-        // wait with it (no EARLY_EXIT cap); once the cursor leaves past the
-        // debounce, the pill releases and the remaining time is capped for
-        // the queue again.
+    fn laid_out_expanded_pill_is_never_held_or_deferred() {
+        // An expanded pill has no hover interaction: the countdown is never
+        // deferred for the cursor. With dismiss-on-hover (the default) the
+        // first hover tick arms the one-way 500ms dismiss — even under the
+        // cursor; without it, hovering changes nothing and an expired
+        // deadline dismisses under the cursor either way.
         let mut config = Config::default();
         config.overlay.layout = LayoutMode::Expanded;
         let mut state = OverlayState::new(config, EventQueue::default());
@@ -9800,49 +9792,70 @@ mod tests {
             ..TrackInfo::default()
         }));
         state.dismiss_at = Some(Instant::now() + Duration::from_secs(10));
-        state.pending.push_back(MediaEvent::TrackChanged(TrackInfo {
-            source_app: "spotify".into(),
-            title: "Next Song".into(),
-            ..TrackInfo::default()
-        }));
         state.test_cursor_over = Some(true);
         state.tick();
         let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
         assert!(
-            remaining > Duration::from_millis(EARLY_EXIT_MS + 500),
-            "a held pill must not be capped for the queue, got {remaining:?}"
+            remaining <= Duration::from_millis(EARLY_EXIT_MS + 50),
+            "dismiss-on-hover must cap the laid-out expanded pill near EARLY_EXIT_MS, got {remaining:?}"
         );
         assert!(matches!(state.phase, Phase::Shown));
-        // Leave: the debounce window still counts as engaged...
-        state.test_cursor_over = Some(false);
-        state.tick();
-        assert!(matches!(state.phase, Phase::Shown));
-        // ...and once it expires the pill releases: the queue cap applies.
-        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+        // The arm is one-way: staying over the pill does not re-arm.
         state.tick();
         let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
         assert!(
             remaining <= Duration::from_millis(EARLY_EXIT_MS + 50),
-            "the released pill must be capped near EARLY_EXIT_MS for the queue, got {remaining:?}"
+            "the one-way arm must not push the deadline while the cursor stays, got {remaining:?}"
         );
-        // A deadline that expired during the hold fires the moment the hold
-        // drops (the user already got their reading time).
+        // A deadline that expires under the cursor dismisses the laid-out
+        // expanded pill: no hold defers it.
         state.dismiss_at = Some(Instant::now() - Duration::from_millis(50));
         state.tick();
         assert!(
             matches!(state.phase, Phase::Collapsing(_)),
-            "the expired deadline must dismiss the released pill"
+            "an expanded pill must dismiss under the cursor, no hold"
         );
     }
 
     #[test]
-    fn held_hover_pinned_pill_collapses_on_leave_then_dismisses() {
-        // A hover-pinned expanded pill held past its deadline survives the
-        // tick, and on leave it runs its collapse leg back to compact before
-        // the expired deadline dismisses it — the dismissal never snaps the
-        // pill mid-collapse.
+    fn laid_out_expanded_pill_ignores_hover_without_dismiss_on_hover() {
+        // dismiss_on_hover off: hovering an expanded pill changes nothing —
+        // no arm, no reset, no deferral; the countdown runs and dismisses.
         let mut config = Config::default();
-        config.overlay.compact_hover_action = CompactHoverAction::Expand;
+        config.overlay.dismiss_on_hover = false;
+        config.overlay.layout = LayoutMode::Expanded;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.layout = LayoutMode::Expanded;
+        state.phase = Phase::Shown;
+        state.content = Some(MediaEvent::TrackChanged(TrackInfo {
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        }));
+        state.dismiss_at = Some(Instant::now() + Duration::from_secs(10));
+        state.test_cursor_over = Some(true);
+        state.tick();
+        let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
+        assert!(
+            remaining > Duration::from_secs(9),
+            "without dismiss-on-hover the hover must leave the deadline alone, got {remaining:?}"
+        );
+        // The expired deadline dismisses even under the cursor.
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(50));
+        state.tick();
+        assert!(
+            matches!(state.phase, Phase::Collapsing(_)),
+            "the countdown must dismiss under the cursor, no deferral"
+        );
+    }
+
+    #[test]
+    fn held_hover_pinned_pill_collapses_on_leave_and_resets() {
+        // A hover-pinned expanded pill is an interaction: held past its
+        // deadline it survives the tick, and on leave it runs its collapse
+        // leg back to compact while the countdown resets to the full
+        // duration — the collapsed pill keeps its normal time instead of
+        // dismissing on the expired deadline.
+        let mut config = Config::default();
         config.overlay.layout = LayoutMode::Compact;
         let mut state = OverlayState::new(config, EventQueue::default());
         state.phase = Phase::Shown;
@@ -9851,8 +9864,8 @@ mod tests {
             source_app: "Spotify".into(),
             ..TrackInfo::default()
         }));
-        // The first hover already pinned the pill; the countdown ran out
-        // long ago while the cursor stayed.
+        // The hover already pinned the pill; the countdown ran out long ago
+        // while the cursor stayed.
         let expand_leg = morph_duration(&state.config, MorphDirection::Expand);
         state.hover_expand = Some(HoverExpand {
             start: Instant::now() - expand_leg,
@@ -9861,7 +9874,6 @@ mod tests {
             velocity: 0.0,
             done: true,
         });
-        state.hover_expanded_once = true;
         state.dismiss_at = Some(Instant::now() - Duration::from_millis(100));
         state.test_cursor_over = Some(true);
         state.tick();
@@ -9873,7 +9885,8 @@ mod tests {
         state.test_cursor_over = Some(false);
         state.tick();
         assert!(matches!(state.phase, Phase::Shown));
-        // ...then the hold drops and leaving runs the collapse leg.
+        // ...then the hold drops and leaving runs the collapse leg while the
+        // countdown resets to the full duration.
         state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
         state.tick();
         assert!(
@@ -9884,8 +9897,14 @@ mod tests {
             matches!(state.phase, Phase::Shown),
             "the dismissal must wait for the in-flight collapse leg"
         );
-        // Fast-forward the collapse leg: the tick after it completes fires
-        // the long-expired deadline.
+        let full = Duration::from_millis(state.config.overlay.duration_ms.max(500));
+        let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
+        assert!(
+            remaining >= full - Duration::from_millis(100) && remaining <= full + Duration::from_millis(100),
+            "leaving the interaction must reset the countdown to the full duration, got {remaining:?} (full {full:?})"
+        );
+        // Fast-forward the collapse leg: the fresh deadline means the pill
+        // stays shown as compact instead of dismissing on the old deadline.
         state.hover_expand = Some(HoverExpand {
             start: Instant::now() - Duration::from_millis(2000),
             direction: MorphDirection::Collapse,
@@ -9896,8 +9915,67 @@ mod tests {
         state.tick();
         assert!(state.hover_expand.is_none(), "the collapse leg must complete");
         assert!(
-            matches!(state.phase, Phase::Collapsing(_)),
-            "the expired deadline must dismiss the released pill"
+            matches!(state.phase, Phase::Shown),
+            "the reset deadline must keep the collapsed pill shown"
+        );
+    }
+
+    #[test]
+    fn compact_second_hover_dismisses_with_dismiss_on_hover() {
+        // The end-to-end compact flow with dismiss-on-hover (the default):
+        // hover 1 expands (+ reset), leaving collapses (+ reset), and hover
+        // 2 over the compact pill again dismisses instead of re-expanding.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::Compact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.phase = Phase::Shown;
+        state.layout = LayoutMode::Compact;
+        state.content = Some(MediaEvent::TrackChanged(TrackInfo {
+            source_app: "Spotify".into(),
+            ..TrackInfo::default()
+        }));
+        // Hover 1: the expand starts.
+        state.test_cursor_over = Some(true);
+        state.tick();
+        assert!(
+            matches!(&state.hover_expand, Some(m) if m.direction == MorphDirection::Expand),
+            "hover 1 must start the expand"
+        );
+        // Complete the expand leg: the expansion is now "used" for this
+        // showing.
+        let expand_leg = morph_duration(&state.config, MorphDirection::Expand);
+        state.hover_expand.as_mut().unwrap().start = Instant::now() - expand_leg;
+        state.tick();
+        assert!(state.hover_expanded_once, "the completed expansion must be recorded");
+        // Leave: the pill runs the collapse leg back to compact.
+        state.test_cursor_over = Some(false);
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+        state.tick();
+        assert!(
+            matches!(&state.hover_expand, Some(m) if m.direction == MorphDirection::Collapse),
+            "leaving must run the collapse leg"
+        );
+        // Fast-forward the collapse leg so the pill is compact again.
+        state.hover_expand = Some(HoverExpand {
+            start: Instant::now() - Duration::from_millis(2000),
+            direction: MorphDirection::Collapse,
+            from: 1.0,
+            velocity: 0.0,
+            done: false,
+        });
+        state.tick();
+        assert!(state.hover_expand.is_none(), "the collapse leg must complete");
+        // Hover 2: the second hover dismisses — no new expand, 500ms arm.
+        state.test_cursor_over = Some(true);
+        state.tick();
+        assert!(
+            state.hover_expand.is_none(),
+            "hover 2 must not re-expand with dismiss-on-hover"
+        );
+        let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
+        assert!(
+            remaining <= Duration::from_millis(EARLY_EXIT_MS + 50),
+            "hover 2 must arm the 500ms dismiss, got {remaining:?}"
         );
     }
 
@@ -9910,7 +9988,6 @@ mod tests {
         // so leaving later gives the new content its normal time.
         let mut config = Config::default();
         config.overlay.layout = LayoutMode::Compact;
-        config.overlay.compact_hover_action = CompactHoverAction::Expand;
         let mut state = OverlayState::new(config, EventQueue::default());
         state.content = Some(MediaEvent::TrackChanged(TrackInfo {
             source_app: "youtube-music".into(),
@@ -9974,7 +10051,6 @@ mod tests {
         // pill. Exercises `tick()` itself (with a fixed cursor), since every
         // isolated morph-math test passes regardless of this ordering bug.
         let mut config = Config::default();
-        config.overlay.compact_hover_action = CompactHoverAction::Expand;
         config.overlay.layout = LayoutMode::Compact;
         let mut state = OverlayState::new(config, EventQueue::default());
         state.phase = Phase::Shown;

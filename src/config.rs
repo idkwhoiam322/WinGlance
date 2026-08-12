@@ -83,9 +83,21 @@ pub struct OverlayConfig {
     /// Which display the Compact pill is placed on while it uses its own
     /// position (see `MonitorMode`).
     pub compact_monitor: MonitorMode,
-    /// What hovering over the pill does while the effective layout is
-    /// Compact (see `CompactHoverAction`).
-    pub compact_hover_action: CompactHoverAction,
+    /// Hovering a pill in the *Expanded* layout arms its dismissal: the
+    /// remaining time is capped at 500 ms, one-way (see `EARLY_EXIT_MS`).
+    /// For pills in the Compact layout it makes the second hover dismiss
+    /// (see `expand_compact_on_hover`): the first hover expands, later
+    /// hovers dismiss. While off, no hover ever dismisses a pill.
+    pub dismiss_on_hover: bool,
+    /// Hovering a pill in the *Compact* layout expands it in place (see the
+    /// hover morph): the countdown resets to the full duration, the expanded
+    /// state is held while the cursor stays on it (it is an interaction,
+    /// never dismissed mid-read), and leaving collapses it back to compact
+    /// and resets the countdown again. With `dismiss_on_hover` enabled, the
+    /// first hover of a showing expands and later hovers dismiss (the second
+    /// hover dismisses); without it, every hover re-expands and resets.
+    /// While off, a Compact pill behaves exactly like an Expanded one.
+    pub expand_compact_on_hover: bool,
     /// Unknown keys under `[overlay]`, preserved across saves.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -126,31 +138,6 @@ pub enum LayoutMode {
     Expanded,
     Compact,
     Auto,
-}
-
-/// What hovering over a pill with the *compact* layout does.
-///
-/// ```toml
-/// compact_hover_action = "dismiss"   # hover dismisses after 500 ms (default)
-/// compact_hover_action = "expand"    # hover morphs the compact pill in place
-///                                    # to the expanded layout once per
-///                                    # notification; the next hover entry
-///                                    # dismisses
-/// ```
-///
-/// An expanded pill under the cursor is never dismissed by its countdown:
-/// while the cursor stays on it, the dismiss clock is deferred (and updates
-/// refresh the pill in place), so the pill cannot disappear mid-read. It
-/// only dismisses once the cursor leaves. Only pills whose layout mode is
-/// explicitly `Compact` expand: an Auto-resolved compact pill is a
-/// deliberate choice (fullscreen app, or a source on the auto-compact list)
-/// and always keeps the Dismiss behavior.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CompactHoverAction {
-    #[default]
-    Dismiss,
-    Expand,
 }
 
 /// Which display the overlay pill is placed on. Serialized as a string so a
@@ -273,7 +260,8 @@ impl Default for OverlayConfig {
             compact_position_x: None,
             compact_position_y: None,
             compact_monitor: MonitorMode::default(),
-            compact_hover_action: CompactHoverAction::default(),
+            dismiss_on_hover: true,
+            expand_compact_on_hover: true,
             unknown: toml::Table::new(),
         }
     }
@@ -839,30 +827,26 @@ nested_appearance = [1, 2, 3]
     }
 
     #[test]
-    fn compact_hover_action_defaults_to_dismiss_and_round_trips_through_toml() {
-        // Defaults to Dismiss: current hover behavior is untouched out of the box.
-        assert_eq!(
-            Config::default().overlay.compact_hover_action,
-            CompactHoverAction::Dismiss
-        );
-        for (form, expected) in [
-            ("dismiss", CompactHoverAction::Dismiss),
-            ("expand", CompactHoverAction::Expand),
-        ] {
-            let config: Config = toml::from_str(&format!("[overlay]\ncompact_hover_action = \"{form}\"\n")).unwrap();
-            assert_eq!(
-                config.overlay.compact_hover_action, expected,
-                "compact_hover_action = \"{form}\" in [overlay] must map to {expected:?}"
-            );
+    fn hover_toggles_default_on_and_round_trip_through_toml() {
+        // Both default to true: compact pills expand on hover and expanded
+        // pills dismiss on hover, matching the previous default behavior.
+        let defaults = Config::default();
+        assert!(defaults.overlay.dismiss_on_hover);
+        assert!(defaults.overlay.expand_compact_on_hover);
+        for (key, value) in [("dismiss_on_hover", "false"), ("expand_compact_on_hover", "false")] {
+            let config: Config = toml::from_str(&format!("[overlay]\n{key} = {value}\n")).unwrap();
+            let loaded = if key == "dismiss_on_hover" {
+                config.overlay.dismiss_on_hover
+            } else {
+                config.overlay.expand_compact_on_hover
+            };
+            assert!(!loaded, "{key} = {value} in [overlay] must load as false");
             let saved = toml::to_string_pretty(&config).unwrap();
             assert!(
-                saved.contains(&format!("compact_hover_action = \"{form}\"")),
-                "the action must serialize in its hand-editable string form:\n{saved}"
+                saved.contains(&format!("{key} = {value}")),
+                "the toggle must serialize back:\n{saved}"
             );
         }
-        // Unknown actions are hard deserialization errors, never a silent
-        // reinterpretation.
-        assert!(toml::from_str::<Config>("[overlay]\ncompact_hover_action = \"bogus\"\n").is_err());
     }
 
     #[test]

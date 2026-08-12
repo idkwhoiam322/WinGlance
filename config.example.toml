@@ -34,12 +34,19 @@ compact_margin = 8
 # compact_position_x = 0
 # compact_position_y = 0
 compact_monitor = "active-window"
-# What hovering over a Compact-layout pill does: "dismiss" (dismiss after
-# 500 ms, default) | "expand" (morph the compact pill in place to the
-# expanded layout once per notification; the next hover entry dismisses).
-# Only pills whose layout is explicitly Compact expand; an Auto-resolved
-# compact pill always dismisses.
-compact_hover_action = "dismiss"
+# Hovering a pill in the Expanded layout arms its dismissal (remaining time
+# capped at 500 ms, one-way). For Compact-layout pills it makes the second
+# hover dismiss: the first hover expands (see below), later hovers dismiss.
+# Off: no hover ever dismisses a pill.
+dismiss_on_hover = true
+# Hovering a pill in the Compact layout expands it in place: the countdown
+# resets to the full duration, the expanded state is held while the cursor
+# stays on it, and leaving collapses it back to compact and resets the
+# countdown again. With dismiss_on_hover on, the first hover of a showing
+# expands and later hovers dismiss (the second hover dismisses); with it
+# off, every hover re-expands. Off: Compact pills behave exactly like
+# Expanded ones.
+expand_compact_on_hover = true
 
 [behavior]
 enable_track_change = true

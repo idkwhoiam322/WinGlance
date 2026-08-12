@@ -193,33 +193,36 @@ Hovering is polled from the tick: the pill has no mouse capture, so the
 cursor is hit-tested against the rendered bounds every frame. A leave is only
 trusted after the cursor has stayed away for `LEAVE_DEBOUNCE` (60 ms), so
 boundary jitter cannot cancel an interaction the moment it starts; re-entering
-clears the leave. What a hover does depends on the effective layout and
-`compact_hover_action`:
+clears the leave. What a hover does follows the pill's *effective* layout
+(an Auto pill follows whichever layout is currently in effect) and the two
+toggles `dismiss_on_hover` and `expand_compact_on_hover`:
 
-- **Expanded pill** — the pill is *held* while the cursor is on it: its
-  dismissal deadline is deferred for the whole hold (the countdown cannot run
-  out while the user reads it), and a queued notification waits with it.
-  Updates route in place — `held_expanded` gives the event-receiving paths
-  the same hold decision between ticks. Once the cursor leaves, the pill
-  resumes its countdown (capped at 500 ms if something is queued).
-- **Compact pill, `compact_hover_action = "dismiss"`** — the first hover
-  caps the remaining display time at 500 ms (`EARLY_EXIT_MS`). The arm is
-  one-way: leaving before the deadline does not cancel the early dismissal.
-- **Compact pill, `compact_hover_action = "expand"`** — the first hover over
-  an explicitly-Compact pill starts an in-place morph to the expanded layout
-  (the pill's layout and position stay Compact-anchored for the whole morph)
-  and resets the dismissal clock to the full configured duration. Leaving —
-  mid-morph or after the pin — immediately runs the collapse leg back to
-  compact. After that one expansion per notification, further hovers fall
-  back to hover-to-dismiss until the next show. A pill whose Compact comes
-  from Auto never expands: compressing for a fullscreen app or an
-  auto-compact source is a deliberate choice, so it always dismisses.
+- **Expanded layout** — hovering has no interaction with the pill: the
+  countdown is never deferred for the cursor, so the pill dismisses on its
+  deadline even under it. With `dismiss_on_hover` (default) the first hover
+  tick arms the one-way 500 ms dismiss (`EARLY_EXIT_MS`); without it,
+  hovering changes nothing.
+- **Compact layout, `expand_compact_on_hover` (default)** — the first hover
+  of a showing starts an in-place morph to the expanded layout (the pill's
+  layout and position stay Compact-anchored for the whole morph) and resets
+  the dismissal clock to the full configured duration. The morph-origin
+  expanded state is an interaction: while the cursor stays on it, its
+  countdown is deferred (`held`), so it is never dismissed mid-read, and a
+  queued notification waits with it (updates route in place — `held_expanded`
+  gives the event-receiving paths the same hold decision between ticks).
+  Leaving — mid-morph or after the pin — runs the collapse leg back to
+  compact and resets the countdown to the full duration. With
+  `dismiss_on_hover` (default), later hovers over the compact pill dismiss
+  instead — the second hover dismisses (one-way 500 ms arm); without it,
+  every hover re-expands and resets again.
+- **Compact layout, `expand_compact_on_hover` off** — the pill behaves
+  exactly like an Expanded-layout one: `dismiss_on_hover` applies, no morph.
 
 The hover decisions apply only to a fully-shown pill; hovering during the
-entrance/exit animations keeps the plain hover-to-dismiss arming. A due
-dismissal loses to an in-flight collapse leg (which runs to completion so it
-cannot snap mid-shrink) but wins over an in-flight expand leg (the pill
-collapses from the plain compact shape).
+entrance/exit animations keeps the plain Expanded-rule arming (`dismiss_on_hover`
+and the layout is Expanded). A due dismissal loses to an in-flight collapse
+leg (which runs to completion so it cannot snap mid-shrink) but wins over an
+in-flight expand leg (the pill collapses from the plain compact shape).
 
 ## Morph springs
 
