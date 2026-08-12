@@ -2885,27 +2885,27 @@ fn morph_radius(compact_radius: f32, expanded_radius: f32, progress: MorphProgre
     compact_radius + (expanded_radius - compact_radius) * p
 }
 
-/// The compact content's opacity during a morph, keyed to the shape
-/// progress — the LESS-advanced of the two axes (see `draw_text_pixels`):
-/// it holds fully visible only very briefly, then dissolves out over
-/// 0.05..0.20, so the compact-mode elements — the inline app icon included —
-/// clear early and are completely gone BEFORE the expanded content starts
-/// arriving (0.25). The windows are deliberately disjoint: the two layouts
-/// must never coexist, or the compact icon would visibly sit beside the
-/// expanding title row.
+/// The compact-exclusive content's opacity during a morph — the inline app
+/// icon — keyed to the shape progress, the LESS-advanced of the two axes
+/// (see `draw_text_pixels`): it holds fully visible only very briefly, then
+/// dissolves out over 0.05..0.20, so it is completely gone BEFORE the
+/// expanded extra rows start arriving (0.25). The windows are deliberately
+/// disjoint: the two exclusive element groups must never coexist, or the
+/// compact icon would visibly sit beside the expanding app row.
 fn compact_alpha(shape_progress: f32) -> f32 {
     const HOLD_END: f32 = 0.05;
     const FADE_OUT_END: f32 = 0.20;
     1.0 - ease_out_quint(((shape_progress - HOLD_END) / (FADE_OUT_END - HOLD_END)).clamp(0.0, 1.0))
 }
 
-/// The expanded content's opacity during a morph, keyed to the shape
-/// progress — the less-advanced of the two axes: on expand that is the
-/// lagging height, so the expanded rows arrive only after the pill has
-/// grown tall enough to show them; on collapse it is the leading width, so
-/// the expanded rows leave as the pill narrows. The fade window (0.25 to
-/// 0.60) starts only where `compact_alpha`'s has ended — the compact layout
-/// is gone before the expanded one appears, so the two never blend.
+/// The expanded-exclusive content's opacity during a morph — the extra rows
+/// (artist, meta, app) — keyed to the shape progress, the less-advanced of
+/// the two axes: on expand that is the lagging height, so the rows arrive
+/// only after the pill has grown tall enough to show them; on collapse it is
+/// the leading width, so the rows leave as the pill narrows. The fade window
+/// (0.25 to 0.60) starts only where `compact_alpha`'s has ended — the icon
+/// is gone before the rows appear, so the two never blend. The shared
+/// elements (title, symbol, art) never fade: they travel (`draw_morph_content`).
 fn expanded_alpha(shape_progress: f32) -> f32 {
     const FADE_IN_START: f32 = 0.25;
     const FADE_IN_END: f32 = 0.60;
@@ -2913,7 +2913,7 @@ fn expanded_alpha(shape_progress: f32) -> f32 {
 }
 
 /// Scales a color's alpha by `factor`, the per-pass opacity of the morph's
-/// content cross-fade: the content primitives all derive their final alpha
+/// content fade: the content primitives all derive their final alpha
 /// from the color's alpha channel, so dimming the color at the call site
 /// fades the whole element (glyphs, symbols, placeholder art) without
 /// touching the primitives.
@@ -3015,6 +3015,104 @@ fn compact_title_viewport(config: &Config) -> (f32, f32) {
     let left = appearance.padding + metrics.art + 12.0;
     let right = pill_w - appearance.padding - metrics.symbol - 16.0 - metrics.icon - 6.0;
     (left, right)
+}
+
+/// f32 lerp on an i32 edge, rounded to the pixel: `a + (b - a) * t`.
+fn lerp_edge(a: i32, b: i32, t: f32) -> i32 {
+    (a as f32 + (b as f32 - a as f32) * t).round() as i32
+}
+
+/// The morph artwork tile: the side length lerps between the compact and
+/// expanded art sizes on the shape progress while the tile stays vertically
+/// centered in the current body. At either endpoint the frame's body has the
+/// matching layout height, so the tile lands exactly on the steady compact
+/// tile (shape 0) or the steady expanded tile (shape 1) at 1.0 DPI; in
+/// between it grows and slides toward the body's center with the card.
+/// `pill_h` is the current body height (animated window height minus the
+/// aura insets).
+fn morph_art_tile(config: &Config, inset: i32, pill_h: i32, scale: f32, shape: f32) -> (i32, i32, i32) {
+    let appearance = &config.appearance;
+    let padding = (appearance.padding * scale).round() as i32;
+    let compact = compact_metrics(config).art * scale;
+    let expanded = appearance.art_size as f32 * scale;
+    let size = (compact + (expanded - compact) * shape).round() as i32;
+    (inset + padding, inset + (pill_h - size) / 2, size)
+}
+
+/// The morph title band: the compact band (right of the small art,
+/// vertically centered in the compact row) travels to the expanded title row
+/// (right of the big art, top-packed and narrowed for the symbol slot),
+/// each edge on its own axis's progress. The compact end is pinned to the
+/// compact body, so the title stays put while the window grows and only
+/// starts traveling as the progress advances; the expanded end matches the
+/// steady expanded band exactly.
+fn morph_title_band(config: &Config, inset: i32, width: i32, scale: f32, progress: MorphProgress) -> RECT {
+    let appearance = &config.appearance;
+    let padding = (appearance.padding * scale).round() as i32;
+    let row_h = (appearance.font_size_title * ROW_HEIGHT * scale).round() as i32;
+    let art = (appearance.art_size as f32 * scale).round() as i32;
+    let symbol = (compact_metrics(config).symbol * scale).round() as i32;
+    let label_w = symbol + (16.0 * scale).round() as i32;
+    let (vp_left, vp_right) = compact_title_viewport(config);
+    let compact_h = (compact_size(config).1 * scale).round() as i32;
+    let compact = RECT {
+        left: inset + (vp_left * scale).round() as i32,
+        top: inset + (compact_h - row_h) / 2,
+        right: inset + (vp_right * scale).round() as i32,
+        bottom: inset + (compact_h - row_h) / 2 + row_h,
+    };
+    let expanded = RECT {
+        left: inset + padding + art + (12.0 * scale).round() as i32,
+        top: inset + padding,
+        right: width - inset - padding - label_w,
+        bottom: inset + padding + row_h,
+    };
+    RECT {
+        left: lerp_edge(compact.left, expanded.left, progress.width),
+        top: lerp_edge(compact.top, expanded.top, progress.height),
+        right: lerp_edge(compact.right, expanded.right, progress.width),
+        bottom: lerp_edge(compact.bottom, expanded.bottom, progress.height),
+    }
+}
+
+/// The morph playback symbol: the compact trailing-chain position (right of
+/// the app icon, vertically centered in the compact row) travels to the
+/// expanded title row's right slot. Both layouts draw the same symbol size,
+/// so only the position travels.
+fn morph_symbol_pos(config: &Config, inset: i32, width: i32, scale: f32, progress: MorphProgress) -> (i32, i32, f32) {
+    let appearance = &config.appearance;
+    let padding = (appearance.padding * scale).round() as i32;
+    let symbol = (compact_metrics(config).symbol * scale).round() as i32;
+    let compact_h = (compact_size(config).1 * scale).round() as i32;
+    let (_, vp_right) = compact_title_viewport(config);
+    let viewport_right = inset + (vp_right * scale).round() as i32;
+    let gap = (6.0 * scale).round() as i32;
+    let icon = (16.0 * scale).round() as i32;
+    let symbol_gap = (16.0 * scale).round() as i32;
+    let compact_right = viewport_right + gap + icon + symbol_gap + symbol;
+    let compact_y = inset + (compact_h - symbol) / 2;
+    let label_w = symbol + (16.0 * scale).round() as i32;
+    let expanded_right = width - inset - padding - label_w;
+    let expanded_y = inset + padding;
+    (
+        lerp_edge(compact_right, expanded_right, progress.width),
+        lerp_edge(compact_y, expanded_y, progress.height),
+        symbol as f32,
+    )
+}
+
+/// The morph app icon's position: the compact trailing chain, pinned to the
+/// compact body (the icon only exists in the compact layout and dissolves
+/// out before the pill has grown much).
+fn morph_icon_pos(config: &Config, inset: i32, scale: f32) -> (i32, i32, i32) {
+    let (_, vp_right) = compact_title_viewport(config);
+    let viewport_right = inset + (vp_right * scale).round() as i32;
+    let gap = (6.0 * scale).round() as i32;
+    let icon = (16.0 * scale).round() as i32;
+    let compact_h = (compact_size(config).1 * scale).round() as i32;
+    let x = viewport_right + gap;
+    let y = inset + (compact_h - icon) / 2;
+    (x, y, icon)
 }
 
 /// Forces the live overlay at `hwnd` to preview its current placement.
@@ -3666,23 +3764,19 @@ fn draw_pixels(
     // and the trailing icon/symbol) in `draw_compact_pill`; drawing it here
     // as well would composite the halo, the cover and the rim twice. The
     // expanded pills draw the art tile at the configured art size. During a
-    // morph the two tiles cross-fade like every other element: the compact
-    // art fades out with `compact_alpha` (in `draw_compact_pill`) while this
-    // expanded tile fades in with `expanded_alpha`, revealed by the body
-    // edge like the rows — nothing travels, the layouts swap in place.
+    // morph the two tiles merge into one interpolated tile (`morph_art_tile`):
+    // the side length lerps between the compact and expanded sizes while the
+    // tile stays centered in the growing body, gated by the body edge like
+    // the rows — the art grows in place instead of two tiles swapping.
     if !compact {
         let padding = (state.config.appearance.padding * scale).round() as usize;
         let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
         let (art_size, art_y, content_alpha) = match (content, morph) {
             (MediaEvent::TrackChanged(_), Some(progress)) => {
-                // The expanded tile at its final rect, gated by the body
-                // edge (it is vertically centered in the tall pill, so it
-                // would render below the still-short body early in the
-                // lerp) and faded with the expanded content.
                 let shape = progress.width.min(progress.height);
-                let art_y = inset + pill_h.saturating_sub(art_size) / 2;
-                let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, (art_y + art_size) as i32);
-                (art_size, art_y, expanded_alpha(shape) * unveil)
+                let (_, art_y, art_size) = morph_art_tile(&state.config, inset as i32, pill_h as i32, scale, shape);
+                let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, art_y + art_size);
+                (art_size as usize, art_y as usize, unveil)
             }
             (MediaEvent::TrackChanged(_), None) => (art_size, inset + pill_h.saturating_sub(art_size) / 2, 1.0),
             (MediaEvent::PlaybackStateChanged(_, _), Some(progress)) => {
@@ -3691,10 +3785,11 @@ fn draw_pixels(
                 // shows the right cover. The art size is clamped to the pill
                 // body: the state-pill layout reserves no extra rows.
                 let shape = progress.width.min(progress.height);
-                let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
-                let art_y = inset + pill_h.saturating_sub(art_size) / 2;
-                let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, (art_y + art_size) as i32);
-                (art_size, art_y, expanded_alpha(shape) * unveil)
+                let (_, _, morph_size) = morph_art_tile(&state.config, inset as i32, pill_h as i32, scale, shape);
+                let art_size = morph_size.min(pill_h as i32 - 2 * padding as i32);
+                let art_y = inset as i32 + (pill_h as i32 - art_size) / 2;
+                let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, art_y + art_size);
+                (art_size as usize, art_y as usize, unveil)
             }
             (MediaEvent::PlaybackStateChanged(_, _), None) => {
                 let art_size = art_size.min(pill_h.saturating_sub(2 * padding));
@@ -4332,7 +4427,10 @@ fn ensure_contrast(text: [u8; 4], bg: [u8; 4], target: f32) -> [u8; 4] {
 /// current edge would render outside the body; `row_unveil_alpha` gates
 /// each row to the edge instead — nothing draws outside the pill, and every
 /// row fades in/out with the sweep of the growing/shrinking bottom edge
-/// (see `draw_text_pixels` for how this interacts with the cross-fade).
+/// (see `draw_text_pixels` for how this interacts with the morph).
+/// `skip_title` keeps the title band's height but skips the title row and
+/// its symbol slot — the morph's traveling title replaces them — so the
+/// remaining rows sit at their steady positions.
 #[allow(clippy::too_many_arguments)]
 fn draw_pill_text_rows(
     state: &mut OverlayState,
@@ -4344,6 +4442,7 @@ fn draw_pill_text_rows(
     content_alpha: f32,
     body_bottom: i32,
     rest_body_bottom: i32,
+    skip_title: bool,
 ) {
     let inset = state.aura_inset;
     let appearance = &state.config.appearance;
@@ -4422,45 +4521,47 @@ fn draw_pill_text_rows(
     let label_w = (symbol_size + 16.0 * scale) as i32;
 
     let title_rect = next_band(0);
-    let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, title_rect.bottom);
-    if unveil > 0.0 {
-        let title_narrow = if playback.is_some() {
-            RECT {
-                left: title_rect.left,
-                top: title_rect.top,
-                right: title_rect.right - label_w,
-                bottom: title_rect.bottom,
-            }
-        } else {
-            title_rect
-        };
-        draw_text_line_pixels(
-            &mut state.text_scratch,
-            &mut state.scratch_utf16,
-            pixels,
-            width as usize,
-            &pill.title,
-            &title_narrow,
-            font_title,
-            h_title,
-            dim_color(appearance.text_color, content_alpha * unveil),
-            false,
-            scale,
-            Some(MarqueeCtx {
-                scroll: &mut state.scroll[0],
-                strip: &mut state.marquee_strips[0],
-            }),
-        );
-        if let Some(playback) = playback {
-            draw_symbol_pixels(
+    if !skip_title {
+        let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, title_rect.bottom);
+        if unveil > 0.0 {
+            let title_narrow = if playback.is_some() {
+                RECT {
+                    left: title_rect.left,
+                    top: title_rect.top,
+                    right: title_rect.right - label_w,
+                    bottom: title_rect.bottom,
+                }
+            } else {
+                title_rect
+            };
+            draw_text_line_pixels(
+                &mut state.text_scratch,
+                &mut state.scratch_utf16,
                 pixels,
                 width as usize,
-                title_rect.right,
-                title_rect.top,
-                symbol_size,
-                playback,
-                dim_color(accent, unveil),
+                &pill.title,
+                &title_narrow,
+                font_title,
+                h_title,
+                dim_color(appearance.text_color, content_alpha * unveil),
+                false,
+                scale,
+                Some(MarqueeCtx {
+                    scroll: &mut state.scroll[0],
+                    strip: &mut state.marquee_strips[0],
+                }),
             );
+            if let Some(playback) = playback {
+                draw_symbol_pixels(
+                    pixels,
+                    width as usize,
+                    title_rect.right,
+                    title_rect.top,
+                    symbol_size,
+                    playback,
+                    dim_color(accent, unveil),
+                );
+            }
         }
     }
 
@@ -4560,15 +4661,16 @@ fn pill_text_from_track(track: &TrackInfo) -> PillText {
 /// shapes: glyph coverage from fontdue becomes alpha, so text alpha-composites
 /// exactly like every other element (GDI text cannot do this on a layered
 /// window — it never touches the alpha channel). While a morph is in flight
-/// the compact layout (drawn by `draw_compact_pill`) and the expanded rows
-/// cross-fade, both keyed to the SHAPE progress — the less-advanced of the
-/// two axes, `min(width, height)`. On expand that is the lagging height, so
-/// the compact content holds until the pill grows tall, then dissolves out
-/// while the expanded rows arrive as the height rises. On collapse it is the
-/// leading width, so the expanded rows leave as the pill narrows, before the
-/// compact content fades back in. The two fade windows (see `compact_alpha` /
-/// `expanded_alpha`) overlap, so the layouts blend in place — nothing moves
-/// between them — and the pill is never empty mid-morph.
+/// `draw_morph_content` takes over: the shared elements (title, playback
+/// symbol) travel between the layouts and only the layout-exclusive elements
+/// fade — the compact app icon out, the expanded extra rows in — both keyed
+/// to the SHAPE progress, the less-advanced of the two axes
+/// `min(width, height)`. On expand that is the lagging height, so the icon
+/// holds until the pill grows tall, then dissolves out while the extra rows
+/// arrive as the height rises. On collapse it is the leading width, so the
+/// extra rows leave as the pill narrows, before the icon fades back in. The
+/// two fade windows (see `compact_alpha` / `expanded_alpha`) are disjoint, so
+/// the exclusive elements never coexist mid-morph.
 /// `body_bottom`/`rest_body_bottom` (the pill body's current and final bottom
 /// edges) additionally gate every expanded row to the animated edge via
 /// `row_unveil_alpha`: a row is not drawn until the edge has passed its band,
@@ -4586,38 +4688,42 @@ fn draw_text_pixels(
     rest_body_bottom: i32,
 ) {
     if let Some(progress) = morph {
-        // The less-advanced axis: on expand the height (so content fades
-        // with the geometry that is still arriving), on collapse the width
-        // (so content fades with the geometry that is already leaving).
-        let shape = progress.width.min(progress.height);
-        let expanded = expanded_alpha(shape);
-        draw_compact_pill(state, pixels, content, width, scale, compact_alpha(shape));
-        // The unveil gating keeps rows inside the body; the overlapping
-        // cross-fade keeps the compact and expanded content blending in
-        // place, so the pill is never empty between the passes.
-        draw_expanded_pill_text(
+        draw_morph_content(
             state,
             pixels,
             content,
             width,
             scale,
-            expanded,
+            progress,
             body_bottom,
             rest_body_bottom,
         );
     } else if compact {
         draw_compact_pill(state, pixels, content, width, scale, 1.0);
     } else {
-        draw_expanded_pill_text(state, pixels, content, width, scale, 1.0, body_bottom, rest_body_bottom);
+        draw_expanded_pill_text(
+            state,
+            pixels,
+            content,
+            width,
+            scale,
+            1.0,
+            body_bottom,
+            rest_body_bottom,
+            false,
+        );
     }
 }
 
 /// Draws the expanded layout's text rows (and the state-pill fallback) into
 /// the pixel buffer, at `content_alpha` (1.0 when no morph is running). The
 /// alpha multiplies every drawn color, so the whole content fades together
-/// as one pass of the morph's cross-fade. `body_bottom`/`rest_body_bottom`
+/// as one pass of the morph's fade. `body_bottom`/`rest_body_bottom`
 /// (see `draw_pill_text_rows`) gate each row to the pill's animated bottom
 /// edge, so no text renders outside the body while it grows or shrinks.
+/// `skip_title` drops the title row and its symbol slot from the draw (the
+/// morph's traveling title replaces them) while keeping the band's height,
+/// so the remaining rows sit at their steady positions.
 #[allow(clippy::too_many_arguments)]
 fn draw_expanded_pill_text(
     state: &mut OverlayState,
@@ -4628,6 +4734,7 @@ fn draw_expanded_pill_text(
     content_alpha: f32,
     body_bottom: i32,
     rest_body_bottom: i32,
+    skip_title: bool,
 ) {
     match content {
         MediaEvent::TrackChanged(track) => {
@@ -4646,6 +4753,7 @@ fn draw_expanded_pill_text(
                 content_alpha,
                 body_bottom,
                 rest_body_bottom,
+                skip_title,
             );
             state.pill_text = Some(pill);
         }
@@ -4668,6 +4776,7 @@ fn draw_expanded_pill_text(
                     content_alpha,
                     body_bottom,
                     rest_body_bottom,
+                    skip_title,
                 );
                 state.pill_text = Some(pill);
             } else {
@@ -4708,55 +4817,57 @@ fn draw_expanded_pill_text(
                 };
                 if let Some(name) = fallback_name {
                     let title_rect = next_band(fs_title * ROW_HEIGHT);
-                    let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, title_rect.bottom);
-                    if unveil > 0.0 {
-                        let title_narrow = RECT {
-                            left: title_rect.left,
-                            top: title_rect.top,
-                            right: title_rect.right - label_w,
-                            bottom: title_rect.bottom,
-                        };
-                        draw_text_line_pixels(
-                            &mut state.text_scratch,
-                            &mut state.scratch_utf16,
-                            pixels,
-                            width as usize,
-                            name,
-                            &title_narrow,
-                            font_title,
-                            h_title,
-                            dim_color(text_color, unveil),
-                            false,
-                            scale,
-                            None,
-                        );
-                        draw_symbol_pixels(
-                            pixels,
-                            width as usize,
-                            title_rect.right,
-                            title_rect.top,
-                            symbol_size,
-                            *playback,
-                            dim_color(accent_color, unveil),
-                        );
-                        let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
-                        let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, artist_rect.bottom);
+                    if !skip_title {
+                        let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, title_rect.bottom);
                         if unveil > 0.0 {
+                            let title_narrow = RECT {
+                                left: title_rect.left,
+                                top: title_rect.top,
+                                right: title_rect.right - label_w,
+                                bottom: title_rect.bottom,
+                            };
                             draw_text_line_pixels(
                                 &mut state.text_scratch,
                                 &mut state.scratch_utf16,
                                 pixels,
                                 width as usize,
-                                "Unknown",
-                                &artist_rect,
-                                font_artist,
-                                h_artist,
-                                dim_color([0xCC, 0xCC, 0xCC, 0xFF], content_alpha * unveil),
+                                name,
+                                &title_narrow,
+                                font_title,
+                                h_title,
+                                dim_color(text_color, unveil),
                                 false,
                                 scale,
                                 None,
                             );
+                            draw_symbol_pixels(
+                                pixels,
+                                width as usize,
+                                title_rect.right,
+                                title_rect.top,
+                                symbol_size,
+                                *playback,
+                                dim_color(accent_color, unveil),
+                            );
                         }
+                    }
+                    let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
+                    let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, artist_rect.bottom);
+                    if unveil > 0.0 {
+                        draw_text_line_pixels(
+                            &mut state.text_scratch,
+                            &mut state.scratch_utf16,
+                            pixels,
+                            width as usize,
+                            "Unknown",
+                            &artist_rect,
+                            font_artist,
+                            h_artist,
+                            dim_color([0xCC, 0xCC, 0xCC, 0xFF], content_alpha * unveil),
+                            false,
+                            scale,
+                            None,
+                        );
                     }
                 }
             }
@@ -4772,13 +4883,9 @@ fn draw_expanded_pill_text(
 /// its edge fade can never render under the app icon or the playback symbol
 /// — and the trailing icon and symbol reuse the shared app-icon and
 /// playback-symbol drawing. The take/put-back of the resolved pill text
-/// mirrors `draw_pill_text_rows`. `content_alpha` (1.0 when no morph is
-/// running) dims the whole content as one pass of the morph's cross-fade —
-/// during a morph the compact content (art, icon and all) dissolves out in
-/// place while the expanded content fades in; nothing travels between the
-/// layouts. The vertical centering anchors to the *compact* pill height, so
-/// while a morph grows the window the compact content stays put and the
-/// extra space reads as the pill growing around it.
+/// mirrors `draw_pill_text_rows`. `content_alpha` is 1.0: a morph frame
+/// never calls this — `draw_morph_content` draws the traveling compact
+/// elements itself, so the compact layout renders only at rest.
 #[allow(clippy::too_many_arguments)]
 fn draw_compact_pill(
     state: &mut OverlayState,
@@ -4928,6 +5035,150 @@ fn draw_compact_pill(
         symbol as f32,
         playback,
         accent,
+    );
+}
+
+/// Draws one morph frame's content: the shared elements — the title and the
+/// playback symbol (the artwork travels in `draw_pixels` via
+/// `morph_art_tile`) — move from their compact positions to their expanded
+/// positions on each axis's own progress, while the layout-exclusive
+/// elements fade: the compact app icon dissolves out with `compact_alpha`
+/// (0.05..0.20 of shape progress) and the expanded extra rows (artist, meta,
+/// app) sweep in with `expanded_alpha` (0.25..0.60), edge-unveiled. The
+/// shared elements never fade, so the morph reads as the card unfolding in
+/// place instead of two layouts swapping.
+#[allow(clippy::too_many_arguments)]
+fn draw_morph_content(
+    state: &mut OverlayState,
+    pixels: &mut [u8],
+    content: &MediaEvent,
+    width: i32,
+    scale: f32,
+    progress: MorphProgress,
+    body_bottom: i32,
+    rest_body_bottom: i32,
+) {
+    let shape = progress.width.min(progress.height);
+    let inset = state.aura_inset;
+    let appearance = &state.config.appearance;
+    let compact_opacity = compact_alpha(shape);
+    let expanded_opacity = expanded_alpha(shape);
+
+    // The pieces the traveling elements share, resolved once (mirrors
+    // `draw_compact_pill` and `draw_expanded_pill_text`).
+    let (title, app_icon, playback) = match content {
+        MediaEvent::TrackChanged(track) => {
+            let pill = state.pill_text.take().unwrap_or_else(|| pill_text_from_track(track));
+            let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
+            state.pill_text = Some(pill);
+            (title, app_icon, PlaybackState::NowPlaying)
+        }
+        MediaEvent::PlaybackStateChanged(playback, source_app) => {
+            let pill = state.pill_text.take().or_else(|| {
+                if source_app.is_empty() {
+                    None
+                } else {
+                    state.track_cache.get(source_app).map(|(t, _)| pill_text_from_track(t))
+                }
+            });
+            match pill {
+                Some(pill) => {
+                    let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
+                    state.pill_text = Some(pill);
+                    (title, app_icon, *playback)
+                }
+                // No cached track (the state change arrived before the first
+                // TrackChanged): the source name stands in for the title.
+                None => {
+                    let name = if !source_app.is_empty() {
+                        source_app.clone()
+                    } else {
+                        state.current_source.clone().unwrap_or_default()
+                    };
+                    (name, None, *playback)
+                }
+            }
+        }
+        // Never rendered: SessionRejected is filtered out before enqueue.
+        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => return,
+    };
+
+    // App icon (compact-only): stays at its compact position and dissolves
+    // out; it is gone by 0.20, before the expanded app row starts arriving
+    // at 0.25, so the two never coexist.
+    match app_icon {
+        Some(icon) if compact_opacity > 0.0 => {
+            let (icon_x, icon_y, icon_size) = morph_icon_pos(&state.config, inset, scale);
+            draw_icon_scaled(
+                pixels,
+                width as usize,
+                &icon,
+                24,
+                icon_x as usize,
+                icon_y as usize,
+                icon_size as usize,
+                compact_opacity,
+            );
+        }
+        _ => {}
+    }
+
+    // The traveling title: one instance, moving from the compact band to
+    // the expanded title row. The marquee state rides along in the same
+    // slot both layouts use.
+    if !title.is_empty() {
+        let band = morph_title_band(&state.config, inset, width, scale, progress);
+        let fs_title = appearance.font_size_title * scale;
+        let (font_title, h_title) = state.fonts.font_for(fs_title as i32, true);
+        draw_text_line_pixels(
+            &mut state.text_scratch,
+            &mut state.scratch_utf16,
+            pixels,
+            width as usize,
+            &title,
+            &band,
+            font_title,
+            h_title,
+            appearance.text_color,
+            false,
+            scale,
+            Some(MarqueeCtx {
+                scroll: &mut state.scroll[0],
+                strip: &mut state.marquee_strips[0],
+            }),
+        );
+    }
+
+    // The traveling playback symbol: from the compact trailing chain to the
+    // expanded title row's right slot. Both layouts draw the same size; the
+    // color matches the expanded steady state (contrast-checked).
+    let accent_base = state.palette.map(|p| p.primary).unwrap_or(appearance.accent_color);
+    let accent = ensure_contrast(accent_base, pill_fill_bg(state), TEXT_CONTRAST_AA);
+    let (symbol_right, symbol_y, symbol_size) = morph_symbol_pos(&state.config, inset, width, scale, progress);
+    draw_symbol_pixels(
+        pixels,
+        width as usize,
+        symbol_right,
+        symbol_y,
+        symbol_size,
+        playback,
+        accent,
+    );
+
+    // The expanded extra rows (artist, meta, app): fade in with the expanded
+    // window and sweep in behind the body edge. The title band keeps its
+    // height so the rows sit at their steady positions, but the row itself
+    // is not drawn here — the title above is the same element traveling.
+    draw_expanded_pill_text(
+        state,
+        pixels,
+        content,
+        width,
+        scale,
+        expanded_opacity,
+        body_bottom,
+        rest_body_bottom,
+        true,
     );
 }
 
@@ -8754,14 +9005,16 @@ mod tests {
     }
 
     #[test]
-    fn morph_cross_fade_never_shows_both_layouts_at_once() {
-        // Both passes key to the shape progress — the less-advanced axis,
-        // min(width, height). The fade windows (compact: 0.05..0.20,
-        // expanded: 0.25..0.60) are deliberately DISJOINT: the compact
-        // layout — the inline app icon included — must be completely gone
-        // before the expanded layout starts arriving, or the icon would
-        // visibly sit beside the expanding title row. The assertion allows
-        // float dust at the window boundary — at no point can both passes be
+    fn morph_exclusive_elements_never_coexist() {
+        // The shared elements (title, playback symbol, art) never fade during
+        // a morph — they travel (see `draw_morph_content`). Only the
+        // layout-exclusive elements fade, both keyed to the shape progress —
+        // the less-advanced axis, min(width, height). The fade windows
+        // (compact: 0.05..0.20, expanded: 0.25..0.60) are deliberately
+        // DISJOINT: the compact app icon must be completely gone before the
+        // expanded extra rows start arriving, or the icon would visibly sit
+        // beside the arriving app row. The assertion allows float dust at
+        // the window boundary — at no point can both exclusive groups be
         // meaningfully visible.
         assert_eq!(compact_alpha(0.05), 1.0);
         assert_eq!(compact_alpha(0.20), 0.0);
@@ -8775,12 +9028,12 @@ mod tests {
             let (compact, expanded) = (compact_alpha(shape), expanded_alpha(shape));
             assert!(
                 compact <= 0.01 || expanded <= 0.01,
-                "the passes must never overlap at t={t}: compact={compact} expanded={expanded}"
+                "the exclusive elements must never overlap at t={t}: compact={compact} expanded={expanded}"
             );
         }
         // The release direction (collapse) keeps the same disjointness, with
-        // the leading width as the limiting axis: the expanded content is
-        // gone before the compact content starts fading back in.
+        // the leading width as the limiting axis: the expanded rows are gone
+        // before the compact icon starts fading back in.
         for i in 0..=400 {
             let t = i as f32 / 400.0;
             let width = spring_collapse(t, 1.0, 0.0);
@@ -8789,8 +9042,198 @@ mod tests {
             let (compact, expanded) = (compact_alpha(shape), expanded_alpha(shape));
             assert!(
                 compact <= 0.01 || expanded <= 0.01,
-                "the passes must never overlap on collapse at t={t}: compact={compact} expanded={expanded}"
+                "the exclusive elements must never overlap on collapse at t={t}: compact={compact} expanded={expanded}"
             );
+        }
+    }
+
+    #[test]
+    fn morph_art_tile_lands_exactly_on_the_steady_tiles_at_both_ends() {
+        // The interpolated tile must be pixel-identical to the compact tile
+        // at shape 0 (rendered in the compact body) and the expanded tile at
+        // shape 1 (in the expanded body) — the morph hands off without a
+        // jump.
+        let config = Config::default();
+        let inset = 0;
+        let scale = 1.0;
+        let compact_h = (compact_size(&config).1 * scale).round() as i32;
+        let expanded_h = (content_size(&config).1 * scale).round() as i32;
+        let metrics = compact_metrics(&config);
+        let appearance = &config.appearance;
+        let padding = (appearance.padding * scale).round() as i32;
+        let (x0, y0, s0) = morph_art_tile(&config, inset, compact_h, scale, 0.0);
+        assert_eq!(s0, (metrics.art * scale).round() as i32, "shape-0 size");
+        assert_eq!(y0, inset + (compact_h - s0) / 2, "shape-0 y");
+        assert_eq!(x0, inset + padding, "shape-0 x");
+        let (x1, y1, s1) = morph_art_tile(&config, inset, expanded_h, scale, 1.0);
+        assert_eq!(s1, (appearance.art_size as f32 * scale).round() as i32, "shape-1 size");
+        assert_eq!(y1, inset + (expanded_h - s1) / 2, "shape-1 y");
+        assert_eq!(x1, inset + padding, "shape-1 x");
+    }
+
+    #[test]
+    fn morph_title_band_lands_exactly_on_the_layout_bands_at_both_ends() {
+        // Same contract as the art tile: the traveling title band is exactly
+        // the compact band at shape 0 and the expanded title row at shape 1.
+        let config = Config::default();
+        let inset = 0;
+        let scale = 1.0;
+        let width = (content_size(&config).0 * scale).round() as i32;
+        let appearance = &config.appearance;
+        let padding = (appearance.padding * scale).round() as i32;
+        let row_h = (appearance.font_size_title * ROW_HEIGHT * scale).round() as i32;
+        let art = (appearance.art_size as f32 * scale).round() as i32;
+        let symbol = (compact_metrics(&config).symbol * scale).round() as i32;
+        let label_w = symbol + (16.0 * scale).round() as i32;
+        let compact_h = (compact_size(&config).1 * scale).round() as i32;
+        let (vp_left, vp_right) = compact_title_viewport(&config);
+        let at0 = morph_title_band(
+            &config,
+            inset,
+            width,
+            scale,
+            MorphProgress {
+                width: 0.0,
+                height: 0.0,
+            },
+        );
+        assert_eq!(at0.left, inset + (vp_left * scale).round() as i32, "shape-0 left");
+        assert_eq!(at0.right, inset + (vp_right * scale).round() as i32, "shape-0 right");
+        assert_eq!(at0.top, inset + (compact_h - row_h) / 2, "shape-0 top");
+        assert_eq!(at0.bottom, at0.top + row_h, "shape-0 bottom");
+        let at1 = morph_title_band(
+            &config,
+            inset,
+            width,
+            scale,
+            MorphProgress {
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        assert_eq!(
+            at1.left,
+            inset + padding + art + (12.0 * scale).round() as i32,
+            "shape-1 left"
+        );
+        assert_eq!(at1.top, inset + padding, "shape-1 top");
+        assert_eq!(at1.right, width - inset - padding - label_w, "shape-1 right");
+        assert_eq!(at1.bottom, at1.top + row_h, "shape-1 bottom");
+    }
+
+    #[test]
+    fn morph_symbol_pos_lands_exactly_on_the_layout_positions_at_both_ends() {
+        // The traveling symbol: the compact trailing chain at shape 0, the
+        // expanded title row's right slot at shape 1, same size throughout.
+        let config = Config::default();
+        let inset = 0;
+        let scale = 1.0;
+        let width = (content_size(&config).0 * scale).round() as i32;
+        let appearance = &config.appearance;
+        let padding = (appearance.padding * scale).round() as i32;
+        let symbol = (compact_metrics(&config).symbol * scale).round() as i32;
+        let compact_h = (compact_size(&config).1 * scale).round() as i32;
+        let (_, vp_right) = compact_title_viewport(&config);
+        let viewport_right = inset + (vp_right * scale).round() as i32;
+        let gap = (6.0 * scale).round() as i32;
+        let icon = (16.0 * scale).round() as i32;
+        let symbol_gap = (16.0 * scale).round() as i32;
+        let at0 = morph_symbol_pos(
+            &config,
+            inset,
+            width,
+            scale,
+            MorphProgress {
+                width: 0.0,
+                height: 0.0,
+            },
+        );
+        assert_eq!(
+            at0.0,
+            viewport_right + gap + icon + symbol_gap + symbol,
+            "shape-0 right"
+        );
+        assert_eq!(at0.1, inset + (compact_h - symbol) / 2, "shape-0 y");
+        assert_eq!(at0.2, symbol as f32, "shape-0 size");
+        let at1 = morph_symbol_pos(
+            &config,
+            inset,
+            width,
+            scale,
+            MorphProgress {
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        assert_eq!(
+            at1.0,
+            width - inset - padding - symbol - (16.0 * scale).round() as i32,
+            "shape-1 right"
+        );
+        assert_eq!(at1.1, inset + padding, "shape-1 y");
+        assert_eq!(at1.2, symbol as f32, "shape-1 size");
+    }
+
+    #[test]
+    fn morph_icon_pos_matches_the_compact_trailing_chain() {
+        // The app icon stays at its compact position while it dissolves out.
+        let config = Config::default();
+        let inset = 0;
+        let scale = 1.0;
+        let (_, vp_right) = compact_title_viewport(&config);
+        let viewport_right = inset + (vp_right * scale).round() as i32;
+        let gap = (6.0 * scale).round() as i32;
+        let icon = (16.0 * scale).round() as i32;
+        let compact_h = (compact_size(&config).1 * scale).round() as i32;
+        let (x, y, size) = morph_icon_pos(&config, inset, scale);
+        assert_eq!(x, viewport_right + gap);
+        assert_eq!(y, inset + (compact_h - icon) / 2);
+        assert_eq!(size, icon);
+    }
+
+    #[test]
+    fn morph_title_band_travels_monotonically_between_the_layouts() {
+        // As the progress advances the title's edges move from the compact
+        // band to the expanded band without reversing — the travel must read
+        // as one continuous move, never a back-and-forth.
+        let config = Config::default();
+        let inset = 0;
+        let scale = 1.0;
+        let width = (content_size(&config).0 * scale).round() as i32;
+        let mut last: Option<RECT> = None;
+        for i in 0..=100 {
+            let t = i as f32 / 100.0;
+            let band = morph_title_band(&config, inset, width, scale, MorphProgress { width: t, height: t });
+            if let Some(prev) = last {
+                assert!(band.left >= prev.left, "left must not move left at t={t}");
+                assert!(band.right >= prev.right, "right must not move left at t={t}");
+                assert!(band.top <= prev.top, "top must not move down at t={t}");
+                assert!(band.bottom <= prev.bottom, "bottom must not move down at t={t}");
+            }
+            last = Some(band);
+        }
+    }
+
+    #[test]
+    fn morph_art_stays_inside_the_body_across_the_leg() {
+        // Sampled over the real expand leg, the interpolated tile must fit
+        // inside the growing body, so the edge gate never clips it mid-morph.
+        let config = Config::default();
+        let content = MediaEvent::TrackChanged(TrackInfo {
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        });
+        for i in 0..=200 {
+            let t = i as f32 / 200.0;
+            let width = EXPAND_SPRING.value_at(t, 0.0, 0.0);
+            let height = lagged_expand(&EXPAND_SPRING, t, MORPH_LAG);
+            let shape = width.min(height);
+            let (_, compact_h) = content_size_of(&config, &content, true);
+            let (_, expanded_h) = content_size_of(&config, &content, false);
+            let pill_h = (compact_h + (expanded_h - compact_h) * height).round() as i32;
+            let (_, y, size) = morph_art_tile(&config, 0, pill_h, 1.0, shape);
+            assert!(size <= pill_h, "art must fit the body at t={t}: {size} > {pill_h}");
+            assert!(y + size <= pill_h, "art must stay inside the body at t={t}");
         }
     }
 

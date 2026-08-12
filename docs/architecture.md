@@ -251,13 +251,18 @@ turning, then settles exactly at compact. A reversal from less than
 `REVERSAL_MIN_PROGRESS` (0.05) drops the morph instead of running a seeded
 release, which would balloon a pill that barely left compact.
 
-During the morph the two layouts' contents never blend: the compact content
-dissolves out over 0.05..0.20 of the shape progress and the expanded content
-fades in over 0.25..0.60 — in both directions, keyed to the *less-advanced*
-axis so nothing renders outside the visible card. The content is drawn
-progressively into the single reusable DIB (one continuously-scaling tile
-replaces two cross-faded buffers), and the expanded text rows unveil as the
-pill's animated bottom edge sweeps past their bands.
+During the morph the shared elements — the title, the playback symbol and
+the artwork — never fade: they travel from their compact positions to their
+expanded positions on each axis's own progress (the artwork's side length
+lerps while it stays centered in the growing body, the title and symbol
+track their bands), so the morph reads as the card unfolding in place.
+Only the layout-exclusive elements fade, keyed to the *less-advanced* axis
+so nothing renders outside the visible card: the compact app icon dissolves
+out over 0.05..0.20 of the shape progress and the expanded extra rows
+(artist, meta, app) fade in over 0.25..0.60 — disjoint windows, in both
+directions, so the icon and the app row never coexist. The content is drawn
+progressively into the single reusable DIB, and the expanded extra rows
+unveil as the pill's animated bottom edge sweeps past their bands.
 
 ## Palette and aura
 
