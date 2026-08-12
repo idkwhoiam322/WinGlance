@@ -4960,9 +4960,15 @@ fn draw_compact_pill(
 ) {
     let inset = state.aura_inset;
     let appearance = &state.config.appearance;
-    let accent = dim_color(
+    // The playback symbol's color, guarded exactly like the expanded layout
+    // and the morph's traveling symbol (see `draw_pill_text_rows`): the raw
+    // palette primary can be too dark against the fill, and the compact and
+    // expanded pills must render the same accent, or the symbol visibly
+    // changes color when the pill morphs between the two layouts.
+    let accent = ensure_contrast(
         state.palette.map(|p| p.primary).unwrap_or(appearance.accent_color),
-        content_alpha,
+        pill_fill_bg(state),
+        TEXT_CONTRAST_AA,
     );
     let metrics = compact_metrics(&state.config);
     let padding = (appearance.padding * scale).round() as i32;
