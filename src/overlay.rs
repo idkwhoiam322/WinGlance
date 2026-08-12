@@ -72,22 +72,24 @@ const MORPH_LAG: f32 = 0.12;
 /// the entire pill scales about its anchor past the final size and back
 /// (expand: 1 -> 1.05 -> 1; compaction: 1 -> 0.95 -> 1), so the
 /// bounce reads as one 1:1 card settling instead of per-element overshoots.
-/// The amplitudes are the first tuning knobs if the bounce reads too weak or
-/// too wild.
+/// The compaction leg is the slow half: ζ=0.6's ~9.5 % undershoot spreads
+/// over the tail of a leg that runs 4/5 of the entrance duration, so the
+/// dip reads as a pronounced settle instead of a thud. The amplitudes are
+/// the first tuning knobs if the bounce reads too weak or too wild.
 const BOUNCE_OVER: f32 = 0.05;
 /// Under-bounce amplitude (compaction only): the pill shrinks to
-/// (1 - UNDER) of its final size before the over-bounce.
+/// (1 - UNDER) of its final size at the spring's undershoot trough.
 const BOUNCE_UNDER: f32 = 0.05;
 /// The expand spring's peak progress (ζ = 0.7, 2.8π, from rest): the
 /// bounce's excess is normalized against it, so the over-bounce peaks at
 /// exactly `BOUNCE_OVER` when the spring peaks. Pinned by
 /// `spring_expand_overshoots_then_settles_exactly`.
 const EXPAND_SPRING_PEAK: f32 = 1.045988;
-/// The collapse spring's undershoot below compact (ζ = 0.9, released from
+/// The collapse spring's undershoot below compact (ζ = 0.6, released from
 /// rest): the compaction's dip is normalized against it, so the pill shrinks
 /// to exactly (1 - `BOUNCE_UNDER`) at the trough. Pinned by
-/// `spring_collapse_release_from_expanded_settles_without_a_visible_bounce`.
-const COLLAPSE_TROUGH: f32 = -0.001524;
+/// `spring_collapse_release_from_expanded_undershoots_once_then_pins_compact`.
+const COLLAPSE_TROUGH: f32 = -0.094780;
 /// Tick period while the pill is fully static (no animation, no marquee
 /// scrolling). The dismiss countdown and hover polling do not need frame
 /// rate; the refresh-rate timer is restored the moment the pill animates or
@@ -2769,7 +2771,8 @@ fn bounce_scale(progress: MorphProgress, direction: MorphDirection) -> f32 {
 
 /// Duration of one hover-morph leg. The expand leg gets the full animation
 /// duration — room for the spring to play out — while the collapse leg runs
-/// shorter: a quick, confident return that still reads smooth. Shared by the
+/// shorter at 4/5: still a confident close, but long enough that the
+/// undershoot tail (the settle-bounce) has time to read. Shared by the
 /// completion check in `tick` and the progress curve, so a leg always
 /// settles exactly when its animation is done. The settle-bounce is not
 /// appended: it rides the spring's own overshoot/undershoot (see
@@ -2777,7 +2780,7 @@ fn bounce_scale(progress: MorphProgress, direction: MorphDirection) -> f32 {
 fn morph_duration(config: &Config, direction: MorphDirection) -> Duration {
     match direction {
         MorphDirection::Expand => animation_duration(config),
-        MorphDirection::Collapse => Duration::from_millis((animation_duration(config).as_millis() * 3 / 5) as u64),
+        MorphDirection::Collapse => Duration::from_millis((animation_duration(config).as_millis() * 4 / 5) as u64),
     }
 }
 
@@ -6051,11 +6054,11 @@ fn animation_duration(config: &Config) -> Duration {
     Duration::from_millis(config.overlay.animation_ms.clamp(100, 1000))
 }
 
-/// The exit leg's duration: shorter than the entrance — a quick, confident
-/// close (the same 3/5 ratio the hover collapse uses) that still has room
-/// for the release spring to run out.
+/// The exit leg's duration: shorter than the entrance — a confident close
+/// (the same 4/5 ratio the hover collapse uses) that still gives the release
+/// spring's undershoot tail room to play out.
 fn collapse_duration(config: &Config) -> Duration {
-    Duration::from_millis((animation_duration(config).as_millis() * 3 / 5) as u64)
+    Duration::from_millis((animation_duration(config).as_millis() * 4 / 5) as u64)
 }
 
 /// Quintic ease-out: a fast start with a long, soft settle. Used for opacity
@@ -6171,11 +6174,14 @@ const ENTRANCE_GROW: Spring = Spring {
 };
 
 /// The collapse spring, shared by the hover return and the exit shrink: the
-/// expand spring's shape family mirrored (see `spring_collapse`), with ζ=0.9
-/// keeping the return from visibly bouncing — its ~0.2 % undershoot lands on
-/// the compact floor invisibly.
+/// expand spring's shape family mirrored (see `spring_collapse`), with ζ=0.6
+/// undershooting below compact by ~9.5 % of the remaining distance. The
+/// undershoot spreads over the tail of the leg — `bounce_scale` renders it
+/// as the whole-pill settle-bounce, and `morph_size` clamps it out of the
+/// geometry — so the return lands with a slow, pronounced bounce instead of
+/// a dead stop.
 const COLLAPSE_SPRING: Spring = Spring {
-    zeta: 0.9,
+    zeta: 0.6,
     omega: 2.8 * std::f32::consts::PI,
 };
 
@@ -8561,29 +8567,39 @@ mod tests {
     fn lagged_collapse_release_trails_the_leader() {
         // The release case (leave after the expansion pinned, and the exit
         // shrink): from rest the follower holds at expanded during the lag,
-        // then lingers above the width all the way down — the height
-        // visibly stays behind the collapsing width — and pins at compact.
-        let mut last_leader = 2.0;
-        let mut last_follower = 2.0;
+        // then lingers above the width while both descend to compact — the
+        // height visibly stays behind the collapsing width. Once the leader
+        // enters the undershoot below compact, the delayed follower trails
+        // deeper into the dip and recovers later, so the trailing assertion
+        // applies only to the descent; both stay within the pinned trough
+        // and pin at compact.
+        let mut min_leader = f32::INFINITY;
+        let mut min_follower = f32::INFINITY;
+        let mut descending = true;
         for i in 0..=200 {
             let t = i as f32 / 200.0;
             let leader = spring_collapse(t, 1.0, 0.0);
             let follower = lagged_collapse(t, MORPH_LAG, 1.0, 0.0);
-            assert!(
-                follower >= leader - 5e-3,
-                "the follower must trail (stay above) the leader at t={t}: {follower} < {leader}"
-            );
-            assert!(
-                follower <= last_follower + 5e-3,
-                "the follower must not grow at t={t}: {follower} > {last_follower}"
-            );
-            assert!(
-                leader <= last_leader + 5e-3,
-                "the leader must not grow at t={t}: {leader} > {last_leader}"
-            );
-            last_leader = leader;
-            last_follower = follower;
+            if leader < 0.0 {
+                descending = false;
+            }
+            if descending {
+                assert!(
+                    follower >= leader - 5e-3,
+                    "the follower must trail (stay above) the leader at t={t}: {follower} < {leader}"
+                );
+            }
+            min_leader = min_leader.min(leader);
+            min_follower = min_follower.min(follower);
         }
+        assert!(
+            (min_leader - COLLAPSE_TROUGH).abs() < 1e-3,
+            "the leader must dip to the pinned trough, got {min_leader}"
+        );
+        assert!(
+            (min_follower - COLLAPSE_TROUGH).abs() < 1e-3,
+            "the follower must dip to the same trough, got {min_follower}"
+        );
         assert_eq!(lagged_collapse(1.0, MORPH_LAG, 1.0, 0.0), 0.0);
     }
 
@@ -9015,21 +9031,44 @@ mod tests {
     }
 
     #[test]
-    fn spring_collapse_release_from_expanded_settles_without_a_visible_bounce() {
+    fn spring_collapse_release_from_expanded_undershoots_once_then_pins_compact() {
         // The release case (cursor leaves the pinned-expanded pill, and the
         // exit shrink): from rest the mirrored spring returns to compact,
-        // dipping at most a hair below it (ζ=0.9's ~0.2 % step undershoot,
-        // which `morph_size`'s floor hides) and pinning exactly at 0 at the
-        // leg end.
-        let mut last = f32::INFINITY;
-        for i in 0..=100 {
-            let t = i as f32 / 100.0;
+        // undershooting below it to the pinned `COLLAPSE_TROUGH` (ζ=0.6's
+        // ~9.5 % step undershoot — the tail that drives the slow
+        // settle-bounce), then recovering to pin exactly at 0 at the leg
+        // end. The recovery may overshoot a hair above compact (the raw
+        // spring's second oscillation, ~0.9 %), which `morph_size`'s clamp
+        // keeps out of the geometry and `bounce_scale` ignores.
+        let mut min = f32::INFINITY;
+        let mut min_i = 0usize;
+        for i in 0..=200 {
+            let t = i as f32 / 200.0;
             let p = spring_collapse(t, 1.0, 0.0);
-            assert!(p <= last + 5e-3, "release must not grow at t={t}: {p} > {last}");
-            assert!(p >= -5e-3, "release must not visibly undershoot compact: {p}");
-            last = p;
+            if p < min {
+                min = p;
+                min_i = i;
+            }
         }
-        assert_eq!(last, 0.0, "release must pin exactly at compact");
+        assert!(
+            (min - COLLAPSE_TROUGH).abs() < 1e-3,
+            "release must dip to the pinned trough, got {min}"
+        );
+        let mut max_after = f32::NEG_INFINITY;
+        for i in min_i..=200 {
+            let t = i as f32 / 200.0;
+            max_after = max_after.max(spring_collapse(t, 1.0, 0.0));
+        }
+        assert!(
+            max_after <= 0.01,
+            "the recovery must overshoot compact only by a hair, got {max_after}"
+        );
+        assert_eq!(
+            spring_collapse(1.0, 1.0, 0.0),
+            0.0,
+            "release must pin exactly at compact"
+        );
+        assert_eq!(spring_collapse(2.0, 1.0, 0.0), 0.0, "past the leg stays pinned");
     }
 
     #[test]
@@ -9621,7 +9660,7 @@ mod tests {
     }
 
     #[test]
-    fn collapse_leg_is_shorter_and_monotonic_back_to_compact() {
+    fn collapse_leg_is_shorter_and_settles_with_a_controlled_undershoot() {
         let config = Config::default();
         let expand = morph_duration(&config, MorphDirection::Expand);
         let collapse = morph_duration(&config, MorphDirection::Collapse);
@@ -9630,15 +9669,19 @@ mod tests {
             "collapse must be faster than expand: {collapse:?} vs {expand:?}"
         );
         // Sampled over its whole leg, the collapse runs back to compact on
-        // both axes: never growing, dipping at most a hair below it (ζ=0.9's
-        // ~0.2 % step undershoot, which `morph_size`'s floor hides), and
-        // pinning exactly at compact at the leg end. The height axis holds
-        // at `from` through the lag before it starts moving.
+        // both axes: never rising above the progress it reversed from,
+        // dipping once below compact to the pinned trough (ζ=0.6's
+        // undershoot, scaled by the remaining distance `from` — the tail the
+        // settle-bounce renders), and pinning exactly at compact at the leg
+        // end. After its own trough each axis recovers, overshooting a hair
+        // above compact at most (the raw spring's second oscillation), which
+        // the geometry clamp hides. The height axis holds at `from` through
+        // the lag before it starts moving.
         let from = 0.6;
-        let mut last_width = from;
-        let mut last_height = from;
-        for i in 0..=100 {
-            let elapsed = Duration::from_millis((collapse.as_millis() as u64 * i / 100).max(1));
+        let expected_trough = COLLAPSE_TROUGH * from;
+        let mut samples = Vec::with_capacity(201);
+        for i in 0..=200 {
+            let elapsed = Duration::from_millis((collapse.as_millis() as u64 * i / 200).max(1));
             let morph = HoverExpand {
                 start: Instant::now() - elapsed,
                 direction: MorphDirection::Collapse,
@@ -9648,40 +9691,61 @@ mod tests {
             };
             let progress = hover_progress(&morph, &config);
             assert!(
-                progress.width <= last_width + 5e-3,
-                "collapse must not grow: width {0} after {last_width} at step {i}",
+                progress.width <= from + 1e-3,
+                "collapse must not rise above its start: width {0} at step {i}",
                 progress.width
             );
             assert!(
-                progress.height <= last_height + 5e-3,
-                "collapse must not grow: height {0} after {last_height} at step {i}",
+                progress.height <= from + 1e-3,
+                "collapse must not rise above its start: height {0} at step {i}",
                 progress.height
             );
-            assert!(
-                progress.width >= -5e-3,
-                "collapse must not visibly undershoot compact: width {0} at step {i}",
-                progress.width
-            );
-            assert!(
-                progress.height >= -5e-3,
-                "collapse must not visibly undershoot compact: height {0} at step {i}",
-                progress.height
-            );
-            last_width = progress.width;
-            last_height = progress.height;
+            samples.push((progress.width, progress.height));
         }
-        assert!(last_width.abs() < 1e-3, "collapse must reach compact, got {last_width}");
+        let min_width = samples.iter().map(|(w, _)| *w).fold(f32::INFINITY, f32::min);
+        let min_height = samples.iter().map(|(_, h)| *h).fold(f32::INFINITY, f32::min);
         assert!(
-            last_height.abs() < 1e-3,
-            "collapse must reach compact, got {last_height}"
+            (min_width - expected_trough).abs() < 1e-3,
+            "collapse must dip to the pinned trough, got {min_width}"
         );
+        assert!(
+            (min_height - expected_trough).abs() < 1e-3,
+            "the lagged height must dip to the same trough, got {min_height}"
+        );
+        let min_w_i = samples.iter().position(|(w, _)| *w == min_width).unwrap();
+        let min_h_i = samples.iter().position(|(_, h)| *h == min_height).unwrap();
+        // After its own trough each axis recovers; the recovery may
+        // overshoot compact by only a hair.
+        let max_width = samples[min_w_i..]
+            .iter()
+            .map(|(w, _)| *w)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let max_height = samples[min_h_i..]
+            .iter()
+            .map(|(_, h)| *h)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            max_width <= 0.01 && max_height <= 0.01,
+            "the recovery must overshoot compact only by a hair: {max_width} / {max_height}"
+        );
+        let done = HoverExpand {
+            start: Instant::now() - collapse,
+            direction: MorphDirection::Collapse,
+            from,
+            velocity: 0.0,
+            done: false,
+        };
+        let progress = hover_progress(&done, &config);
+        assert_eq!(progress.width, 0.0, "collapse must reach compact");
+        assert_eq!(progress.height, 0.0, "collapse must reach compact");
     }
 
     #[test]
     fn expand_leg_is_more_expressive_than_collapse() {
         // The asymmetry that makes expansion feel like a reveal and collapse
         // like a close: expand springs (overshoots its endpoint), collapse
-        // stays monotonic; and the collapse leg itself is shorter.
+        // undershoots compact only in its tail (the settle-bounce); and the
+        // collapse leg itself is shorter.
         let config = Config::default();
         assert!(morph_duration(&config, MorphDirection::Collapse) < morph_duration(&config, MorphDirection::Expand));
         // Mid-flight, the expand spring travels past its endpoint...
@@ -9709,7 +9773,8 @@ mod tests {
             "the height axis must trail the width axis, got {expand_progress:?}"
         );
         // ...while the collapse at its own midpoint has only closed toward
-        // compact, never exceeding its start.
+        // compact, dipping into the undershoot band (the settle-bounce) but
+        // never past the pinned trough.
         let collapse_mid = HoverExpand {
             start: Instant::now()
                 - Duration::from_millis(morph_duration(&config, MorphDirection::Collapse).as_millis() as u64 / 2),
@@ -9720,8 +9785,8 @@ mod tests {
         };
         let collapse_progress = hover_progress(&collapse_mid, &config);
         assert!(
-            collapse_progress.width > 0.0 && collapse_progress.width < 0.75,
-            "collapse must be strictly inside its return path, got {}",
+            collapse_progress.width >= COLLAPSE_TROUGH * 0.75 - 1e-3 && collapse_progress.width < 0.75,
+            "collapse must be inside its return path, got {}",
             collapse_progress.width
         );
     }

@@ -228,12 +228,15 @@ hover morph — runs the same damped-oscillator model. A `Spring` is a damped
 harmonic oscillator (damping ratio ζ, angular frequency ω) whose closed-form
 response is evaluated at normalized leg time. `value_at` pins the endpoint:
 at or past the leg end the curve is exactly 1.0, so the resting pill always
-renders at the exact compact/expanded size, never a hair short. The renderers
-clamp the curve into the endpoint interval, so the expand spring's ~5 %
-overshoot (ζ = 0.7, 2.8π) never reaches the hover morph's geometry — a dip
-below compact would visibly shrink the card mid-leg — while the entrance
-bounce and the settle-bounce scale the rendered pill as a whole (`BOUNCE_OVER`
-past the endpoint, with a matching under-bounce on compaction).
+renders at the exact compact/expanded size, never a hair short. The renderers clamp the curve into the endpoint interval, so the expand
+spring's ~5 % overshoot (ζ = 0.7, 2.8π) never reaches the hover morph's
+geometry, while the entrance bounce and the settle-bounce scale the rendered
+pill as a whole (`BOUNCE_OVER` past the endpoint, and on compaction the whole
+pill dips to (1 − `BOUNCE_UNDER`) of its final size). The collapse spring
+(ζ = 0.6) undershoots below compact by ~9.5 % of the remaining distance, and
+because that undershoot spreads over the tail of a leg running 4/5 of the
+entrance duration, the compaction bounce reads as a slow, pronounced settle
+rather than a fast blip.
 
 The width axis leads and the height axis chases it with `MORPH_LAG` (0.12 of
 the leg): the follower evaluates the leader's curve at a delayed, compressed
