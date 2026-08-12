@@ -125,7 +125,39 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
                     *guard = (hwnd.0 as usize, overlay.0 as usize);
                 }
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                debug!("position adjustor opened");
+                // Start the sample where the pill currently lives, so the user
+                // drags from the right spot; fall back to the default top-center
+                // placement (the same target the Settings Reset applies to the
+                // pill) when the overlay has no on-screen window. The sample is
+                // placed on the overlay's target monitor and clamped into its
+                // work area, so it can never launch off-monitor.
+                let scale = GetDpiForWindow(overlay).max(96) as f32 / 96.0;
+                let work = monitor_work_area(overlay);
+                let pw = (WIDTH as f32 * scale).round() as i32;
+                let ph = (HEIGHT as f32 * scale).round() as i32;
+                let mut pill_rect = RECT::default();
+                let (x, y) = if GetWindowRect(overlay, &mut pill_rect).is_ok()
+                    && pill_rect.left != pill_rect.right
+                    && pill_rect.top != pill_rect.bottom
+                {
+                    (
+                        pill_rect.left.clamp(work.left, (work.right - pw).max(work.left)),
+                        pill_rect.top.clamp(work.top, (work.bottom - ph).max(work.top)),
+                    )
+                } else {
+                    let margin = (DEFAULT_MARGIN * scale).round() as i32;
+                    (work.left + (work.right - work.left - pw) / 2, work.top + margin)
+                };
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+                debug!("position adjustor opened at ({x}, {y})");
                 true
             }
             Err(_) => {
