@@ -300,7 +300,10 @@ pub(super) fn placement(work: RECT, width: i32, height: i32, position: &OverlayP
     // window) must be centered/anchored. Subtract the inset so the pill lands
     // where the user expects it.
     let x = if let Some(px) = position.x {
-        (px as f32 * scale).round() as i32
+        // Absolute overrides are pill-body coordinates (96-DPI logical), so the
+        // window body lands at the dragged corner exactly like the anchor arms:
+        // subtract the aura inset so body.left (not window.left) sits at `px`.
+        (px as f32 * scale).round() as i32 - inset
     } else {
         match position.horizontal {
             HorizontalPosition::Left => work.left + margin - inset,
@@ -309,7 +312,7 @@ pub(super) fn placement(work: RECT, width: i32, height: i32, position: &OverlayP
         }
     };
     let y = if let Some(py) = position.y {
-        (py as f32 * scale).round() as i32
+        (py as f32 * scale).round() as i32 - inset
     } else {
         match position.vertical {
             // The DIB extends `inset` beyond the pill on each side; shift the

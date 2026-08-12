@@ -6924,6 +6924,41 @@ mod tests {
     }
 
     #[test]
+    fn placement_custom_overrides_land_the_pill_body_at_the_coordinate() {
+        // Custom `position_x`/`position_y` are pill-body coordinates: the aura
+        // inset is subtracted so the body (not the window) top-left lands at the
+        // configured spot, exactly like the anchor arms.
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let custom = OverlayPos {
+            x: Some(200),
+            y: Some(300),
+            ..anchor_pos(None, None)
+        };
+        // inset 10 at 1.0 scale: the window sits `inset` above/left of the body.
+        let point = placement(work, 400, 100, &custom, 10, 1.0);
+        assert_eq!(
+            point,
+            POINT { x: 190, y: 290 },
+            "the window top-left is the body coordinate minus the aura inset"
+        );
+        // At a non-1.0 scale the override scales first, then the inset subtracts.
+        let point = placement(work, 400, 100, &custom, 15, 1.5);
+        assert_eq!(
+            point,
+            POINT {
+                x: (200f32 * 1.5).round() as i32 - 15,
+                y: (300f32 * 1.5).round() as i32 - 15
+            },
+            "scale applies to the override, then the inset is subtracted"
+        );
+    }
+
+    #[test]
     fn placement_with_no_work_area_inset_uses_the_full_monitor() {
         // Fullscreen or no taskbar: Windows reports rcWork == rcMonitor, so the
         // pill sits at the configured margin from the physical monitor edges —
