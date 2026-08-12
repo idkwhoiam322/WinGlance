@@ -828,8 +828,12 @@ nested_appearance = [1, 2, 3]
 
     #[test]
     fn hover_toggles_default_on_and_round_trip_through_toml() {
-        // Both default to true: compact pills expand on hover and expanded
-        // pills dismiss on hover, matching the previous default behavior.
+        // Both default to true. This is a deliberate model change from the
+        // old single compact_hover_action: compact pills now expand on the
+        // first hover and dismiss on the second, and hovering an expanded
+        // pill arms a 500 ms dismiss — the previous model deferred an
+        // expanded pill's countdown while the cursor stayed on it, and had
+        // no equivalent of dismiss-on-hover at all.
         let defaults = Config::default();
         assert!(defaults.overlay.dismiss_on_hover);
         assert!(defaults.overlay.expand_compact_on_hover);

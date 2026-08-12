@@ -23,8 +23,11 @@ interrupts and never needs interaction.
 - **Completely passive** — `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`: no focus
   steal, no Alt-Tab entry, no click capture. Clicks pass straight through to
   your game.
-- **Dismissal** — hover over the pill (or queue a newer notification) and it
-  collapses within 500 ms instead of waiting out its full duration.
+- **Hover interaction** — hover a compact pill and it expands in place so
+  you can read it (a second hover dismisses it); hover an expanded pill and
+  it dismisses within 500 ms instead of waiting out its full duration.
+  Queueing a newer notification caps the current pill at 500 ms the same
+  way. Both behaviors are tunable in the Settings pane.
 - **Marquee titles** — long titles scroll only when they actually overflow
   the visible band, then stop when shown.
 - **Placement** — anchor to any of six screen edges with a configurable
