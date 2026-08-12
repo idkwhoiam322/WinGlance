@@ -3039,6 +3039,16 @@ fn morph_art_tile(config: &Config, inset: i32, pill_h: i32, scale: f32, shape: f
     (inset + padding, inset + (pill_h - size) / 2, size)
 }
 
+/// The art tile's edge gate during a morph: full opacity while the tile fits
+/// inside the current body, fading proportionally to the cut only when the
+/// body edge passes through it. The tile grows with the body, so in practice
+/// the gate never bites — unlike `row_unveil_alpha`, it is not normalized
+/// against the rest height, because the tile must not fade while it simply
+/// waits for the body to finish growing.
+fn art_edge_gate(body_bottom: i32, art_y: i32, art_size: i32) -> f32 {
+    ((body_bottom - art_y) as f32 / art_size as f32).clamp(0.0, 1.0)
+}
+
 /// The morph title band: the compact band (right of the small art,
 /// vertically centered in the compact row) travels to the expanded title row
 /// (right of the big art, top-packed and narrowed for the symbol slot),
@@ -3077,8 +3087,10 @@ fn morph_title_band(config: &Config, inset: i32, width: i32, scale: f32, progres
 
 /// The morph playback symbol: the compact trailing-chain position (right of
 /// the app icon, vertically centered in the compact row) travels to the
-/// expanded title row's right slot. Both layouts draw the same symbol size,
-/// so only the position travels.
+/// expanded title row's right slot — the same right edge the steady
+/// expanded symbol uses (`title_rect.right`; the `label_w` narrowing applies
+/// to the title text, not the symbol). Both layouts draw the same symbol
+/// size, so only the position travels.
 fn morph_symbol_pos(config: &Config, inset: i32, width: i32, scale: f32, progress: MorphProgress) -> (i32, i32, f32) {
     let appearance = &config.appearance;
     let padding = (appearance.padding * scale).round() as i32;
@@ -3091,8 +3103,7 @@ fn morph_symbol_pos(config: &Config, inset: i32, width: i32, scale: f32, progres
     let symbol_gap = (16.0 * scale).round() as i32;
     let compact_right = viewport_right + gap + icon + symbol_gap + symbol;
     let compact_y = inset + (compact_h - symbol) / 2;
-    let label_w = symbol + (16.0 * scale).round() as i32;
-    let expanded_right = width - inset - padding - label_w;
+    let expanded_right = width - inset - padding;
     let expanded_y = inset + padding;
     (
         lerp_edge(compact_right, expanded_right, progress.width),
@@ -3318,7 +3329,6 @@ fn render_layered(
         compact,
         morph,
         body_bottom,
-        rest_body_bottom,
     )?;
     draw_text_pixels(
         state,
@@ -3658,7 +3668,6 @@ fn draw_pixels(
     compact: bool,
     morph: Option<MorphProgress>,
     body_bottom: i32,
-    rest_body_bottom: i32,
 ) -> Result<()> {
     // One radius per frame. A morph lerps the radius continuously between
     // the compact and the expanded radius (see `morph_radius`), so the
@@ -3766,8 +3775,9 @@ fn draw_pixels(
     // expanded pills draw the art tile at the configured art size. During a
     // morph the two tiles merge into one interpolated tile (`morph_art_tile`):
     // the side length lerps between the compact and expanded sizes while the
-    // tile stays centered in the growing body, gated by the body edge like
-    // the rows — the art grows in place instead of two tiles swapping.
+    // tile stays centered in the growing body — the art grows in place
+    // instead of two tiles swapping, and only the defensive edge gate
+    // (`art_edge_gate`) can dim it.
     if !compact {
         let padding = (state.config.appearance.padding * scale).round() as usize;
         let art_size = (state.config.appearance.art_size as f32 * scale).round() as usize;
@@ -3775,7 +3785,11 @@ fn draw_pixels(
             (MediaEvent::TrackChanged(_), Some(progress)) => {
                 let shape = progress.width.min(progress.height);
                 let (_, art_y, art_size) = morph_art_tile(&state.config, inset as i32, pill_h as i32, scale, shape);
-                let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, art_y + art_size);
+                // The tile grows with the body and stays inside it, so it
+                // renders at full opacity for the whole leg; the gate only
+                // fades it in the extreme case where the shrinking body edge
+                // would cut through it.
+                let unveil = art_edge_gate(body_bottom, art_y, art_size);
                 (art_size as usize, art_y as usize, unveil)
             }
             (MediaEvent::TrackChanged(_), None) => (art_size, inset + pill_h.saturating_sub(art_size) / 2, 1.0),
@@ -3788,7 +3802,7 @@ fn draw_pixels(
                 let (_, _, morph_size) = morph_art_tile(&state.config, inset as i32, pill_h as i32, scale, shape);
                 let art_size = morph_size.min(pill_h as i32 - 2 * padding as i32);
                 let art_y = inset as i32 + (pill_h as i32 - art_size) / 2;
-                let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, art_y + art_size);
+                let unveil = art_edge_gate(body_bottom, art_y, art_size);
                 (art_size as usize, art_y as usize, unveil)
             }
             (MediaEvent::PlaybackStateChanged(_, _), None) => {
@@ -9165,13 +9179,31 @@ mod tests {
                 height: 1.0,
             },
         );
-        assert_eq!(
-            at1.0,
-            width - inset - padding - symbol - (16.0 * scale).round() as i32,
-            "shape-1 right"
-        );
+        assert_eq!(at1.0, width - inset - padding, "shape-1 right");
         assert_eq!(at1.1, inset + padding, "shape-1 y");
         assert_eq!(at1.2, symbol as f32, "shape-1 size");
+    }
+
+    #[test]
+    fn art_edge_gate_stays_full_while_the_tile_fits_and_fades_with_the_cut() {
+        // The morph art must render at full opacity the moment it fits the
+        // current body (no fade while the body finishes growing), and fade
+        // only proportionally to the edge cutting through it.
+        let art_y = 20;
+        let art_size = 40;
+        assert_eq!(art_edge_gate(art_y + art_size, art_y, art_size), 1.0, "fits exactly");
+        assert_eq!(
+            art_edge_gate(art_y + art_size + 50, art_y, art_size),
+            1.0,
+            "fits with room"
+        );
+        assert_eq!(art_edge_gate(art_y + art_size / 2, art_y, art_size), 0.5, "half cut");
+        assert_eq!(art_edge_gate(art_y, art_y, art_size), 0.0, "edge at the tile top");
+        assert_eq!(
+            art_edge_gate(art_y - 10, art_y, art_size),
+            0.0,
+            "tile fully below the edge"
+        );
     }
 
     #[test]
@@ -9217,7 +9249,9 @@ mod tests {
     #[test]
     fn morph_art_stays_inside_the_body_across_the_leg() {
         // Sampled over the real expand leg, the interpolated tile must fit
-        // inside the growing body, so the edge gate never clips it mid-morph.
+        // inside the growing body, so the edge gate never clips it mid-morph
+        // — the artwork renders at full opacity for the whole leg, with no
+        // fade while the body finishes growing.
         let config = Config::default();
         let content = MediaEvent::TrackChanged(TrackInfo {
             source_app: "youtube-music".into(),
@@ -9234,6 +9268,11 @@ mod tests {
             let (_, y, size) = morph_art_tile(&config, 0, pill_h, 1.0, shape);
             assert!(size <= pill_h, "art must fit the body at t={t}: {size} > {pill_h}");
             assert!(y + size <= pill_h, "art must stay inside the body at t={t}");
+            assert_eq!(
+                art_edge_gate(pill_h, y, size),
+                1.0,
+                "the edge gate must not fade the art at t={t}"
+            );
         }
     }
 
