@@ -2175,10 +2175,13 @@ impl MainWindowState {
                         ),
                         SettingId::AutoCompactApps => (
                             "Auto-compact apps",
+                            // Fullscreen apps always compact under Auto (see
+                            // `decide_layout`), so the coverage leads the
+                            // value regardless of the selected apps.
                             if auto_compact_sources.is_empty() {
-                                "Only fullscreen".to_string()
+                                "Full screen apps".to_string()
                             } else {
-                                auto_compact_sources.clone()
+                                format!("Full screen apps, {auto_compact_sources}")
                             },
                             SETTINGS_MUTED,
                         ),

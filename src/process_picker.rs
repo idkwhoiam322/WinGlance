@@ -26,11 +26,12 @@ use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindow
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GetClientRect, GetParent,
     GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, LB_ADDSTRING,
-    LB_GETCOUNT, LB_GETITEMDATA, LB_GETTOPINDEX, LB_SETCURSEL, LB_SETITEMDATA, LB_SETITEMHEIGHT, LBS_HASSTRINGS,
-    LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, PostMessageW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE,
-    WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT,
-    WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT, LB_GETTOPINDEX, LB_SETCURSEL, LB_SETITEMDATA, LB_SETITEMHEIGHT,
+    LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, PostMessageW, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -314,14 +315,15 @@ fn build_picker_list(current: &[String], mut entries: Vec<ProcessEntry>) -> Vec<
     not_running
 }
 
-/// The Auto-compact picker's row list: the "Full screen only" mode row is
-/// always the first entry — fullscreen apps compact regardless of the app
-/// list (see `decide_layout`), so the mode stays visible even after apps are
-/// selected. Its empty pattern never matches, and `read_checked` skips it.
+/// The Auto-compact picker's row list: the pinned "Full screen apps" status
+/// row is always the first entry — fullscreen apps compact regardless of the
+/// app list (see `decide_layout`), so the coverage stays visible even after
+/// apps are selected. Its empty pattern never matches, it is always checked
+/// and clicks never toggle it, and `read_checked` skips it.
 fn build_auto_compact_list(current: &[String], entries: Vec<ProcessEntry>) -> Vec<ProcessEntry> {
     let mut list = Vec::with_capacity(entries.len() + 1);
     list.push(ProcessEntry {
-        display_name: "Full screen only".into(),
+        display_name: "Full screen apps".into(),
         pattern: String::new(),
     });
     list.extend(build_picker_list(current, entries));
@@ -471,9 +473,9 @@ pub(crate) fn open(
         // Pre-check with the same normalization the SMTC worker applies to
         // allow-list patterns, so a stored "youtube music" matches the
         // session-derived "youtube-music" entry. The Auto-compact picker's
-        // "Full screen only" mode row is checked while the app list is empty
-        // (the default); the app rows' pre-check must not mark it via the
-        // empty-pattern contains rule.
+        // "Full screen apps" status row is always checked — fullscreen
+        // coverage is unconditional — and the app rows' pre-check must not
+        // mark it via the empty-pattern contains rule.
         let norm_current: Vec<String> = current
             .iter()
             .map(|p| normalize_pattern(p))
@@ -484,7 +486,7 @@ pub(crate) fn open(
             .enumerate()
             .map(|(i, e)| {
                 if auto_picker && i == 0 {
-                    current.is_empty()
+                    true
                 } else {
                     let ne = normalize_pattern(&e.pattern);
                     norm_current.iter().any(|n| ne.contains(n.as_str()) || n.contains(&ne))
@@ -798,38 +800,27 @@ unsafe extern "system" fn listbox_proc(
                     } else {
                         BST_CHECKED
                     };
-                    let _ = unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
-                    // The Auto-compact picker's first row is the "Full screen
-                    // only" mode row, mutually exclusive with the app rows:
-                    // checking it clears the apps, checking an app clears it,
-                    // and unchecking the last app returns to fullscreen-only.
-                    let fullscreen_row = state.list.first().is_some_and(|e| e.pattern.is_empty()) && i == 0;
-                    if fullscreen_row && toggled == BST_CHECKED {
-                        for j in 1..state.list.len() {
-                            let _ =
-                                unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(j), LPARAM(BST_UNCHECKED as isize)) };
-                        }
-                    } else if !fullscreen_row && state.list.first().is_some_and(|e| e.pattern.is_empty()) {
-                        if toggled == BST_CHECKED {
-                            let _ =
-                                unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(0), LPARAM(BST_UNCHECKED as isize)) };
-                        } else {
-                            let any_app = (1..state.list.len()).any(|j| {
-                                let d = unsafe { SendMessageW(lb, LB_GETITEMDATA, WPARAM(j), LPARAM(0)) }.0 as usize;
-                                d == BST_CHECKED
-                            });
-                            if !any_app {
-                                let _ = unsafe {
-                                    SendMessageW(lb, LB_SETITEMDATA, WPARAM(0), LPARAM(BST_CHECKED as isize))
-                                };
-                            }
-                        }
-                    }
                     let _ = unsafe { SendMessageW(lb, LB_SETCURSEL, WPARAM(i), LPARAM(0)) };
-                    // Sibling rows' checkboxes can change too; repaint the
-                    // whole list instead of just the clicked row.
+                    // The Auto-compact picker's first row is the pinned
+                    // "Full screen apps" status row: fullscreen coverage is
+                    // unconditional, so its check is fixed — clicks select
+                    // the row but never toggle it.
+                    let pinned_row = state.list.first().is_some_and(|e| e.pattern.is_empty()) && i == 0;
+                    if pinned_row {
+                        return LRESULT(0);
+                    }
+                    let _ = unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
+                    let mut item_rect = RECT::default();
+                    let _ = unsafe {
+                        SendMessageW(
+                            lb,
+                            LB_GETITEMRECT,
+                            WPARAM(i),
+                            LPARAM(&mut item_rect as *mut RECT as isize),
+                        )
+                    };
                     unsafe {
-                        let _ = InvalidateRect(lb, None, false);
+                        let _ = InvalidateRect(lb, Some(&item_rect), false);
                     }
                     return LRESULT(0);
                 }
@@ -1048,8 +1039,17 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     );
                 }
 
-                // Entry text.
-                SetTextColor(draw.hDC, COLORREF(0x00F0F0F0));
+                // Entry text. The pinned "Full screen apps" status row (empty
+                // pattern) renders muted to read as a status line rather than
+                // a selectable app.
+                SetTextColor(
+                    draw.hDC,
+                    COLORREF(if entry.pattern.is_empty() {
+                        0x00C8C8C8
+                    } else {
+                        0x00F0F0F0
+                    }),
+                );
                 SetBkMode(draw.hDC, TRANSPARENT);
                 let mut name = wide(&entry.display_name);
                 DrawTextW(
@@ -1219,19 +1219,19 @@ mod tests {
     }
 
     #[test]
-    fn build_auto_compact_list_prepends_the_fullscreen_mode_row() {
-        // The Auto-compact picker always leads with the "Full screen only"
-        // mode row: fullscreen apps compact regardless of the app list, so
-        // the mode stays visible even after apps are selected. Its empty
-        // pattern never matches and `read_checked` skips it.
+    fn build_auto_compact_list_prepends_the_fullscreen_status_row() {
+        // The Auto-compact picker always leads with the pinned "Full screen
+        // apps" status row: fullscreen apps compact regardless of the app
+        // list, so the coverage stays visible even after apps are selected.
+        // Its empty pattern never matches and `read_checked` skips it.
         let list = build_auto_compact_list(&["spotify".to_string()], vec![entry("spotify"), entry("netflix")]);
         assert_eq!(list.len(), 3);
-        assert_eq!(list[0].display_name, "Full screen only");
-        assert!(list[0].pattern.is_empty(), "the mode row must never store a pattern");
-        // The app rows keep their usual (alphabetical) order below the mode.
+        assert_eq!(list[0].display_name, "Full screen apps");
+        assert!(list[0].pattern.is_empty(), "the status row must never store a pattern");
+        // The app rows keep their usual (alphabetical) order below the status.
         let apps: Vec<&str> = list[1..].iter().map(|e| e.pattern.as_str()).collect();
         assert_eq!(apps, ["netflix", "spotify"]);
-        // An empty app list still gets the mode row.
+        // An empty app list still gets the status row.
         let only = build_auto_compact_list(&[], vec![entry("youtube-music")]);
         assert_eq!(only.len(), 2);
         assert!(only[0].pattern.is_empty());
