@@ -5,20 +5,23 @@ overlay, Rust, raw Win32 + GDI).
 
 ## Build and verify
 
-The app runs in the system tray by default (`start_in_tray = true`), so
-starting it after a build is silent — no windows pop up. Use the packaging
-script as the default build path:
+The packaging script is the sanctioned build-and-verify command for this
+repo — you are allowed to run it, and one invocation covers the whole gate:
 
 ```powershell
 .\create_exe.ps1 -Release -Start
 ```
 
-This formats-check, checks all targets, builds the optimized `WinGlance.exe`,
-runs cargo-audit + cargo-deny, stops any running instance, and relaunches it
-into the tray. Use `-NoRestart` when you do not want it relaunched,
-`-SkipAudit` for a quick loop, `-NoThrottle`/`-Jobs N` to control parallelism.
+It formats-checks, checks all targets, clippy with `-D warnings`, runs
+`cargo test`, builds the optimized `WinGlance.exe`, runs cargo-audit +
+cargo-deny, stops any running instance, and relaunches it into the tray
+(silent — `start_in_tray = true`). Use `-NoRestart` when you do not want it
+relaunched, `-SkipAudit` for a quick loop, `-NoThrottle`/`-Jobs N` to control
+parallelism.
 
-Direct checks (run these before claiming verification):
+When the script exits successfully, label the checks it ran as **Verified**
+(its output records each step). Fall back to the raw commands only for
+targeted re-checks during a fix loop:
 
 ```powershell
 cargo fmt --all --check
@@ -29,10 +32,10 @@ cargo deny check
 ```
 
 Verification claims must be labeled: **Verified** (actually run),
-**Reasoned but not executed**, or **Unable to verify**. Never claim tests pass
-without running `cargo test`. GUI behavior (pill rendering, tray, positioner,
-hover tooltips) needs a live Windows desktop with media playing — cannot be
-verified headless.
+**Reasoned but not executed**, or **Unable to verify**. Never claim tests
+pass without running `cargo test` (the script runs it). GUI behavior (pill
+rendering, tray, positioner, hover tooltips) needs a live Windows desktop
+with media playing — cannot be verified headless.
 
 ## Runtime data
 
@@ -51,6 +54,10 @@ verified headless.
   that can appear on the user's screen (no `Start-Process`, no `.exe`
   launches, no GUI/screenshot tooling) — the user may be in a fullscreen
   game. This is a hard rule.
+- The single exception: running `.\create_exe.ps1 -Release -Start` as the
+  build-and-verify gate (see Build and verify) is explicitly allowed — its
+  relaunch into the tray is silent (`start_in_tray = true`) and shows no
+  window. No other launch path is permitted.
 - Verify through log files only: `log-Live.log` (+ `crash.log`) under
   `%APPDATA%\WinGlance\WinGlance\data\logs\`, and temporary files under
   `C:\Users\admin\AppData\Local\Temp\opencode\`. All diagnostic output goes
