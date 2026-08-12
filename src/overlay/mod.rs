@@ -1239,10 +1239,11 @@ impl OverlayState {
         // A refresh that lands during the collapse (e.g. artwork arriving as
         // the pill fades) would otherwise be cut short: the collapse keeps its
         // original start time and hides the pill when its animation finishes,
-        // ignoring the extended deadline. Bring it back to full visibility for
-        // the extended time instead.
+        // ignoring the extended deadline. Revive it with a fresh entrance so it
+        // grows back smoothly to full visibility for the extended time, instead
+        // of snapping to the full size on the next frame.
         if matches!(self.phase, Phase::Collapsing(_)) {
-            self.phase = Phase::Shown;
+            self.phase = Phase::Expanding(Instant::now());
         }
         self.render();
     }
@@ -2974,8 +2975,8 @@ mod tests {
         state.receive_events();
 
         assert!(
-            matches!(state.phase, Phase::Shown),
-            "the toggle must rescue the collapsing pill"
+            matches!(state.phase, Phase::Expanding(_)),
+            "the toggle must rescue the collapsing pill by resuming the entrance, not snapping to shown"
         );
     }
 
