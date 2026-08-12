@@ -1783,6 +1783,17 @@ impl MainWindowState {
         });
         y += row_h + gap;
         items.push(SettingsItem::Row {
+            id: SettingId::CompactPosition,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                // Same two-line layout as Position (value/Reset + anchors).
+                bottom: y + (70.0 * scale) as i32,
+            },
+        });
+        y += (70.0 * scale) as i32 + gap;
+        items.push(SettingsItem::Row {
             id: SettingId::DismissOnHover,
             rect: RECT {
                 left,
@@ -1802,17 +1813,6 @@ impl MainWindowState {
             },
         });
         y += row_h + gap;
-        items.push(SettingsItem::Row {
-            id: SettingId::CompactPosition,
-            rect: RECT {
-                left,
-                top: y,
-                right,
-                // Same two-line layout as Position (value/Reset + anchors).
-                bottom: y + (70.0 * scale) as i32,
-            },
-        });
-        y += (70.0 * scale) as i32 + gap;
         items.push(SettingsItem::Row {
             id: SettingId::AutoCompactApps,
             rect: RECT {
