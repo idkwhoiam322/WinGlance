@@ -1,3 +1,10 @@
+//! The pill overlay: state, tick, event handling, hover interaction and the
+//! window/timer glue. Rendering lives in `render`, morph springs and pill
+//! geometry in `morph`, and display enumeration and fullscreen detection in
+//! `fullscreen`; the `set_*` push functions and `create_window`/`show_sample`
+//! are the crate-facing entry points, re-exported at the bottom of this
+//! module's import block.
+
 use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, VerticalPosition};
 use crate::events::{
     MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo, artwork_same, media_event_into_owned,
@@ -79,10 +86,11 @@ const IDLE_BUFFER_TIMER_ID: usize = 3;
 const IDLE_BUFFER_RELEASE_MS: u32 = 30_000;
 const LIGHT_DURATION: Duration = Duration::from_millis(120);
 /// Remaining time left on the current pill when something newer wants the
-/// screen: a queued update (or hovering a compact pill) both cap the exit at
-/// this, so the user never waits out the full duration to see a change. An
-/// expanded pill held under the cursor is exempt — its dismissal is deferred
-/// while the hold lasts (see `held` in `tick`).
+/// screen: a queued update, or a hover that arms the dismiss-on-hover (a
+/// laid-out expanded pill, or the second hover over a compact pill), caps
+/// the exit at this, so the user never waits out the full duration to see
+/// a change. A morph-origin expanded pill held under the cursor is exempt —
+/// its dismissal is deferred while the hold lasts (see `held` in `tick`).
 const EARLY_EXIT_MS: u64 = 500;
 /// How long a cursor leave is ignored before it counts: boundary jitter
 /// must not reverse a fresh hover morph the moment it starts.
@@ -1672,8 +1680,8 @@ impl OverlayState {
         // always the one that renders it. Without this the hover leg's
         // progress was computed for sizing and then discarded: the render
         // got `frame.morph` (None during Shown), so the corner radius
-        // snapped to the expanded value and the two art tiles never
-        // cross-faded on the very first hover frame.
+        // snapped to the expanded value and the interpolated art tile never
+        // rendered at its morph position on the very first hover frame.
         let morph = if let Some(hover) = &self.hover_expand {
             debug_assert!(
                 frame.morph.is_none(),
@@ -4420,7 +4428,7 @@ mod tests {
 
     #[test]
     fn compact_icon_leaves_no_trace_at_the_morph_end() {
-        // The cross-fade model: the compact-mode icon (inline, after the
+        // The morph model: the compact-mode icon (inline, after the
         // title, next to the playback symbol) must dissolve with the compact
         // content and be completely gone by the time the morph reaches the
         // expanded state — the expanded layout's icon lives only in the app

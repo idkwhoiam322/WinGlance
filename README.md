@@ -94,7 +94,7 @@ loop), `-NoThrottle` / `-Jobs N` (parallelism). Direct checks:
   `render` (frame composition, text, vector primitives) and `fullscreen`
   (display enumeration and fullscreen detection): expand/light/collapse
   animation, palette + aura rendering, vector glyphs, marquee rows,
-  hover-dismiss.
+  hover expand/dismiss.
 - `src/palette.rs` / `src/icon.rs` — the color quantizer and the shell icon
   extraction.
 - `src/main_window.rs` — tracking window, tray icon/menu, history.

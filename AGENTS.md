@@ -67,7 +67,7 @@ with media playing — cannot be verified headless.
 
 ## Architecture guardrails
 
-- The pill (`src/overlay.rs`) is strictly passive: no click targets, no focus,
+- The pill (`src/overlay/`) is strictly passive: no click targets, no focus,
   no keyboard input.
 - SMTC worker thread ↔ UI thread split must be preserved: the worker only
   emits `MediaEvent`s over `mpsc`; the UI thread owns all Win32 windows.

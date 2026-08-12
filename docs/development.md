@@ -28,7 +28,7 @@ WinGlance/
     ├── events.rs           Shared event types + WM_APP message ids
     ├── logging.rs          Single-file logger (log-Live.log, current run)
     ├── smtc.rs             Isolated SMTC listener on its own COM thread
-    ├── overlay.rs          Win32 layered pill; GDI rendering, position math
+    ├── overlay/            Pill overlay: mod/morph/render/fullscreen (see below)
     ├── icon.rs             Source-app icon extraction (shell COM, worker thread)
     ├── palette.rs          Vibrant-color quantizer for the accent/aura
     ├── main_window.rs      Maximized tracking window + tray icon/menu
@@ -52,12 +52,16 @@ WinGlance/
   `MediaPropertiesChanged`, reads metadata and artwork bytes, extracts app
   icons, deduplicates (content diff, session-recreation, artwork-change
   time-gate, per-source churn cool-down), and sends events down the channel.
-- **overlay.rs** — passive pill: `UpdateLayeredWindow`, DPI-aware position,
-  the expand/light/collapse state machine, the palette aura, the per-track
-  fill tint, the directional edge highlight, vector playback
-  glyphs (play/pause/stop/music note), marquee rows, and hover-dismiss.
-  `set_positions`/`show_sample` are the only entry points other windows reach
-  into.
+- **overlay/** — the passive pill, split into `mod` (state, tick, events,
+  hover handling, window/timer glue), `morph` (springs, hover decisions,
+  pill geometry), `render` (frame composition, text rasterization, vector
+  primitives) and `fullscreen` (display enumeration, target resolution,
+  fullscreen detection). Rendering: `UpdateLayeredWindow`, DPI-aware
+  position, the expand/light/collapse state machine, the palette aura, the
+  per-track fill tint, the directional edge highlight, vector playback
+  glyphs (play/pause/stop/music note), marquee rows, and the hover
+  expand/dismiss interaction. The `set_*` push functions and `show_sample`
+  are the only entry points other windows reach into.
 - **icon.rs** — resolves a source app's icon from its AUMID through the shell
   (`SHCreateItemFromParsingName` + `IShellItemImageFactory`), cached per
   source. All shell calls run on one persistent bounded worker thread (16-job
