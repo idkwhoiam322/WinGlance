@@ -4972,10 +4972,11 @@ fn draw_compact_pill(
     );
     let metrics = compact_metrics(&state.config);
     let padding = (appearance.padding * scale).round() as i32;
-    // The compact layout's own height: the compact content keeps its compact
-    // position inside the window while a morph grows it (see the doc
-    // comment). Outside a morph the window is exactly this height anyway.
-    let pill_h = compact_size(&state.config).1 as i32;
+    // The compact body height, DPI-scaled like every element size below —
+    // centering against the logical height would sit the content high in
+    // the body at scaled DPI and disagree with the hover morph's shape-0
+    // frame (which centers in the scaled body), jumping at the boundary.
+    let pill_h = (compact_size(&state.config).1 * scale).round() as i32;
     let (title_vp_left, title_vp_right) = compact_title_viewport(&state.config);
 
     // Art tile: left-aligned like the expanded pill (inset + padding),
@@ -8307,6 +8308,48 @@ mod tests {
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 500, "expected text + art pixels, got {lit}");
+    }
+
+    #[test]
+    fn compact_content_is_centered_in_the_scaled_body() {
+        // Regression for the DPI-centering bug: draw_compact_pill centered
+        // its content against the LOGICAL compact height while every element
+        // was DPI-scaled, so at 150 % the content sat ~15 px high in the
+        // body, and the hover morph's shape-0 frame (centered in the scaled
+        // body) jumped at the morph boundary. The art tile's top edge must
+        // sit at (scaled_body_h - scaled_art)/2.
+        let config = Config::default();
+        let scale = 1.5;
+        let (compact_w, compact_h) = compact_size(&config);
+        let buf_w = (compact_w * scale).round() as usize;
+        let buf_h = (compact_h * scale).round() as usize;
+        let mut state = OverlayState::new(config.clone(), EventQueue::default());
+        let art_side = (compact_metrics(&config).art * scale).round() as usize;
+        // Solid opaque red artwork (RGBA), sized to the scaled tile.
+        let mut art = vec![255u8; art_side * art_side * 4];
+        for px in art.chunks_mut(4) {
+            px[1] = 0;
+            px[2] = 0;
+        }
+        state.decoded_art = Some(art);
+        let content = MediaEvent::TrackChanged(TrackInfo {
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        });
+        let mut pixels = vec![0u8; buf_w * buf_h * 4];
+        draw_compact_pill(&mut state, &mut pixels, &content, buf_w as i32, scale, 1.0);
+        let padding = (config.appearance.padding * scale).round() as usize;
+        let art_x = state.aura_inset as usize + padding;
+        // The tile's topmost opaque row within its horizontal extent (skip
+        // the corner-mask columns, which round the corners transparent).
+        let art_y =
+            (0..buf_h).find(|&y| (art_x + 2..art_x + art_side - 2).any(|x| pixels[(y * buf_w + x) * 4 + 3] > 0));
+        let expected = (buf_h - art_side) / 2;
+        assert_eq!(
+            art_y,
+            Some(expected),
+            "the art tile must be centered in the scaled body"
+        );
     }
 
     #[test]
