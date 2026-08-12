@@ -174,6 +174,26 @@ fn mix(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
     ]
 }
 
+/// The settings window's effective accent pair from the playing song's
+/// decoded artwork: the album palette's primary (brightened against the
+/// settings surface so accent text stays readable, like the pill guards its
+/// text) and secondary. When there is no artwork or the pixels yield no
+/// palette, both fall back to the configured accent — the default pink
+/// theme. `decoded_art` is the worker's premultiplied-BGRA decode, the same
+/// buffer the pill palettizes from.
+fn accent_from_art(decoded_art: Option<&[u8]>, fallback: [u8; 4]) -> ([u8; 4], [u8; 4]) {
+    let Some(palette) = decoded_art
+        .and_then(crate::overlay::pm_bgra_to_rgba)
+        .and_then(|rgba| crate::palette::palette_from_rgba(&rgba))
+    else {
+        return (fallback, fallback);
+    };
+    (
+        crate::overlay::ensure_contrast(palette.primary, SETTINGS_SURFACE, crate::overlay::TEXT_CONTRAST_AA),
+        palette.secondary,
+    )
+}
+
 /// FNV-1a 64 hash, used to detect artwork byte changes cheaply (compared to
 /// re-decoding the image to find out).
 fn fingerprint(data: &[u8]) -> u64 {
@@ -633,6 +653,17 @@ struct MainWindowState {
     history_selected_brush: HBRUSH,
     history_row_even_brush: HBRUSH,
     history_row_odd_brush: HBRUSH,
+    /// Effective accent: the playing song's album palette primary (guarded
+    /// against the settings surface so accent text stays readable), falling
+    /// back to the configured accent. Rebuilt when the artwork changes.
+    accent_color: [u8; 4],
+    /// Effective secondary accent: the album palette secondary, falling back
+    /// to the configured accent. Drives the dark highlight surfaces (sidebar
+    /// active pane, history selection).
+    accent_secondary: [u8; 4],
+    /// The decoded artwork the current accent was derived from. The palette
+    /// is recomputed only when this `Arc` changes.
+    accent_art_source: Option<Arc<[u8]>>,
     active_pane: Pane,
     /// Hovered settings row (row index, sub-control) for highlight.
     settings_hover: Option<(usize, SettingSub)>,
@@ -812,6 +843,9 @@ impl MainWindowState {
             history_selected_brush: HBRUSH::default(),
             history_row_even_brush: HBRUSH::default(),
             history_row_odd_brush: HBRUSH::default(),
+            accent_color: [0, 0, 0, 255],
+            accent_secondary: [0, 0, 0, 255],
+            accent_art_source: None,
             active_pane: Pane::Activity,
             settings_hover: None,
             tooltip_ctrl: HWND::default(),
@@ -885,45 +919,30 @@ impl MainWindowState {
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         self.listbox_font = Self::make_listbox_font(scale);
         self.gray_brush = unsafe { CreateSolidBrush(colorref(0x1E, 0x1E, 0x1E)) };
-        let accent = self.cfg().appearance.accent_color;
-        self.accent_brush = unsafe { CreateSolidBrush(colorref(accent[0], accent[1], accent[2])) };
         // Fixed-color brushes for the panes, created once instead of per paint
         // (a settings repaint previously created ~40 brushes).
         self.black_brush = unsafe { CreateSolidBrush(COLORREF(0)) };
         self.sidebar_bg_brush = unsafe { CreateSolidBrush(COLORREF(0x0A0A0A)) };
-        // The highlight surfaces (sidebar active pane, history selection) are
-        // dark tints of the configured accent — the whole default theme is
-        // accent-based, with no fixed blue/green tones.
-        let highlight = |weight: f32| -> HBRUSH {
-            let c = mix(accent, [0x0A, 0x0A, 0x0A, 0xFF], weight);
-            unsafe { CreateSolidBrush(colorref(c[0], c[1], c[2])) }
-        };
-        self.sidebar_highlight_brush = highlight(0.15);
         self.settings_border_brush =
             unsafe { CreateSolidBrush(colorref(SETTINGS_BORDER[0], SETTINGS_BORDER[1], SETTINGS_BORDER[2])) };
         self.settings_surface_brush =
             unsafe { CreateSolidBrush(colorref(SETTINGS_SURFACE[0], SETTINGS_SURFACE[1], SETTINGS_SURFACE[2])) };
         self.settings_hover_brush =
             unsafe { CreateSolidBrush(colorref(SETTINGS_HOVER[0], SETTINGS_HOVER[1], SETTINGS_HOVER[2])) };
-        // Accent-derived control brushes: every settings-paint fill is a fixed
-        // color per process (the accent cannot change at runtime), so the
-        // segment/button paints reuse these instead of creating ~20 transient
-        // brushes per repaint. `accent_brush` above supplies the accent border.
-        let soft = |weight: f32| -> HBRUSH {
-            let c = mix(accent, [0x1B, 0x1B, 0x1B, 0xFF], weight);
-            unsafe { CreateSolidBrush(colorref(c[0], c[1], c[2])) }
-        };
-        self.settings_accent_soft_brush = soft(0.28);
-        self.settings_near_brush = soft(0.55);
-        self.settings_adjust_hover_brush = soft(0.45);
         self.settings_small_fill_brush = unsafe { CreateSolidBrush(COLORREF(0x00121212)) };
-        self.settings_small_hover_brush = soft(0.35);
         // History-row brushes: a fixed four-color set, created once instead of
         // per owner-draw row (every scroll tick repaints every visible row).
         self.history_header_brush = unsafe { CreateSolidBrush(COLORREF(0x00141414)) };
-        self.history_selected_brush = highlight(0.20);
         self.history_row_even_brush = unsafe { CreateSolidBrush(COLORREF(0)) };
         self.history_row_odd_brush = unsafe { CreateSolidBrush(COLORREF(0x000E0E0E)) };
+        // The accent-derived brushes start from the configured accent (the
+        // default pink theme) and are rebuilt when the playing song's artwork
+        // changes (see `update_accent`). The highlight surfaces (sidebar
+        // active pane, history selection) are dark tints of the secondary
+        // accent — the whole theme is accent-based, with no fixed blue/green
+        // tones.
+        (self.accent_color, self.accent_secondary) = accent_from_art(None, self.cfg().appearance.accent_color);
+        self.rebuild_accent_brushes();
 
         self.listbox = unsafe {
             CreateWindowExW(
@@ -1131,6 +1150,87 @@ impl MainWindowState {
         }
     }
 
+    /// Recreates the accent-derived brushes from the current effective
+    /// colors: the accent brush + the four soft fills derive from
+    /// `accent_color`, and the two highlight surfaces (sidebar active pane,
+    /// history selection) derive from `accent_secondary`. Called once at
+    /// window creation and whenever the playing song's palette changes; the
+    /// old brushes are deleted first, so every paint site picks up the new
+    /// accent without per-paint brush allocation.
+    fn rebuild_accent_brushes(&mut self) {
+        unsafe {
+            for brush in [
+                &mut self.accent_brush,
+                &mut self.settings_accent_soft_brush,
+                &mut self.settings_near_brush,
+                &mut self.settings_adjust_hover_brush,
+                &mut self.settings_small_hover_brush,
+                &mut self.sidebar_highlight_brush,
+                &mut self.history_selected_brush,
+            ] {
+                if !brush.0.is_null() {
+                    let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
+                }
+            }
+            let accent = self.accent_color;
+            self.accent_brush = CreateSolidBrush(colorref(accent[0], accent[1], accent[2]));
+            let soft = |weight: f32| -> HBRUSH {
+                let c = mix(accent, SETTINGS_SURFACE, weight);
+                CreateSolidBrush(colorref(c[0], c[1], c[2]))
+            };
+            self.settings_accent_soft_brush = soft(0.28);
+            self.settings_near_brush = soft(0.55);
+            self.settings_adjust_hover_brush = soft(0.45);
+            self.settings_small_hover_brush = soft(0.35);
+            let highlight = |weight: f32| -> HBRUSH {
+                let c = mix(self.accent_secondary, [0x0A, 0x0A, 0x0A, 0xFF], weight);
+                CreateSolidBrush(colorref(c[0], c[1], c[2]))
+            };
+            self.sidebar_highlight_brush = highlight(0.15);
+            self.history_selected_brush = highlight(0.20);
+        }
+    }
+
+    /// Re-derives the accent from the current song's artwork after an event
+    /// batch. The palette is recomputed only when the decoded-art `Arc`
+    /// changed (a metadata refresh re-reporting the same cover must not
+    /// recompute); the brushes are rebuilt and the window repainted only
+    /// when the accent actually changed.
+    fn update_accent(&mut self) {
+        let art = self.current.as_ref().and_then(|c| c.track.decoded_art.clone());
+        let unchanged = match (&self.accent_art_source, &art) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        self.accent_art_source = art.clone();
+        let (primary, secondary) = accent_from_art(art.as_deref(), self.cfg().appearance.accent_color);
+        if primary != self.accent_color || secondary != self.accent_secondary {
+            self.accent_color = primary;
+            self.accent_secondary = secondary;
+            self.rebuild_accent_brushes();
+            // Re-color the window title bar to match (COLORREF is 0x00BBGGRR,
+            // hence the swapped red/blue channels).
+            let color = COLORREF(((primary[2] as u32) << 16) | ((primary[1] as u32) << 8) | primary[0] as u32);
+            let _ = unsafe {
+                DwmSetWindowAttribute(
+                    self.hwnd,
+                    DWMWA_CAPTION_COLOR,
+                    &color as *const COLORREF as *const c_void,
+                    size_of::<u32>() as u32,
+                )
+            };
+            debug!(
+                "settings accent: primary=#{:02X}{:02X}{:02X} secondary=#{:02X}{:02X}{:02X}",
+                primary[0], primary[1], primary[2], secondary[0], secondary[1], secondary[2]
+            );
+            self.invalidate();
+        }
+    }
+
     fn receive_events(&mut self) {
         // Clear the wake flag before draining; an event pushed while we drain
         // re-arms it (and possibly posts), so nothing stays stuck.
@@ -1180,6 +1280,10 @@ impl MainWindowState {
         if dirty {
             self.invalidate();
         }
+        // The accent follows the playing song's artwork; this runs even when
+        // the batch only refreshed metadata (late cover arrival changes the
+        // palette).
+        self.update_accent();
         // One tooltip rebuild per batch: a session-churn burst otherwise
         // rebuilds the full tool set once per event.
         if self.tooltips_dirty {
@@ -1408,7 +1512,7 @@ impl MainWindowState {
         // Sidebar items
         let item_h = (32.0 * scale) as i32;
         let items = [("Now Playing", Pane::Activity), ("Settings", Pane::Settings)];
-        let accent = self.cfg().appearance.accent_color;
+        let accent = self.accent_color;
         for (i, (label, pane)) in items.iter().enumerate() {
             let y = (40.0 * scale) as i32 + (i as i32) * (item_h + (4.0 * scale) as i32);
             let item_rect = RECT {
@@ -1465,7 +1569,7 @@ impl MainWindowState {
             "NOW PLAYING",
             &mut header_rect,
             (11.0 * scale) as i32,
-            self.cfg().appearance.accent_color,
+            self.accent_color,
             true,
             false,
         );
@@ -1476,7 +1580,7 @@ impl MainWindowState {
         let text_left = art_x + art + (12.0 * scale) as i32;
         let text_right = client_w - pad;
 
-        let accent_color = self.cfg().appearance.accent_color;
+        let accent_color = self.accent_color;
         let text_color = self.cfg().appearance.text_color;
 
         // The SMTC worker already decoded the artwork once at event time (see
@@ -1897,7 +2001,7 @@ impl MainWindowState {
         // Read the config once per paint instead of ~10 lock acquisitions,
         // and snapshot the hover/flag state so the row loop stays pure.
         let cfg = self.cfg();
-        let accent = cfg.appearance.accent_color;
+        let accent = self.accent_color;
         let notifications_enabled = cfg.behavior.notifications_enabled;
         let settings_hover = self.settings_hover;
         let duration_ms = cfg.overlay.duration_ms;
@@ -2666,7 +2770,7 @@ impl MainWindowState {
         let header_font = (11.0 * scale) as i32;
         let row_font = (13.0 * scale) as i32;
         let header_color = [0x9A, 0x9A, 0x9A, 0xFF];
-        let accent_color = self.cfg().appearance.accent_color;
+        let accent_color = self.accent_color;
 
         let cell = |x: i32, w: i32, text: &str, font: i32, color: [u8; 4], bold: bool| {
             if w <= 0 {
@@ -3653,14 +3757,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if !state_ptr.is_null() {
                 (*state_ptr).create_children();
             }
-            // Color the window title bar with the configured accent so the
+            // Color the window title bar with the effective accent so the
             // app reads as one theme. Applied here, after the frame is
             // realized, rather than right after CreateWindowExW. COLORREF is
             // 0x00BBGGRR, hence the swapped red/blue channels.
             let accent = if state_ptr.is_null() {
                 [240, 110, 155, 255]
             } else {
-                (*state_ptr).cfg().appearance.accent_color
+                (*state_ptr).accent_color
             };
             let color = COLORREF(((accent[2] as u32) << 16) | ((accent[1] as u32) << 8) | accent[0] as u32);
             let result = unsafe {
@@ -4225,6 +4329,23 @@ mod tests {
         // Newest first: the last pushed entry is at the front.
         let titles: Vec<_> = history.iter().map(|entry| entry.track.title.as_str()).collect();
         assert_eq!(titles, ["Track 4", "Track 3", "Track 2"]);
+    }
+
+    #[test]
+    fn accent_from_art_uses_the_album_palette_and_falls_back() {
+        let fallback = [240, 110, 155, 255];
+        // No artwork: the configured accent stands in for both.
+        assert_eq!(accent_from_art(None, fallback), (fallback, fallback));
+        // Truncated/garbage bytes (not pixel-aligned): same fallback.
+        assert_eq!(accent_from_art(Some(&[0, 0, 255]), fallback), (fallback, fallback));
+        // A solid white cover (premultiplied BGRA) yields a palette: the
+        // primary and secondary leave the pink fallback behind, and the
+        // monochrome palette keeps both equal.
+        let white: Vec<u8> = vec![255u8; 8 * 8 * 4];
+        let (primary, secondary) = accent_from_art(Some(&white), fallback);
+        assert_ne!(primary, fallback, "a cover must recolor the accent");
+        assert_ne!(secondary, fallback, "a cover must recolor the secondary");
+        assert_eq!(primary, secondary, "monochrome art keeps primary == secondary");
     }
 
     #[test]

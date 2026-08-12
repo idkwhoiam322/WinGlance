@@ -4381,7 +4381,7 @@ fn muted_accent(primary: [u8; 4]) -> [u8; 4] {
 /// WCAG 2.x AA contrast target for the palette-derived text rows (normal-
 /// sized text on the pill body). The meta row's clock icon shares the row's
 /// color and inherits the same floor.
-const TEXT_CONTRAST_AA: f32 = 4.5;
+pub(crate) const TEXT_CONTRAST_AA: f32 = 4.5;
 
 /// The pill body fill actually painted behind the text rows: the configured
 /// background blended 16% toward the artwork's palette primary when a
@@ -4434,7 +4434,7 @@ fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
 /// strictly raises luminance, so a bisection in the blend weight finds the
 /// smallest lift that passes. Even pure white is returned as the best
 /// effort when it cannot pass (a near-white fill).
-fn ensure_contrast(text: [u8; 4], bg: [u8; 4], target: f32) -> [u8; 4] {
+pub(crate) fn ensure_contrast(text: [u8; 4], bg: [u8; 4], target: f32) -> [u8; 4] {
     let text_rgb = [text[0], text[1], text[2]];
     let bg_rgb = [bg[0], bg[1], bg[2]];
     if contrast_ratio(text_rgb, bg_rgb) >= target {
@@ -5769,11 +5769,12 @@ fn composite_pm(pixels: &mut [u8], width: usize, x: usize, y: usize, rgb: [u8; 3
 
 /// Converts the worker's premultiplied BGRA artwork (square, adaptive
 /// per-DPI size) into the straight RGBA buffer the overlay composites and
-/// palettizes from.
+/// palettizes from. Shared with the main window, which derives its accent
+/// from the same decode.
 /// Runs once per cover change, keyed by the decoded pixels in `ensure_art`.
 /// The result is always a perfect square; `draw_art_scaled` derives the side
 /// from the buffer length.
-fn pm_bgra_to_rgba(pm: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn pm_bgra_to_rgba(pm: &[u8]) -> Option<Vec<u8>> {
     let mut rgba = Vec::with_capacity(pm.len());
     for px in pm.chunks_exact(4) {
         let (b, g, r, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
