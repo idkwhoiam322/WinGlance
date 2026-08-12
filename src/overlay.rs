@@ -4440,19 +4440,30 @@ pub(crate) fn ensure_contrast(text: [u8; 4], bg: [u8; 4], target: f32) -> [u8; 4
     if contrast_ratio(text_rgb, bg_rgb) >= target {
         return text;
     }
+    // Blend toward whichever of pure white or pure black gives the higher
+    // contrast against this background. On the default dark fills that is
+    // white (brighten); on a user-configured light fill it is black
+    // (darken) — brightening toward white there would push contrast the
+    // wrong way and can make it worse than doing nothing.
+    let endpoint = if contrast_ratio([255, 255, 255], bg_rgb) >= contrast_ratio([0, 0, 0], bg_rgb) {
+        255.0
+    } else {
+        0.0
+    };
     let blend = |w: f32| -> [u8; 3] {
         [
-            (text[0] as f32 + (255.0 - text[0] as f32) * w).round() as u8,
-            (text[1] as f32 + (255.0 - text[1] as f32) * w).round() as u8,
-            (text[2] as f32 + (255.0 - text[2] as f32) * w).round() as u8,
+            (text[0] as f32 + (endpoint - text[0] as f32) * w).round() as u8,
+            (text[1] as f32 + (endpoint - text[1] as f32) * w).round() as u8,
+            (text[2] as f32 + (endpoint - text[2] as f32) * w).round() as u8,
         ]
     };
     // Bisection on the blend weight, keeping `hi` the smallest weight seen
     // so far that passes and `lo` the largest that fails; the initial
-    // `hi = 1.0` is only actually passing when pure white passes, so when
-    // even white cannot reach the target (a near-white fill) white is the
-    // best effort. Blending toward white strictly raises luminance, which
-    // makes the pass/fail boundary monotonic and the bisection exact.
+    // `hi = 1.0` is only actually passing when the pure endpoint passes, so
+    // when even it cannot reach the target (a fill that contrasts poorly
+    // with both endpoints) the endpoint is the best effort. Blending toward
+    // an endpoint strictly moves luminance toward it, which makes the
+    // pass/fail boundary monotonic and the bisection exact.
     let mut lo = 0.0f32;
     let mut hi = 1.0f32;
     for _ in 0..24 {
@@ -9413,6 +9424,33 @@ mod tests {
         assert_eq!(
             ensure_contrast([200, 200, 200, 128], [18, 20, 28, 235], TEXT_CONTRAST_AA),
             [200, 200, 200, 128]
+        );
+    }
+
+    #[test]
+    fn ensure_contrast_darkens_on_a_light_background() {
+        // On a light fill (a user-configured light background), brightening
+        // toward white would push contrast the wrong way; the correction
+        // must darken toward black and still reach the AA target.
+        let bg = [230, 230, 230, 255];
+        let white = [255, 255, 255, 255];
+        assert!(
+            contrast_ratio([white[0], white[1], white[2]], [bg[0], bg[1], bg[2]]) < TEXT_CONTRAST_AA,
+            "precondition: white on the light fill must fail AA"
+        );
+        let fixed = ensure_contrast(white, bg, TEXT_CONTRAST_AA);
+        assert!(
+            contrast_ratio([fixed[0], fixed[1], fixed[2]], [bg[0], bg[1], bg[2]]) >= TEXT_CONTRAST_AA,
+            "the corrected color must reach the AA target"
+        );
+        assert!(fixed[0] < white[0], "the correction must darken, not brighten");
+        // A dark background keeps the old brightening behavior.
+        let dark = [0x1B, 0x1B, 0x1B, 255];
+        let dark_text = [60, 60, 60, 255];
+        let lifted = ensure_contrast(dark_text, dark, TEXT_CONTRAST_AA);
+        assert!(
+            lifted[0] > dark_text[0],
+            "on a dark fill the correction still brightens"
         );
     }
 
