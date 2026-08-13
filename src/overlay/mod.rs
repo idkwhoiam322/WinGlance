@@ -42,7 +42,7 @@ mod fullscreen;
 mod morph;
 mod render;
 
-pub(crate) use fullscreen::enumerate_displays;
+pub(crate) use fullscreen::{enumerate_displays_cached, invalidate_display_cache};
 pub(crate) use render::{TEXT_CONTRAST_AA, ensure_contrast, pm_bgra_to_rgba};
 
 use fullscreen::{
@@ -1835,7 +1835,7 @@ impl OverlayState {
     /// are never cached, so a hot-plugged or reordered display takes effect
     /// on the very next frame.
     fn target(&self) -> Option<TargetMonitor> {
-        let displays = enumerate_displays();
+        let displays = enumerate_displays_cached();
         let foreground_nearest = foreground_monitor_index(&displays);
         let index = resolve_target(self.position.monitor, &displays, foreground_nearest)?;
         let display = &displays[index];
@@ -2430,6 +2430,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     state.reposition();
                 }
             }
+            invalidate_display_cache();
             LRESULT(0)
         }
         FOREGROUND_CHANGE_MSG => {

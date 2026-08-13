@@ -6,8 +6,8 @@ use crate::events::{
 };
 use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
-    EventQueue, OverlayPos, enumerate_displays, set_dismiss_on_hover, set_duration, set_expand_compact_on_hover,
-    set_layout, set_positions, show_sample,
+    EventQueue, OverlayPos, enumerate_displays_cached, invalidate_display_cache, set_dismiss_on_hover, set_duration,
+    set_expand_compact_on_hover, set_layout, set_positions, show_sample,
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG};
@@ -55,9 +55,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos,
     ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT,
-    WM_SIZE, WM_TIMER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT,
+    WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -2040,7 +2041,7 @@ impl MainWindowState {
         let compact_position_label = compact_position_label(&cfg);
         let compact_custom = cfg.overlay.compact_effective().x.is_some();
         let auto_compact_sources = cfg.behavior.auto_compact_sources.join(", ");
-        let display_count = enumerate_displays().len();
+        let display_count = enumerate_displays_cached().len();
 
         let mut hdr = RECT {
             left: content_left + pad,
@@ -3679,7 +3680,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
         // released before the TrackPopupMenu loop below, which calls
         // mutate_config on selection.
         let monitor_mode = state.cfg().overlay.monitor;
-        let displays = enumerate_displays();
+        let displays = enumerate_displays_cached();
         let monitor_flags = |mode: MonitorMode| {
             if monitor_mode == mode {
                 MF_STRING | MF_CHECKED
@@ -4349,7 +4350,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     // (Active window → Primary → Display 1 →
                                     // … → back); the tray menu offers direct
                                     // selection.
-                                    let displays = enumerate_displays();
+                                    let displays = enumerate_displays_cached();
                                     let next = next_monitor_mode(state.cfg().overlay.monitor, displays.len());
                                     state.apply_monitor(next);
                                     state.invalidate();
@@ -4538,6 +4539,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     state.invalidate();
                 }
             }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            // A display was added, removed, or reordered (or its resolution
+            // changed). Invalidate the shared display cache so the next tray
+            // menu or settings paint picks up the new layout.
+            invalidate_display_cache();
             LRESULT(0)
         }
         WM_CLOSE => {
