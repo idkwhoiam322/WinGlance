@@ -2715,7 +2715,7 @@ mod tests {
         round_rect_coverage, round_rect_coverage_fast, round_rect_coverage_supersampled, rounded_triangle_coverage,
         scale_frame_about, shrink_frame_scratch, tinted_fill,
     };
-    use crate::events::ARTWORK_DECODE;
+    use crate::events::{ARTWORK_DECODE, PlaybackType};
     use std::ptr::null_mut;
     use windows::Win32::Foundation::COLORREF;
     use windows::Win32::Graphics::Gdi::{
@@ -5018,6 +5018,7 @@ mod tests {
             30,
             size,
             PlaybackState::Paused,
+            PlaybackType::Unknown,
             [255, 255, 255, 255],
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
@@ -5052,6 +5053,7 @@ mod tests {
             30,
             40.0,
             PlaybackState::Playing,
+            PlaybackType::Unknown,
             [255, 255, 255, 255],
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
@@ -6929,6 +6931,7 @@ mod tests {
             30,
             40.0,
             PlaybackState::Stopped,
+            PlaybackType::Unknown,
             [255, 255, 255, 255],
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
@@ -6947,6 +6950,7 @@ mod tests {
             24,
             size,
             PlaybackState::Paused,
+            PlaybackType::Unknown,
             [255, 255, 255, 255],
         );
         // Find the rightmost lit pixel in the vertical center band.
@@ -6966,6 +6970,93 @@ mod tests {
             rightmost_lit >= 168,
             "rightmost lit pixel at {rightmost_lit} should be inside the right-aligned box (>=168)"
         );
+    }
+
+    #[test]
+    fn now_playing_video_draws_a_connected_player_box() {
+        let mut pixels = vec![0u8; 256 * 256 * 4];
+        // Icon box: 192px at left edge 32, vertically centered (y 32..224).
+        // Frame is 0.72S wide (138px → x 59..197) and 0.48S tall (92px →
+        // y 82..174); rails are 0.055S (11px) thick; the play triangle is
+        // 0.22S×0.26S (x ≈112..154, y ≈103..153), shifted right 0.025S.
+        draw_symbol_pixels(
+            &mut pixels,
+            256,
+            224,
+            32,
+            192.0,
+            PlaybackState::NowPlaying,
+            PlaybackType::Video,
+            [255, 255, 255, 255],
+        );
+        let lit = |x: i32, y: i32| pixels[((y * 256 + x) * 4 + 3) as usize] > 0;
+        // Rail midpoints: each of the four sides must be solid.
+        assert!(lit(59, 128), "left rail must be drawn");
+        assert!(lit(191, 128), "right rail must be drawn");
+        assert!(lit(128, 82), "top rail must be drawn");
+        assert!(lit(128, 168), "bottom rail must be drawn");
+        // Corners: the rail overlap region (x 59..70 / y 82..93 and the
+        // mirror) must be solid — the frame reads connected, not notched.
+        for (cx, cy) in [(64, 87), (192, 87), (64, 169), (192, 169)] {
+            assert!(lit(cx, cy), "corner ({cx},{cy}) must be solid");
+        }
+        // Interior between the rails and the triangle must be hollow.
+        for (cx, cy) in [(80, 128), (160, 128)] {
+            assert!(!lit(cx, cy), "interior ({cx},{cy}) must be hollow");
+        }
+        // The play triangle interior must be solid.
+        assert!(lit(130, 120), "play triangle must be solid");
+    }
+
+    #[test]
+    fn video_icon_rails_end_on_one_shared_bottom_edge() {
+        // Regression: the frame rails used to round their own (x,w)/(y,h)
+        // pairs, so at smaller glyph sizes the vertical rails could extend
+        // one pixel BELOW the bottom rail's edge (e.g. size 24: vertical
+        // bottom = round(0.48·24) = 12 vs horizontal bottom =
+        // round(10.2) + round(1.32) = 11). The six frame edges are rounded
+        // once and every rail derives from them, so all four rails end on
+        // the same rows.
+        let mut pixels = vec![0u8; 256 * 256 * 4];
+        let size = 64.0_f32;
+        draw_symbol_pixels(
+            &mut pixels,
+            256,
+            224,
+            32,
+            size,
+            PlaybackState::NowPlaying,
+            PlaybackType::Video,
+            [255, 255, 255, 255],
+        );
+        let fw = 0.72 * size;
+        let fh = 0.48 * size;
+        let thick = 0.055 * size;
+        let left = (224.0 - size) + (size - fw) / 2.0;
+        let top = 32.0 + size * 0.5 - fh / 2.0;
+        let l = left.round() as i32;
+        let r = (left + fw).round() as i32;
+        let b = (top + fh).round() as i32;
+        let th = thick.round() as i32;
+        let bottommost = |x: i32| (0..=b).rev().find(|&y| pixels[((y * 256 + x) * 4 + 3) as usize] > 0);
+        // The left/right rails' centerlines and the bottom rail's straight
+        // span all end on the same row (b-1); nothing paints at row b or
+        // below anywhere across the frame width.
+        for x in [l + th / 2, r - th / 2, l + (r - l) / 2] {
+            assert_eq!(
+                bottommost(x),
+                Some(b - 1),
+                "rail at column {x} must end at row {}",
+                b - 1
+            );
+        }
+        for x in l..r {
+            assert_eq!(
+                pixels[((b * 256 + x) * 4 + 3) as usize],
+                0,
+                "nothing may paint below the bottom edge at column {x}"
+            );
+        }
     }
 
     #[test]

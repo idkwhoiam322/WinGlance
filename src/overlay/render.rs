@@ -10,7 +10,7 @@ use super::{
     OverlayState, PillText, ROW_HEIGHT, TextScratch,
 };
 use crate::config::Config;
-use crate::events::{MediaEvent, PlaybackState, TrackInfo};
+use crate::events::{MediaEvent, PlaybackState, PlaybackType, TrackInfo};
 use crate::palette::Palette;
 use anyhow::{Context, Result};
 use log::debug;
@@ -854,6 +854,7 @@ pub(super) fn draw_symbol_pixels(
     y: i32,
     size: f32,
     playback: PlaybackState,
+    playback_type: PlaybackType,
     color: [u8; 4],
 ) {
     let radius = (0.10 * size).max(0.0);
@@ -919,6 +920,12 @@ pub(super) fn draw_symbol_pixels(
                 color,
             );
         }
+        PlaybackState::NowPlaying if playback_type == PlaybackType::Video => {
+            draw_video_icon(pixels, width, box_left as f32, v_center, size, color);
+        }
+        PlaybackState::NowPlaying if playback_type == PlaybackType::Image => {
+            draw_image_icon(pixels, width, box_left as f32, v_center, size, color);
+        }
         PlaybackState::NowPlaying => {
             // Eighth note (♪) — synced to 0.88
             let note_h = 0.88 * size;
@@ -969,6 +976,122 @@ pub(super) fn draw_symbol_pixels(
             );
         }
     }
+}
+
+/// Draws the video-player glyph shown on track-change pills whose source
+/// reported `Video`: a hollow rounded box with an optically centered play
+/// triangle. The frame is 0.72S × 0.48S; four capsule bars (0.055S thick,
+/// radius half the thickness) are laid as full-width top/bottom and
+/// full-height left/right rails, overlapping so the corners connect solidly
+/// instead of reading as four separate lines. The frame's six edges are
+/// rounded once and every rail derives from them, so the rails can never
+/// disagree by a pixel (independent (x,w)/(y,h) rounding would let the
+/// vertical rails extend one row past the horizontal ones at small sizes).
+/// The triangle is 0.22S × 0.26S with 0.03S corner radius, shifted 0.025S
+/// right of the box center for optical balance. Every shard is CCW:
+/// `rounded_triangle_coverage` treats only counter-clockwise triangles as
+/// inside.
+fn draw_video_icon(pixels: &mut [u8], width: usize, x: f32, y: f32, size: f32, color: [u8; 4]) {
+    let fw = 0.72 * size;
+    let fh = 0.48 * size;
+    let thick = 0.055 * size;
+    let left = x + (size - fw) / 2.0;
+    let top = y - fh / 2.0;
+    // Shared, once-rounded frame edges; the corner radius is capped inside
+    // the fill helper.
+    let l = left.round() as i32;
+    let t = top.round() as i32;
+    let r = (left + fw).round() as i32;
+    let b = (top + fh).round() as i32;
+    let th = thick.round() as i32;
+
+    // Top and bottom rails run the full frame width; left and right rails
+    // run the full frame height over them, so the corners overlap into a
+    // solid capsule instead of a notched joint.
+    for by in [t, b - th] {
+        draw_rounded_rect_filled(pixels, width, l, by, r - l, th, thick / 2.0, color);
+    }
+    for bx in [l, r - th] {
+        draw_rounded_rect_filled(pixels, width, bx, t, th, b - t, thick / 2.0, color);
+    }
+
+    let tri_w = 0.22 * size;
+    let tri_h = 0.26 * size;
+    let tx = left + fw / 2.0 + 0.025 * size - tri_w / 2.0;
+    let ty = y - tri_h / 2.0;
+    draw_triangle_filled(
+        pixels,
+        width,
+        (tx.round() as i32, ty.round() as i32),
+        ((tx + tri_w).round() as i32, (ty + tri_h / 2.0).round() as i32),
+        (tx.round() as i32, (ty + tri_h).round() as i32),
+        0.03 * size,
+        color,
+    );
+}
+
+/// Draws the image glyph for `Image`-typed tracks: a landscape icon — a
+/// rounded frame (0.66S × 0.50S, rails 0.055S thick) with a sun disc and a
+/// mountain triangle. The frame's six edges are rounded once and shared by
+/// every rail (same discipline as `draw_video_icon`), and the horizontal
+/// rails' own rounded caps form the corners at the same radius as the video
+/// frame. The mountain is CCW. This glyph draws only for an `Image` type,
+/// which the worker currently suppresses — so it never renders in
+/// production.
+fn draw_image_icon(pixels: &mut [u8], width: usize, x: f32, y: f32, size: f32, color: [u8; 4]) {
+    let fw = 0.66 * size;
+    let fh = 0.50 * size;
+    let thick = 0.055 * size;
+    let left = x + (size - fw) / 2.0;
+    let top = y - fh / 2.0;
+    // Shared, once-rounded frame edges (see `draw_video_icon`).
+    let l = left.round() as i32;
+    let t = top.round() as i32;
+    let r = (left + fw).round() as i32;
+    let b = (top + fh).round() as i32;
+    let th = thick.round() as i32;
+
+    // Full-width top/bottom rails; the side rails butt between them, so the
+    // horizontal rails' rounded caps round the four corners on their own.
+    draw_rounded_rect_filled(pixels, width, l, t, r - l, th, thick / 2.0, color);
+    draw_rounded_rect_filled(pixels, width, l, b - th, r - l, th, thick / 2.0, color);
+    draw_rounded_rect_filled(pixels, width, l, t + th, th, b - t - 2 * th, thick / 2.0, color);
+    draw_rounded_rect_filled(pixels, width, r - th, t + th, th, b - t - 2 * th, thick / 2.0, color);
+
+    // Sun: a disc (a rounded square at radius d/2) tucked into the top-left.
+    let sun_d = 0.14 * size;
+    let sun_x = left + thick + 0.05 * size;
+    let sun_y = top + thick + 0.05 * size;
+    draw_rounded_rect_filled(
+        pixels,
+        width,
+        sun_x.round() as i32,
+        sun_y.round() as i32,
+        sun_d.round() as i32,
+        sun_d.round() as i32,
+        sun_d / 2.0,
+        color,
+    );
+
+    // Mountain: CCW triangle from the bottom corners to a centered peak.
+    draw_triangle_filled(
+        pixels,
+        width,
+        (
+            (left + thick + 0.03 * size).round() as i32,
+            (top + fh - thick).round() as i32,
+        ),
+        (
+            (left + fw * 0.5).round() as i32,
+            (top + thick + 0.06 * size).round() as i32,
+        ),
+        (
+            (left + fw - thick - 0.03 * size).round() as i32,
+            (top + fh - thick).round() as i32,
+        ),
+        0.06 * size,
+        color,
+    );
 }
 
 /// Fills a rounded rectangle into the pixel buffer using `round_rect_coverage`.
@@ -1289,6 +1412,7 @@ pub(super) fn draw_pill_text_rows(
     scale: f32,
     pill: &PillText,
     playback: Option<PlaybackState>,
+    playback_type: PlaybackType,
     content_alpha: f32,
     body_bottom: i32,
     rest_body_bottom: i32,
@@ -1407,6 +1531,7 @@ pub(super) fn draw_pill_text_rows(
                     title_rect.top,
                     symbol_size,
                     playback,
+                    playback_type,
                     dim_color(accent, unveil),
                 );
             }
@@ -1597,6 +1722,7 @@ pub(super) fn draw_expanded_pill_text(
                 scale,
                 &pill,
                 Some(PlaybackState::NowPlaying),
+                track.playback_type,
                 content_alpha,
                 body_bottom,
                 rest_body_bottom,
@@ -1620,6 +1746,7 @@ pub(super) fn draw_expanded_pill_text(
                     scale,
                     &pill,
                     Some(*playback),
+                    PlaybackType::Unknown,
                     content_alpha,
                     body_bottom,
                     rest_body_bottom,
@@ -1693,6 +1820,7 @@ pub(super) fn draw_expanded_pill_text(
                                 title_rect.top,
                                 symbol_size,
                                 *playback,
+                                PlaybackType::Unknown,
                                 dim_color(accent_color, unveil),
                             );
                         }
@@ -1798,12 +1926,12 @@ pub(super) fn draw_compact_pill(
         bottom: band_top + row_h,
     };
 
-    let (title, app_icon, playback) = match content {
+    let (title, app_icon, playback, playback_type) = match content {
         MediaEvent::TrackChanged(track) => {
             let pill = state.pill_text.take().unwrap_or_else(|| pill_text_from_track(track));
             let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
             state.pill_text = Some(pill);
-            (title, app_icon, PlaybackState::NowPlaying)
+            (title, app_icon, PlaybackState::NowPlaying, track.playback_type)
         }
         MediaEvent::PlaybackStateChanged(playback, source_app) => {
             let pill = state.pill_text.take().or_else(|| {
@@ -1817,7 +1945,7 @@ pub(super) fn draw_compact_pill(
                 Some(pill) => {
                     let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
                     state.pill_text = Some(pill);
-                    (title, app_icon, *playback)
+                    (title, app_icon, *playback, PlaybackType::Unknown)
                 }
                 // No cached track (the state change arrived before the first
                 // TrackChanged): the source name stands in for the title, and
@@ -1828,7 +1956,7 @@ pub(super) fn draw_compact_pill(
                     } else {
                         state.current_source.clone().unwrap_or_default()
                     };
-                    (name, None, *playback)
+                    (name, None, *playback, PlaybackType::Unknown)
                 }
             }
         }
@@ -1887,6 +2015,7 @@ pub(super) fn draw_compact_pill(
         symbol_y,
         symbol as f32,
         playback,
+        playback_type,
         accent,
     );
 }
@@ -1919,12 +2048,12 @@ pub(super) fn draw_morph_content(
 
     // The pieces the traveling elements share, resolved once (mirrors
     // `draw_compact_pill` and `draw_expanded_pill_text`).
-    let (title, app_icon, playback) = match content {
+    let (title, app_icon, playback, playback_type) = match content {
         MediaEvent::TrackChanged(track) => {
             let pill = state.pill_text.take().unwrap_or_else(|| pill_text_from_track(track));
             let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
             state.pill_text = Some(pill);
-            (title, app_icon, PlaybackState::NowPlaying)
+            (title, app_icon, PlaybackState::NowPlaying, track.playback_type)
         }
         MediaEvent::PlaybackStateChanged(playback, source_app) => {
             let pill = state.pill_text.take().or_else(|| {
@@ -1938,7 +2067,7 @@ pub(super) fn draw_morph_content(
                 Some(pill) => {
                     let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
                     state.pill_text = Some(pill);
-                    (title, app_icon, *playback)
+                    (title, app_icon, *playback, PlaybackType::Unknown)
                 }
                 // No cached track (the state change arrived before the first
                 // TrackChanged): the source name stands in for the title.
@@ -1948,7 +2077,7 @@ pub(super) fn draw_morph_content(
                     } else {
                         state.current_source.clone().unwrap_or_default()
                     };
-                    (name, None, *playback)
+                    (name, None, *playback, PlaybackType::Unknown)
                 }
             }
         }
@@ -2016,6 +2145,7 @@ pub(super) fn draw_morph_content(
         symbol_y,
         symbol_size,
         playback,
+        playback_type,
         accent,
     );
 

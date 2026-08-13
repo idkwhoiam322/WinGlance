@@ -176,6 +176,14 @@ Beyond these knobs the pill derives its look from the playing track:
 - **App icon** — the source app's icon (from its AUMID) renders next to the
   source-app name.
 - **Album-art rim** — a thin accent stroke around the art square.
+- **Content type** — the type SMTC reports for the session (music, video,
+  image) does two things, with no config knob:
+  - Track-change pills from sources that report `Video` swap the music note
+    for a video-player glyph. State pills (play/pause/stop) never change.
+  - `Image` content (slideshows, photo apps) is suppressed entirely: no
+    track or state pill fires while the image session is current. The
+    worker logs one `pill suppressed | reason=image-content` line per
+    transition.
 
 ## Logging
 
