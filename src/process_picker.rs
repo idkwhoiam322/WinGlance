@@ -1,21 +1,25 @@
-use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
+use crate::winutil::{StateClaim, clear_window_state, set_window_state, wide, window_state};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{BOOL, COLORREF, CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    BOOL, COLORREF, CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
+    WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
-    BDR_SUNKENOUTER, BF_RECT, BeginPaint, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
-    HBRUSH, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, SelectObject,
-    SetBkMode, SetTextColor, TRANSPARENT,
+    BDR_SUNKENOUTER, BF_RECT, BeginPaint, ClientToScreen, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS,
+    DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect,
+    GetMonitorInfoW, HBRUSH, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
@@ -30,14 +34,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCDESTROY, WM_PAINT, WM_SETFONT, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 const CLASS_NAME: &str = "WinGlanceProcessPicker";
 const WIDTH: i32 = 400;
 const HEADER_H: i32 = 30;
 const ROW_HEIGHT: i32 = 22;
 const MAX_VISIBLE: usize = 12;
-const WS_EX_TOOLWINDOW_STYLE: i32 = 0x80;
 const CLOSE_BTN_SIZE: i32 = 20;
 const BST_CHECKED: usize = 1;
 const BST_UNCHECKED: usize = 0;
@@ -95,9 +98,9 @@ static OPEN_PICKER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
 /// Set when this window's WM_NCCREATE claims the state box handed over in
 /// `lpCreateParams`, so a failed CreateWindowExW can tell whether the box was
 /// taken by the system (and freed in WM_NCDESTROY) or still belongs to the
-/// caller. Reset before each open; window creation is single-threaded on the
-/// UI thread, so a plain atomic flag is race-free.
-static PICKER_STATE_CLAIMED: AtomicBool = AtomicBool::new(false);
+/// caller. Reset before each open. See `winutil::StateClaim` for the shared
+/// mechanics.
+static PICKER_STATE_CLAIMED: StateClaim = StateClaim::new();
 
 /// Guards class registration: registering twice would leak the class brush.
 static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -172,13 +175,60 @@ fn process_names() -> HashMap<u32, String> {
     names
 }
 
-/// The executable name of a process, from a fresh Toolhelp snapshot. Used by
-/// the overlay to identify the foreground window's app for Auto-layout source
-/// matching. `None` when the process does not exist or cannot be read (e.g.
-/// an elevated process snapshot from a non-elevated instance) — callers treat
-/// that as "no match".
+/// The executable name of a process, resolved through a targeted handle
+/// query instead of a full process-table snapshot. Used by the overlay to
+/// identify the foreground window's app for Auto-layout source matching
+/// (it fires on each foreground switch; a `CreateToolhelp32Snapshot`
+/// enumeration per switch is O(process count) work for one answer).
+/// `PROCESS_QUERY_LIMITED_INFORMATION` is the documented minimum for
+/// `QueryFullProcessImageNameW` and is granted across elevation for the
+/// same user, so an elevated foreground app still resolves (the access-
+/// denied case is an elevated process of a *different* user, which cannot
+/// own the interactive foreground). `None` when the process does not exist
+/// or cannot be read — callers treat that as "no match".
 pub(crate) fn exe_name_for_pid(pid: u32) -> Option<String> {
-    process_names().remove(&pid)
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return None;
+        };
+        let handle = ProcessQueryGuard(handle);
+        // Long image paths need more than the 260-char MAX_PATH buffer;
+        // retry once at the 32,768-char Windows path limit, the canonical
+        // ceiling (the function does not report the required size).
+        let mut capacity = 260u32;
+        loop {
+            let mut buffer = vec![0u16; capacity as usize];
+            let mut size = capacity;
+            if QueryFullProcessImageNameW(handle.0, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
+                buffer.truncate(size as usize);
+                let path = String::from_utf16_lossy(&buffer);
+                return Some(
+                    std::path::Path::new(&path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&path)
+                        .to_string(),
+                );
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER.0 as i32) && capacity < 32768 {
+                capacity = 32768;
+            } else {
+                return None;
+            }
+        }
+    }
+}
+
+/// RAII guard for the process handle opened by `exe_name_for_pid`.
+struct ProcessQueryGuard(HANDLE);
+
+impl Drop for ProcessQueryGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
 }
 
 /// Scan state threaded through the EnumWindows callback: the accumulated
@@ -265,6 +315,21 @@ fn build_picker_list(current: &[String], mut entries: Vec<ProcessEntry>) -> Vec<
     not_running
 }
 
+/// The Auto-compact picker's row list: the pinned "Full screen apps" status
+/// row is always the first entry — fullscreen apps compact regardless of the
+/// app list (see `decide_layout`), so the coverage stays visible even after
+/// apps are selected. Its empty pattern never matches, it is always checked
+/// and clicks never toggle it, and `read_checked` skips it.
+fn build_auto_compact_list(current: &[String], entries: Vec<ProcessEntry>) -> Vec<ProcessEntry> {
+    let mut list = Vec::with_capacity(entries.len() + 1);
+    list.push(ProcessEntry {
+        display_name: "Full screen apps".into(),
+        pattern: String::new(),
+    });
+    list.extend(build_picker_list(current, entries));
+    list
+}
+
 /// Same normalization the SMTC worker uses when matching allow-list patterns
 /// against AUMIDs, so picker pre-checking agrees with session filtering.
 fn normalize_pattern(value: &str) -> String {
@@ -299,7 +364,7 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
     }
 
     let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
-    if ex_style & WS_EX_TOOLWINDOW_STYLE as isize != 0 {
+    if ex_style & windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW.0 as isize != 0 {
         return BOOL(1);
     }
 
@@ -354,11 +419,17 @@ pub(crate) fn open(
     result: Arc<Mutex<Option<Vec<String>>>>,
     result_msg: u32,
 ) -> bool {
-    let list = build_picker_list(current, merge_smtc_sources(enumerate_app_processes()));
-    if list.is_empty() {
+    let entries = merge_smtc_sources(enumerate_app_processes());
+    if entries.is_empty() {
         warn!("no app processes or SMTC sessions found for picker");
         return false;
     }
+    let auto_picker = result_msg == AUTO_SOURCES_RESULT_MSG;
+    let list = if auto_picker {
+        build_auto_compact_list(current, entries)
+    } else {
+        build_picker_list(current, entries)
+    };
 
     unsafe {
         let instance = match GetModuleHandleW(None) {
@@ -379,12 +450,21 @@ pub(crate) fn open(
         let height = ((HEADER_H + item_count as i32 * ROW_HEIGHT + 10) as f32 * owner_scale).round() as i32;
         let width = (WIDTH as f32 * owner_scale).round() as i32;
 
-        // Clamp the popup to the owner monitor's work area: the trigger
-        // control can sit near the bottom edge, where an unclamped
-        // `trigger_rect.bottom + 4` would push the popup under the taskbar
-        // or off-screen. Prefer below the control, flip above when that
-        // would overflow, then clamp into the work area.
-        let (mut x, mut y) = (trigger_rect.left, trigger_rect.bottom + 4);
+        // The trigger rect is in the owner window's *client* coordinates, but
+        // CreateWindowExW positions the popup in *screen* coordinates. Translate
+        // the anchor edge into screen space first, then clamp in screen space
+        // (the earlier client-coordinate clamp clamped the wrong numbers).
+        let mut below = POINT {
+            x: trigger_rect.left,
+            y: trigger_rect.bottom,
+        };
+        let mut above = POINT {
+            x: trigger_rect.left,
+            y: trigger_rect.top,
+        };
+        let _ = ClientToScreen(owner, &mut below);
+        let _ = ClientToScreen(owner, &mut above);
+        let (mut x, mut y) = (below.x, below.y + 4);
         let monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -393,7 +473,7 @@ pub(crate) fn open(
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
             let work = info.rcWork;
             if y + height > work.bottom {
-                y = (trigger_rect.top - 4 - height).max(work.top);
+                y = (above.y - 4 - height).max(work.top);
             }
             x = x.clamp(work.left, (work.right - width).max(work.left));
             y = y.clamp(work.top, (work.bottom - height).max(work.top));
@@ -401,7 +481,10 @@ pub(crate) fn open(
 
         // Pre-check with the same normalization the SMTC worker applies to
         // allow-list patterns, so a stored "youtube music" matches the
-        // session-derived "youtube-music" entry.
+        // session-derived "youtube-music" entry. The Auto-compact picker's
+        // "Full screen apps" status row is always checked — fullscreen
+        // coverage is unconditional — and the app rows' pre-check must not
+        // mark it via the empty-pattern contains rule.
         let norm_current: Vec<String> = current
             .iter()
             .map(|p| normalize_pattern(p))
@@ -409,9 +492,14 @@ pub(crate) fn open(
             .collect();
         let checked: Vec<bool> = list
             .iter()
-            .map(|e| {
-                let ne = normalize_pattern(&e.pattern);
-                norm_current.iter().any(|n| ne.contains(n.as_str()) || n.contains(&ne))
+            .enumerate()
+            .map(|(i, e)| {
+                if auto_picker && i == 0 {
+                    true
+                } else {
+                    let ne = normalize_pattern(&e.pattern);
+                    norm_current.iter().any(|n| ne.contains(n.as_str()) || n.contains(&ne))
+                }
             })
             .collect();
 
@@ -433,7 +521,7 @@ pub(crate) fn open(
             result_msg,
         });
         let state_ptr = Box::into_raw(state);
-        PICKER_STATE_CLAIMED.store(false, Ordering::SeqCst);
+        PICKER_STATE_CLAIMED.reset();
 
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -457,8 +545,8 @@ pub(crate) fn open(
                 // and freed in WM_NCDESTROY. WM_NCCREATE flips
                 // PICKER_STATE_CLAIMED when it takes the box; if it never ran,
                 // the box still belongs to us and must be freed here.
-                if !PICKER_STATE_CLAIMED.load(Ordering::SeqCst) {
-                    drop(Box::from_raw(state_ptr));
+                if let Some(state) = PICKER_STATE_CLAIMED.take_unclaimed(state_ptr) {
+                    drop(state);
                 }
                 return false;
             }
@@ -608,6 +696,9 @@ fn read_checked(hwnd: HWND, lb: HWND) -> Vec<String> {
         let data = unsafe { SendMessageW(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
         if data.0 as usize == BST_CHECKED
             && let Some(entry) = state.list.get(i)
+            // The Auto-compact picker's "Full screen only" mode row has an
+            // empty pattern: it is a mode, never an app pattern to store.
+            && !entry.pattern.is_empty()
         {
             result.push(entry.pattern.clone());
         }
@@ -718,8 +809,16 @@ unsafe extern "system" fn listbox_proc(
                     } else {
                         BST_CHECKED
                     };
-                    let _ = unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
                     let _ = unsafe { SendMessageW(lb, LB_SETCURSEL, WPARAM(i), LPARAM(0)) };
+                    // The Auto-compact picker's first row is the pinned
+                    // "Full screen apps" status row: fullscreen coverage is
+                    // unconditional, so its check is fixed — clicks select
+                    // the row but never toggle it.
+                    let pinned_row = state.list.first().is_some_and(|e| e.pattern.is_empty()) && i == 0;
+                    if pinned_row {
+                        return LRESULT(0);
+                    }
+                    let _ = unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
                     let mut item_rect = RECT::default();
                     let _ = unsafe {
                         SendMessageW(
@@ -765,7 +864,7 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             if !create.is_null() {
                 let state = (*create).lpCreateParams as *mut PickerState;
                 set_window_state(hwnd, state);
-                PICKER_STATE_CLAIMED.store(true, Ordering::SeqCst);
+                PICKER_STATE_CLAIMED.claim();
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
@@ -949,8 +1048,17 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     );
                 }
 
-                // Entry text.
-                SetTextColor(draw.hDC, COLORREF(0x00F0F0F0));
+                // Entry text. The pinned "Full screen apps" status row (empty
+                // pattern) renders muted to read as a status line rather than
+                // a selectable app.
+                SetTextColor(
+                    draw.hDC,
+                    COLORREF(if entry.pattern.is_empty() {
+                        0x00C8C8C8
+                    } else {
+                        0x00F0F0F0
+                    }),
+                );
                 SetBkMode(draw.hDC, TRANSPARENT);
                 let mut name = wide(&entry.display_name);
                 DrawTextW(
@@ -1068,6 +1176,23 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
 mod tests {
     use super::*;
 
+    #[test]
+    fn exe_name_for_pid_resolves_the_current_process() {
+        // The targeted query must resolve a live process to its executable
+        // name; under test that is the WinGlance test binary.
+        let name = exe_name_for_pid(unsafe { GetCurrentProcessId() });
+        assert!(
+            name.as_deref().is_some_and(|n| n.ends_with(".exe")),
+            "the current process must resolve to an .exe name, got {name:?}"
+        );
+    }
+
+    #[test]
+    fn exe_name_for_pid_returns_none_for_a_missing_process() {
+        // pid 0 is never a valid process handle target.
+        assert_eq!(exe_name_for_pid(0), None);
+    }
+
     fn entry(pattern: &str) -> ProcessEntry {
         ProcessEntry {
             display_name: pretty_source_label(pattern).to_string(),
@@ -1100,6 +1225,25 @@ mod tests {
     #[test]
     fn empty_patterns_add_no_rows() {
         assert!(build_picker_list(&[" ".to_string(), "".to_string()], vec![]).is_empty());
+    }
+
+    #[test]
+    fn build_auto_compact_list_prepends_the_fullscreen_status_row() {
+        // The Auto-compact picker always leads with the pinned "Full screen
+        // apps" status row: fullscreen apps compact regardless of the app
+        // list, so the coverage stays visible even after apps are selected.
+        // Its empty pattern never matches and `read_checked` skips it.
+        let list = build_auto_compact_list(&["spotify".to_string()], vec![entry("spotify"), entry("netflix")]);
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].display_name, "Full screen apps");
+        assert!(list[0].pattern.is_empty(), "the status row must never store a pattern");
+        // The app rows keep their usual (alphabetical) order below the status.
+        let apps: Vec<&str> = list[1..].iter().map(|e| e.pattern.as_str()).collect();
+        assert_eq!(apps, ["netflix", "spotify"]);
+        // An empty app list still gets the status row.
+        let only = build_auto_compact_list(&[], vec![entry("youtube-music")]);
+        assert_eq!(only.len(), 2);
+        assert!(only[0].pattern.is_empty());
     }
 
     #[test]

@@ -23,8 +23,11 @@ interrupts and never needs interaction.
 - **Completely passive** — `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE`: no focus
   steal, no Alt-Tab entry, no click capture. Clicks pass straight through to
   your game.
-- **Dismissal** — hover over the pill (or queue a newer notification) and it
-  collapses within 500 ms instead of waiting out its full duration.
+- **Hover interaction** — hover a compact pill and it expands in place so
+  you can read it (a second hover dismisses it); hover an expanded pill and
+  it dismisses within 500 ms instead of waiting out its full duration.
+  Queueing a newer notification caps the current pill at 500 ms the same
+  way. Both behaviors are tunable in the Settings pane.
 - **Marquee titles** — long titles scroll only when they actually overflow
   the visible band, then stop when shown.
 - **Placement** — anchor to any of six screen edges with a configurable
@@ -48,10 +51,14 @@ start-on-login, close-to-tray, allowed apps, position, logs).
 - **Toggle notifications** — enable/disable pills
 - **Start with Windows** — launch at logon
 - **Close window to tray** — hide instead of quit when the window is closed
-- **Position** — choose an edge anchor, or **Adjust position…** to drag the
-  pill to a custom spot (then **Show sample** to preview it)
+- **Monitor** — place the pill on the active window's display, the primary
+  display, or a numbered display
 - **Duration** — 2 / 3 / 5 / 10 seconds
+- **Layout** — Expanded / Compact / Auto
 - **Quit**
+
+  Placement (edge anchor, custom coordinates) is not in the tray; it is edited in
+  the **Settings** pane's **Position** row, which opens the drag sample.
 
 ## Configuration
 
@@ -86,9 +93,12 @@ loop), `-NoThrottle` / `-Jobs N` (parallelism). Direct checks:
 - `src/smtc.rs` — the SMTC worker thread: subscribes to every session,
   reads metadata/artwork, extracts app icons, and deduplicates (content
   diff, session-recreation, churn cool-down, artwork-change time-gate).
-- `src/overlay.rs` — the raw Win32 layered pill: expand/light/collapse
+- `src/overlay/` — the raw Win32 layered pill, split into `mod` (state,
+  tick, window glue), `morph` (springs, hover decisions, geometry),
+  `render` (frame composition, text, vector primitives) and `fullscreen`
+  (display enumeration and fullscreen detection): expand/light/collapse
   animation, palette + aura rendering, vector glyphs, marquee rows,
-  hover-dismiss.
+  hover expand/dismiss.
 - `src/palette.rs` / `src/icon.rs` — the color quantizer and the shell icon
   extraction.
 - `src/main_window.rs` — tracking window, tray icon/menu, history.

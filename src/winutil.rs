@@ -1,4 +1,5 @@
 use log::warn;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{HINSTANCE, HWND};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HBRUSH, HGDIOBJ};
@@ -77,6 +78,51 @@ pub(crate) fn clear_window_state(hwnd: HWND) {
 /// null when the slot is empty or was cleared.
 pub(crate) fn window_state<T>(hwnd: HWND) -> *mut T {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut T }
+}
+
+/// Tracks whether a window's WM_NCCREATE took ownership of the state box
+/// passed through `lpCreateParams`, so the box's creator can tell, after a
+/// failed `CreateWindowExW`, whether the window claimed it (and frees it in
+/// WM_NCDESTROY) or whether it never materialized and the creator must free
+/// it. Window creation is single-threaded on the UI thread, so a plain
+/// atomic flag is race-free.
+pub(crate) struct StateClaim {
+    claimed: AtomicBool,
+}
+
+impl StateClaim {
+    pub(crate) const fn new() -> Self {
+        Self {
+            claimed: AtomicBool::new(false),
+        }
+    }
+
+    /// Arms the flag before `CreateWindowExW`; `WM_NCCREATE` flips it via
+    /// `claim` when the window object materializes.
+    pub(crate) fn reset(&self) {
+        self.claimed.store(false, Ordering::SeqCst);
+    }
+
+    /// Marks the state box as taken by the window. WM_NCCREATE calls this
+    /// after storing `lpCreateParams` in GWLP_USERDATA.
+    pub(crate) fn claim(&self) {
+        self.claimed.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns the state box to the caller when WM_NCCREATE never ran (a
+    /// creation failure before the window object existed). `None` when the
+    /// window owns the box — freeing it there would double-free, because the
+    /// system tears the window down through WM_NCDESTROY first.
+    pub(crate) fn take_unclaimed<T>(&self, state_ptr: *mut T) -> Option<Box<T>> {
+        if self.claimed.load(Ordering::SeqCst) {
+            None
+        } else {
+            // SAFETY: the caller created the box with `Box::into_raw` and
+            // has not freed it; an unclaimed box is still owned by the
+            // caller, so taking it back is sound.
+            Some(unsafe { Box::from_raw(state_ptr) })
+        }
+    }
 }
 
 /// Closes a window whose handle is registered in a `OnceLock<Mutex<T>>`

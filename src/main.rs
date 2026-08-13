@@ -125,7 +125,11 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if info.is_null() {
         return 0;
     }
-    let record = unsafe { &*((*info).ExceptionRecord) };
+    let record_ptr = unsafe { (*info).ExceptionRecord };
+    if record_ptr.is_null() {
+        return 0;
+    }
+    let record = unsafe { &*record_ptr };
     if record.ExceptionCode.0 != 0xC000_0005u32 as i32 {
         return 0;
     }
@@ -257,7 +261,7 @@ fn install_panic_hook(logs_dir: &Path) {
 const CRASH_LOG_CAP: u64 = 1024 * 1024;
 
 /// Holds the raw value of the single-instance mutex handle for the lifetime of
-/// the process so the "Reload config" button can release it before spawning
+/// the process so the "Restart app" button can release it before spawning
 /// the next instance. A relaunch must free it first, otherwise the freshly
 /// launched process would see a live owner (this one) and exit immediately.
 /// Stored as `isize` because `HANDLE` is neither `Send` nor `Sync` and cannot
@@ -374,12 +378,12 @@ fn main() -> Result<()> {
 
     info!("starting WinGlance");
 
-    // Distinguish a user-requested reload (Settings "Reload config" button)
+    // Distinguish a user-requested reload (Settings "Restart app" button)
     // from a plain launch, tray start or autostart: the old process cannot
     // log it reliably because the new process truncates the live log at
     // startup, so the marker is passed as an argument and recorded here.
     if std::env::args_os().any(|arg| arg == "--reload-config") {
-        info!("started via the Settings 'Reload config' action; applying the on-disk config");
+        info!("started via the Settings 'Restart app' action; applying the on-disk config");
     }
 
     if let Err(error) = autostart::apply(config.behavior.start_on_login) {

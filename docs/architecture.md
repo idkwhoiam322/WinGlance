@@ -175,14 +175,97 @@ WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`, returns `HTTRANSPARENT` from
 `WM_NCHITTEST`, and is shown with `SW_SHOWNOACTIVATE`. It therefore cannot
 be clicked through to, activated, or tabbed to.
 
-Animation is a simple three-phase ease-out: expanding (grow + fade in), light
-(short fade for playback-state changes), collapsing (shrink + fade out),
-driven by a high-resolution timer matched to the monitor's refresh rate while
-the pill animates or a text line scrolls. A fully static pill drops to a
-coarse 250 ms tick — the dismiss countdown and hover polling do not need frame
-rate — and the pill repaints only while animating or marquee-scrolling; a
-static pill does no per-frame drawing. Hovering the cursor over the pill, or
-queueing a newer notification, caps the remaining display time at 500 ms.
+Animation runs through three phases — expanding (grow + fade in), light (a
+short 120 ms fade for playback-state changes), collapsing (shrink + fade out)
+— on the spring model described in "Morph springs" below, driven by a
+high-resolution timer matched to the monitor's refresh rate while the pill
+animates or a text line scrolls (the period is capped by `max_tick_hz`,
+default 60 Hz). A fully static pill drops to a coarse 250 ms tick — the
+dismiss countdown and hover polling do not need frame rate — and the pill
+repaints only while animating or marquee-scrolling; a static pill does no
+per-frame drawing. Queueing a newer notification caps the remaining display
+time at 500 ms. What hovering does to the pill is described in "Hover
+behavior" below.
+
+## Hover behavior
+
+Hovering is polled from the tick: the pill has no mouse capture, so the
+cursor is hit-tested against the rendered bounds every frame. A leave is only
+trusted after the cursor has stayed away for `LEAVE_DEBOUNCE` (60 ms), so
+boundary jitter cannot cancel an interaction the moment it starts; re-entering
+clears the leave. What a hover does follows the pill's *effective* layout
+(an Auto pill follows whichever layout is currently in effect) and the two
+toggles `dismiss_on_hover` and `expand_compact_on_hover`:
+
+- **Expanded layout** — hovering has no interaction with the pill: the
+  countdown is never deferred for the cursor, so the pill dismisses on its
+  deadline even under it. With `dismiss_on_hover` (default) the first hover
+  tick arms the one-way 500 ms dismiss (`EARLY_EXIT_MS`); without it,
+  hovering changes nothing.
+- **Compact layout, `expand_compact_on_hover` (default)** — the first hover
+  of a showing starts an in-place morph to the expanded layout (the pill's
+  layout and position stay Compact-anchored for the whole morph) and resets
+  the dismissal clock to the full configured duration. The morph-origin
+  expanded state is an interaction: while the cursor stays on it, its
+  countdown is deferred (`held`), so it is never dismissed mid-read, and a
+  queued notification waits with it (updates route in place — `held_expanded`
+  gives the event-receiving paths the same hold decision between ticks).
+  Leaving — mid-morph or after the pin — runs the collapse leg back to
+  compact and resets the countdown to the full duration. With
+  `dismiss_on_hover` (default), later hovers over the compact pill dismiss
+  instead — the second hover dismisses (one-way 500 ms arm); without it,
+  every hover re-expands and resets again.
+- **Compact layout, `expand_compact_on_hover` off** — the pill behaves
+  exactly like an Expanded-layout one: `dismiss_on_hover` applies, no morph.
+
+The hover decisions apply only to a fully-shown pill; hovering during the
+entrance/exit animations keeps the plain Expanded-rule arming (`dismiss_on_hover`
+and the layout is Expanded). A due dismissal loses to an in-flight collapse
+leg (which runs to completion so it cannot snap mid-shrink) but wins over an
+in-flight expand leg (the pill collapses from the plain compact shape).
+
+## Morph springs
+
+Every size transition — the entrance grow, the exit shrink, the in-place
+hover morph — runs the same damped-oscillator model. A `Spring` is a damped
+harmonic oscillator (damping ratio ζ, angular frequency ω) whose closed-form
+response is evaluated at normalized leg time. `value_at` pins the endpoint:
+at or past the leg end the curve is exactly 1.0, so the resting pill always
+renders at the exact compact/expanded size, never a hair short. The renderers clamp the curve into the endpoint interval, so the expand
+spring's ~5 % overshoot (ζ = 0.7, 2.8π) never reaches the hover morph's
+geometry, while the entrance bounce and the settle-bounce scale the rendered
+pill as a whole (`BOUNCE_OVER` past the endpoint, and on compaction the whole
+pill dips to (1 − `BOUNCE_UNDER`) of its final size). The collapse spring
+(ζ = 0.6) undershoots below compact by ~9.5 % of the remaining distance, and
+because that undershoot spreads over the tail of a leg running 4/5 of the
+entrance duration, the compaction bounce reads as a slow, pronounced settle
+rather than a fast blip.
+
+The width axis leads and the height axis chases it with `MORPH_LAG` (0.12 of
+the leg): the follower evaluates the leader's curve at a delayed, compressed
+local time (`(t − lag) / (1 − lag)`), so the card widens before it grows tall,
+never overtakes the leader, and pins at its endpoint exactly when the leg
+ends. A reversal (the cursor leaves mid-expand) does not restart the
+animation: the collapse leg is the expand curve's mirror, seeded with the
+exact progress and per-second velocity at the reversal moment (converted
+across the two leg lengths by `reversal_seed`), so the motion continues
+through the flip without a kink — the pill may travel a little farther before
+turning, then settles exactly at compact. A reversal from less than
+`REVERSAL_MIN_PROGRESS` (0.05) drops the morph instead of running a seeded
+release, which would balloon a pill that barely left compact.
+
+During the morph the shared elements — the title, the playback symbol and
+the artwork — never fade: they travel from their compact positions to their
+expanded positions on each axis's own progress (the artwork's side length
+lerps while it stays centered in the growing body, the title and symbol
+track their bands), so the morph reads as the card unfolding in place.
+Only the layout-exclusive elements fade, keyed to the *less-advanced* axis
+so nothing renders outside the visible card: the compact app icon dissolves
+out over 0.05..0.20 of the shape progress and the expanded extra rows
+(artist, meta, app) fade in over 0.25..0.60 — disjoint windows, in both
+directions, so the icon and the app row never coexist. The content is drawn
+progressively into the single reusable DIB, and the expanded extra rows
+unveil as the pill's animated bottom edge sweeps past their bands.
 
 ## Palette and aura
 
@@ -212,8 +295,8 @@ anti-aliased.
   location (virtual-screen coordinates) and are clamped to the target work
   area so they stay on-screen.
 
-The target display comes from `monitor`: `active-window` (the monitor of
-`GetForegroundWindow`, the historical behavior), `primary` (the display
+The target display comes from `monitor`: `active-window` (the monitor of the
+foreground window — see "Foreground tracking" below), `primary` (the display
 flagged `MONITORINFOF_PRIMARY`), or `index-N` (the (N+1)-th display in
 `EnumDisplayMonitors` order). `overlay::enumerate_displays()` takes a fresh
 snapshot on every placement — handles are never cached — and
@@ -234,14 +317,48 @@ while animating), falling back to the target's display-mode frequency.
 Because the 16 ms `WM_TIMER` recomputes geometry each tick while the pill is
 shown, a monitor removal or resolution change moves the pill back onto the
 new work area on the next frame; `WM_DISPLAYCHANGE` additionally repositions
-a visible pill immediately. The tray **Expanded Position → Adjust position…**
-command opens `src/positioner.rs`, a draggable sample that posts the chosen
+a visible pill immediately. The **Adjust position…** command in the Settings
+pane opens `src/positioner.rs`, a draggable sample that posts the chosen
 `position_x`/`position_y` to the main window via `POSITION_MSG`; the main
 window — the single owner of the config — applies and persists them, and
 nudges the live overlay via `overlay::set_positions` (which calls
 `reposition()` without a full redraw). `OverlayPos` carries the monitor mode,
 so anchor, custom-position and monitor changes all flow through the same
 push path.
+
+## Foreground tracking
+
+`MonitorMode::ActiveWindow` and the Auto layout both depend on the foreground
+window, so the overlay tracks it event-driven, with a polling fallback:
+
+- A `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` hook, installed when the
+  overlay window is created (`WINEVENT_OUTOFCONTEXT`, so the system delivers
+  the callback on the UI thread), notices every foreground change. The
+  callback only posts `FOREGROUND_CHANGE_MSG` — it never touches overlay
+  state. The message handler re-resolves the Auto layout and the effective
+  work-area anchor and repositions immediately, instead of waiting for the
+  next media event or the 250 ms static tick. A switch that changes nothing
+  (e.g. Alt-Tab between two normal apps on the same monitor) is skipped by
+  comparing the re-resolved anchor with the last one. When the Auto layout
+  flipped (Compact ↔ Expanded) the pill is fully re-rendered; the animation
+  phase is preserved, so a foreground switch never restarts it.
+- The 250 ms static tick is the fallback: `tick_layout_check` reacts to a
+  foreground change within one static tick even when no media event arrives
+  (e.g. an Alt-Tab into a fullscreen game while a pill is up). The full
+  decision runs only when the foreground *HWND* changed; the same-window
+  geometry (a resize into fullscreen) is re-checked at most once per second.
+  The tick also covers a failed hook install (logged; the overlay degrades
+  to polling) and the teardown race: the hook is unhooked in WM_NCDESTROY
+  before the window state is released, and a racing callback sees a null
+  overlay handle and no-ops.
+
+The executable identity the Auto layout matches against
+(`auto_compact_sources`) is cached with the foreground HWND, so the process
+lookup (`exe_name_for_pid`, a targeted `OpenProcess` + image-name query
+rather than a process-table walk) runs only when the foreground window
+actually changes; the fullscreen verdict is recomputed cheaply from the
+window rect on every sample. Both decisions feed `decide_layout`, the single
+pure resolver of Auto.
 
 ## Main window: panes and the process picker
 
@@ -250,7 +367,8 @@ switching between two panes:
 
 - **Now Playing** — the current activity (art, state, title/artist/album,
   meta) and the per-session history listbox (newest first, capped at 400
-  rows). A native `TOOLTIPS_CLASSW` control shows full row details on hover,
+  rows, auto-pinned to the newest entry via `LB_SETTOPINDEX` on every insert —
+  intended). A native `TOOLTIPS_CLASSW` control shows full row details on hover,
   synced to the visible row band on a 1 Hz timer while the window is visible.
 - **Settings** — cards mirroring the tray menu and `[behavior]`/`[overlay]`
   config: notifications toggle, duration presets, start-on-login, close-to-

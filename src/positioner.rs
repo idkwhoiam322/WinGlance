@@ -1,7 +1,6 @@
 use crate::events::{COMPACT_POSITION_MSG, POSITION_MSG};
-use crate::winutil::{clear_window_state, set_window_state, wide, window_state};
+use crate::winutil::{StateClaim, clear_window_state, set_window_state, wide, window_state};
 use log::debug;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -60,9 +59,9 @@ struct PositionerState {
 /// Set when this window's WM_NCCREATE claims the state box handed over in
 /// `lpCreateParams`, so a failed CreateWindowExW can tell whether the box was
 /// taken by the system (and freed in WM_NCDESTROY) or still belongs to the
-/// caller. Reset before each open; window creation is single-threaded on the
-/// UI thread, so a plain atomic flag is race-free.
-static POSITIONER_STATE_CLAIMED: AtomicBool = AtomicBool::new(false);
+/// caller. Reset before each open. See `winutil::StateClaim` for the shared
+/// mechanics.
+static POSITIONER_STATE_CLAIMED: StateClaim = StateClaim::new();
 
 /// Opens a floating sample notification that the user can drag to set WinGlance's
 /// placement. The window stays open until the user clicks X or presses Escape.
@@ -101,7 +100,7 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
             pen: CreatePen(PS_SOLID, 2, COLORREF(0x999999)),
         });
         let state_ptr = Box::into_raw(state);
-        POSITIONER_STATE_CLAIMED.store(false, Ordering::SeqCst);
+        POSITIONER_STATE_CLAIMED.reset();
         // The positioner sits on the owner's monitor: create it at the owner's
         // DPI so the sample box and its close button are sized like the rest
         // of the UI on high-DPI displays.
@@ -126,7 +125,39 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
                     *guard = (hwnd.0 as usize, overlay.0 as usize);
                 }
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                debug!("position adjustor opened");
+                // Start the sample where the pill currently lives, so the user
+                // drags from the right spot; fall back to the default top-center
+                // placement (the same target the Settings Reset applies to the
+                // pill) when the overlay has no on-screen window. The sample is
+                // placed on the overlay's target monitor and clamped into its
+                // work area, so it can never launch off-monitor.
+                let scale = GetDpiForWindow(overlay).max(96) as f32 / 96.0;
+                let work = monitor_work_area(overlay);
+                let pw = (WIDTH as f32 * scale).round() as i32;
+                let ph = (HEIGHT as f32 * scale).round() as i32;
+                let mut pill_rect = RECT::default();
+                let (x, y) = if GetWindowRect(overlay, &mut pill_rect).is_ok()
+                    && pill_rect.left != pill_rect.right
+                    && pill_rect.top != pill_rect.bottom
+                {
+                    (
+                        pill_rect.left.clamp(work.left, (work.right - pw).max(work.left)),
+                        pill_rect.top.clamp(work.top, (work.bottom - ph).max(work.top)),
+                    )
+                } else {
+                    let margin = (DEFAULT_MARGIN * scale).round() as i32;
+                    (work.left + (work.right - work.left - pw) / 2, work.top + margin)
+                };
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+                debug!("position adjustor opened at ({x}, {y})");
                 true
             }
             Err(_) => {
@@ -135,12 +166,10 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
                 // POSITIONER_STATE_CLAIMED when it takes the box; if it never
                 // ran, the box still belongs to us and must be freed here —
                 // including its fixed GDI objects.
-                if !POSITIONER_STATE_CLAIMED.load(Ordering::SeqCst) {
-                    let state = Box::from_raw(state_ptr);
+                if let Some(state) = POSITIONER_STATE_CLAIMED.take_unclaimed(state_ptr) {
                     let _ = DeleteObject(HGDIOBJ(state.bg_brush.0));
                     let _ = DeleteObject(HGDIOBJ(state.x_brush.0));
                     let _ = DeleteObject(HGDIOBJ(state.pen.0));
-                    drop(state);
                 }
                 false
             }
@@ -298,7 +327,7 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
             if !create.is_null() {
                 let state = (*create).lpCreateParams as *mut PositionerState;
                 set_window_state(hwnd, state);
-                POSITIONER_STATE_CLAIMED.store(true, Ordering::SeqCst);
+                POSITIONER_STATE_CLAIMED.claim();
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }

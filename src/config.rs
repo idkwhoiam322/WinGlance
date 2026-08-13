@@ -83,9 +83,21 @@ pub struct OverlayConfig {
     /// Which display the Compact pill is placed on while it uses its own
     /// position (see `MonitorMode`).
     pub compact_monitor: MonitorMode,
-    /// What hovering over the pill does while the effective layout is
-    /// Compact (see `CompactHoverAction`).
-    pub compact_hover_action: CompactHoverAction,
+    /// Hovering a pill in the *Expanded* layout arms its dismissal: the
+    /// remaining time is capped at 500 ms, one-way (see `EARLY_EXIT_MS`).
+    /// For pills in the Compact layout it makes the second hover dismiss
+    /// (see `expand_compact_on_hover`): the first hover expands, later
+    /// hovers dismiss. While off, no hover ever dismisses a pill.
+    pub dismiss_on_hover: bool,
+    /// Hovering a pill in the *Compact* layout expands it in place (see the
+    /// hover morph): the countdown resets to the full duration, the expanded
+    /// state is held while the cursor stays on it (it is an interaction,
+    /// never dismissed mid-read), and leaving collapses it back to compact
+    /// and resets the countdown again. With `dismiss_on_hover` enabled, the
+    /// first hover of a showing expands and later hovers dismiss (the second
+    /// hover dismisses); without it, every hover re-expands and resets.
+    /// While off, a Compact pill behaves exactly like an Expanded one.
+    pub expand_compact_on_hover: bool,
     /// Unknown keys under `[overlay]`, preserved across saves.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -126,27 +138,6 @@ pub enum LayoutMode {
     Expanded,
     Compact,
     Auto,
-}
-
-/// What hovering over a pill with the *compact* layout does.
-///
-/// ```toml
-/// compact_hover_action = "dismiss"   # hover dismisses after 500 ms (default)
-/// compact_hover_action = "expand"    # hover morphs the compact pill in place
-///                                    # to the expanded layout once per
-///                                    # notification; the next hover entry
-///                                    # dismisses
-/// ```
-///
-/// Only pills whose layout mode is explicitly `Compact` expand: an
-/// Auto-resolved compact pill is a deliberate choice (fullscreen app, or a
-/// source on the auto-compact list) and always keeps the Dismiss behavior.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CompactHoverAction {
-    #[default]
-    Dismiss,
-    Expand,
 }
 
 /// Which display the overlay pill is placed on. Serialized as a string so a
@@ -251,8 +242,8 @@ pub struct AppearanceConfig {
 impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
-            duration_ms: 3000,
-            animation_ms: 280,
+            duration_ms: 5000,
+            animation_ms: 500,
             vertical: VerticalPosition::Top,
             horizontal: HorizontalPosition::Center,
             margin: 8,
@@ -269,7 +260,8 @@ impl Default for OverlayConfig {
             compact_position_x: None,
             compact_position_y: None,
             compact_monitor: MonitorMode::default(),
-            compact_hover_action: CompactHoverAction::default(),
+            dismiss_on_hover: true,
+            expand_compact_on_hover: true,
             unknown: toml::Table::new(),
         }
     }
@@ -486,14 +478,20 @@ impl Config {
 
     /// Writes `config.toml` via a co-located temp file + same-volume rename,
     /// so a crash mid-write cannot leave a truncated config behind (the
-    /// rename atomically replaces an existing file).
+    /// rename atomically replaces an existing file). The file is synced
+    /// before the rename so a power loss cannot lose the settings change.
     fn save_to(&self, config_path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(self)?;
         let tmp_path = config_path.with_extension("toml.tmp");
-        std::fs::write(&tmp_path, content)?;
+        {
+            let mut f = std::fs::File::create(&tmp_path)?;
+            use std::io::Write;
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+        }
         if let Err(e) = std::fs::rename(&tmp_path, config_path) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(e.into());
@@ -519,7 +517,7 @@ impl Config {
 
     fn normalize(&mut self) {
         self.overlay.duration_ms = self.overlay.duration_ms.clamp(500, 60_000);
-        self.overlay.animation_ms = self.overlay.animation_ms.clamp(100, 500);
+        self.overlay.animation_ms = self.overlay.animation_ms.clamp(100, 1000);
         self.overlay.max_width = self.overlay.max_width.clamp(180, 800);
         self.overlay.max_tick_hz = self.overlay.max_tick_hz.map(|hz| hz.clamp(60, 1000));
         self.overlay.margin = self.overlay.margin.clamp(0, 500);
@@ -835,30 +833,30 @@ nested_appearance = [1, 2, 3]
     }
 
     #[test]
-    fn compact_hover_action_defaults_to_dismiss_and_round_trips_through_toml() {
-        // Defaults to Dismiss: current hover behavior is untouched out of the box.
-        assert_eq!(
-            Config::default().overlay.compact_hover_action,
-            CompactHoverAction::Dismiss
-        );
-        for (form, expected) in [
-            ("dismiss", CompactHoverAction::Dismiss),
-            ("expand", CompactHoverAction::Expand),
-        ] {
-            let config: Config = toml::from_str(&format!("[overlay]\ncompact_hover_action = \"{form}\"\n")).unwrap();
-            assert_eq!(
-                config.overlay.compact_hover_action, expected,
-                "compact_hover_action = \"{form}\" in [overlay] must map to {expected:?}"
-            );
+    fn hover_toggles_default_on_and_round_trip_through_toml() {
+        // Both default to true. This is a deliberate model change from the
+        // old single compact_hover_action: compact pills now expand on the
+        // first hover and dismiss on the second, and hovering an expanded
+        // pill arms a 500 ms dismiss — the previous model deferred an
+        // expanded pill's countdown while the cursor stayed on it, and had
+        // no equivalent of dismiss-on-hover at all.
+        let defaults = Config::default();
+        assert!(defaults.overlay.dismiss_on_hover);
+        assert!(defaults.overlay.expand_compact_on_hover);
+        for (key, value) in [("dismiss_on_hover", "false"), ("expand_compact_on_hover", "false")] {
+            let config: Config = toml::from_str(&format!("[overlay]\n{key} = {value}\n")).unwrap();
+            let loaded = if key == "dismiss_on_hover" {
+                config.overlay.dismiss_on_hover
+            } else {
+                config.overlay.expand_compact_on_hover
+            };
+            assert!(!loaded, "{key} = {value} in [overlay] must load as false");
             let saved = toml::to_string_pretty(&config).unwrap();
             assert!(
-                saved.contains(&format!("compact_hover_action = \"{form}\"")),
-                "the action must serialize in its hand-editable string form:\n{saved}"
+                saved.contains(&format!("{key} = {value}")),
+                "the toggle must serialize back:\n{saved}"
             );
         }
-        // Unknown actions are hard deserialization errors, never a silent
-        // reinterpretation.
-        assert!(toml::from_str::<Config>("[overlay]\ncompact_hover_action = \"bogus\"\n").is_err());
     }
 
     #[test]
@@ -1000,5 +998,53 @@ nested_appearance = [1, 2, 3]
         config.appearance.compact_corner_radius = -5.0;
         config.normalize();
         assert_eq!(config.appearance.compact_corner_radius, 4.0);
+    }
+
+    #[test]
+    fn docs_and_config_example_cover_every_config_field() {
+        // Every serializable field must be documented in both
+        // docs/configuration.md and config.example.toml. The key set is
+        // derived from a fully-populated default config, so no struct field
+        // can be added without this test failing until both files mention
+        // it — the schema drift the review found cannot recur.
+        let mut config = Config::default();
+        // Populate the Option fields that skip_serializing_if would omit.
+        config.overlay.position_x = Some(0);
+        config.overlay.position_y = Some(0);
+        config.overlay.compact_position_x = Some(0);
+        config.overlay.compact_position_y = Some(0);
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let keys: Vec<&str> = serialized
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim()))
+            .collect();
+        assert!(
+            keys.len() >= 30,
+            "the fully-populated default must expose the whole field set, got {keys:?}"
+        );
+        let example = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml"))
+            .expect("config.example.toml must exist at the crate root");
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/configuration.md"))
+            .expect("docs/configuration.md must exist at the crate root");
+
+        let missing_in_example: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| !example.contains(&format!("{key} =")))
+            .collect();
+        let missing_in_docs: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| !doc.contains(&format!("`{key}`")))
+            .collect();
+
+        assert!(
+            missing_in_example.is_empty(),
+            "config.example.toml does not cover: {missing_in_example:?}"
+        );
+        assert!(
+            missing_in_docs.is_empty(),
+            "docs/configuration.md does not cover: {missing_in_docs:?}"
+        );
     }
 }
