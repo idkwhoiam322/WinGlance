@@ -373,7 +373,7 @@ switching between two panes:
 - **Settings** — cards mirroring the tray menu and `[behavior]`/`[overlay]`
   config: notifications toggle, duration presets, start-on-login, close-to-
   tray, allowed apps, position anchors + Reset/Adjust, target display
-  selection, "Show sample", and the "Copy logs" button. The main window is the
+  selection, "Preview Notification", and the "Copy logs" button. The main window is the
   single writer of the in-memory config (see the guardrail in `AGENTS.md`);
   every change goes through `mutate_config` and is persisted.
 

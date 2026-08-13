@@ -66,6 +66,7 @@ use windows::core::{PCWSTR, PWSTR};
 const WM_TRAY: u32 = WM_APP + 2;
 const TRAY_ID: u32 = 1;
 const MENU_OPEN_ID: usize = 1001;
+const MENU_PREVIEW_NOTIFY_ID: usize = 1029;
 const MENU_NOTIFY_ID: usize = 1002;
 const MENU_AUTOSTART_ID: usize = 1003;
 const MENU_CLOSE_TRAY_ID: usize = 1004;
@@ -2324,7 +2325,7 @@ impl MainWindowState {
                             },
                             SETTINGS_MUTED,
                         ),
-                        SettingId::ShowSample => ("Show sample", String::new(), SETTINGS_MUTED),
+                        SettingId::ShowSample => ("Preview Notification", String::new(), SETTINGS_MUTED),
                         SettingId::CopyLogs => ("Logs", String::new(), SETTINGS_MUTED),
                         SettingId::OpenConfig => ("Config", String::new(), SETTINGS_MUTED),
                     };
@@ -3772,6 +3773,12 @@ fn show_tray_menu(state: &mut MainWindowState) {
     }
     unsafe {
         let _ = AppendMenuW(menu, open_flags, MENU_OPEN_ID, PCWSTR(wide("Open WinGlance").as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_PREVIEW_NOTIFY_ID,
+            PCWSTR(wide("Preview Notification").as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
             menu,
@@ -3949,6 +3956,11 @@ fn show_tray_menu(state: &mut MainWindowState) {
             .0 as usize;
             match command {
                 MENU_OPEN_ID => state.show_window(),
+                // Show the pill now with the current track (or the sample
+                // when nothing has played this session), dismissing after
+                // the configured duration — the same path the settings
+                // "Preview the notification" button uses.
+                MENU_PREVIEW_NOTIFY_ID => show_sample(state.overlay_hwnd),
                 MENU_NOTIFY_ID => {
                     let new_value = !state.cfg().behavior.notifications_enabled;
                     // Flip the overlay first; persist only when the toggle
