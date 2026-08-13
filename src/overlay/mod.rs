@@ -680,6 +680,11 @@ pub(crate) fn set_layout(hwnd: HWND, mode: LayoutMode) {
         state.hover_expand = None;
         state.hover_expanded_once = false;
         state.content_fade = None;
+        // Reset persistent-compact state: switching away from (or to) the
+        // layout must not leave a stale faded/collapse flag that would
+        // affect the next dismiss cycle.
+        state.persistent_faded = false;
+        state.persistent_collapse_on_dismiss = false;
         // A hidden pill's sample re-resolves the layout from the foreground
         // itself (show_sample → refresh_layout), so only the visible path
         // refreshes here.
@@ -1363,6 +1368,9 @@ impl OverlayState {
     fn apply_track_progress(&mut self, track: &TrackInfo) {
         self.progress_duration_secs = track.duration_secs;
         self.progress_rate = track.playback_rate;
+        // Reset the stale-sample baseline: a new track's first ProgressChanged
+        // must not be compared against the previous track's last sample.
+        self.last_progress_position_secs = None;
         self.estimated_position_secs = track.position_secs;
         self.progress_anchor = Some((
             track.position_updated_at.unwrap_or_else(Instant::now),
@@ -2367,9 +2375,12 @@ impl OverlayState {
             self.persistent_collapse_on_dismiss = should_hide;
             if should_hide && !was_auto_hidden {
                 // Save content before hide() clears it, so resume can restore it.
-                let saved = self.content.clone();
+                // hide() calls show_next(), which may show a pending event;
+                // show_with_duration will overwrite held_content for that event,
+                // which is correct — the pending event's pill is the one that
+                // was shown and collapsed. If no pending event, the save survives.
+                self.held_content = self.content.clone();
                 self.hide();
-                self.held_content = saved;
                 return;
             }
             if was_auto_hidden && !should_hide {
