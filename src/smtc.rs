@@ -1501,12 +1501,21 @@ fn emit_track(prev: &LogicalState, merged: &TrackInfo, read_artwork: bool) -> (b
     // Seek detection: a position jump beyond the threshold (or a presence
     // flip in reported position) re-emits so the overlay re-bases instead of
     // drifting from a stale base. Position is excluded from content_differ.
+    // A fresh session's first read always shows a position presence flip, so
+    // the seek term must not override the artwork deferral: sources that
+    // recreate their session per track change would otherwise emit a
+    // title-only pill while SMTC populates the thumbnail (~500 ms later), and
+    // the cover would then swap in under it. Established sessions have
+    // `defer_first == false`, so their seek re-emits are unaffected.
     let seek = match (merged.position_secs, prev.last_position_secs) {
         (Some(rp), Some(pp)) => (rp - pp as f64).abs() > SEEK_DELTA_SECS,
         (Some(_), None) | (None, Some(_)) => true,
         _ => false,
     };
-    (content_changed && !defer_first || artwork_gained || seek, artwork_lost)
+    (
+        (content_changed || seek) && !defer_first || artwork_gained,
+        artwork_lost,
+    )
 }
 
 /// Whether a deferred first pill has waited past the artwork timeout and
@@ -2472,5 +2481,30 @@ mod tests {
         assert!(emit_track(&prev_none, &make(Some(5.0)), false).0);
         // Presence flip (position vanished) → re-emit.
         assert!(emit_track(&prev, &make(None), false).0);
+    }
+
+    #[test]
+    fn fresh_session_first_read_defers_for_artwork_over_seek() {
+        // A recreated session (sources recreate one per track change) starts
+        // from a default LogicalState: its first read reports a position
+        // presence flip, which must NOT bypass the artwork deferral — the
+        // thumbnail populates ~500 ms after the title, so emitting here would
+        // show a title-only pill and swap the cover in under it.
+        let prev = LogicalState::default();
+        let read = TrackInfo {
+            title: "New Song".into(),
+            artist: "New Artist".into(),
+            source_app: "spotify".into(),
+            position_secs: Some(0.0),
+            ..TrackInfo::default()
+        };
+        // Artwork not readable yet: defer despite the position flip.
+        assert!(!emit_track(&prev, &read, true).0);
+        // Artwork readable on the same first read: emit normally.
+        let with_art = TrackInfo {
+            artwork: Some(Arc::from([1u8, 2, 3, 4])),
+            ..read
+        };
+        assert!(emit_track(&prev, &with_art, true).0);
     }
 }
