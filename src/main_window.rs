@@ -91,6 +91,8 @@ const LISTBOX_ID: usize = 2;
 const HISTORY_CAP: usize = 400;
 /// Timer used to clear the "Copied" feedback on the Copy logs button.
 const TIMER_LOGS_ID: usize = 101;
+/// Timer used to clear the "Opened" feedback on the Open logs/Open config buttons.
+const TIMER_OPENED_ID: usize = 104;
 /// Timer used to keep the native history tooltip's item rects in sync (scroll).
 const TIMER_TOOLTIPS_ID: usize = 102;
 /// One-shot timer that frees the cached artwork blit after the window has
@@ -704,6 +706,10 @@ struct MainWindowState {
     tooltips_dirty: bool,
     /// Timestamp of the last "Copy logs" press, for the "Copied" feedback.
     logs_copied_at: Option<Instant>,
+    /// Timestamp of the last "Open logs" press, for the "Opened" feedback.
+    logs_opened_at: Option<Instant>,
+    /// Timestamp of the last "Open config" press, for the "Opened" feedback.
+    config_opened_at: Option<Instant>,
     /// Shared slot for the process picker's confirmed allow-list patterns. The
     /// picker writes the result here and posts a bare `PICKER_RESULT_MSG`; no
     /// pointer ever crosses the message boundary.
@@ -880,6 +886,8 @@ impl MainWindowState {
             tooltip_range: None,
             tooltips_dirty: false,
             logs_copied_at: None,
+            logs_opened_at: None,
+            config_opened_at: None,
             picker_result: Arc::new(Mutex::new(None)),
             auto_sources_result: Arc::new(Mutex::new(None)),
             source_states: HashMap::new(),
@@ -2611,11 +2619,14 @@ impl MainWindowState {
                             let copied = self
                                 .logs_copied_at
                                 .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
+                            let opened = self
+                                .logs_opened_at
+                                .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
                             draw_small_button(
                                 &self.fonts,
                                 hdc,
                                 &open_rect,
-                                "Open logs",
+                                if opened { "Opened" } else { "Open logs" },
                                 accent,
                                 hovered_open,
                                 scale,
@@ -2643,11 +2654,14 @@ impl MainWindowState {
                             let (open_rect, reload_rect) = halve(&control_rect, gap);
                             let hovered_open = self.settings_hover == Some((current_row, SettingSub::OpenConfig));
                             let hovered_reload = self.settings_hover == Some((current_row, SettingSub::ReloadConfig));
+                            let opened = self
+                                .config_opened_at
+                                .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
                             draw_small_button(
                                 &self.fonts,
                                 hdc,
                                 &open_rect,
-                                "Open config",
+                                if opened { "Opened" } else { "Open config" },
                                 accent,
                                 hovered_open,
                                 scale,
@@ -3994,6 +4008,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == TIMER_OPENED_ID => {
+            unsafe {
+                let _ = KillTimer(hwnd, TIMER_OPENED_ID);
+            }
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.logs_opened_at = None;
+                state.config_opened_at = None;
+                state.invalidate();
+            }
+            LRESULT(0)
+        }
         WM_TIMER if wparam.0 == TIMER_TOOLTIPS_ID => {
             if !state_ptr.is_null() {
                 unsafe {
@@ -4357,6 +4383,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     let (open_rect, _copy_rect) = halve(&control_rect, gap);
                                     if x >= open_rect.left && x < open_rect.right {
                                         state.open_logs();
+                                        state.logs_opened_at = Some(Instant::now());
+                                        unsafe { SetTimer(hwnd, TIMER_OPENED_ID, 2000, None) };
+                                        state.invalidate();
                                     } else {
                                         state.copy_logs();
                                     }
@@ -4366,6 +4395,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     let (open_rect, _reload_rect) = halve(&control_rect, gap);
                                     if x >= open_rect.left && x < open_rect.right {
                                         state.open_config();
+                                        state.config_opened_at = Some(Instant::now());
+                                        unsafe { SetTimer(hwnd, TIMER_OPENED_ID, 2000, None) };
+                                        state.invalidate();
                                     } else {
                                         state.reload_config();
                                     }
