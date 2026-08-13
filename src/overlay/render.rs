@@ -819,8 +819,7 @@ pub(super) fn draw_symbol_pixels(
     playback: PlaybackState,
     color: [u8; 4],
 ) {
-    let bar_w = 0.20 * size;
-    let radius = (0.20 * size).min(bar_w / 2.0).max(0.0);
+    let radius = (0.10 * size).max(0.0);
     let box_left = (right as f32 - size).round() as i32;
     // The symbols are ~0.88×S tall; center them in the S×S box.
     let v_center = y as f32 + size * 0.5;
