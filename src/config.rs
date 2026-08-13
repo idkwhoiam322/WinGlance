@@ -98,6 +98,13 @@ pub struct OverlayConfig {
     /// hover dismisses); without it, every hover re-expands and resets.
     /// While off, a Compact pill behaves exactly like an Expanded one.
     pub expand_compact_on_hover: bool,
+    /// When `layout = "persistent-compact"`, fade the pill to 25% idle
+    /// opacity after `duration_ms` elapses. Off: the pill stays at full
+    /// opacity while media is playing (no idle fade), and hides after
+    /// `duration_ms` when nothing is playing (paused or stopped) instead of
+    /// lingering. Fullscreen/listed-foreground hiding
+    /// (`hide_for_auto_compact_sources`) applies either way. Default: `true`.
+    pub fade_persistent_pill: bool,
     /// Unknown keys under `[overlay]`, preserved across saves.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -270,6 +277,7 @@ impl Default for OverlayConfig {
             compact_monitor: MonitorMode::default(),
             dismiss_on_hover: true,
             expand_compact_on_hover: true,
+            fade_persistent_pill: true,
             unknown: toml::Table::new(),
         }
     }

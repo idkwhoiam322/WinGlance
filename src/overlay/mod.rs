@@ -770,6 +770,30 @@ pub(crate) fn set_expand_compact_on_hover(hwnd: HWND, enabled: bool) {
     }
 }
 
+/// Pushes the persistent-pill idle-fade toggle to the live overlay (which
+/// keeps its own config snapshot). A pill that is currently faded returns
+/// to full opacity immediately, so the change is visible right away; a
+/// hidden pill stays hidden (no preview — the setting only affects what
+/// happens once the next dismiss deadline fires).
+pub(crate) fn set_fade_persistent_pill(hwnd: HWND, enabled: bool) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = window_state::<OverlayState>(hwnd);
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        state.config.overlay.fade_persistent_pill = enabled;
+        state.persistent_faded = false;
+        info!("overlay fade_persistent_pill set to {enabled}");
+        if !matches!(state.phase, Phase::Hidden | Phase::Collapsing(_)) {
+            state.render();
+        }
+    }
+}
+
 /// Pushes the hide-for-auto-compact-sources setting to the live overlay.
 /// The next foreground change evaluates the new value.
 pub(crate) fn set_hide_for_auto_compact_sources(hwnd: HWND, enabled: bool) {
@@ -996,6 +1020,7 @@ impl OverlayState {
     /// foreground), and the fade ramp hasn't elapsed yet.
     fn persistent_fade_active(&self) -> bool {
         self.config.overlay.layout == LayoutMode::PersistentCompact
+            && self.config.overlay.fade_persistent_pill
             && self.persistent_faded
             && !self.persistent_collapse_on_dismiss
             && self
@@ -1970,14 +1995,28 @@ impl OverlayState {
         // Exception: when persistent_collapse_on_dismiss is set (foreground is
         // fullscreen/listed), skip the idle fade and fall through to the
         // normal collapse path so the pill hides instead of lingering at 0.25.
+        // With the idle fade disabled (fade_persistent_pill = false): the
+        // deadline is a no-op while something is playing (the pill stays at
+        // full opacity), but when nothing is playing a bright stale pill must
+        // not linger — collapse and hide it like any other mode.
         if self.config.overlay.layout == LayoutMode::PersistentCompact && !self.persistent_collapse_on_dismiss {
-            if !self.persistent_faded
+            if self.config.overlay.fade_persistent_pill {
+                if !self.persistent_faded
+                    && !cursor_over
+                    && self.dismiss_at.is_some_and(|deadline| deadline <= now)
+                    && matches!(self.phase, Phase::Shown)
+                {
+                    self.persistent_faded = true;
+                    debug!("persistent pill faded to idle opacity");
+                }
+            } else if !playing
                 && !cursor_over
                 && self.dismiss_at.is_some_and(|deadline| deadline <= now)
                 && matches!(self.phase, Phase::Shown)
             {
-                self.persistent_faded = true;
-                debug!("persistent pill faded to idle opacity");
+                self.phase = Phase::Collapsing(now);
+                self.hover_expand = None;
+                debug!("persistent pill hidden (nothing playing, fade disabled)");
             }
         } else if !held
             && self.dismiss_at.is_some_and(|deadline| deadline <= now)
@@ -2010,7 +2049,14 @@ impl OverlayState {
                 // idle opacity instead of hiding) — unless
                 // persistent_collapse_on_dismiss is set (foreground is
                 // fullscreen/listed), in which case the pill fully hides.
+                // With the idle fade disabled, a collapse while nothing is
+                // playing (paused/stopped) hides the pill instead of reviving
+                // it at full opacity.
                 if self.config.overlay.layout == LayoutMode::PersistentCompact && !self.persistent_collapse_on_dismiss {
+                    if !self.config.overlay.fade_persistent_pill && !playing {
+                        self.hide();
+                        return;
+                    }
                     self.phase = Phase::Shown;
                     self.persistent_faded = false;
                     self.dismiss_at = Some(now + Duration::from_millis(self.config.overlay.duration_ms.max(500)));
@@ -4157,6 +4203,68 @@ mod tests {
         assert!(
             state.render_count > before,
             "the idle-fade must be painted, not just flagged"
+        );
+    }
+
+    #[test]
+    fn fade_disabled_persistent_pill_stays_bright_while_playing() {
+        // fade_persistent_pill = false + media playing: the dismiss deadline
+        // is a no-op — the pill stays at full opacity in the Shown phase,
+        // never fading and never collapsing.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.overlay.fade_persistent_pill = false;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Song", "Artist")));
+        state.phase = Phase::Shown;
+        // dismiss_at just in the past; hover_leave_at also in the past so the
+        // cursor-leave branch doesn't push the deadline back to the future.
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+
+        assert!(
+            matches!(state.phase, Phase::Shown),
+            "a playing persistent pill must not collapse with the fade off"
+        );
+        assert!(!state.persistent_faded, "the idle fade must never arm");
+    }
+
+    #[test]
+    fn fade_disabled_persistent_pill_hides_when_nothing_playing() {
+        // fade_persistent_pill = false + paused: the dismiss deadline
+        // collapses the pill, and the collapse completes into a full hide —
+        // a bright stale pill must not linger over nothing, and must not be
+        // revived at full opacity by the collapse completion.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.overlay.fade_persistent_pill = false;
+        let mut state = OverlayState::new(config.clone(), EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.content = Some(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "spotify".into(),
+        ));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+        assert!(
+            matches!(state.phase, Phase::Collapsing(_)),
+            "a paused persistent pill must collapse with the fade off"
+        );
+
+        // Run the collapse past its animation length: it must complete into a
+        // hide, not back into a bright shown pill.
+        state.phase = Phase::Collapsing(Instant::now() - collapse_duration(&state.config) - Duration::from_millis(1));
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.tick();
+        assert!(
+            matches!(state.phase, Phase::Hidden),
+            "the completed collapse must hide the pill"
         );
     }
 

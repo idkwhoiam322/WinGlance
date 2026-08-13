@@ -7,7 +7,8 @@ use crate::events::{
 use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
     EventQueue, OverlayPos, enumerate_displays_cached, invalidate_display_cache, set_dismiss_on_hover, set_duration,
-    set_expand_compact_on_hover, set_hide_for_auto_compact_sources, set_layout, set_positions, show_sample,
+    set_expand_compact_on_hover, set_fade_persistent_pill, set_hide_for_auto_compact_sources, set_layout,
+    set_positions, show_sample,
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG};
@@ -154,6 +155,7 @@ enum SettingId {
     DismissOnHover,
     ExpandCompactOnHover,
     HideForAutoCompactSources,
+    FadePersistentPill,
     CompactPosition,
     AutoCompactApps,
     Monitor,
@@ -2032,6 +2034,16 @@ impl MainWindowState {
         });
         y += row_h + gap;
         items.push(SettingsItem::Row {
+            id: SettingId::FadePersistentPill,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        items.push(SettingsItem::Row {
             id: SettingId::Monitor,
             rect: RECT {
                 left,
@@ -2115,6 +2127,7 @@ impl MainWindowState {
         let compact_custom = cfg.overlay.compact_effective().x.is_some();
         let auto_compact_sources = cfg.behavior.auto_compact_sources.join(", ");
         let hide_for_auto_compact = cfg.behavior.hide_for_auto_compact_sources;
+        let fade_persistent_pill = cfg.overlay.fade_persistent_pill;
         let display_count = enumerate_displays_cached().len();
 
         let mut hdr = RECT {
@@ -2292,6 +2305,15 @@ impl MainWindowState {
                             },
                             if hide_for_auto_compact { accent } else { SETTINGS_FAINT },
                         ),
+                        SettingId::FadePersistentPill => (
+                            "Fade Persistent Compact Pill after duration",
+                            if fade_persistent_pill {
+                                "Yes".to_string()
+                            } else {
+                                "No".to_string()
+                            },
+                            if fade_persistent_pill { accent } else { SETTINGS_FAINT },
+                        ),
                         SettingId::Monitor => ("Monitor", monitor_label(&cfg, display_count), SETTINGS_MUTED),
                         SettingId::AllowedApps => (
                             "Allowed apps",
@@ -2327,6 +2349,7 @@ impl MainWindowState {
                         | SettingId::DismissOnHover
                         | SettingId::ExpandCompactOnHover
                         | SettingId::HideForAutoCompactSources
+                        | SettingId::FadePersistentPill
                         | SettingId::AutoCompactApps
                         | SettingId::Monitor => {
                             let mut val_rect = control_rect;
@@ -4365,6 +4388,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     state.mutate_config(|cfg| cfg.behavior.hide_for_auto_compact_sources = new_value);
                                     set_hide_for_auto_compact_sources(state.overlay_hwnd, new_value);
                                     info!("hide for auto compact sources set: {new_value}");
+                                    state.invalidate();
+                                }
+                                SettingId::FadePersistentPill => {
+                                    let new_value = !state.cfg().overlay.fade_persistent_pill;
+                                    state.mutate_config(|cfg| cfg.overlay.fade_persistent_pill = new_value);
+                                    set_fade_persistent_pill(state.overlay_hwnd, new_value);
+                                    info!("fade persistent pill set: {new_value}");
                                     state.invalidate();
                                 }
                                 SettingId::SeparateCompact => {
