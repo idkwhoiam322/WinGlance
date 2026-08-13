@@ -751,7 +751,10 @@ impl ListenerState {
                     // app's pill, the identical re-report is a switch-back that
                     // must re-emit — the overlay's cache for this source may
                     // already be evicted, so the pill needs the fresh track
-                    // (with injected art) to come back itself.
+                    // (with injected art) to come back itself. The suppression
+                    // is only reported when an emit would actually have fired
+                    // (see the emit gate below): an unchanged re-read cannot be
+                    // "suppressed" and must not be logged as one.
                     let session_recreation = should_suppress_recreation(
                         self.last_track_per_source.get(&merged.source_app),
                         &merged,
@@ -794,7 +797,14 @@ impl ListenerState {
                             .insert(merged.source_app.clone(), merged.clone());
                         self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
                         next.deferred_at = None;
-                    } else if session_recreation {
+                    } else if emit && session_recreation {
+                        // Only an emit that would actually fire is worth logging
+                        // as suppressed: the 2-second poll re-reads the current
+                        // track unchanged (emit=false) and must not be reported
+                        // as a suppressed recreation — it never would have
+                        // emitted in the first place. Gating the log on `emit`
+                        // keeps a steady-state source from flooding the log
+                        // with one "suppressed" line per poll pass.
                         let label = track_label(&merged);
                         debug!("track emit suppressed | reason=session-recreation | {label}");
                     } else if artwork_lost {

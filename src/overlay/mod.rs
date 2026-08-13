@@ -1067,6 +1067,14 @@ impl OverlayState {
                 _ => None,
             })
             .collect();
+        // Persistent-compact never collapses to Hidden on its own, so the
+        // pending queue (drained only while hidden) would hold cross-source
+        // events forever — a source switch would never update the pill.
+        // While such a pill is visible, any event — same or cross-source —
+        // updates it in place; the queue stays for the hidden phase (auto-hide)
+        // and for the notification layouts, where pills still collapse.
+        let persistent_visible =
+            self.config.overlay.layout == LayoutMode::PersistentCompact && !matches!(self.phase, Phase::Hidden);
         // The queue carries Arc<MediaEvent> so the fan-out to both windows
         // never copies the event; recover the owned event here (zero-copy
         // when this window is the last holder, a clone otherwise).
@@ -1103,7 +1111,7 @@ impl OverlayState {
                         self.last_track = Some(track.clone());
                         self.cache_track(&track);
                         self.update_content(MediaEvent::TrackChanged(track), update_min_duration(&self.config));
-                    } else if self.held_expanded() || same_source_shown {
+                    } else if self.held_expanded() || same_source_shown || persistent_visible {
                         // A new track while the cursor holds an expanded pill, or
                         // a newer track from the same source arriving while any
                         // pill is up, swaps the content in place instead of
@@ -1222,6 +1230,16 @@ impl OverlayState {
                         && self.current_source.as_deref() == Some(source_app.as_str());
                     if replaying {
                         debug!("playback state pill suppressed | reason=replaying same source | source={source_app}");
+                        continue;
+                    }
+                    if persistent_visible {
+                        // A cross-source state while a persistent pill is up:
+                        // the queue would never drain (the pill fades to idle,
+                        // it never hides), so swap the state in place exactly
+                        // like the same-source state toggle above.
+                        let event = MediaEvent::PlaybackStateChanged(state, source_app);
+                        let full = Duration::from_millis(self.config.overlay.duration_ms.max(500));
+                        self.update_content(event, full);
                         continue;
                     }
                     self.enqueue(MediaEvent::PlaybackStateChanged(state, source_app));
@@ -3700,6 +3718,121 @@ mod tests {
         assert!(matches!(
             state.pending.back(),
             Some(MediaEvent::TrackChanged(t)) if t.title == "Song B"
+        ));
+    }
+
+    #[test]
+    fn persistent_layout_swaps_cross_source_track_in_place() {
+        // A persistent-compact pill never collapses to Hidden, so the pending
+        // queue (drained only while hidden) would hold a cross-source track
+        // forever — a source switch must swap the pill in place instead.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.config.overlay.layout = LayoutMode::PersistentCompact;
+        state.content = Some(MediaEvent::TrackChanged(track_for("youtube-music", "Song A", "Artist")));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() + Duration::from_millis(3000));
+
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "Brave", "Song B", "Artist",
+            ))));
+        state.receive_events();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "Brave" && t.title == "Song B"
+            ),
+            "the cross-source track must become the shown content"
+        );
+        assert!(
+            state.pending.is_empty(),
+            "nothing may queue behind a persistent pill that never collapses"
+        );
+    }
+
+    #[test]
+    fn persistent_layout_swaps_cross_source_state_in_place() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.config.overlay.layout = LayoutMode::PersistentCompact;
+        state.content = Some(MediaEvent::TrackChanged(track_for("youtube-music", "Song A", "Artist")));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() + Duration::from_millis(3000));
+
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Paused,
+                "Brave".into(),
+            )));
+        state.receive_events();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, source))
+                    if source == "Brave"
+            ),
+            "the cross-source state must become the shown content"
+        );
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn persistent_layout_hidden_still_queues_cross_source_track() {
+        // Auto-hide (fullscreen/listed foreground) hides the persistent pill;
+        // while hidden the queue is the correct sink — a later show drains it.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.config.overlay.layout = LayoutMode::PersistentCompact;
+        state.phase = Phase::Hidden;
+
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "Brave", "Song B", "Artist",
+            ))));
+        state.receive_events();
+
+        assert_eq!(state.pending.len(), 1, "a hidden persistent pill must still queue");
+        assert!(matches!(
+            state.pending.front(),
+            Some(MediaEvent::TrackChanged(t)) if t.source_app == "Brave"
+        ));
+    }
+
+    #[test]
+    fn non_persistent_layout_still_queues_cross_source_track() {
+        // Notification layouts collapse and hide, so their queue drains; a
+        // cross-source track must keep queueing there (regression guard).
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.content = Some(MediaEvent::TrackChanged(track_for("youtube-music", "Song A", "Artist")));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() + Duration::from_millis(3000));
+
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "Brave", "Song B", "Artist",
+            ))));
+        state.receive_events();
+
+        assert_eq!(
+            state.pending.len(),
+            1,
+            "notification layouts keep queueing cross-source tracks"
+        );
+        assert!(matches!(
+            state.content.as_ref(),
+            Some(MediaEvent::TrackChanged(t)) if t.source_app == "youtube-music"
         ));
     }
 
