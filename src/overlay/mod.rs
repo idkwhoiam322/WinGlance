@@ -487,6 +487,14 @@ struct OverlayState {
     /// extra move, never a misplacement, since every reposition recomputes the
     /// anchor from scratch.
     last_anchor_edge: Option<RECT>,
+    /// Whether the persistent-compact pill is currently in the faded (idle)
+    /// state. The alpha drops to the idle level (0.25 * 255 = 64) after the
+    /// dismiss timeout. Reset on hover, track change, or playback change.
+    persistent_faded: bool,
+    /// `auto_compact_sources` list) is foreground. Saved here before
+    /// `hide()` clears `content`, so `on_foreground_change` can restore it
+    /// on the resume path without depending on the queue.
+    held_content: Option<MediaEvent>,
     /// Cached result of `is_cursor_over_pill()` from the last animation tick,
     /// so `held_expanded()` (called from `receive_events` between ticks) can
     /// skip the display enumeration the cursor poll triggers. Updated every
@@ -531,6 +539,11 @@ struct OverlayState {
     /// can be driven deterministically without polling the real cursor.
     #[cfg(test)]
     test_cursor_over: Option<bool>,
+    /// Test-only: when set, `sample_foreground` returns this verdict instead
+    /// of polling the real foreground window, so layout/hide decisions can be
+    /// tested deterministically.
+    #[cfg(test)]
+    test_fg_verdict: Option<ForegroundVerdict>,
     /// Test-only: counts `render()` entries, so a tick-level test can assert
     /// that the tick which starts a hover morph renders on that same tick.
     #[cfg(test)]
@@ -729,6 +742,23 @@ pub(crate) fn set_expand_compact_on_hover(hwnd: HWND, enabled: bool) {
     }
 }
 
+/// Pushes the hide-for-auto-compact-sources setting to the live overlay.
+/// The next foreground change evaluates the new value.
+pub(crate) fn set_hide_for_auto_compact_sources(hwnd: HWND, enabled: bool) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = window_state::<OverlayState>(hwnd);
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        state.config.behavior.hide_for_auto_compact_sources = enabled;
+        info!("overlay hide_for_auto_compact_sources set to {enabled}");
+    }
+}
+
 impl OverlayState {
     fn new(config: Config, queue: EventQueue) -> Self {
         let position = OverlayPos::from_config(&config);
@@ -749,6 +779,7 @@ impl OverlayState {
             hover_expand: None,
             hover_expanded_once: false,
             hover_leave_at: None,
+            persistent_faded: false,
             content_fade: None,
             last_frame_w: 0,
             last_frame_h: 0,
@@ -783,6 +814,7 @@ impl OverlayState {
             wake: Arc::new(AtomicBool::new(false)),
             hook: None,
             last_anchor_edge: None,
+            held_content: None,
             last_cursor_over_pill: false,
             current_source: None,
             track_cache: HashMap::new(),
@@ -794,6 +826,8 @@ impl OverlayState {
             aura_inset: 0,
             #[cfg(test)]
             test_cursor_over: None,
+            #[cfg(test)]
+            test_fg_verdict: None,
             #[cfg(test)]
             render_count: 0,
         }
@@ -1273,7 +1307,6 @@ impl OverlayState {
             }
         }
     }
-
     fn flush_pending(&mut self) {
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_DEBOUNCE);
@@ -1285,7 +1318,6 @@ impl OverlayState {
         }
         self.show_next();
     }
-
     /// Refreshes the shown content in place: keeps the current animation
     /// phase, extends the dismiss deadline to at least `now + min_visible`
     /// (a metadata refresh grants a short extension, a real content change —
@@ -1381,6 +1413,11 @@ impl OverlayState {
         };
         self.resolve_pill_text();
         self.reset_scroll();
+        // Persistent-compact: a content refresh restores full opacity and
+        // restarts the fade timer.
+        if self.config.overlay.layout == LayoutMode::PersistentCompact {
+            self.persistent_faded = false;
+        }
         if let Some(deadline) = self.dismiss_at {
             self.dismiss_at = Some(deadline.max(Instant::now() + min_visible));
         }
@@ -1449,6 +1486,7 @@ impl OverlayState {
         self.hover_expand = None;
         self.hover_expanded_once = false;
         self.hover_leave_at = None;
+        self.persistent_faded = false;
         self.content_fade = None;
         self.phase = if full_animation {
             Phase::Expanding(now)
@@ -1492,6 +1530,12 @@ impl OverlayState {
     /// identity is cached with the foreground HWND, so the process table is
     /// enumerated only when the foreground window actually changed.
     fn sample_foreground(&mut self) -> ForegroundVerdict {
+        #[cfg(test)]
+        {
+            if let Some(verdict) = &self.test_fg_verdict {
+                return verdict.clone();
+            }
+        }
         let foreground = unsafe { GetForegroundWindow() };
         let fullscreen = window_is_fullscreen(foreground, self.hwnd);
         let exe = if self.layout_fg == Some(foreground) {
@@ -1645,6 +1689,13 @@ impl OverlayState {
         self.last_cursor_over_pill = cursor_over;
         if cursor_over {
             self.hover_leave_at = None;
+            // Persistent-compact: hovering the pill restores full opacity and
+            // restarts the fade timer for when the cursor leaves.
+            if self.config.overlay.layout == LayoutMode::PersistentCompact && self.persistent_faded {
+                self.persistent_faded = false;
+                self.dismiss_at = Some(now + Duration::from_millis(self.config.overlay.duration_ms.max(500)));
+                debug!("persistent pill restored on hover");
+            }
         } else if self.hover_leave_at.is_none() {
             self.hover_leave_at = Some(now);
         }
@@ -1688,7 +1739,15 @@ impl OverlayState {
                         morph_expanding: matches!(&self.hover_expand, Some(m) if m.direction == MorphDirection::Expand),
                         dismiss_armed: self.hover_dismiss_at.is_some(),
                     },
-                    self.config.overlay.dismiss_on_hover,
+                    // Persistent-compact: the expanded pill never dismisses on
+                    // hover — it collapses back to compact and fades after the
+                    // timeout. Override dismiss_on_hover to false so the hover
+                    // machine never arms a dismiss.
+                    if self.config.overlay.layout == LayoutMode::PersistentCompact {
+                        false
+                    } else {
+                        self.config.overlay.dismiss_on_hover
+                    },
                     self.config.overlay.expand_compact_on_hover,
                     self.hover_expanded_once,
                     self.layout == LayoutMode::Expanded,
@@ -1769,7 +1828,28 @@ impl OverlayState {
             let early = now + Duration::from_millis(EARLY_EXIT_MS);
             self.dismiss_at = Some(self.dismiss_at.map_or(early, |d| d.min(early)));
         }
-        if !held
+        // Persistent-compact: when the cursor leaves the pill, restart the
+        // fade timer so the pill fades from full opacity after another
+        // duration_ms idle period.
+        if self.config.overlay.layout == LayoutMode::PersistentCompact
+            && !cursor_over
+            && self.hover_leave_at == Some(now)
+        {
+            self.dismiss_at = Some(now + Duration::from_millis(self.config.overlay.duration_ms.max(500)));
+            self.persistent_faded = false;
+        }
+        // Persistent-compact: when dismiss_at fires, fade to idle opacity
+        // instead of collapsing. Skip the normal dismiss path entirely.
+        if self.config.overlay.layout == LayoutMode::PersistentCompact {
+            if !self.persistent_faded
+                && !cursor_over
+                && self.dismiss_at.is_some_and(|deadline| deadline <= now)
+                && matches!(self.phase, Phase::Shown)
+            {
+                self.persistent_faded = true;
+                debug!("persistent pill faded to idle opacity");
+            }
+        } else if !held
             && self.dismiss_at.is_some_and(|deadline| deadline <= now)
             && !matches!(self.phase, Phase::Collapsing(_) | Phase::Hidden)
             && !matches!(&self.hover_expand, Some(m) if m.direction == MorphDirection::Collapse)
@@ -1795,8 +1875,18 @@ impl OverlayState {
                 debug!("pill phase -> shown");
             }
             Phase::Collapsing(start) if start.elapsed() >= collapse_duration(&self.config) => {
-                self.hide();
-                return;
+                // Persistent-compact: the collapse animation shrinks the pill
+                // back to compact size, but the pill stays visible (fades to
+                // idle opacity instead of hiding).
+                if self.config.overlay.layout == LayoutMode::PersistentCompact {
+                    self.phase = Phase::Shown;
+                    self.persistent_faded = false;
+                    self.dismiss_at = Some(now + Duration::from_millis(self.config.overlay.duration_ms.max(500)));
+                    debug!("persistent pill collapsed to compact, restarting fade timer");
+                } else {
+                    self.hide();
+                    return;
+                }
             }
             _ => {}
         }
@@ -1994,10 +2084,25 @@ impl OverlayState {
                     morph: None,
                 }
             }
-            Phase::Shown => FrameState {
-                alpha: 255,
-                morph: None,
-            },
+            Phase::Shown => {
+                if self.config.overlay.layout == LayoutMode::PersistentCompact && self.persistent_faded {
+                    // Persistent-compact idle fade: ramp from full to idle
+                    // opacity over 300 ms once the dismiss timeout fires.
+                    let idle = 64.0_f32; // 0.25 * 255
+                    let fade_start = self.dismiss_at.unwrap_or_else(Instant::now);
+                    let t = ((fade_start.elapsed().as_secs_f32() - 0.3) / 0.3).clamp(0.0, 1.0);
+                    let alpha = 255.0 - (255.0 - idle) * t;
+                    FrameState {
+                        alpha: alpha as u8,
+                        morph: None,
+                    }
+                } else {
+                    FrameState {
+                        alpha: 255,
+                        morph: None,
+                    }
+                }
+            }
             Phase::Collapsing(start) => {
                 let total_dur = collapse_duration(&self.config).as_secs_f32();
                 let t = (start.elapsed().as_secs_f32() / total_dur).clamp(0.0, 1.0);
@@ -2168,9 +2273,36 @@ impl OverlayState {
     fn on_foreground_change(&mut self) {
         // While the pill is hidden there is nothing to anchor; bail before any
         // display/monitor enumeration so a foreground switch with no pill up
-        // only pays for the posted-message round-trip.
-        if matches!(self.phase, Phase::Hidden) {
+        // only pays for the posted-message round-trip. Exception:
+        // persistent-compact mode may need to resume from an auto-hide.
+        let is_persistent = self.config.overlay.layout == LayoutMode::PersistentCompact;
+        let was_auto_hidden = is_persistent && matches!(self.phase, Phase::Hidden);
+        if matches!(self.phase, Phase::Hidden) && !was_auto_hidden {
             return;
+        }
+        // Persistent-compact auto-hide: hide the pill while a fullscreen or
+        // listed `auto_compact_sources` app is the foreground window and the
+        // toggle is enabled. When the foreground clears, resume the held
+        // content (saved before hide() cleared it).
+        if is_persistent && self.config.behavior.hide_for_auto_compact_sources {
+            let verdict = self.sample_foreground();
+            let should_hide =
+                verdict.fullscreen || fullscreen::auto_source_matches(&self.config, verdict.exe.as_deref());
+            if should_hide && !was_auto_hidden {
+                // Save content before hide() clears it, so resume can restore it.
+                let saved = self.content.clone();
+                self.hide();
+                self.held_content = saved;
+                return;
+            }
+            if was_auto_hidden && !should_hide {
+                // Resume: re-show the content that was saved before hide().
+                if let Some(event) = self.held_content.take() {
+                    let full_animation = matches!(event, MediaEvent::TrackChanged(_));
+                    self.show(event, full_animation);
+                }
+                return;
+            }
         }
         let before_layout = self.layout;
         self.refresh_layout();
@@ -3525,6 +3657,82 @@ mod tests {
         // An empty list means Auto-compact is off: nothing compacts.
         config.behavior.auto_compact_sources.clear();
         assert_eq!(decide_layout(&config, &listed), LayoutMode::Expanded);
+    }
+
+    #[test]
+    fn decide_layout_persistent_compact_always_uses_compact_geometry() {
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let verdict = ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        };
+        assert_eq!(decide_layout(&config, &verdict), LayoutMode::Compact);
+        let fullscreen = ForegroundVerdict {
+            exe: None,
+            fullscreen: true,
+        };
+        assert_eq!(decide_layout(&config, &fullscreen), LayoutMode::Compact);
+    }
+
+    #[test]
+    fn hide_for_auto_compact_hides_persistent_pill_for_fullscreen() {
+        // When layout = "persistent-compact" and hide_for_auto_compact_sources
+        // is on, switching to a fullscreen foreground must hide the pill.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: true,
+        });
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Song", "Artist")));
+        state.phase = Phase::Shown;
+
+        state.on_foreground_change();
+
+        assert!(
+            matches!(state.phase, Phase::Hidden),
+            "the persistent pill must hide when the foreground goes fullscreen"
+        );
+        assert!(
+            state.content.is_none(),
+            "content is cleared on hide, but held_content must preserve it"
+        );
+    }
+
+    #[test]
+    fn hide_for_auto_compact_resumes_persistent_pill_when_foreground_clears() {
+        // After hiding, switching back to a non-fullscreen foreground must
+        // restore the held content as a fresh pill.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        let track = track_for("spotify", "Song", "Artist");
+
+        // Simulate a showing pill over a fullscreen foreground, then hide it.
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: true,
+        });
+        state.content = Some(MediaEvent::TrackChanged(track.clone()));
+        state.phase = Phase::Shown;
+        state.on_foreground_change();
+        assert!(matches!(state.phase, Phase::Hidden), "pill must hide for fullscreen");
+
+        // Frontend clears: resume the held content.
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.on_foreground_change();
+
+        assert!(
+            !matches!(state.phase, Phase::Hidden),
+            "the persistent pill must resume when the foreground clears"
+        );
+        assert!(state.content.is_some(), "the resume path must restore the held content");
+        assert!(state.held_content.is_none(), "held_content must be consumed on resume");
     }
 
     #[test]

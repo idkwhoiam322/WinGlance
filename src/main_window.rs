@@ -7,7 +7,7 @@ use crate::events::{
 use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
     EventQueue, OverlayPos, enumerate_displays_cached, invalidate_display_cache, set_dismiss_on_hover, set_duration,
-    set_expand_compact_on_hover, set_layout, set_positions, show_sample,
+    set_expand_compact_on_hover, set_hide_for_auto_compact_sources, set_layout, set_positions, show_sample,
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG};
@@ -82,6 +82,7 @@ const MENU_MONITOR_DISPLAY_BASE: usize = 1023;
 const MENU_LAYOUT_EXPANDED: usize = 1024;
 const MENU_LAYOUT_COMPACT: usize = 1025;
 const MENU_LAYOUT_AUTO: usize = 1026;
+const MENU_LAYOUT_PERSISTENT_COMPACT: usize = 1028;
 /// Duration submenu: shown only when the current duration is not a preset.
 const MENU_DURATION_CUSTOM: usize = 1027;
 const LISTBOX_ID: usize = 2;
@@ -152,6 +153,7 @@ enum SettingId {
     SeparateCompact,
     DismissOnHover,
     ExpandCompactOnHover,
+    HideForAutoCompactSources,
     CompactPosition,
     AutoCompactApps,
     Monitor,
@@ -2020,6 +2022,16 @@ impl MainWindowState {
         });
         y += row_h + gap;
         items.push(SettingsItem::Row {
+            id: SettingId::HideForAutoCompactSources,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        items.push(SettingsItem::Row {
             id: SettingId::Monitor,
             rect: RECT {
                 left,
@@ -2102,6 +2114,7 @@ impl MainWindowState {
         let compact_position_label = compact_position_label(&cfg);
         let compact_custom = cfg.overlay.compact_effective().x.is_some();
         let auto_compact_sources = cfg.behavior.auto_compact_sources.join(", ");
+        let hide_for_auto_compact = cfg.behavior.hide_for_auto_compact_sources;
         let display_count = enumerate_displays_cached().len();
 
         let mut hdr = RECT {
@@ -2270,6 +2283,15 @@ impl MainWindowState {
                             },
                             SETTINGS_MUTED,
                         ),
+                        SettingId::HideForAutoCompactSources => (
+                            "Hide Persistent Pill for Auto-compact Apps",
+                            if hide_for_auto_compact {
+                                "ON".to_string()
+                            } else {
+                                "OFF".to_string()
+                            },
+                            if hide_for_auto_compact { accent } else { SETTINGS_FAINT },
+                        ),
                         SettingId::Monitor => ("Monitor", monitor_label(&cfg, display_count), SETTINGS_MUTED),
                         SettingId::AllowedApps => (
                             "Allowed apps",
@@ -2304,6 +2326,7 @@ impl MainWindowState {
                         | SettingId::SeparateCompact
                         | SettingId::DismissOnHover
                         | SettingId::ExpandCompactOnHover
+                        | SettingId::HideForAutoCompactSources
                         | SettingId::AutoCompactApps
                         | SettingId::Monitor => {
                             let mut val_rect = control_rect;
@@ -2393,11 +2416,16 @@ impl MainWindowState {
                             }
                         }
                         SettingId::Layout => {
-                            // Three segments mirroring the LayoutMode variants;
+                            // Four segments mirroring the LayoutMode variants;
                             // the same accent/hover treatment as Duration.
-                            let segments = segment_rects(&control_rect, 3, (4.0 * scale) as i32);
-                            let values = [LayoutMode::Expanded, LayoutMode::Compact, LayoutMode::Auto];
-                            let labels = ["Expanded", "Compact", "Auto"];
+                            let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
+                            let values = [
+                                LayoutMode::Expanded,
+                                LayoutMode::Compact,
+                                LayoutMode::Auto,
+                                LayoutMode::PersistentCompact,
+                            ];
+                            let labels = ["Expanded", "Compact", "Auto", "Persistent"];
                             for (i, seg) in segments.iter().enumerate() {
                                 let active = layout_mode == values[i];
                                 let seg_hovered = settings_hover == Some((current_row, SettingSub::Seg(i)));
@@ -3870,6 +3898,12 @@ fn show_tray_menu(state: &mut MainWindowState) {
             MENU_LAYOUT_AUTO,
             PCWSTR(wide("Auto").as_ptr()),
         );
+        let _ = AppendMenuW(
+            layout_menu,
+            layout_flags(LayoutMode::PersistentCompact),
+            MENU_LAYOUT_PERSISTENT_COMPACT,
+            PCWSTR(wide("Persistent Compact").as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_POPUP, layout_menu.0 as usize, PCWSTR(wide("Layout").as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT_ID, PCWSTR(wide("Quit").as_ptr()));
@@ -3960,6 +3994,10 @@ fn show_tray_menu(state: &mut MainWindowState) {
                 MENU_LAYOUT_AUTO => {
                     state.mutate_config(|cfg| cfg.overlay.layout = LayoutMode::Auto);
                     set_layout(state.overlay_hwnd, LayoutMode::Auto);
+                }
+                MENU_LAYOUT_PERSISTENT_COMPACT => {
+                    state.mutate_config(|cfg| cfg.overlay.layout = LayoutMode::PersistentCompact);
+                    set_layout(state.overlay_hwnd, LayoutMode::PersistentCompact);
                 }
                 _ => {}
             }
@@ -4291,8 +4329,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     }
                                 }
                                 SettingId::Layout => {
-                                    let segments = segment_rects(&control_rect, 3, (4.0 * scale) as i32);
-                                    let values = [LayoutMode::Expanded, LayoutMode::Compact, LayoutMode::Auto];
+                                    let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
+                                    let values = [
+                                        LayoutMode::Expanded,
+                                        LayoutMode::Compact,
+                                        LayoutMode::Auto,
+                                        LayoutMode::PersistentCompact,
+                                    ];
                                     if let Some((i, _)) =
                                         segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right)
                                     {
@@ -4315,6 +4358,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     state.mutate_config(|cfg| cfg.overlay.expand_compact_on_hover = new_value);
                                     set_expand_compact_on_hover(state.overlay_hwnd, new_value);
                                     info!("expand compact on hover set: {new_value}");
+                                    state.invalidate();
+                                }
+                                SettingId::HideForAutoCompactSources => {
+                                    let new_value = !state.cfg().behavior.hide_for_auto_compact_sources;
+                                    state.mutate_config(|cfg| cfg.behavior.hide_for_auto_compact_sources = new_value);
+                                    set_hide_for_auto_compact_sources(state.overlay_hwnd, new_value);
+                                    info!("hide for auto compact sources set: {new_value}");
                                     state.invalidate();
                                 }
                                 SettingId::SeparateCompact => {

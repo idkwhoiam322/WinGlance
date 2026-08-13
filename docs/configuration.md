@@ -23,7 +23,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 > suppressed in favor of the bar while it is visible (the `m:ss` text remains).
 > Apps that do not report position show no bar and behave exactly as before.
 | `animation_ms` | `500`   | 100–1000 | Expand/collapse animation length                  |
-| `layout`       | `"expanded"` | `expanded` \| `compact` \| `auto` | Which pill layout is used (see below) |
+| `layout`       | `"expanded"` | `expanded` \| `compact` \| `auto` \| `persistent-compact` | Which pill layout is used (see below) |
 | `vertical`     | `"top"` | `top` \| `bottom` | Which monitor edge the pill anchors to |
 | `horizontal`   | `"center"` | `left` \| `center` \| `right` | Horizontal anchor within the work area |
 | `margin`       | `8`     | 0–500   | Distance from the chosen edge (logical px)        |
@@ -52,6 +52,9 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
   foreground app is fullscreen or its executable matches an
   `auto_compact_sources` pattern, and expands otherwise. The verdict is
   re-sampled at every show and whenever the foreground window changes.
+- `"persistent-compact"` — the pill is always shown, but in the Compact
+  layout (a slim, lower-profile pill). Useful for a permanent status
+  indicator that never auto-hides.
 
 While `compact_position_separate` is `false`, the Compact layout follows the
 live Expanded position — changing `vertical`/`horizontal`/`margin`/`monitor`
@@ -120,6 +123,7 @@ Expanded rules, in the compact layout the Compact rules):
 | `close_to_tray`                 | `true`  | bool   | Hide (instead of close) the window when its X is pressed |
 | `media_sources`                 | `[]`    | list   | Media source apps (case-insensitive substrings) to allow; empty = all apps |
 | `auto_compact_sources`          | `[]`    | list   | Apps (case-insensitive substrings) that force the Compact layout while `layout` is `"auto"`; empty = only fullscreen compacts |
+| `hide_for_auto_compact_sources` | `true`  | bool   | When `layout` is `"persistent-compact"`, hide the pill while a fullscreen window or a listed `auto_compact_sources` app is the foreground window; resumes when the foreground clears |
 
 ## [appearance]
 

@@ -68,6 +68,11 @@ close_to_tray = true
 # is the foreground app (same matching rules as media_sources). When empty,
 # only fullscreen foregrounds compact.
 auto_compact_sources = []
+# When layout = "persistent-compact", hide the pill entirely while a
+# fullscreen or listed foreground app is active — instead of showing a
+# faded compact pill over games/fullscreen apps. The pill resumes when
+# the foreground clears.
+hide_for_auto_compact_sources = true
 
 [appearance]
 # Near-opaque dark-slate pill background (alpha 235 = ~92%): text, album art

@@ -124,12 +124,15 @@ pub enum HorizontalPosition {
 /// `config.toml` stays readable:
 ///
 /// ```toml
-/// layout = "expanded"   # the full four-row pill (default)
-/// layout = "compact"    # single-line pill: small art, title, app icon,
-///                       # playback symbol
-/// layout = "auto"       # compact while a configured source app is the
-///                       # foreground app or a genuine fullscreen window is
-///                       # foreground; expanded otherwise
+/// layout = "expanded"           # the full four-row pill (default)
+/// layout = "compact"            # single-line pill: small art, title, app icon,
+///                               # playback symbol
+/// layout = "auto"               # compact while a configured source app is the
+///                               # foreground app or a genuine fullscreen window is
+///                               # foreground; expanded otherwise
+/// layout = "persistent-compact" # always-visible compact pill while media plays;
+///                               # fades to idle opacity after the dismiss timeout;
+///                               # optionally hides over fullscreen / listed apps
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -138,6 +141,7 @@ pub enum LayoutMode {
     Expanded,
     Compact,
     Auto,
+    PersistentCompact,
 }
 
 /// Which display the overlay pill is placed on. Serialized as a string so a
@@ -209,10 +213,14 @@ pub struct BehaviorConfig {
     pub media_sources: Vec<String>,
     /// Source apps (same form, identity and matching rules as `media_sources`)
     /// that force the pill into the Compact layout while `layout = "auto"` and
-    /// one of them is the foreground app. Persisted even while layout is
-    /// Expanded or Compact, but only ever consulted in Auto mode — switching
-    /// the layout never clears this list.
+    /// one of them is the foreground app, or hide the pill while
+    /// `layout = "persistent-compact"` and `hide_for_auto_compact_sources` is
+    /// enabled.
     pub auto_compact_sources: Vec<String>,
+    /// When `layout = "persistent-compact"`, hide the pill while a fullscreen
+    /// window or a listed `auto_compact_sources` app is the foreground window,
+    /// and resume the held content when the foreground clears. Default: `true`.
+    pub hide_for_auto_compact_sources: bool,
     /// Unknown keys under `[behavior]`, preserved across saves.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -342,6 +350,7 @@ impl Default for BehaviorConfig {
             close_to_tray: true,
             media_sources: Vec::new(),
             auto_compact_sources: Vec::new(),
+            hide_for_auto_compact_sources: true,
             unknown: toml::Table::new(),
         }
     }
@@ -815,6 +824,7 @@ nested_appearance = [1, 2, 3]
             ("expanded", LayoutMode::Expanded),
             ("compact", LayoutMode::Compact),
             ("auto", LayoutMode::Auto),
+            ("persistent-compact", LayoutMode::PersistentCompact),
         ] {
             let config: Config = toml::from_str(&format!("[overlay]\nlayout = \"{form}\"\n")).unwrap();
             assert_eq!(
@@ -926,7 +936,12 @@ nested_appearance = [1, 2, 3]
         // layout and must never be cleared by a layout switch.
         let mut config = Config::default();
         config.behavior.auto_compact_sources = vec!["spotify".into()];
-        for mode in [LayoutMode::Expanded, LayoutMode::Compact, LayoutMode::Auto] {
+        for mode in [
+            LayoutMode::Expanded,
+            LayoutMode::Compact,
+            LayoutMode::Auto,
+            LayoutMode::PersistentCompact,
+        ] {
             config.overlay.layout = mode;
             let saved = toml::to_string_pretty(&config).unwrap();
             let reloaded: Config = toml::from_str(&saved).unwrap();

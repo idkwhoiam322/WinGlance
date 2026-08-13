@@ -367,6 +367,7 @@ pub(super) fn placement(work: RECT, width: i32, height: i32, position: &OverlayP
 /// The sampled foreground state a layout decision is based on. Produced by
 /// `OverlayState::sample_foreground` (the only place Win32 is queried), so
 /// `decide_layout` stays pure and unit-testable.
+#[derive(Clone)]
 pub(super) struct ForegroundVerdict {
     /// The foreground window's executable name (with extension, as the
     /// process table reports it), when it could be read.
@@ -521,11 +522,13 @@ pub(super) fn auto_source_matches(config: &Config, exe_name: Option<&str>) -> bo
 /// foreground verdict. Pure: the caller samples the foreground and feeds the
 /// verdict in, so every branch is unit-testable without Win32. Auto compacts
 /// when the foreground app is fullscreen or on the `auto_compact_sources`
-/// list; everything else stays Expanded.
+/// list; everything else stays Expanded. PersistentCompact always uses compact
+/// geometry.
 pub(super) fn decide_layout(config: &Config, verdict: &ForegroundVerdict) -> LayoutMode {
     match config.overlay.layout {
         LayoutMode::Expanded => LayoutMode::Expanded,
         LayoutMode::Compact => LayoutMode::Compact,
+        LayoutMode::PersistentCompact => LayoutMode::Compact,
         LayoutMode::Auto => {
             if verdict.fullscreen || auto_source_matches(config, verdict.exe.as_deref()) {
                 LayoutMode::Compact
