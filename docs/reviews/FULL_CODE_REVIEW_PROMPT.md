@@ -27,6 +27,14 @@ description of the scenario that exposes it:
   contrast problems, animation timing or easing that reads wrong, abrupt cuts where a
   transition is expected, hover/interaction behavior that surprises, misleading labels or
   settings rows, clipping/truncation, focus/keyboard gaps, tooltip problems.
+- **Behavioral consistency & UX truth** — behavior that is self-consistent with the code,
+  the docs, or even a regression test but still contradicts best UX: a suppression/dedup
+  rule designed against spam that also swallows a genuine user action, two code paths that
+  give the same logical event different outcomes without a stated reason, a state the UI
+  shows that cannot occur in practice, silent no-ops where the user expects a visible
+  response. Documented intent is not a defense (the only sacred exceptions are the repo's
+  hard mandates in AGENTS.md, e.g. never delete user data under
+  `%APPDATA%\WinGlance\WinGlance\data\`, never launch anything that can appear on screen).
 - **Accessibility** — WCAG contrast failures, keyboard-only reachability, high-DPI
   breakage, tiny hit targets.
 - **Performance, memory, safety, concurrency, architecture, maintainability, dead code,
@@ -40,6 +48,15 @@ Do not self-censor because something looks deliberate or "probably intended": fl
 state clearly when a behavior looks like a deliberate design choice that only the
 maintainer can confirm. It is more useful to be wrong about a low-severity item than to
 stay silent about a real one.
+
+A behavior that is intentional, documented, and even covered by a test can still be a High
+finding when it contradicts best UX. Self-consistency is not a defense: flag a suppression
+rule that swallows a genuine user action (e.g. a Paused arriving right after its
+TrackChanged), and flag two code paths that give the same logical event different outcomes
+without a stated reason, and name the design intent you suspect — the maintainer decides.
+This does not extend to the repo's hard mandates (never delete or overwrite user data
+under `%APPDATA%\WinGlance\WinGlance\data\`, never launch anything that can appear on the
+screen; see step 2 below): those are sacred and must never be flagged as defects.
 
 **Before you start** (read all of these, in order):
 1. `README.md`, `docs/architecture.md`, `docs/development.md`, `docs/configuration.md`,
@@ -95,7 +112,8 @@ config.example.toml
 - High: significant performance bottleneck, memory/resource leak, race condition, major
   functional flaw with no easy workaround, unbounded memory/handle growth that degrades the
   process over time, or a UI/UX flaw that breaks a core interaction (e.g. a pill state the
-  user cannot escape, an always-wrong color/position).
+  user cannot escape, an always-wrong color/position, a suppression rule that swallows a
+  genuine user action (e.g. a Paused arriving right after its TrackChanged))).
 - Medium: code anti-pattern, edge-case failure, sub-optimal logic, notable
   maintainability debt, or a visible-but-workaroundable UI/UX inconsistency.
 - Low: minor dead code, non-blocking optimization, small cleanup, style inconsistency,
