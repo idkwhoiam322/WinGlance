@@ -562,7 +562,7 @@ pub(super) fn draw_pixels(
         let bar_y = inset + pill_h.saturating_sub(bar_h);
         let bar_w = (pill_w as f32 * fraction).round() as usize;
         let bar_color = aura_palette.primary;
-        let bar_alpha = (bar_color[3] as f32 * 0.6) as u32;
+        let bar_alpha = (bar_color[3] as f32 * 0.8) as u32;
         for y in bar_y..(bar_y + bar_h).min(height) {
             for x in inset..(inset + bar_w).min(width) {
                 let cov = round_rect_coverage_supersampled(
