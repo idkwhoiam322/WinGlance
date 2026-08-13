@@ -595,10 +595,23 @@ impl ListenerState {
                         }
                     }
                     let (mut emit, artwork_lost) = emit_track(&prev, &merged, read_artwork);
+                    let placeholder = is_placeholder_like(&merged);
+                    // A metadata snapshot that is just the source-app fallback (empty
+                    // title + empty artist) carries no real track to announce: drop it
+                    // everywhere below so it can never flash as a "sample track". A
+                    // real MediaPropertiesChanged or the poll supersedes it once the
+                    // source populates its metadata.
+                    if placeholder {
+                        debug!("track emit skipped | reason=placeholder | source={}", merged.source_app);
+                    }
                     // Safety net: a first pill deferred for artwork shows
                     // anyway after ARTWORK_TIMEOUT, so a source that never
-                    // provides a thumbnail still gets its pill.
-                    if !emit && defer_expired(prev.deferred_at) {
+                    // provides a thumbnail still gets its pill — but never for a
+                    // placeholder read (title is just the source-app fallback),
+                    // which must not be announced as a "sample track". A real
+                    // MediaPropertiesChanged or the poll will surface the actual
+                    // track when its metadata lands.
+                    if !emit && !placeholder && defer_expired(prev.deferred_at) {
                         emit = true;
                         let label = track_label(&merged);
                         debug!("track emit forced | reason=artwork-timeout | {label}");
@@ -691,7 +704,7 @@ impl ListenerState {
                     {
                         events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
                     }
-                    if emit && !session_recreation {
+                    if emit && !placeholder && !session_recreation {
                         let label = track_label(&merged);
                         info!("track changed | {label}");
                         let cfg = self.config.read().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -985,7 +998,7 @@ impl ListenerState {
         let track_changed = emit_track(&prev, &merged, true).0;
         let recreation_suppressed =
             merged.artwork.is_some() && !retry_should_emit(&merged, self.last_track_per_source.get(&merged.source_app));
-        let emit = track_changed && !recreation_suppressed;
+        let emit = track_changed && !recreation_suppressed && !is_placeholder_like(&merged);
         if let Some(state) = self.states.get_mut(&key) {
             state.has_artwork = merged.artwork.is_some();
             state.artwork_attempts += 1;
@@ -1003,6 +1016,8 @@ impl ListenerState {
             if let Some(state) = self.states.get_mut(&key) {
                 state.deferred_at = None;
             }
+        } else if is_placeholder_like(&merged) {
+            debug!("track emit skipped | reason=placeholder | source={}", merged.source_app);
         } else if recreation_suppressed {
             let label = track_label(&merged);
             debug!("track emit suppressed | reason=session-recreation | {label}");
@@ -1536,6 +1551,17 @@ fn with_decoded_art(mut track: TrackInfo, size: usize) -> TrackInfo {
 fn is_placeholder_read(prev: &LogicalState, merged: &TrackInfo) -> bool {
     let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
     is_first_read && merged.artist.is_empty() && merged.title == merged.source_app
+}
+
+/// A metadata snapshot that carries no real content: the title is just the
+/// source-app fallback (empty `properties.Title()`) and the artist is also empty.
+/// Unlike `is_placeholder_read` this is independent of whether the session is
+/// first-read — the worker can land this snapshot on any read during a transition
+/// for a source that recreates its session — so any such read is suppressed and
+/// never announced as a (fake) "sample track". A real `MediaPropertiesChanged` or
+/// the periodic poll supersedes it once metadata lands.
+fn is_placeholder_like(merged: &TrackInfo) -> bool {
+    merged.artist.is_empty() && merged.title == merged.source_app
 }
 
 fn register_sessions_handler(
@@ -2108,6 +2134,33 @@ mod tests {
         // Not a first read → not a placeholder (even if fields are empty).
         let stored = state("Song", "Artist");
         assert!(!is_placeholder_read(&stored, &placeholder));
+    }
+
+    #[test]
+    fn is_placeholder_like_rejects_source_app_fallback_independent_of_first_read() {
+        // Title fell back to source_app and artist is empty → placeholder, and
+        // this does NOT depend on it being a first read (the bug that flashed a
+        // "sample track" on a re-created session's non-first placeholder read).
+        let placeholder = TrackInfo {
+            title: "spotify".into(),
+            artist: "".into(),
+            source_app: "spotify".into(),
+            ..TrackInfo::default()
+        };
+        assert!(is_placeholder_like(&placeholder));
+
+        // Real title + source as artist is still a real track, not a placeholder.
+        assert!(!is_placeholder_like(&track("Payphone", "Artist")));
+
+        // A real title with an empty artist is NOT the source-app fallback, so it
+        // is a real track that should still be announced.
+        let empty_artist = TrackInfo {
+            title: "Payphone".into(),
+            artist: "".into(),
+            source_app: "spotify".into(),
+            ..TrackInfo::default()
+        };
+        assert!(!is_placeholder_like(&empty_artist));
     }
 
     #[test]
