@@ -2806,7 +2806,7 @@ impl MainWindowState {
                     return Some((row_index, seg.map_or(SettingSub::None, SettingSub::Seg)));
                 }
                 if *id == SettingId::Layout {
-                    let segments = segment_rects(&control_rect, 3, (4.0 * scale) as i32);
+                    let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
                     let seg = segments.iter().position(|s| x >= s.left && x < s.right);
                     return Some((row_index, seg.map_or(SettingSub::None, SettingSub::Seg)));
                 }
@@ -2898,7 +2898,7 @@ impl MainWindowState {
                         }
                     }
                     SettingId::Layout => {
-                        for (i, s) in segment_rects(&control_rect, 3, gap).iter().enumerate() {
+                        for (i, s) in segment_rects(&control_rect, 4, gap).iter().enumerate() {
                             out.push(SettingsFocus {
                                 row_index,
                                 sub: SettingSub::Seg(i),
