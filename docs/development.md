@@ -75,7 +75,7 @@ WinGlance/
   luminance guard, ≥ 30° hue separation) that feeds the accents and the aura.
 - **main_window.rs** — the tracking window (current activity + history) and the
   full tray menu: Open, Toggle notifications, Start with Windows, Close to tray,
-  Expanded Position submenu, and Quit.
+  and the Monitor, Duration, and Layout submenus, and Quit.
 - **autostart.rs** — reads/writes the `HKCU ...\Run` entry for start-on-login.
 - **positioner.rs** — the in-app floating sample used to drag-place the pill; it
   posts the chosen `position_x`/`position_y` to the main window via

@@ -51,10 +51,14 @@ start-on-login, close-to-tray, allowed apps, position, logs).
 - **Toggle notifications** — enable/disable pills
 - **Start with Windows** — launch at logon
 - **Close window to tray** — hide instead of quit when the window is closed
-- **Position** — choose an edge anchor, or **Adjust position…** to drag the
-  pill to a custom spot (then **Show sample** to preview it)
+- **Monitor** — place the pill on the active window's display, the primary
+  display, or a numbered display
 - **Duration** — 2 / 3 / 5 / 10 seconds
+- **Layout** — Expanded / Compact / Auto
 - **Quit**
+
+  Placement (edge anchor, custom coordinates) is not in the tray; it is edited in
+  the **Settings** pane's **Position** row, which opens the drag sample.
 
 ## Configuration
 

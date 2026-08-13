@@ -157,9 +157,6 @@ pub(super) fn content_size_of(config: &Config, content: &MediaEvent, compact: bo
     }
 }
 
-/// Duration of one hover-morph leg. The expand leg gets the full animation
-/// duration — room for the spring to play out — while the collapse leg runs
-/// shorter: a quick, confident return that still reads smooth. Shared by the
 /// The whole-pill scale factor of the settle-bounce, as a pure function of
 /// the leg's progress — there is no appended phase, so the bounce starts the
 /// instant the size completes and there is never a still pause before it.

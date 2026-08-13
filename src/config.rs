@@ -478,14 +478,20 @@ impl Config {
 
     /// Writes `config.toml` via a co-located temp file + same-volume rename,
     /// so a crash mid-write cannot leave a truncated config behind (the
-    /// rename atomically replaces an existing file).
+    /// rename atomically replaces an existing file). The file is synced
+    /// before the rename so a power loss cannot lose the settings change.
     fn save_to(&self, config_path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(self)?;
         let tmp_path = config_path.with_extension("toml.tmp");
-        std::fs::write(&tmp_path, content)?;
+        {
+            let mut f = std::fs::File::create(&tmp_path)?;
+            use std::io::Write;
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+        }
         if let Err(e) = std::fs::rename(&tmp_path, config_path) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(e.into());

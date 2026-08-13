@@ -1,6 +1,6 @@
 [overlay]
 duration_ms = 5000
-animation_ms = 280
+animation_ms = 500
 # Vertical edge: "top" | "bottom".
 vertical = "top"
 # Horizontal placement: "left" | "center" | "right".

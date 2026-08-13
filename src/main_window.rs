@@ -6,8 +6,8 @@ use crate::events::{
 };
 use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
-    EventQueue, OverlayPos, enumerate_displays, set_dismiss_on_hover, set_duration, set_expand_compact_on_hover,
-    set_layout, set_positions, show_sample,
+    EventQueue, OverlayPos, enumerate_displays_cached, invalidate_display_cache, set_dismiss_on_hover, set_duration,
+    set_expand_compact_on_hover, set_layout, set_positions, show_sample,
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG};
@@ -39,7 +39,10 @@ use windows::Win32::UI::Controls::{
     TTM_SETMAXTIPWIDTH, TTM_SETTOOLINFOW, TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN,
+    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     Shell_NotifyIconW, ShellExecuteW,
@@ -52,9 +55,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos,
     ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER,
-    WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT,
+    WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -78,6 +82,8 @@ const MENU_MONITOR_DISPLAY_BASE: usize = 1023;
 const MENU_LAYOUT_EXPANDED: usize = 1024;
 const MENU_LAYOUT_COMPACT: usize = 1025;
 const MENU_LAYOUT_AUTO: usize = 1026;
+/// Duration submenu: shown only when the current duration is not a preset.
+const MENU_DURATION_CUSTOM: usize = 1027;
 const LISTBOX_ID: usize = 2;
 /// History rows are kept in the heap (as entries) and duplicated in the
 /// listbox as UTF-16 row strings, so the cap directly sizes the app's
@@ -85,6 +91,8 @@ const LISTBOX_ID: usize = 2;
 const HISTORY_CAP: usize = 400;
 /// Timer used to clear the "Copied" feedback on the Copy logs button.
 const TIMER_LOGS_ID: usize = 101;
+/// Timer used to clear the "Opened" feedback on the Open logs/Open config buttons.
+const TIMER_OPENED_ID: usize = 104;
 /// Timer used to keep the native history tooltip's item rects in sync (scroll).
 const TIMER_TOOLTIPS_ID: usize = 102;
 /// One-shot timer that frees the cached artwork blit after the window has
@@ -157,12 +165,32 @@ enum SettingsItem {
     Row { id: SettingId, rect: RECT },
 }
 
+/// A keyboard-focusable Settings-pane control. `cx`/`cy` is the window client
+/// coordinate at the control's center — the keyboard handler activates a control
+/// by posting a synthetic `WM_LBUTTONDOWN` there, so it reuses the existing mouse
+/// click path verbatim. The list order (top-to-bottom, left-to-right within a
+/// row) is what Tab/arrows walk.
+struct SettingsFocus {
+    row_index: usize,
+    sub: SettingSub,
+    cx: i32,
+    cy: i32,
+}
+
 const SETTINGS_SURFACE: [u8; 4] = [0x1B, 0x1B, 0x1B, 0xFF];
 const SETTINGS_BORDER: [u8; 4] = [0x2D, 0x2D, 0x2D, 0xFF];
 const SETTINGS_HOVER: [u8; 4] = [0x24, 0x24, 0x24, 0xFF];
 const SETTINGS_TEXT: [u8; 4] = [0xF0, 0xF0, 0xF0, 0xFF];
 const SETTINGS_MUTED: [u8; 4] = [0xC8, 0xC8, 0xC8, 0xFF];
 const SETTINGS_FAINT: [u8; 4] = [0x7A, 0x7A, 0x7A, 0xFF];
+
+/// Mix weights (toward `SETTINGS_SURFACE`) for the accent soft fills. Kept
+/// as named constants so the brush rebuild and the render-time contrast guard
+/// below stay in lockstep — a drift between the two would silently recompute
+/// the wrong backdrop for the label guard.
+const SETTINGS_ACCENT_SOFT_WEIGHT: f32 = 0.28;
+const SETTINGS_NEAR_WEIGHT: f32 = 0.55;
+const SETTINGS_ADJUST_HOVER_WEIGHT: f32 = 0.45;
 
 /// Blends `a` over `b` (0.0 = b, 1.0 = a).
 fn mix(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
@@ -219,7 +247,7 @@ enum SettingSub {
     Copy,
     /// The left half of the Config row ("Open config" button).
     OpenConfig,
-    /// The right half of the Config row ("Reload config" button).
+    /// The right half of the Config row ("Restart app" button).
     ReloadConfig,
 }
 
@@ -603,6 +631,11 @@ struct CurrentActivity {
     /// the artwork bytes change, so a corrupt cover is attempted once instead
     /// of on every repaint.
     art_decode_failed: bool,
+    /// Cached GDI source for the source-app icon. Built lazily from
+    /// `track.app_icon` (the worker's premultiplied BGRA at 24×24) on first
+    /// paint. The icon data is already in memory (Arc-shared); this blit
+    /// adds ~2.4 KB (24×24×4 pixel data + GDI handles).
+    icon_blit: Option<ArtBlit>,
 }
 
 /// Cached memory DC + DIB section holding the decoded premultiplied artwork
@@ -678,6 +711,10 @@ struct MainWindowState {
     tooltips_dirty: bool,
     /// Timestamp of the last "Copy logs" press, for the "Copied" feedback.
     logs_copied_at: Option<Instant>,
+    /// Timestamp of the last "Open logs" press, for the "Opened" feedback.
+    logs_opened_at: Option<Instant>,
+    /// Timestamp of the last "Open config" press, for the "Opened" feedback.
+    config_opened_at: Option<Instant>,
     /// Shared slot for the process picker's confirmed allow-list patterns. The
     /// picker writes the result here and posts a bare `PICKER_RESULT_MSG`; no
     /// pointer ever crosses the message boundary.
@@ -696,6 +733,8 @@ struct MainWindowState {
     /// flight. The forwarder and this window only post when the flag was
     /// clear, so an event burst collapses into one wake message per drain.
     wake: Arc<AtomicBool>,
+    /// Whether the position indicator in the Activity pane is hovered.
+    position_hover: bool,
 }
 
 /// Set when this window's WM_NCCREATE claims the state box handed over in
@@ -852,11 +891,14 @@ impl MainWindowState {
             tooltip_range: None,
             tooltips_dirty: false,
             logs_copied_at: None,
+            logs_opened_at: None,
+            config_opened_at: None,
             picker_result: Arc::new(Mutex::new(None)),
             auto_sources_result: Arc::new(Mutex::new(None)),
             source_states: HashMap::new(),
             source_order: VecDeque::new(),
             wake: Arc::new(AtomicBool::new(false)),
+            position_hover: false,
         }
     }
 
@@ -1178,9 +1220,9 @@ impl MainWindowState {
                 let c = mix(accent, SETTINGS_SURFACE, weight);
                 CreateSolidBrush(colorref(c[0], c[1], c[2]))
             };
-            self.settings_accent_soft_brush = soft(0.28);
-            self.settings_near_brush = soft(0.55);
-            self.settings_adjust_hover_brush = soft(0.45);
+            self.settings_accent_soft_brush = soft(SETTINGS_ACCENT_SOFT_WEIGHT);
+            self.settings_near_brush = soft(SETTINGS_NEAR_WEIGHT);
+            self.settings_adjust_hover_brush = soft(SETTINGS_ADJUST_HOVER_WEIGHT);
             self.settings_small_hover_brush = soft(0.35);
             let highlight = |weight: f32| -> HBRUSH {
                 let c = mix(self.accent_secondary, [0x0A, 0x0A, 0x0A, 0xFF], weight);
@@ -1403,6 +1445,10 @@ impl MainWindowState {
 
         if is_update {
             if let Some(current) = &mut self.current {
+                // Free the icon blit if the source app changed (icon is per-source).
+                if current.track.source_app != track.source_app {
+                    free_art_blit(&mut current.icon_blit);
+                }
                 current.track = track.clone();
                 // Artwork is decoded lazily on first paint; a metadata refresh
                 // re-reporting the same cover must not re-decode, so only bump
@@ -1472,6 +1518,7 @@ impl MainWindowState {
             art_blit: None,
             art_fingerprint,
             art_decode_failed: false,
+            icon_blit: None,
         });
     }
 
@@ -1607,6 +1654,16 @@ impl MainWindowState {
                 }
             }
         }
+        // Build the app-icon blit lazily from the worker's decoded pixels.
+        // The icon is 24×24 premultiplied BGRA (Arc-shared); the blit adds
+        // ~2.4 KB (pixel data + GDI handles).
+        if let Some(current) = &mut self.current
+            && current.icon_blit.is_none()
+            && let Some(icon) = current.track.app_icon.as_deref()
+        {
+            let base = ((icon.len() / 4) as f64).sqrt() as i32;
+            current.icon_blit = build_art_blit(icon, base);
+        }
 
         if let Some(current) = &self.current {
             // Artwork is cached after first paint; paint just blends it.
@@ -1669,7 +1726,7 @@ impl MainWindowState {
             );
 
             let subtitle = if current.track.artist.trim().is_empty() {
-                "Unknown"
+                "Unknown Artist"
             } else {
                 &current.track.artist
             };
@@ -1728,9 +1785,20 @@ impl MainWindowState {
                 );
             }
             if !current.track.source_app.trim().is_empty() {
+                let app_y = art_y + (100.0 * scale) as i32;
+                let icon_size = (16.0 * scale).round() as i32;
+                let icon_gap = (4.0 * scale).round() as i32;
+                // Render the app icon before the source name, matching the
+                // pill's app-row convention (icon left, name right).
+                let app_text_left = if let Some(icon_blit) = &current.icon_blit {
+                    draw_art_blit(hdc, icon_blit, icon_size, text_left, app_y);
+                    text_left + icon_size + icon_gap
+                } else {
+                    text_left
+                };
                 let mut app_rect = RECT {
-                    left: text_left,
-                    top: art_y + (100.0 * scale) as i32,
+                    left: app_text_left,
+                    top: app_y,
                     right: text_right,
                     bottom: art_y + (114.0 * scale) as i32,
                 };
@@ -1800,13 +1868,18 @@ impl MainWindowState {
             right: client_w - pad,
             bottom: pos_y + (16.0 * scale) as i32,
         };
+        let pos_color = if self.position_hover {
+            [0x99, 0x99, 0x99, 0xFF]
+        } else {
+            [0x66, 0x66, 0x66, 0xFF]
+        };
         draw_string(
             &self.fonts,
             hdc,
             &pos_label,
             &mut pos_rect,
             (10.0 * scale) as i32,
-            [0x66, 0x66, 0x66, 0xFF],
+            pos_color,
             false,
             false,
         );
@@ -2017,7 +2090,7 @@ impl MainWindowState {
         let compact_position_label = compact_position_label(&cfg);
         let compact_custom = cfg.overlay.compact_effective().x.is_some();
         let auto_compact_sources = cfg.behavior.auto_compact_sources.join(", ");
-        let display_count = enumerate_displays().len();
+        let display_count = enumerate_displays_cached().len();
 
         let mut hdr = RECT {
             left: content_left + pad,
@@ -2279,6 +2352,17 @@ impl MainWindowState {
                                 }
                                 let mut t = s_inner;
                                 let tc = if active || near { SETTINGS_TEXT } else { SETTINGS_MUTED };
+                                // The near-segment fill is a tint of the accent;
+                                // for a light accent that tint can sit too close
+                                // to white text. Clamp the label against the
+                                // actual fill color — a no-op for accents dark
+                                // enough to already pass AA.
+                                let tc = if near {
+                                    let fill = mix(accent, SETTINGS_SURFACE, SETTINGS_NEAR_WEIGHT);
+                                    crate::overlay::ensure_contrast(tc, fill, crate::overlay::TEXT_CONTRAST_AA)
+                                } else {
+                                    tc
+                                };
                                 let label = if near {
                                     format!("≈{}s", values[i] / 1000)
                                 } else {
@@ -2404,6 +2488,21 @@ impl MainWindowState {
                                     },
                                 );
                             }
+                            // Clamp the accent label against the Adjust button's
+                            // soft fill so a light accent stays readable on hover
+                            // (no-op for accents that already pass AA). The fill
+                            // color mirrors `brushes.adjust_hover` / `accent_soft`
+                            // so the guard targets the exact backdrop being drawn.
+                            let fill_weight = if adjust_hovered {
+                                SETTINGS_ADJUST_HOVER_WEIGHT
+                            } else {
+                                SETTINGS_ACCENT_SOFT_WEIGHT
+                            };
+                            let label_color = crate::overlay::ensure_contrast(
+                                accent,
+                                mix(accent, SETTINGS_SURFACE, fill_weight),
+                                crate::overlay::TEXT_CONTRAST_AA,
+                            );
                             let mut bt = parts.adjust;
                             draw_string(
                                 &self.fonts,
@@ -2411,7 +2510,7 @@ impl MainWindowState {
                                 "Adjust…",
                                 &mut bt,
                                 (10.0 * scale) as i32,
-                                accent,
+                                label_color,
                                 true,
                                 true,
                             );
@@ -2492,6 +2591,21 @@ impl MainWindowState {
                                     },
                                 );
                             }
+                            // Clamp the accent label against the Adjust button's
+                            // soft fill so a light accent stays readable on hover
+                            // (no-op for accents that already pass AA). The fill
+                            // color mirrors `brushes.adjust_hover` / `accent_soft`
+                            // so the guard targets the exact backdrop being drawn.
+                            let fill_weight = if adjust_hovered {
+                                SETTINGS_ADJUST_HOVER_WEIGHT
+                            } else {
+                                SETTINGS_ACCENT_SOFT_WEIGHT
+                            };
+                            let label_color = crate::overlay::ensure_contrast(
+                                accent,
+                                mix(accent, SETTINGS_SURFACE, fill_weight),
+                                crate::overlay::TEXT_CONTRAST_AA,
+                            );
                             let mut bt = parts.adjust;
                             draw_string(
                                 &self.fonts,
@@ -2499,7 +2613,7 @@ impl MainWindowState {
                                 "Adjust…",
                                 &mut bt,
                                 (10.0 * scale) as i32,
-                                accent,
+                                label_color,
                                 true,
                                 true,
                             );
@@ -2536,11 +2650,14 @@ impl MainWindowState {
                             let copied = self
                                 .logs_copied_at
                                 .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
+                            let opened = self
+                                .logs_opened_at
+                                .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
                             draw_small_button(
                                 &self.fonts,
                                 hdc,
                                 &open_rect,
-                                "Open logs",
+                                if opened { "Opened" } else { "Open logs" },
                                 accent,
                                 hovered_open,
                                 scale,
@@ -2568,11 +2685,14 @@ impl MainWindowState {
                             let (open_rect, reload_rect) = halve(&control_rect, gap);
                             let hovered_open = self.settings_hover == Some((current_row, SettingSub::OpenConfig));
                             let hovered_reload = self.settings_hover == Some((current_row, SettingSub::ReloadConfig));
+                            let opened = self
+                                .config_opened_at
+                                .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
                             draw_small_button(
                                 &self.fonts,
                                 hdc,
                                 &open_rect,
-                                "Open config",
+                                if opened { "Opened" } else { "Open config" },
                                 accent,
                                 hovered_open,
                                 scale,
@@ -2582,7 +2702,7 @@ impl MainWindowState {
                                 &self.fonts,
                                 hdc,
                                 &reload_rect,
-                                "Reload config",
+                                "Restart app",
                                 accent,
                                 hovered_reload,
                                 scale,
@@ -2642,7 +2762,7 @@ impl MainWindowState {
                 }
                 if *id == SettingId::OpenConfig {
                     // Per-button hover for the two side-by-side buttons: the
-                    // left half is "Open config", the right half "Reload config".
+                    // left half is "Open config", the right half "Restart app".
                     let gap = (4.0 * scale) as i32;
                     let (open_rect, reload_rect) = halve(&control_rect, gap);
                     if x >= open_rect.left && x < open_rect.right {
@@ -2687,6 +2807,126 @@ impl MainWindowState {
             }
         }
         None
+    }
+
+    /// Enumerates every keyboard-focusable control in the Settings pane, in the
+    /// same top-to-bottom, left-to-right order `settings_hover_at` would visit
+    /// them, each with the client coordinate a click on its center carries. The
+    /// keyboard handler reuses the mouse click path by posting `WM_LBUTTONDOWN`
+    /// at `(cx, cy)`, so this enumeration must stay in lockstep with the hover
+    /// geometry in `settings_hover_at`.
+    fn settings_focus_targets(&self, content_left: i32, client_w: i32, pad: i32, scale: f32) -> Vec<SettingsFocus> {
+        let items = self.settings_items(content_left, client_w, pad, scale);
+        let mut out = Vec::new();
+        let gap = (4.0 * scale) as i32;
+        let mut row_index = 0usize;
+        for item in &items {
+            if let SettingsItem::Row { id, rect } = item {
+                let control_rect = row_split(rect, scale).control;
+                match *id {
+                    SettingId::Duration => {
+                        for (i, s) in segment_rects(&control_rect, 4, gap).iter().enumerate() {
+                            out.push(SettingsFocus {
+                                row_index,
+                                sub: SettingSub::Seg(i),
+                                cx: (s.left + s.right) / 2,
+                                cy: (s.top + s.bottom) / 2,
+                            });
+                        }
+                    }
+                    SettingId::Layout => {
+                        for (i, s) in segment_rects(&control_rect, 3, gap).iter().enumerate() {
+                            out.push(SettingsFocus {
+                                row_index,
+                                sub: SettingSub::Seg(i),
+                                cx: (s.left + s.right) / 2,
+                                cy: (s.top + s.bottom) / 2,
+                            });
+                        }
+                    }
+                    SettingId::CopyLogs => {
+                        let (open_rect, copy_rect) = halve(&control_rect, gap);
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::Open,
+                            cx: (open_rect.left + open_rect.right) / 2,
+                            cy: (open_rect.top + open_rect.bottom) / 2,
+                        });
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::Copy,
+                            cx: (copy_rect.left + copy_rect.right) / 2,
+                            cy: (copy_rect.top + copy_rect.bottom) / 2,
+                        });
+                    }
+                    SettingId::OpenConfig => {
+                        let (open_rect, reload_rect) = halve(&control_rect, gap);
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::OpenConfig,
+                            cx: (open_rect.left + open_rect.right) / 2,
+                            cy: (open_rect.top + open_rect.bottom) / 2,
+                        });
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::ReloadConfig,
+                            cx: (reload_rect.left + reload_rect.right) / 2,
+                            cy: (reload_rect.top + reload_rect.bottom) / 2,
+                        });
+                    }
+                    SettingId::Position | SettingId::CompactPosition => {
+                        let parts = position_parts(rect, scale);
+                        for (i, a) in parts.anchors.iter().enumerate() {
+                            out.push(SettingsFocus {
+                                row_index,
+                                sub: SettingSub::Anchor(i),
+                                cx: (a.left + a.right) / 2,
+                                cy: (a.top + a.bottom) / 2,
+                            });
+                        }
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::Reset,
+                            cx: (parts.reset.left + parts.reset.right) / 2,
+                            cy: (parts.reset.top + parts.reset.bottom) / 2,
+                        });
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::Adjust,
+                            cx: (parts.adjust.left + parts.adjust.right) / 2,
+                            cy: (parts.adjust.top + parts.adjust.bottom) / 2,
+                        });
+                    }
+                    _ => {
+                        out.push(SettingsFocus {
+                            row_index,
+                            sub: SettingSub::None,
+                            cx: (control_rect.left + control_rect.right) / 2,
+                            cy: (control_rect.top + control_rect.bottom) / 2,
+                        });
+                    }
+                }
+            }
+            // Row index counts rows only, matching `settings_hover_at` and
+            // `paint_settings`; headers are skipped here.
+            if matches!(item, SettingsItem::Row { .. }) {
+                row_index += 1;
+            }
+        }
+        out
+    }
+
+    /// Moves the keyboard focus cursor onto `targets[idx]` and repaints the rows
+    /// that changed. The cursor reuses `settings_hover`, so the existing hover
+    /// highlight doubles as the focus ring — no separate paint path.
+    fn focus_settings_target(&mut self, targets: &[SettingsFocus], idx: usize, client_w: i32) {
+        let t = &targets[idx];
+        let new_hover = Some((t.row_index, t.sub));
+        if new_hover != self.settings_hover {
+            let old = self.settings_hover;
+            self.settings_hover = new_hover;
+            self.invalidate_hover_rows(client_w, old, new_hover);
+        }
     }
 
     fn layout(&self) {
@@ -2830,6 +3070,7 @@ impl MainWindowState {
         remove_tray_icon(self.hwnd);
         if let Some(current) = &mut self.current {
             free_art_blit(&mut current.art_blit);
+            free_art_blit(&mut current.icon_blit);
         }
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_TOOLTIPS_ID);
@@ -3162,8 +3403,12 @@ impl MainWindowState {
         // The log keeps the raw field value (greppable) and the displayed
         // polarity (ON = follows Expanded = field false).
         info!(
-            "compact_position_separate set to {separate} (display: {})",
-            if separate { "OFF" } else { "ON" }
+            "compact_position_separate set to {separate} ({})",
+            if separate {
+                "compact position: independent"
+            } else {
+                "compact position: follows expanded"
+            }
         );
         crate::overlay::set_compact_separate(self.overlay_hwnd, separate);
     }
@@ -3495,7 +3740,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
         // released before the TrackPopupMenu loop below, which calls
         // mutate_config on selection.
         let monitor_mode = state.cfg().overlay.monitor;
-        let displays = enumerate_displays();
+        let displays = enumerate_displays_cached();
         let monitor_flags = |mode: MonitorMode| {
             if monitor_mode == mode {
                 MF_STRING | MF_CHECKED
@@ -3550,50 +3795,30 @@ fn show_tray_menu(state: &mut MainWindowState) {
             return;
         };
         let current_secs = state.cfg().overlay.duration_ms / 1000;
-        let dur_2s_flags = if current_secs == 2 {
-            MF_STRING | MF_CHECKED
-        } else {
-            MF_STRING
-        };
-        let dur_3s_flags = if current_secs == 3 {
-            MF_STRING | MF_CHECKED
-        } else {
-            MF_STRING
-        };
-        let dur_5s_flags = if current_secs == 5 {
-            MF_STRING | MF_CHECKED
-        } else {
-            MF_STRING
-        };
-        let dur_10s_flags = if current_secs == 10 {
-            MF_STRING | MF_CHECKED
-        } else {
-            MF_STRING
-        };
-        let _ = AppendMenuW(
-            duration_menu,
-            dur_2s_flags,
-            MENU_DURATION_2S,
-            PCWSTR(wide("2 seconds").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            duration_menu,
-            dur_3s_flags,
-            MENU_DURATION_3S,
-            PCWSTR(wide("3 seconds").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            duration_menu,
-            dur_5s_flags,
-            MENU_DURATION_5S,
-            PCWSTR(wide("5 seconds").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            duration_menu,
-            dur_10s_flags,
-            MENU_DURATION_10S,
-            PCWSTR(wide("10 seconds").as_ptr()),
-        );
+        let presets: [(u64, usize, &str); 4] = [
+            (2, MENU_DURATION_2S, "2 seconds"),
+            (3, MENU_DURATION_3S, "3 seconds"),
+            (5, MENU_DURATION_5S, "5 seconds"),
+            (10, MENU_DURATION_10S, "10 seconds"),
+        ];
+        let is_preset = presets.iter().any(|(s, _, _)| *s == current_secs);
+        for (secs, id, label) in presets {
+            let flags = if current_secs == secs {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            let _ = AppendMenuW(duration_menu, flags, id, PCWSTR(wide(label).as_ptr()));
+        }
+        if !is_preset {
+            let label = format!("Custom ({current_secs}s)");
+            let _ = AppendMenuW(
+                duration_menu,
+                MF_STRING | MF_CHECKED,
+                MENU_DURATION_CUSTOM,
+                PCWSTR(wide(&label).as_ptr()),
+            );
+        }
         let _ = AppendMenuW(
             menu,
             MF_POPUP,
@@ -3704,6 +3929,9 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = 10000);
                     set_duration(state.overlay_hwnd, 10000);
                 }
+                // Custom duration is already the current value; clicking it
+                // is a no-op (the entry just shows what the value is).
+                MENU_DURATION_CUSTOM => {}
                 MENU_MONITOR_ACTIVE => state.apply_monitor(MonitorMode::ActiveWindow),
                 MENU_MONITOR_PRIMARY => state.apply_monitor(MonitorMode::Primary),
                 _ if command >= MENU_MONITOR_DISPLAY_BASE && command < MENU_MONITOR_DISPLAY_BASE + displays.len() => {
@@ -3812,6 +4040,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == TIMER_OPENED_ID => {
+            unsafe {
+                let _ = KillTimer(hwnd, TIMER_OPENED_ID);
+            }
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.logs_opened_at = None;
+                state.config_opened_at = None;
+                state.invalidate();
+            }
+            LRESULT(0)
+        }
         WM_TIMER if wparam.0 == TIMER_TOOLTIPS_ID => {
             if !state_ptr.is_null() {
                 unsafe {
@@ -3830,6 +4070,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     && let Some(current) = &mut state.current
                 {
                     free_art_blit(&mut current.art_blit);
+                    free_art_blit(&mut current.icon_blit);
                 }
             }
             LRESULT(0)
@@ -3850,6 +4091,82 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                         info.hinst = HINSTANCE::default();
                     }
                 }
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                let k = VIRTUAL_KEY(wparam.0 as u16);
+                // From the Activity pane, Tab / Enter / Down / Right steps into
+                // the Settings pane and focuses its first control.
+                if state.active_pane != Pane::Settings {
+                    if matches!(k, VK_TAB | VK_RETURN | VK_SPACE | VK_DOWN | VK_RIGHT) {
+                        state.active_pane = Pane::Settings;
+                        state.apply_pane();
+                        let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+                        let (client_w, _) = client_size(hwnd);
+                        let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+                        let pad = (PAD * scale) as i32;
+                        let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
+                        if let Some(first) = targets.first() {
+                            let new_hover = Some((first.row_index, first.sub));
+                            let old = state.settings_hover;
+                            state.settings_hover = new_hover;
+                            state.invalidate_hover_rows(client_w, old, new_hover);
+                        }
+                        state.invalidate();
+                    }
+                    return LRESULT(0);
+                }
+                // Settings pane: walk focusable controls and activate one.
+                let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+                let (client_w, _) = client_size(hwnd);
+                let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+                let pad = (PAD * scale) as i32;
+                let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
+                if targets.is_empty() {
+                    return LRESULT(0);
+                }
+                let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 };
+                let idx = state
+                    .settings_hover
+                    .and_then(|(r, s)| targets.iter().position(|t| t.row_index == r && t.sub == s))
+                    .unwrap_or(0);
+                match k {
+                    VK_TAB => {
+                        let next = if shift {
+                            (idx + targets.len() - 1) % targets.len()
+                        } else {
+                            (idx + 1) % targets.len()
+                        };
+                        state.focus_settings_target(&targets, next, client_w);
+                    }
+                    VK_DOWN | VK_RIGHT => {
+                        state.focus_settings_target(&targets, (idx + 1) % targets.len(), client_w);
+                    }
+                    VK_UP | VK_LEFT => {
+                        state.focus_settings_target(&targets, (idx + targets.len() - 1) % targets.len(), client_w);
+                    }
+                    VK_RETURN | VK_SPACE => {
+                        if let Some(t) = targets.get(idx) {
+                            let lp = LPARAM(t.cx as isize | (t.cy as isize) << 16);
+                            let _ = unsafe { PostMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp) };
+                        }
+                    }
+                    VK_ESCAPE => {
+                        // Return to the Activity pane and clear the keyboard
+                        // focus highlight so the next Tab starts fresh.
+                        state.active_pane = Pane::Activity;
+                        let old = state.settings_hover;
+                        state.settings_hover = None;
+                        state.apply_pane();
+                        state.invalidate_hover_rows(client_w, old, None);
+                        state.invalidate();
+                    }
+                    _ => {}
+                }
+                return LRESULT(0);
             }
             LRESULT(0)
         }
@@ -3876,6 +4193,25 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     }
                     if previous != state.active_pane {
                         debug!("switched to the {:?} pane", state.active_pane);
+                        // When entering Settings via mouse, set keyboard focus
+                        // on the first control so the next Tab starts from a
+                        // known position instead of a stale or absent highlight.
+                        if state.active_pane == Pane::Settings {
+                            let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
+                            if let Some(first) = targets.first() {
+                                let new_hover = Some((first.row_index, first.sub));
+                                let old = state.settings_hover;
+                                state.settings_hover = new_hover;
+                                state.invalidate_hover_rows(client_w, old, new_hover);
+                            }
+                        }
+                        // Clear the Settings focus highlight when leaving, so
+                        // it does not persist behind the Activity pane.
+                        if state.active_pane == Pane::Activity {
+                            let old = state.settings_hover;
+                            state.settings_hover = None;
+                            state.invalidate_hover_rows(client_w, old, None);
+                        }
                     }
                     state.apply_pane();
                     state.invalidate();
@@ -4070,7 +4406,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     // (Active window → Primary → Display 1 →
                                     // … → back); the tray menu offers direct
                                     // selection.
-                                    let displays = enumerate_displays();
+                                    let displays = enumerate_displays_cached();
                                     let next = next_monitor_mode(state.cfg().overlay.monitor, displays.len());
                                     state.apply_monitor(next);
                                     state.invalidate();
@@ -4080,6 +4416,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     let (open_rect, _copy_rect) = halve(&control_rect, gap);
                                     if x >= open_rect.left && x < open_rect.right {
                                         state.open_logs();
+                                        state.logs_opened_at = Some(Instant::now());
+                                        unsafe { SetTimer(hwnd, TIMER_OPENED_ID, 2000, None) };
+                                        state.invalidate();
                                     } else {
                                         state.copy_logs();
                                     }
@@ -4089,6 +4428,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     let (open_rect, _reload_rect) = halve(&control_rect, gap);
                                     if x >= open_rect.left && x < open_rect.right {
                                         state.open_config();
+                                        state.config_opened_at = Some(Instant::now());
+                                        unsafe { SetTimer(hwnd, TIMER_OPENED_ID, 2000, None) };
+                                        state.invalidate();
                                     } else {
                                         state.reload_config();
                                     }
@@ -4144,6 +4486,42 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     let (client_w, _client_h) = client_size(hwnd);
                     state.invalidate_hover_rows(client_w, Some(old), None);
                 }
+                // Position indicator hover in the Activity pane.
+                if state.active_pane == Pane::Activity {
+                    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+                    let x = (lparam.0 & 0xFFFF) as i32;
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+                    let pad = (PAD * scale) as i32;
+                    let (client_w, _) = client_size(hwnd);
+                    let content_left = sidebar_w;
+                    let art = (ART_SIZE * scale).round() as i32;
+                    let art_y = (ART_Y * scale) as i32;
+                    let sep_y = art_y + art + (SEP_GAP * scale) as i32;
+                    let hist_bottom = sep_y + ((HIST_GAP + HIST_H) * scale) as i32;
+                    let pos_y = hist_bottom + (4.0 * scale) as i32;
+                    let pos_bottom = pos_y + (16.0 * scale) as i32;
+                    let over = x >= content_left + pad && x < client_w - pad && y >= pos_y && y <= pos_bottom;
+                    if over != state.position_hover {
+                        state.position_hover = over;
+                        let pos_rect = RECT {
+                            left: content_left + pad,
+                            top: pos_y,
+                            right: client_w - pad,
+                            bottom: pos_bottom,
+                        };
+                        state.invalidate_rect(&pos_rect);
+                    }
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut tme);
+                } else if state.position_hover {
+                    state.position_hover = false;
+                }
             }
             LRESULT(0)
         }
@@ -4154,6 +4532,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     state.settings_hover = None;
                     let (client_w, _client_h) = client_size(hwnd);
                     state.invalidate_hover_rows(client_w, Some(old), None);
+                }
+                if state.position_hover {
+                    state.position_hover = false;
+                    state.invalidate();
                 }
             }
             LRESULT(0)
@@ -4259,6 +4641,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     state.invalidate();
                 }
             }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            // A display was added, removed, or reordered (or its resolution
+            // changed). Invalidate the shared display cache so the next tray
+            // menu or settings paint picks up the new layout.
+            invalidate_display_cache();
             LRESULT(0)
         }
         WM_CLOSE => {
@@ -4383,6 +4772,7 @@ mod tests {
             art_blit: None,
             art_fingerprint: None,
             art_decode_failed: false,
+            icon_blit: None,
         }
     }
 

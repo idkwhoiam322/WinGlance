@@ -42,7 +42,7 @@ mod fullscreen;
 mod morph;
 mod render;
 
-pub(crate) use fullscreen::enumerate_displays;
+pub(crate) use fullscreen::{enumerate_displays_cached, invalidate_display_cache};
 pub(crate) use render::{TEXT_CONTRAST_AA, ensure_contrast, pm_bgra_to_rgba};
 
 use fullscreen::{
@@ -252,7 +252,6 @@ struct MarqueeStrip {
     font: HFONT,
     font_height: i32,
     color: [u8; 4],
-    centered: bool,
     text_w: i32,
     pixels: Vec<u8>,
 }
@@ -460,6 +459,11 @@ struct OverlayState {
     /// extra move, never a misplacement, since every reposition recomputes the
     /// anchor from scratch.
     last_anchor_edge: Option<RECT>,
+    /// Cached result of `is_cursor_over_pill()` from the last animation tick,
+    /// so `held_expanded()` (called from `receive_events` between ticks) can
+    /// skip the display enumeration the cursor poll triggers. Updated every
+    /// tick; stale by at most one tick period (250 ms static, ~16 ms animated).
+    last_cursor_over_pill: bool,
     /// Source app of the last TrackChanged shown, used as the label fallback
     /// in state pills for current-session playback states so the pill always
     /// names the app that owns the media — never another app's last track.
@@ -648,8 +652,12 @@ pub(crate) fn set_compact_separate(hwnd: HWND, separate: bool) {
         let state = &mut *state_ptr;
         state.config.overlay.compact_position_separate = separate;
         info!(
-            "overlay compact_position_separate set to {separate} (display: {})",
-            if separate { "OFF" } else { "ON" }
+            "overlay compact_position_separate set to {separate} ({})",
+            if separate {
+                "compact position: independent"
+            } else {
+                "compact position: follows expanded"
+            }
         );
         if !state.preview_if_hidden() {
             state.render();
@@ -740,6 +748,7 @@ impl OverlayState {
             wake: Arc::new(AtomicBool::new(false)),
             hook: None,
             last_anchor_edge: None,
+            last_cursor_over_pill: false,
             current_source: None,
             track_cache: HashMap::new(),
             track_cache_order: VecDeque::new(),
@@ -1240,10 +1249,11 @@ impl OverlayState {
         // A refresh that lands during the collapse (e.g. artwork arriving as
         // the pill fades) would otherwise be cut short: the collapse keeps its
         // original start time and hides the pill when its animation finishes,
-        // ignoring the extended deadline. Bring it back to full visibility for
-        // the extended time instead.
+        // ignoring the extended deadline. Revive it with a fresh entrance so it
+        // grows back smoothly to full visibility for the extended time, instead
+        // of snapping to the full size on the next frame.
         if matches!(self.phase, Phase::Collapsing(_)) {
-            self.phase = Phase::Shown;
+            self.phase = Phase::Expanding(Instant::now());
         }
         self.render();
     }
@@ -1439,6 +1449,7 @@ impl OverlayState {
         // Computed here, outside the phase guard, so the `held` gate below
         // can use it.
         let cursor_over = self.is_cursor_over_pill();
+        self.last_cursor_over_pill = cursor_over;
         if cursor_over {
             self.hover_leave_at = None;
         } else if self.hover_leave_at.is_none() {
@@ -1553,9 +1564,6 @@ impl OverlayState {
                     debug!("pill hover-dismiss armed");
                 }
             }
-        } else {
-            self.hover_dismiss_at = None;
-            self.dismiss_at = None;
         }
         // A newer notification is waiting: while the pill is held under the
         // cursor the queue waits (the user is reading it), but once the hold
@@ -1607,8 +1615,7 @@ impl OverlayState {
         // nothing, so its coarse tick must not pay for a per-tick DPI call.
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
         let scale = if marquee_active {
-            let dpi = unsafe { GetDpiForWindow(self.hwnd) };
-            dpi.max(96) as f32 / 96.0
+            self.fonts.dpi().max(96) as f32 / 96.0
         } else {
             1.0
         };
@@ -1831,7 +1838,7 @@ impl OverlayState {
     /// are never cached, so a hot-plugged or reordered display takes effect
     /// on the very next frame.
     fn target(&self) -> Option<TargetMonitor> {
-        let displays = enumerate_displays();
+        let displays = enumerate_displays_cached();
         let foreground_nearest = foreground_monitor_index(&displays);
         let index = resolve_target(self.position.monitor, &displays, foreground_nearest)?;
         let display = &displays[index];
@@ -1923,7 +1930,7 @@ impl OverlayState {
     /// resolves it. Only the compact→expanded hover morph is an interaction
     /// and gets held — a laid-out expanded pill is never held.
     fn held_expanded(&self) -> bool {
-        let engaged = hover_engaged(self.is_cursor_over_pill(), self.hover_leave_at, Instant::now());
+        let engaged = hover_engaged(self.last_cursor_over_pill, self.hover_leave_at, Instant::now());
         engaged && self.hover_expand.is_some()
     }
 
@@ -2426,6 +2433,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     state.reposition();
                 }
             }
+            invalidate_display_cache();
             LRESULT(0)
         }
         FOREGROUND_CHANGE_MSG => {
@@ -2978,8 +2986,8 @@ mod tests {
         state.receive_events();
 
         assert!(
-            matches!(state.phase, Phase::Shown),
-            "the toggle must rescue the collapsing pill"
+            matches!(state.phase, Phase::Expanding(_)),
+            "the toggle must rescue the collapsing pill by resuming the entrance, not snapping to shown"
         );
     }
 
@@ -3595,7 +3603,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             None,
         );
@@ -3631,7 +3638,6 @@ mod tests {
             font,
             h,
             [0x80, 0x80, 0x80, 0xFF],
-            false,
             1.0,
             None,
         );
@@ -3682,7 +3688,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -3719,7 +3724,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -3766,7 +3770,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -3789,7 +3792,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -3834,7 +3836,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -3852,7 +3853,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -3878,7 +3878,6 @@ mod tests {
             font: HFONT(std::ptr::null_mut()),
             font_height: 10,
             color: [0, 0, 255, 255],
-            centered: false,
             text_w: 10,
             pixels: [255u8, 0, 0, 255].repeat(10 * 20), // solid premultiplied blue (BGRA)
         };
@@ -3981,7 +3980,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             None,
         );
@@ -3998,7 +3996,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -4050,7 +4047,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -4079,7 +4075,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -4179,7 +4174,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             Some(MarqueeCtx {
                 scroll: &mut scroll,
@@ -4229,7 +4223,6 @@ mod tests {
             font: HFONT(std::ptr::null_mut()),
             font_height: 10,
             color: [0, 0, 255, 255],
-            centered: false,
             text_w: 40,
             pixels: [255u8, 0, 0, 255].repeat(40 * 20), // solid premultiplied blue (BGRA)
         };
@@ -4611,7 +4604,6 @@ mod tests {
             font,
             h,
             [255, 255, 255, 255],
-            false,
             1.0,
             None,
         );
@@ -5476,12 +5468,14 @@ mod tests {
     }
 
     #[test]
-    fn scale_frame_about_is_a_true_uniform_scale_about_the_anchor() {
+    fn scale_frame_about_is_a_uniform_scale_about_the_content_corner() {
         // A 4x4 src with one solid premultiplied pixel; scaling by 0.5 about
-        // the bottom-center anchor must map the src's center pixel (2, 2) to
-        // the dst's center pixel (1, 1) — the bottom-anchored shrink pulls
-        // everything down toward the anchor — with every other dst pixel
-        // transparent.
+        // the content corner (inset 0) must map the src's center pixel (2, 2)
+        // to the dst's center pixel (1, 1) — the shrink pulls everything toward
+        // the top-left corner — with every other dst pixel transparent. The
+        // function has no anchor parameter (the on-screen anchor is produced by
+        // `placement()` repositioning the window), so the result must be
+        // identical for any hypothetical anchor value.
         let src_w = 4usize;
         let src_h = 4usize;
         let mut src = vec![0u8; src_w * src_h * 4];
@@ -5491,22 +5485,7 @@ mod tests {
         let dst_w = 2usize;
         let dst_h = 2usize;
         let mut dst = vec![0u8; dst_w * dst_h * 4];
-        scale_frame_about(
-            &mut dst,
-            dst_w * 4,
-            dst_w,
-            dst_h,
-            &src,
-            src_w * 4,
-            src_w,
-            src_h,
-            4,
-            4,
-            0,
-            0.5,
-            1.0,
-            0.5,
-        );
+        scale_frame_about(&mut dst, dst_w * 4, dst_w, dst_h, &src, src_w * 4, src_w, src_h, 0, 0.5);
         // The dst's center pixel (1, 1) samples the src's center exactly.
         let q = (dst_w + 1) * 4;
         assert_eq!(
@@ -6170,6 +6149,7 @@ mod tests {
         });
         state.dismiss_at = Some(Instant::now() - Duration::from_millis(100));
         state.test_cursor_over = Some(true);
+        state.last_cursor_over_pill = true;
 
         state
             .queue
@@ -6954,6 +6934,41 @@ mod tests {
         };
         let point = placement(left_monitor, 400, 100, &custom, 0, 1.0);
         assert_eq!(point, POINT { x: -400, y: 200 }, "clamped to the target work area");
+    }
+
+    #[test]
+    fn placement_custom_overrides_land_the_pill_body_at_the_coordinate() {
+        // Custom `position_x`/`position_y` are pill-body coordinates: the aura
+        // inset is subtracted so the body (not the window) top-left lands at the
+        // configured spot, exactly like the anchor arms.
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let custom = OverlayPos {
+            x: Some(200),
+            y: Some(300),
+            ..anchor_pos(None, None)
+        };
+        // inset 10 at 1.0 scale: the window sits `inset` above/left of the body.
+        let point = placement(work, 400, 100, &custom, 10, 1.0);
+        assert_eq!(
+            point,
+            POINT { x: 190, y: 290 },
+            "the window top-left is the body coordinate minus the aura inset"
+        );
+        // At a non-1.0 scale the override scales first, then the inset subtracts.
+        let point = placement(work, 400, 100, &custom, 15, 1.5);
+        assert_eq!(
+            point,
+            POINT {
+                x: (200f32 * 1.5).round() as i32 - 15,
+                y: (300f32 * 1.5).round() as i32 - 15
+            },
+            "scale applies to the override, then the inset is subtracted"
+        );
     }
 
     #[test]

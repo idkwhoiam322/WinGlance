@@ -98,6 +98,7 @@ pub(super) fn monitor_frequency_ms(monitor: HMONITOR) -> Option<u32> {
 /// same order Windows uses in display settings. Re-enumerated on every use
 /// (handles are never cached), so a hot-plugged or reordered display is
 /// picked up immediately.
+#[derive(Clone)]
 pub(crate) struct DisplayInfo {
     pub handle: HMONITOR,
     /// The display's work area (excludes taskbars and app bars) in virtual
@@ -113,6 +114,40 @@ pub(crate) struct DisplayInfo {
     /// The device name (`\\.\DISPLAY1`), as reported by the system.
     pub name: String,
 }
+
+/// Cached display enumeration: returns the snapshot if it is less than 1 second
+/// old, otherwise re-enumerates and stores the result. Eliminates the
+/// per-animation-frame `EnumDisplayMonitors` + `GetMonitorInfoW` calls that
+/// `enumerate_displays()` issues. Invalidated by `invalidate_display_cache()`
+/// when `WM_DISPLAYCHANGE` fires.
+pub(crate) fn enumerate_displays_cached() -> Vec<DisplayInfo> {
+    let mut guard = DISPLAY_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((at, displays)) = guard.0.as_ref()
+        && at.elapsed() < Duration::from_secs(1)
+    {
+        return displays.clone();
+    }
+    let displays = enumerate_displays();
+    guard.0 = Some((Instant::now(), displays.clone()));
+    displays
+}
+
+/// Clears the display enumeration cache so the next call to
+/// `enumerate_displays_cached()` re-enumerates. Called from `WM_DISPLAYCHANGE`
+/// handlers in both windows.
+pub(crate) fn invalidate_display_cache() {
+    let mut guard = DISPLAY_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.0 = None;
+}
+
+/// HMONITOR is an opaque OS handle, not a data pointer — safe to send across
+/// threads. The Mutex provides the necessary synchronization.
+struct DisplayCacheEntry(Option<(Instant, Vec<DisplayInfo>)>);
+unsafe impl Send for DisplayCacheEntry {}
+
+/// The shared display enumeration cache. Poison-tolerant: a panicking holder
+/// must not crash the pill thread.
+static DISPLAY_CACHE: Mutex<DisplayCacheEntry> = Mutex::new(DisplayCacheEntry(None));
 
 /// Enumerates every active display. Returns an empty vec only when the system
 /// currently reports no display (for example, a locked or disconnected
@@ -300,7 +335,10 @@ pub(super) fn placement(work: RECT, width: i32, height: i32, position: &OverlayP
     // window) must be centered/anchored. Subtract the inset so the pill lands
     // where the user expects it.
     let x = if let Some(px) = position.x {
-        (px as f32 * scale).round() as i32
+        // Absolute overrides are pill-body coordinates (96-DPI logical), so the
+        // window body lands at the dragged corner exactly like the anchor arms:
+        // subtract the aura inset so body.left (not window.left) sits at `px`.
+        (px as f32 * scale).round() as i32 - inset
     } else {
         match position.horizontal {
             HorizontalPosition::Left => work.left + margin - inset,
@@ -309,7 +347,7 @@ pub(super) fn placement(work: RECT, width: i32, height: i32, position: &OverlayP
         }
     };
     let y = if let Some(py) = position.y {
-        (py as f32 * scale).round() as i32
+        (py as f32 * scale).round() as i32 - inset
     } else {
         match position.vertical {
             // The DIB extends `inset` beyond the pill on each side; shift the

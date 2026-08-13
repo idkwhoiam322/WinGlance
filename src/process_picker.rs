@@ -4,13 +4,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
-    BOOL, COLORREF, CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    BOOL, COLORREF, CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
+    WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BDR_SUNKENOUTER, BF_RECT, BeginPaint, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
-    HBRUSH, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, SelectObject,
-    SetBkMode, SetTextColor, TRANSPARENT,
+    BDR_SUNKENOUTER, BF_RECT, BeginPaint, ClientToScreen, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS,
+    DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect,
+    GetMonitorInfoW, HBRUSH, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -40,7 +41,6 @@ const WIDTH: i32 = 400;
 const HEADER_H: i32 = 30;
 const ROW_HEIGHT: i32 = 22;
 const MAX_VISIBLE: usize = 12;
-const WS_EX_TOOLWINDOW_STYLE: i32 = 0x80;
 const CLOSE_BTN_SIZE: i32 = 20;
 const BST_CHECKED: usize = 1;
 const BST_UNCHECKED: usize = 0;
@@ -364,7 +364,7 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
     }
 
     let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
-    if ex_style & WS_EX_TOOLWINDOW_STYLE as isize != 0 {
+    if ex_style & windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW.0 as isize != 0 {
         return BOOL(1);
     }
 
@@ -450,12 +450,21 @@ pub(crate) fn open(
         let height = ((HEADER_H + item_count as i32 * ROW_HEIGHT + 10) as f32 * owner_scale).round() as i32;
         let width = (WIDTH as f32 * owner_scale).round() as i32;
 
-        // Clamp the popup to the owner monitor's work area: the trigger
-        // control can sit near the bottom edge, where an unclamped
-        // `trigger_rect.bottom + 4` would push the popup under the taskbar
-        // or off-screen. Prefer below the control, flip above when that
-        // would overflow, then clamp into the work area.
-        let (mut x, mut y) = (trigger_rect.left, trigger_rect.bottom + 4);
+        // The trigger rect is in the owner window's *client* coordinates, but
+        // CreateWindowExW positions the popup in *screen* coordinates. Translate
+        // the anchor edge into screen space first, then clamp in screen space
+        // (the earlier client-coordinate clamp clamped the wrong numbers).
+        let mut below = POINT {
+            x: trigger_rect.left,
+            y: trigger_rect.bottom,
+        };
+        let mut above = POINT {
+            x: trigger_rect.left,
+            y: trigger_rect.top,
+        };
+        let _ = ClientToScreen(owner, &mut below);
+        let _ = ClientToScreen(owner, &mut above);
+        let (mut x, mut y) = (below.x, below.y + 4);
         let monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -464,7 +473,7 @@ pub(crate) fn open(
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
             let work = info.rcWork;
             if y + height > work.bottom {
-                y = (trigger_rect.top - 4 - height).max(work.top);
+                y = (above.y - 4 - height).max(work.top);
             }
             x = x.clamp(work.left, (work.right - width).max(work.left));
             y = y.clamp(work.top, (work.bottom - height).max(work.top));
