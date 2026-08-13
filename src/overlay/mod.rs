@@ -1611,8 +1611,7 @@ impl OverlayState {
         // nothing, so its coarse tick must not pay for a per-tick DPI call.
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
         let scale = if marquee_active {
-            let dpi = unsafe { GetDpiForWindow(self.hwnd) };
-            dpi.max(96) as f32 / 96.0
+            self.fonts.dpi().max(96) as f32 / 96.0
         } else {
             1.0
         };
