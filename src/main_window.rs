@@ -2284,7 +2284,7 @@ impl MainWindowState {
                             SETTINGS_MUTED,
                         ),
                         SettingId::HideForAutoCompactSources => (
-                            "Hide Persistent Pill for Auto-compact Apps",
+                            "Hide Persistent Compact Pill for Auto-compact Apps",
                             if hide_for_auto_compact {
                                 "ON".to_string()
                             } else {
@@ -2425,7 +2425,7 @@ impl MainWindowState {
                                 LayoutMode::Auto,
                                 LayoutMode::PersistentCompact,
                             ];
-                            let labels = ["Expanded", "Compact", "Auto", "Persistent"];
+                            let labels = ["Expanded", "Compact", "Auto", "Persistent Compact"];
                             for (i, seg) in segments.iter().enumerate() {
                                 let active = layout_mode == values[i];
                                 let seg_hovered = settings_hover == Some((current_row, SettingSub::Seg(i)));
