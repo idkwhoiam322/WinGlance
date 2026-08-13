@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 /// Two dominant colors extracted from track artwork at decode time, used to
 /// recolor UI accents (playback symbols, clock icon) and to drive the pill's
 /// boundary aura gradient. Both colors pass one tier of the guard hierarchy
@@ -34,6 +36,13 @@ const MIN_HUE_DISTANCE: f32 = 30.0;
 /// 4 bits per channel: 4096 histogram buckets.
 const CHANNEL_BITS: u32 = 4;
 const BUCKET_COUNT: usize = 1 << (CHANNEL_BITS * 3);
+/// Fixed grid for the palette's box-average pre-sample. The worker decodes
+/// artwork at a DPI-dependent size (64²–256², see `events::artwork_decode_size`),
+/// so a raw histogram would shift with the decode size and the same cover could
+/// pick a different accent depending on the display DPI. Box-averaging onto a
+/// fixed 16×16 grid first makes the palette converge to the same color
+/// distribution for every decode size.
+const SAMPLE_GRID: usize = 16;
 
 #[derive(Default, Clone, Copy)]
 struct Bucket {
@@ -48,16 +57,23 @@ struct Bucket {
 /// through a four-tier hierarchy — Vibrant target, strict guard, relaxed
 /// guard (dark art), monochrome guard (B&W/high-key) — with the secondary
 /// picked for ≥ 30° hue separation. The input is the overlay's already-decoded
-/// artwork buffer (≤ art_size square), so no extra image decode is needed —
-/// computing the palette here is ~0.1ms, done once per unique cover in
-/// `ensure_art`.
+/// artwork buffer, so no extra image decode is needed — computing the palette
+/// here is ~0.1ms, done once per unique cover in `ensure_art`. Square buffers
+/// are box-averaged onto a fixed 16×16 grid first (see `SAMPLE_GRID`), so the
+/// result does not depend on the worker's DPI-dependent decode size.
 pub(crate) fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
+    // Box-average square artwork onto the fixed grid before histogramming;
+    // non-square or sub-grid inputs (tests, degenerate art) histogram as-is.
+    let sampled: Cow<[u8]> = match box_downsample_square(rgba, SAMPLE_GRID) {
+        Some(buf) => Cow::Owned(buf),
+        None => Cow::Borrowed(rgba),
+    };
     let shift = 8 - CHANNEL_BITS;
     // Heap-allocated: 4096 ~32-byte buckets (~128 KiB) would be a large single
     // stack frame on the UI thread's render path (under ensure_art), and the
     // worker threads already run on deliberately small stacks.
     let mut buckets = vec![Bucket::default(); BUCKET_COUNT];
-    for px in rgba.chunks_exact(4) {
+    for px in sampled.chunks_exact(4) {
         let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
         if a < 32 {
             continue;
@@ -144,6 +160,55 @@ pub(crate) fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
         .map(|(_, c)| *c)
         .unwrap_or(primary);
     Some(Palette { primary, secondary })
+}
+
+/// Box-averages a square RGBA buffer onto a `grid × grid` sample. Pixels below
+/// the histogram's alpha gate are skipped per cell, so an all-transparent cell
+/// emits no sample and opaque regions are not darkened by transparent ones.
+/// Returns `None` when the input is not a perfect square or has fewer than
+/// `grid` pixels per side, so the caller falls back to the raw buffer.
+fn box_downsample_square(rgba: &[u8], grid: usize) -> Option<Vec<u8>> {
+    if !rgba.len().is_multiple_of(4) {
+        return None;
+    }
+    let n = (rgba.len() / 4) as u64;
+    let side = n.isqrt() as usize;
+    if (side as u64) * (side as u64) != n || side < grid {
+        return None;
+    }
+    let cell = side / grid;
+    let mut out = Vec::with_capacity(grid * grid * 4);
+    for gy in 0..grid {
+        let y0 = gy * cell;
+        let y1 = (y0 + cell).min(side);
+        for gx in 0..grid {
+            let x0 = gx * cell;
+            let x1 = (x0 + cell).min(side);
+            let (mut sum_r, mut sum_g, mut sum_b, mut count) = (0u64, 0u64, 0u64, 0u32);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let px = &rgba[(y * side + x) * 4..(y * side + x) * 4 + 4];
+                    if px[3] < 32 {
+                        continue;
+                    }
+                    sum_r += px[0] as u64;
+                    sum_g += px[1] as u64;
+                    sum_b += px[2] as u64;
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            out.extend_from_slice(&[
+                (sum_r / count as u64) as u8,
+                (sum_g / count as u64) as u8,
+                (sum_b / count as u64) as u8,
+                255,
+            ]);
+        }
+    }
+    Some(out)
 }
 
 fn bucket_mean(b: &Bucket) -> [u8; 4] {
@@ -331,6 +396,76 @@ mod tests {
         let palette = palette_from_rgba(&buf).unwrap();
         let (hue, sat, _) = rgb_to_hsl(palette.primary[0], palette.primary[1], palette.primary[2]);
         assert!(sat >= MIN_SATURATION);
+        assert!(
+            !(30.0..=330.0).contains(&hue),
+            "primary should be red-ish, got hue {hue}"
+        );
+    }
+
+    #[test]
+    fn decode_size_does_not_shift_the_palette() {
+        // The worker decodes the same cover at a DPI-dependent size; the
+        // fixed-grid pre-sample must make the palette size-independent.
+        // 8×8 pattern: 6 columns of red, 2 of blue, nearest-neighbor upsized
+        // to the real decode sizes (multiples of 64).
+        let mut pattern = solid([220, 40, 40, 255], 6, 8);
+        pattern.extend_from_slice(&solid([50, 50, 220, 255], 2, 8));
+        let upscaled = |side: usize| -> Vec<u8> {
+            let mut out = vec![0u8; side * side * 4];
+            for y in 0..side {
+                for x in 0..side {
+                    let src = &pattern[((y * 8 / side) * 8 + (x * 8 / side)) * 4..][..4];
+                    out[(y * side + x) * 4..(y * side + x) * 4 + 4].copy_from_slice(src);
+                }
+            }
+            out
+        };
+        let palettes: Vec<_> = [64usize, 128, 192, 256]
+            .iter()
+            .map(|&s| palette_from_rgba(&upscaled(s)).expect("art must yield a palette"))
+            .collect();
+        for p in &palettes[1..] {
+            assert_eq!(*p, palettes[0], "palette must not depend on the decode size");
+        }
+        // The red majority, not the blue minority, drives the primary.
+        let (hue, sat, _) = rgb_to_hsl(palettes[0].primary[0], palettes[0].primary[1], palettes[0].primary[2]);
+        assert!(sat >= MIN_SATURATION);
+        assert!(
+            !(30.0..=330.0).contains(&hue),
+            "primary should be red-ish, got hue {hue}"
+        );
+    }
+
+    #[test]
+    fn white_square_uses_the_downscale_path() {
+        // Square buffers (the real worker decodes) go through the fixed-grid
+        // box average; a 64×64 white cover must still yield a monochrome
+        // palette, matching the non-square high-key behavior.
+        let palette = palette_from_rgba(&solid([255, 255, 255, 255], 64, 64));
+        assert!(palette.is_some(), "white square art must get a palette");
+    }
+
+    #[test]
+    fn box_downsample_skips_transparent_pixels() {
+        // 4×4 buffer onto a 2×2 grid (cell = 2×2): one opaque red pixel per
+        // cell corner (only cell (0,0) gets one), the rest transparent. The
+        // box average must ignore transparent pixels — the cell mean is the
+        // red pixel itself, not a darkened average — and fully transparent
+        // cells must emit no sample.
+        let mut buf = vec![0u8; 4 * 4 * 4]; // transparent
+        buf[0..4].copy_from_slice(&[220, 40, 40, 255]); // row 0, col 0
+        let out = box_downsample_square(&buf, 2).expect("4×4 must downscale to 2×2");
+        assert_eq!(out, [220, 40, 40, 255], "transparent pixels must be skipped");
+    }
+
+    #[test]
+    fn non_square_input_falls_back_to_the_raw_histogram() {
+        // The real decodes are square, but non-square inputs (and everything
+        // below the grid) must still histogram directly.
+        let mut buf = solid([220, 40, 40, 255], 6, 4);
+        buf.extend_from_slice(&solid([50, 50, 220, 255], 2, 4));
+        let palette = palette_from_rgba(&buf).expect("non-square art must yield a palette");
+        let (hue, _, _) = rgb_to_hsl(palette.primary[0], palette.primary[1], palette.primary[2]);
         assert!(
             !(30.0..=330.0).contains(&hue),
             "primary should be red-ish, got hue {hue}"
