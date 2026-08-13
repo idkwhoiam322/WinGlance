@@ -967,18 +967,31 @@ impl OverlayState {
                     let is_update = self.content.as_ref().is_some_and(
                         |content| matches!(content, MediaEvent::TrackChanged(shown) if shown.same_media(&track)),
                     );
+                    // While a pill is up, a newer TrackChanged from the same
+                    // source swaps the content in place instead of enqueueing
+                    // behind the visible one — otherwise rapid skip-next/prev
+                    // leaves the pill on the oldest queued track, showing a
+                    // stale title/art/duration while a different track plays.
+                    // Cross-source changes still queue.
+                    let same_source_shown = !matches!(self.phase, Phase::Hidden)
+                        && self.content.as_ref().is_some_and(|content| match content {
+                            MediaEvent::TrackChanged(shown) => shown.source_app == track.source_app,
+                            MediaEvent::PlaybackStateChanged(_, source) => source == &track.source_app,
+                            _ => false,
+                        });
                     if is_update {
                         self.current_source = Some(track.source_app.clone());
                         self.last_track = Some(track.clone());
                         self.cache_track(&track);
                         self.update_content(MediaEvent::TrackChanged(track), update_min_duration(&self.config));
-                    } else if self.held_expanded() {
-                        // A new track while the cursor holds an expanded pill
-                        // swaps the content in place and stays expanded (the
-                        // hold defers its dismissal): queueing would tear the
-                        // pill out from under the cursor. Full duration from
-                        // the swap, so leaving later gives the new content
-                        // its normal time.
+                    } else if self.held_expanded() || same_source_shown {
+                        // A new track while the cursor holds an expanded pill, or
+                        // a newer track from the same source arriving while any
+                        // pill is up, swaps the content in place instead of
+                        // queueing behind the visible one. Full duration from the
+                        // swap, so leaving later gives the new content its normal
+                        // time; update_content revives a collapsing pill so the
+                        // latest track always reads on screen.
                         self.current_source = Some(track.source_app.clone());
                         self.last_track = Some(track.clone());
                         self.cache_track(&track);
@@ -7774,5 +7787,66 @@ mod tests {
         // A forward sample is always adopted (forward seek or catch-up).
         state.apply_progress(Some(52.0), Some(120), Some(1.0));
         assert_eq!(state.estimated_position_secs, Some(52.0));
+    }
+
+    #[test]
+    fn newer_same_source_track_swaps_in_place_while_showing() {
+        let config = Config::default();
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut state = OverlayState::new(config, queue.clone());
+        state.layout = LayoutMode::Expanded;
+        state.phase = Phase::Shown;
+        // Pill is up showing Apologize (Spotify).
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Apologize", "Coldplay")));
+        state.render();
+
+        // Skip to Payphone on the SAME source while the pill is visible.
+        queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "spotify", "Payphone", "Maroon 5",
+            ))));
+        state.receive_events();
+
+        // The newer same-source track swaps the visible content in place instead
+        // of queueing behind it, so the pill shows the current track, not Apologize.
+        assert!(
+            matches!(state.content, Some(MediaEvent::TrackChanged(t)) if t.title == "Payphone"),
+            "must show Payphone, the current track"
+        );
+        assert!(
+            state.pending.is_empty(),
+            "a same-source swap must not enqueue behind the visible pill"
+        );
+    }
+
+    #[test]
+    fn cross_source_track_still_enqueues_behind_the_visible_pill() {
+        let config = Config::default();
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut state = OverlayState::new(config, queue.clone());
+        state.layout = LayoutMode::Expanded;
+        state.phase = Phase::Shown;
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Apologize", "Coldplay")));
+        state.render();
+
+        // Skip to a different source (YouTube Music) while the pill is up.
+        queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "youtube-music",
+                "Payphone",
+                "Maroon 5",
+            ))));
+        state.receive_events();
+
+        // Cross-source still queues; the visible pill keeps showing Apologize.
+        assert!(
+            matches!(state.content, Some(MediaEvent::TrackChanged(t)) if t.title == "Apologize"),
+            "cross-source must not swap the visible pill in place"
+        );
+        assert_eq!(state.pending.len(), 1, "cross-source track must be enqueued");
     }
 }
