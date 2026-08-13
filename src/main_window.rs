@@ -245,7 +245,7 @@ enum SettingSub {
     Copy,
     /// The left half of the Config row ("Open config" button).
     OpenConfig,
-    /// The right half of the Config row ("Reload config" button).
+    /// The right half of the Config row ("Restart app" button).
     ReloadConfig,
 }
 
@@ -2649,7 +2649,7 @@ impl MainWindowState {
                                 &self.fonts,
                                 hdc,
                                 &reload_rect,
-                                "Reload config",
+                                "Restart app",
                                 accent,
                                 hovered_reload,
                                 scale,
@@ -2709,7 +2709,7 @@ impl MainWindowState {
                 }
                 if *id == SettingId::OpenConfig {
                     // Per-button hover for the two side-by-side buttons: the
-                    // left half is "Open config", the right half "Reload config".
+                    // left half is "Open config", the right half "Restart app".
                     let gap = (4.0 * scale) as i32;
                     let (open_rect, reload_rect) = halve(&control_rect, gap);
                     if x >= open_rect.left && x < open_rect.right {
