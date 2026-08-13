@@ -440,6 +440,12 @@ struct OverlayState {
     progress_anchor: Option<(Instant, f64)>,
     /// Whether the current content is playing (drives freeze/resume).
     progress_playing: bool,
+    /// Last SMTC-reported position seen by `apply_progress`. Used to detect
+    /// stale samples: when the OS has not advanced the position since the last
+    /// read (apps that refresh SMTC position every few seconds, not every poll),
+    /// the bar must keep interpolating instead of snapping back to the stale
+    /// value. A genuinely fresh backward jump (seek / new track) is still adopted.
+    last_progress_position_secs: Option<f64>,
     /// Bar fraction painted on the last frame, so a settled pill can skip a
     /// static-tick repaint when the bar did not move by at least a pixel.
     last_bar_fraction: Option<f32>,
@@ -805,6 +811,7 @@ impl OverlayState {
             progress_rate: None,
             progress_anchor: None,
             progress_playing: false,
+            last_progress_position_secs: None,
             last_bar_fraction: None,
             dib: None,
             frame_scratch: Vec::new(),
@@ -1358,20 +1365,28 @@ impl OverlayState {
         self.progress_duration_secs = duration_secs;
         self.progress_rate = rate;
         if let Some(pos) = position_secs {
-            // Reconcile the live sample against the interpolated estimate instead
-            // of hard-snapping. Adopt the sample when it is at/ahead of the display;
-            // when it is a little behind (latency jitter) keep the displayed value and
-            // only forward the anchor time, so the bar stays monotonic; when it is far
-            // behind (backward seek or a new track) adopt it so the bar tracks the real
-            // position. A genuine seek also re-emits a TrackChanged, which re-anchors
-            // here to the new position directly.
+            // Detect stale SMTC samples: many media apps refresh the OS timeline
+            // position every few seconds rather than on every poll, so consecutive
+            // reads can return the same value while the bar keeps interpolating ahead.
+            // Snapping to an unchanged (stale) value every 3-4s makes the bar jerk
+            // backward on every poll that didn't advance. When the position is
+            // fresh — moved since the last read — the normal reconciliation logic
+            // applies: a small backward jitter is absorbed (monotonic bar), a large
+            // backward jump (seek / new track at 0) is adopted.
+            let stale = self.last_progress_position_secs == Some(pos);
             let base = match self.estimated_position_secs {
                 Some(cur) if pos >= cur => pos,
-                Some(cur) if pos >= cur - PROGRESS_LATENCY_TOL_SECS => cur,
+                Some(cur) if !stale && pos >= cur - PROGRESS_LATENCY_TOL_SECS => cur,
+                Some(cur) if stale => cur,
                 _ => pos,
             };
             self.estimated_position_secs = Some(base);
-            self.progress_anchor = Some((Instant::now(), base));
+            // Only re-anchor on a fresh sample. A stale sample must not reset the
+            // anchor instant, which would freeze the bar at the stale position.
+            if !stale {
+                self.progress_anchor = Some((Instant::now(), base));
+            }
+            self.last_progress_position_secs = Some(pos);
         }
     }
 
@@ -8122,9 +8137,10 @@ mod tests {
         state.progress_rate = Some(1.0);
         state.progress_duration_secs = Some(120);
 
-        // A sample a little behind the display (OS report latency) must NOT snap
-        // the bar backward — that jitter is what made it oscillate. 49.5s is within
-        // PROGRESS_LATENCY_TOL_SECS of 50.0s, so the displayed position is kept.
+        // A sample behind the display but within PROGRESS_LATENCY_TOL_SECS must
+        // NOT snap the bar backward — that jitter is what made it oscillate.
+        // 49.5s is within tolerance of 50.0s, so the displayed position is kept
+        // and last_progress_position_secs is updated (the sample is fresh).
         state.apply_progress(Some(49.5), Some(120), Some(1.0));
         assert_eq!(
             state.estimated_position_secs,
@@ -8145,6 +8161,36 @@ mod tests {
         // A forward sample is always adopted (forward seek or catch-up).
         state.apply_progress(Some(52.0), Some(120), Some(1.0));
         assert_eq!(state.estimated_position_secs, Some(52.0));
+    }
+
+    #[test]
+    fn progress_changed_skips_stale_sm_sample() {
+        // Apps that refresh SMTC position every few seconds can return the same
+        // value on consecutive polls. The bar must keep interpolating instead of
+        // snapping backward to the stale value (which exceeds the 3 s tolerance
+        // after ~4 s of playback at 1x).
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        // Bar has interpolated to 14.0s (4s ahead of the last fresh SMTC sample).
+        state.estimated_position_secs = Some(14.0);
+        state.progress_anchor = Some((Instant::now(), 14.0));
+        state.progress_playing = true;
+        state.progress_rate = Some(1.0);
+        state.progress_duration_secs = Some(120);
+        state.last_progress_position_secs = Some(10.0);
+
+        // Same stale position arrives again: must NOT snap backward.
+        state.apply_progress(Some(10.0), Some(120), Some(1.0));
+        assert_eq!(state.estimated_position_secs, Some(14.0));
+        assert_eq!(
+            state.progress_anchor.unwrap().1,
+            14.0,
+            "stale sample must not re-anchor to the stale position"
+        );
+
+        // A fresh sample beyond tolerance is still adopted (genuine seek/new track),
+        // even though it is behind the displayed position.
+        state.apply_progress(Some(5.0), Some(120), Some(1.0));
+        assert_eq!(state.estimated_position_secs, Some(5.0));
     }
 
     #[test]
