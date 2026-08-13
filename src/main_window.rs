@@ -631,6 +631,11 @@ struct CurrentActivity {
     /// the artwork bytes change, so a corrupt cover is attempted once instead
     /// of on every repaint.
     art_decode_failed: bool,
+    /// Cached GDI source for the source-app icon. Built lazily from
+    /// `track.app_icon` (the worker's premultiplied BGRA at 24×24) on first
+    /// paint. The icon data is already in memory (Arc-shared); this blit
+    /// adds ~2.4 KB (24×24×4 pixel data + GDI handles).
+    icon_blit: Option<ArtBlit>,
 }
 
 /// Cached memory DC + DIB section holding the decoded premultiplied artwork
@@ -1440,6 +1445,10 @@ impl MainWindowState {
 
         if is_update {
             if let Some(current) = &mut self.current {
+                // Free the icon blit if the source app changed (icon is per-source).
+                if current.track.source_app != track.source_app {
+                    free_art_blit(&mut current.icon_blit);
+                }
                 current.track = track.clone();
                 // Artwork is decoded lazily on first paint; a metadata refresh
                 // re-reporting the same cover must not re-decode, so only bump
@@ -1509,6 +1518,7 @@ impl MainWindowState {
             art_blit: None,
             art_fingerprint,
             art_decode_failed: false,
+            icon_blit: None,
         });
     }
 
@@ -1644,6 +1654,16 @@ impl MainWindowState {
                 }
             }
         }
+        // Build the app-icon blit lazily from the worker's decoded pixels.
+        // The icon is 24×24 premultiplied BGRA (Arc-shared); the blit adds
+        // ~2.4 KB (pixel data + GDI handles).
+        if let Some(current) = &mut self.current
+            && current.icon_blit.is_none()
+            && let Some(icon) = current.track.app_icon.as_deref()
+        {
+            let base = ((icon.len() / 4) as f64).sqrt() as i32;
+            current.icon_blit = build_art_blit(icon, base);
+        }
 
         if let Some(current) = &self.current {
             // Artwork is cached after first paint; paint just blends it.
@@ -1765,9 +1785,20 @@ impl MainWindowState {
                 );
             }
             if !current.track.source_app.trim().is_empty() {
+                let app_y = art_y + (100.0 * scale) as i32;
+                let icon_size = (16.0 * scale).round() as i32;
+                let icon_gap = (4.0 * scale).round() as i32;
+                // Render the app icon before the source name, matching the
+                // pill's app-row convention (icon left, name right).
+                let app_text_left = if let Some(icon_blit) = &current.icon_blit {
+                    draw_art_blit(hdc, icon_blit, icon_size, text_left, app_y);
+                    text_left + icon_size + icon_gap
+                } else {
+                    text_left
+                };
                 let mut app_rect = RECT {
-                    left: text_left,
-                    top: art_y + (100.0 * scale) as i32,
+                    left: app_text_left,
+                    top: app_y,
                     right: text_right,
                     bottom: art_y + (114.0 * scale) as i32,
                 };
@@ -3039,6 +3070,7 @@ impl MainWindowState {
         remove_tray_icon(self.hwnd);
         if let Some(current) = &mut self.current {
             free_art_blit(&mut current.art_blit);
+            free_art_blit(&mut current.icon_blit);
         }
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_TOOLTIPS_ID);
@@ -4038,6 +4070,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     && let Some(current) = &mut state.current
                 {
                     free_art_blit(&mut current.art_blit);
+                    free_art_blit(&mut current.icon_blit);
                 }
             }
             LRESULT(0)
@@ -4739,6 +4772,7 @@ mod tests {
             art_blit: None,
             art_fingerprint: None,
             art_decode_failed: false,
+            icon_blit: None,
         }
     }
 
