@@ -366,7 +366,21 @@ impl ListenerState {
                 .min(SESSION_CHECK_INTERVAL);
 
             match signal_rx.recv_timeout(timeout) {
-                Ok(signal) => self.handle_signal(signal)?,
+                Ok(signal) => {
+                    self.handle_signal(signal)?;
+                    // A continuous signal stream must not starve the debounce
+                    // flush or the periodic safety net: run both once their
+                    // deadline has passed, regardless of how many signals
+                    // arrived in between.
+                    if self.pending_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                        self.flush();
+                    }
+                    if self.last_session_check.elapsed() >= SESSION_CHECK_INTERVAL {
+                        self.last_session_check = Instant::now();
+                        self.sync_subscriptions();
+                        self.poll_sessions();
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.flush();
                     // Periodic safety net: re-sync (a session can appear
@@ -380,17 +394,6 @@ impl ListenerState {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            // A continuous signal stream must not starve the debounce flush
-            // or the periodic safety net: run both once their deadline has
-            // passed, regardless of how many signals arrived in between.
-            if self.pending_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
-                self.flush();
-            }
-            if self.last_session_check.elapsed() >= SESSION_CHECK_INTERVAL {
-                self.last_session_check = Instant::now();
-                self.sync_subscriptions();
-                self.poll_sessions();
             }
         }
         Ok(())
