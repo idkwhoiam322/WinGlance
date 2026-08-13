@@ -1306,13 +1306,12 @@ pub(super) fn draw_pill_text_rows(
     let (font_app, h_app) = state.fonts.font_for(rows[3].1 as i32, false);
     // Only rows that will actually be drawn take up vertical space: the rest
     // of the pill's constant height stays empty below the rows.
-    let artist_active = !pill.artist.trim().is_empty();
-    let active: [bool; 4] = [
-        true,
-        artist_active,
-        !pill.meta.is_empty(),
-        !pill.source_app.trim().is_empty(),
-    ];
+    let artist_display = if pill.artist.trim().is_empty() {
+        "Unknown Artist"
+    } else {
+        pill.artist.as_str()
+    };
+    let active: [bool; 4] = [true, true, !pill.meta.is_empty(), !pill.source_app.trim().is_empty()];
     let text_top = inset as f32 + pad * scale;
     let mut y = text_top;
     let mut next_band = |i: usize| -> RECT {
@@ -1378,7 +1377,7 @@ pub(super) fn draw_pill_text_rows(
     }
 
     let artist_rect = next_band(1);
-    if artist_active {
+    {
         let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, artist_rect.bottom);
         if unveil > 0.0 {
             draw_text_line_pixels(
@@ -1386,7 +1385,7 @@ pub(super) fn draw_pill_text_rows(
                 &mut state.scratch_utf16,
                 pixels,
                 width as usize,
-                &pill.artist,
+                artist_display,
                 &artist_rect,
                 font_artist,
                 h_artist,
@@ -1593,7 +1592,7 @@ pub(super) fn draw_expanded_pill_text(
             } else {
                 // No cached track (the state change arrived before the first
                 // TrackChanged): fall back to the source name with an
-                // "Unknown" artist row.
+                // "Unknown Artist" artist row.
                 let appearance = &state.config.appearance;
                 let inset = state.aura_inset;
                 let padding = (appearance.padding * scale) as i32;
@@ -1669,7 +1668,7 @@ pub(super) fn draw_expanded_pill_text(
                             &mut state.scratch_utf16,
                             pixels,
                             width as usize,
-                            "Unknown",
+                            "Unknown Artist",
                             &artist_rect,
                             font_artist,
                             h_artist,

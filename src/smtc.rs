@@ -1584,9 +1584,9 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_art
     let source_app = read_source_app(session);
     let properties = session.TryGetMediaPropertiesAsync()?.get()?;
     let title = cap_meta(non_empty(properties.Title()?.to_string(), &source_app));
-    // Keep artist empty when the app has not provided it yet; the pill hides
-    // the artist row instead of showing "Unknown" (which duplicates the
-    // source-app line and shows a made-up name).
+    // Keep artist empty when the app has not provided it yet; the pill and
+    // the Activity pane show "Unknown Artist" as a placeholder so the row
+    // is never blank.
     let artist = cap_meta(non_empty(properties.Artist()?.to_string(), ""));
     // Keep album empty when the app has not provided it yet; renderers hide the
     // album line until real data arrives (prevents a bogus "Unknown album").
@@ -1858,7 +1858,8 @@ mod tests {
         assert_eq!(merged.album, "");
         assert_eq!(merged.genre, None);
         assert_eq!(merged.track_number, None);
-        // An empty artist on a new title stays empty (the pill hides the row).
+        // An empty artist on a new title stays empty (the pill shows
+        // "Unknown Artist" as a placeholder).
         let merged = merge_track(&prev, &track("Next", ""), true);
         assert_eq!(merged.artist, "");
     }

@@ -1693,7 +1693,7 @@ impl MainWindowState {
             );
 
             let subtitle = if current.track.artist.trim().is_empty() {
-                "Unknown"
+                "Unknown Artist"
             } else {
                 &current.track.artist
             };
