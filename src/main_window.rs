@@ -722,6 +722,8 @@ struct MainWindowState {
     /// flight. The forwarder and this window only post when the flag was
     /// clear, so an event burst collapses into one wake message per drain.
     wake: Arc<AtomicBool>,
+    /// Whether the position indicator in the Activity pane is hovered.
+    position_hover: bool,
 }
 
 /// Set when this window's WM_NCCREATE claims the state box handed over in
@@ -883,6 +885,7 @@ impl MainWindowState {
             source_states: HashMap::new(),
             source_order: VecDeque::new(),
             wake: Arc::new(AtomicBool::new(false)),
+            position_hover: false,
         }
     }
 
@@ -1826,13 +1829,18 @@ impl MainWindowState {
             right: client_w - pad,
             bottom: pos_y + (16.0 * scale) as i32,
         };
+        let pos_color = if self.position_hover {
+            [0x99, 0x99, 0x99, 0xFF]
+        } else {
+            [0x66, 0x66, 0x66, 0xFF]
+        };
         draw_string(
             &self.fonts,
             hdc,
             &pos_label,
             &mut pos_rect,
             (10.0 * scale) as i32,
-            [0x66, 0x66, 0x66, 0xFF],
+            pos_color,
             false,
             false,
         );
@@ -4413,6 +4421,42 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     let (client_w, _client_h) = client_size(hwnd);
                     state.invalidate_hover_rows(client_w, Some(old), None);
                 }
+                // Position indicator hover in the Activity pane.
+                if state.active_pane == Pane::Activity {
+                    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+                    let x = (lparam.0 & 0xFFFF) as i32;
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+                    let pad = (PAD * scale) as i32;
+                    let (client_w, _) = client_size(hwnd);
+                    let content_left = sidebar_w;
+                    let art = (ART_SIZE * scale).round() as i32;
+                    let art_y = (ART_Y * scale) as i32;
+                    let sep_y = art_y + art + (SEP_GAP * scale) as i32;
+                    let hist_bottom = sep_y + ((HIST_GAP + HIST_H) * scale) as i32;
+                    let pos_y = hist_bottom + (4.0 * scale) as i32;
+                    let pos_bottom = pos_y + (16.0 * scale) as i32;
+                    let over = x >= content_left + pad && x < client_w - pad && y >= pos_y && y <= pos_bottom;
+                    if over != state.position_hover {
+                        state.position_hover = over;
+                        let pos_rect = RECT {
+                            left: content_left + pad,
+                            top: pos_y,
+                            right: client_w - pad,
+                            bottom: pos_bottom,
+                        };
+                        state.invalidate_rect(&pos_rect);
+                    }
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut tme);
+                } else if state.position_hover {
+                    state.position_hover = false;
+                }
             }
             LRESULT(0)
         }
@@ -4423,6 +4467,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     state.settings_hover = None;
                     let (client_w, _client_h) = client_size(hwnd);
                     state.invalidate_hover_rows(client_w, Some(old), None);
+                }
+                if state.position_hover {
+                    state.position_hover = false;
+                    state.invalidate();
                 }
             }
             LRESULT(0)
