@@ -272,20 +272,13 @@ pub(super) fn blit_packed_rows(dst: &mut [u8], dst_stride_bytes: usize, src: &[u
     }
 }
 
-/// Scales the composed final-layout frame about the pill's anchor point into
-/// the window-sized DIB region: the settle-bounce's whole-pill motion (see
-/// `bounce_scale`). The anchor is the fixed screen point `placement` keeps
-/// anchored — the pill's anchored edge/center, expressed as a fraction of the
-/// pill's width/height (`anchor_frac_x`/`anchor_frac_y`: 0 = left/top edge,
-/// 0.5 = center, 1 = right/bottom edge) — so the pill grows and shrinks 1:1
-/// about the same point the window position pivots around. Every dst pixel
 /// Uniformly scales the composed frame into the window-sized DIB region, so the
 /// whole pill — body, aura, rows, art, icon — grows and shrinks 1:1. The pivot
-/// is the content's top-left corner (`inset`, `inset`): for any anchor fraction
-/// the `content_w`/`content_h` terms cancel, so the resample is scale-about-corner
-/// and the on-screen anchor is produced entirely by `placement()` repositioning the
-/// window top-left as the size changes (see `fullscreen.rs::placement`). Pure and
-/// GDI-free so it can be unit tested directly.
+/// is the content's top-left corner (`inset`, `inset`): the resample is
+/// scale-about-corner and the on-screen anchor is produced entirely by
+/// `placement()` repositioning the window top-left as the size changes
+/// (see `fullscreen.rs::placement`). Pure and GDI-free so it can be unit
+/// tested directly.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scale_frame_about(
     dst: &mut [u8],
