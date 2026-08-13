@@ -405,6 +405,16 @@ struct OverlayState {
     /// was re-checked. The same-window re-check is throttled to 1 Hz (the
     /// geometry can only change on a window resize, never at 4 Hz).
     last_geometry_check: Option<Instant>,
+    /// Fullscreen verdict of the most recent `sample_foreground` call, used
+    /// to detect a verdict change on an unchanged foreground window (a
+    /// same-window fullscreen toggle fires no WinEvent hook). Updated on
+    /// every sample, test verdicts included.
+    last_fullscreen: Option<bool>,
+    /// While the pill is auto-hidden with held content (fullscreen/listed
+    /// foreground), a coarse 1 Hz timer keeps polling the foreground — see
+    /// `tick_hidden_watchdog`. False while the pill is visible or hidden
+    /// without a hold.
+    hidden_watchdog: bool,
     /// Per-row marquee state for the four track lines (title/subtitle/meta/app).
     scroll: [LineScroll; 4],
     /// Per-row cached marquee rasters (parallel to `scroll`), see `MarqueeStrip`.
@@ -811,6 +821,8 @@ impl OverlayState {
             layout_fg: None,
             layout_fg_exe: None,
             last_geometry_check: None,
+            last_fullscreen: None,
+            hidden_watchdog: false,
             scroll: [LineScroll::default(); 4],
             marquee_strips: [None, None, None, None],
             anim_timer: HANDLE::default(),
@@ -1509,6 +1521,10 @@ impl OverlayState {
         if !self.enabled {
             return;
         }
+        // Any show ends the auto-hide hold: the watchdog (armed by hide()
+        // when content was held) must not poll while a pill is up, and the
+        // next hide re-arms it from scratch.
+        self.hidden_watchdog = false;
         // A show is a meaningful pill-update boundary: re-resolve the Auto
         // layout from the current foreground before the frame geometry is
         // computed, so a pill that appears over a fullscreen game (or over a
@@ -1603,11 +1619,13 @@ impl OverlayState {
         #[cfg(test)]
         {
             if let Some(verdict) = &self.test_fg_verdict {
+                self.last_fullscreen = Some(verdict.fullscreen);
                 return verdict.clone();
             }
         }
         let foreground = unsafe { GetForegroundWindow() };
         let fullscreen = window_is_fullscreen(foreground, self.hwnd);
+        self.last_fullscreen = Some(fullscreen);
         let exe = if self.layout_fg == Some(foreground) {
             self.layout_fg_exe.clone()
         } else {
@@ -1625,15 +1643,17 @@ impl OverlayState {
         ForegroundVerdict { exe, fullscreen }
     }
 
-    /// The static-tick re-check for Auto layout: reacts to a foreground
-    /// change within one static tick (250 ms) even when no media event
-    /// arrives (e.g. an alt-tab into a fullscreen game while the pill is
-    /// up). The full decision (process enumeration) runs only when the
-    /// foreground HWND changed; an unchanged window gets its fullscreen
-    /// geometry re-checked at most once per second — a same-window resize
-    /// (fullscreen toggle) cannot matter more often than that. Returns
-    /// whether the layout flipped, so the caller can force a re-render.
-    fn tick_layout_check(&mut self) -> bool {
+    /// The static-tick re-check: reacts to a foreground change within one
+    /// static tick (250 ms) even when no media event arrives (e.g. an
+    /// alt-tab into a fullscreen game while the pill is up). The full
+    /// decision (process enumeration) runs only when the foreground HWND
+    /// changed; an unchanged window gets its fullscreen geometry re-checked
+    /// at most once per second — a same-window resize (fullscreen toggle)
+    /// cannot matter more often than that. Returns (whether the layout
+    /// flipped, whether the fullscreen verdict changed), so the caller can
+    /// force a re-render (Auto) or re-run the auto-hide decision
+    /// (PersistentCompact).
+    fn tick_layout_check(&mut self) -> (bool, bool) {
         let now = Instant::now();
         let foreground = unsafe { GetForegroundWindow() };
         let hwnd_changed = self.layout_fg != Some(foreground);
@@ -1642,21 +1662,58 @@ impl OverlayState {
                 .last_geometry_check
                 .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
         if !geometry_due {
-            return false;
+            return (false, false);
         }
         self.last_geometry_check = Some(now);
-        let before = self.layout;
+        let before_layout = self.layout;
+        let before_fullscreen = self.last_fullscreen;
         self.refresh_layout();
-        self.layout != before
+        (self.layout != before_layout, self.last_fullscreen != before_fullscreen)
+    }
+
+    /// 1 Hz foreground re-check while the pill is auto-hidden with held
+    /// content (see `hide`). A same-window fullscreen-exit (F11 in a browser,
+    /// Alt+Enter in a game) leaves the foreground HWND unchanged, so
+    /// `EVENT_SYSTEM_FOREGROUND` never fires and `on_foreground_change`
+    /// would not run; this poll routes a verdict change through it so the
+    /// held pill resumes. Disarms itself when the auto-hide is no longer
+    /// applicable (layout/config changed while hidden).
+    fn tick_hidden_watchdog(&mut self) {
+        if !self.enabled
+            || !(self.config.overlay.layout == LayoutMode::PersistentCompact
+                && self.config.behavior.hide_for_auto_compact_sources)
+        {
+            self.hidden_watchdog = false;
+            self.delete_anim_timer();
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_geometry_check
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_geometry_check = Some(now);
+        let before = self.last_fullscreen;
+        self.sample_foreground();
+        if self.last_fullscreen != before {
+            self.on_foreground_change();
+        }
     }
 
     fn tick(&mut self) {
         let now = Instant::now();
         // A tick can be delivered after the pill was hidden (one was already
         // queued when hide() ran). The hidden phase must not re-arm the
-        // refresh-rate timer or do any per-tick work.
+        // refresh-rate timer or do any per-tick work. The single exception
+        // is the auto-hide watchdog: those ticks are deliberately armed by
+        // hide() and only poll the foreground at 1 Hz.
         if matches!(self.phase, Phase::Hidden) {
             self.last_tick = now;
+            if self.hidden_watchdog {
+                self.tick_hidden_watchdog();
+            }
             return;
         }
         let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
@@ -1988,13 +2045,39 @@ impl OverlayState {
                 line.offset += per_tick;
             }
         }
-        // Auto layout re-check: a foreground change flips the pill between
+        // Foreground re-check: a foreground change flips the Auto pill between
         // layouts within one static tick even when no media event arrives
-        // (an alt-tab into a fullscreen game mid-pill). Only the static tick
+        // (an alt-tab into a fullscreen game mid-pill). Persistent-compact
+        // re-checks too: a same-window fullscreen toggle (F11 in a browser,
+        // Alt+Enter in a game) leaves the foreground HWND unchanged, so the
+        // WinEvent hook never fires, and the verdict comparison keeps the
+        // auto-hide decision honest without the hook. Only the static tick
         // runs it; animation frames skip it, so a flip never lands mid-
         // expand/collapse. A flipped layout forces a render (the pill's
         // size, content layout and placement all change with it).
-        let layout_flipped = self.config.overlay.layout == LayoutMode::Auto && !animating && self.tick_layout_check();
+        let mode = self.config.overlay.layout;
+        let (layout_flipped, fullscreen_changed) = if !animating
+            && (mode == LayoutMode::Auto
+                || (mode == LayoutMode::PersistentCompact && self.config.behavior.hide_for_auto_compact_sources))
+        {
+            self.tick_layout_check()
+        } else {
+            (false, false)
+        };
+        // Persistent-compact: route a fullscreen-verdict change through the
+        // foreground-change handler so the pill auto-hides the moment a
+        // same-window fullscreen toggle lands (the foreground HWND never
+        // changed, so the event hook cannot have reported it).
+        if fullscreen_changed && mode == LayoutMode::PersistentCompact {
+            self.on_foreground_change();
+            // The auto-hide hid the pill mid-tick; the trailing
+            // sync_anim_timer would treat Hidden as animating and recreate
+            // the timer at refresh rate, clobbering the watchdog's coarse
+            // 1 s cadence. Mirror the collapse-finish precedent: stop here.
+            if matches!(self.phase, Phase::Hidden) {
+                return;
+            }
+        }
         // The render gate must see the hover state as it stands AFTER this
         // tick's hover-detection code ran: `animating` was computed at the
         // top of the tick, before the cursor poll, so on the tick that
@@ -2489,6 +2572,24 @@ impl OverlayState {
         // Advance the queue: the next pending notification shows as a fresh
         // pill. show() checks `enabled`, so a toggle-off collapse stays hidden.
         self.show_next();
+        // Auto-hide watchdog: while the pill stays hidden with held content
+        // (PersistentCompact auto-hide for a fullscreen/listed foreground),
+        // keep a coarse 1 s timer polling the foreground. A same-window
+        // fullscreen-exit (F11 / Alt+Enter) never fires EVENT_SYSTEM_FOREGROUND,
+        // so without it the held pill would stay hidden until the next media
+        // event or foreground change. Only the held state arms it (and only
+        // while notifications are enabled — a watchdog that cannot show
+        // anything must not poll); any other hide leaves no timer running
+        // (deleted above; hidden ticks no-op).
+        self.hidden_watchdog = self.enabled
+            && self.config.overlay.layout == LayoutMode::PersistentCompact
+            && self.config.behavior.hide_for_auto_compact_sources
+            && self.held_content.is_some()
+            && matches!(self.phase, Phase::Hidden);
+        if self.hidden_watchdog {
+            self.tick_period = 1000;
+            self.ensure_anim_timer();
+        }
     }
 
     /// Releases the size-reuse buffers after the pill has been hidden for a
@@ -3822,6 +3923,183 @@ mod tests {
         );
         assert!(state.content.is_some(), "the resume path must restore the held content");
         assert!(state.held_content.is_none(), "held_content must be consumed on resume");
+    }
+
+    #[test]
+    fn same_window_fullscreen_toggle_hides_persistent_pill_on_tick() {
+        // A same-window fullscreen toggle (F11 in a browser, Alt+Enter in a
+        // game) fires no EVENT_SYSTEM_FOREGROUND — the foreground HWND never
+        // changes. The static tick re-check must detect the verdict flip and
+        // auto-hide the pill through on_foreground_change.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.last_fullscreen = Some(false);
+        let track = track_for("spotify", "Song", "Artist");
+        state.content = Some(MediaEvent::TrackChanged(track));
+        state.phase = Phase::Shown;
+        // Keep the dismiss countdown in the future so the pill cannot fade or
+        // collapse independently of the fullscreen transition.
+        state.dismiss_at = Some(Instant::now() + Duration::from_secs(3600));
+
+        // The window goes fullscreen without changing identity.
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: true,
+        });
+        state.tick();
+
+        assert!(
+            matches!(state.phase, Phase::Hidden),
+            "the pill must auto-hide on the tick"
+        );
+        assert!(state.content.is_none(), "content is cleared on hide");
+        assert!(state.held_content.is_some(), "the content must be held for resume");
+        assert!(
+            state.hidden_watchdog,
+            "the hidden-hold state must arm the foreground watchdog"
+        );
+        assert_eq!(
+            state.tick_period, 1000,
+            "the watchdog must keep its coarse 1 s cadence — the trailing \
+             sync_anim_timer must not recreate the timer at refresh rate"
+        );
+    }
+
+    #[test]
+    fn hidden_watchdog_resumes_persistent_pill_on_same_window_fullscreen_exit() {
+        // Once auto-hidden, only a foreground change used to resume the pill.
+        // A same-window fullscreen-exit fires no event either, so the 1 Hz
+        // hidden watchdog must detect the verdict flip and resume the held
+        // content through on_foreground_change.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: true,
+        });
+        let track = track_for("spotify", "Song", "Artist");
+        state.content = Some(MediaEvent::TrackChanged(track));
+        state.phase = Phase::Shown;
+        state.on_foreground_change();
+        assert!(
+            matches!(state.phase, Phase::Hidden),
+            "pill must auto-hide for fullscreen"
+        );
+        assert!(state.hidden_watchdog, "auto-hide must arm the watchdog");
+
+        // The same window exits fullscreen; no foreground change occurs.
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.tick();
+
+        assert!(
+            !matches!(state.phase, Phase::Hidden),
+            "the watchdog must resume the held pill"
+        );
+        assert!(state.content.is_some(), "the resumed pill must restore the content");
+        assert!(state.held_content.is_none(), "held_content must be consumed on resume");
+        assert!(
+            !state.hidden_watchdog,
+            "the resumed pill must not keep the watchdog armed"
+        );
+    }
+
+    #[test]
+    fn hidden_watchdog_ignores_unchanged_verdict() {
+        // The watchdog must not disturb the hidden-hold state while the
+        // foreground stays fullscreen (a verdict flip is the only trigger).
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: true,
+        });
+        let track = track_for("spotify", "Song", "Artist");
+        state.content = Some(MediaEvent::TrackChanged(track));
+        state.phase = Phase::Shown;
+        state.on_foreground_change();
+        assert!(
+            matches!(state.phase, Phase::Hidden),
+            "pill must auto-hide for fullscreen"
+        );
+
+        state.tick();
+        state.tick();
+
+        assert!(
+            matches!(state.phase, Phase::Hidden),
+            "an unchanged verdict must keep the pill hidden"
+        );
+        assert!(
+            state.hidden_watchdog,
+            "the watchdog must stay armed while the hold is in place"
+        );
+    }
+
+    #[test]
+    fn hidden_watchdog_disarms_when_auto_hide_no_longer_applies() {
+        // Layout/config can change while the pill is hidden (settings pane).
+        // The watchdog must disarm itself instead of polling pointlessly; the
+        // held content is left alone — a later, properly-armed hide resumes it.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: true,
+        });
+        let track = track_for("spotify", "Song", "Artist");
+        state.content = Some(MediaEvent::TrackChanged(track));
+        state.phase = Phase::Shown;
+        state.on_foreground_change();
+        assert!(state.hidden_watchdog, "auto-hide must arm the watchdog");
+
+        state.config.overlay.layout = LayoutMode::Expanded;
+        state.tick();
+
+        assert!(
+            !state.hidden_watchdog,
+            "the watchdog must disarm when the auto-hide no longer applies"
+        );
+        assert!(matches!(state.phase, Phase::Hidden), "the pill stays hidden");
+    }
+
+    #[test]
+    fn hidden_watchdog_not_armed_while_notifications_disabled() {
+        // Disabling notifications while the pill is auto-hidden must not arm
+        // (or keep) a watchdog poll: it could never show anything, and a
+        // verdict flip while disabled would consume the held content into a
+        // no-op show.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: true,
+        });
+        let track = track_for("spotify", "Song", "Artist");
+        state.content = Some(MediaEvent::TrackChanged(track));
+        state.phase = Phase::Shown;
+        state.on_foreground_change();
+        assert!(state.hidden_watchdog, "auto-hide must arm the watchdog");
+
+        state.toggle_enabled();
+
+        assert!(
+            !state.hidden_watchdog,
+            "disabling notifications must disarm the watchdog"
+        );
+        assert!(matches!(state.phase, Phase::Hidden), "the pill stays hidden");
     }
 
     #[test]
