@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::events::{MediaEvent, PlaybackState, TrackInfo, decode_artwork_pm};
+use crate::events::{MediaEvent, PlaybackState, PlaybackType, TrackInfo, decode_artwork_pm};
 use crate::palette::{Palette, palette_from_rgba};
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
@@ -15,6 +15,7 @@ use windows::Media::Control::{
     MediaPropertiesChangedEventArgs, PlaybackInfoChangedEventArgs, SessionsChangedEventArgs,
     TimelinePropertiesChangedEventArgs,
 };
+use windows::Media::MediaPlaybackType;
 use windows::Storage::Streams::{Buffer, DataReader, InputStreamOptions};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
@@ -55,6 +56,10 @@ struct LogicalState {
     track_count: Option<u32>,
     genre: Option<String>,
     playback: Option<PlaybackState>,
+    /// Content type the session last reported (`PlaybackInfo.PlaybackType`).
+    /// Used to inherit the type across poll reads (which never report it
+    /// freshly) and to suppress `Image` content wholesale.
+    playback_type: PlaybackType,
     /// When the first read was deferred waiting for artwork: the pill shows
     /// anyway once this timestamp is older than `ARTWORK_TIMEOUT`.
     deferred_at: Option<Instant>,
@@ -537,6 +542,20 @@ impl ListenerState {
         let mut next = prev.clone();
         let mut events: Vec<MediaEvent> = Vec::new();
 
+        // Image content (slideshows, photo apps) is not "now playing": no
+        // pill fires for it — neither the track nor the paired state event.
+        // Read early (playback_info is already fetched) and return before the
+        // playback diff, so an image session can never push a pill. Logged
+        // once per type transition so the 2s poll does not spam.
+        let playback_type = session_playback_type(session);
+        if playback_type == PlaybackType::Image {
+            if prev.playback_type != PlaybackType::Image {
+                let label = read_source_app(session);
+                debug!("pill suppressed | reason=image-content | source={label}");
+            }
+            return Ok(());
+        }
+
         // Playback is a normal diffable field: Stopped goes through the same
         // path as Playing/Paused and can produce a pill like any other real
         // transition. Transitional statuses leave the stored state untouched.
@@ -570,6 +589,7 @@ impl ListenerState {
                 session,
                 read_artwork,
                 playback_info.PlaybackRate().ok().and_then(|r| r.Value().ok()),
+                playback_type,
             ) {
                 Ok(read) => {
                     let mut merged = merge_track(&prev, &read, read_artwork);
@@ -821,6 +841,7 @@ impl ListenerState {
                     next.track_number = merged.track_number;
                     next.track_count = merged.track_count;
                     next.genre = merged.genre;
+                    next.playback_type = merged.playback_type;
                     // Marked fresh for the poll skip only on a successful
                     // read: a failed read must not suppress the poll, which
                     // is the safety net for exactly that case.
@@ -1039,7 +1060,7 @@ impl ListenerState {
         {
             return Ok(());
         }
-        let read = match read_track_info(session, true, None) {
+        let read = match read_track_info(session, true, None, session_playback_type(session)) {
             Ok(read) => read,
             Err(error) => {
                 // Count a failed read against the budget too: a session whose
@@ -1591,12 +1612,44 @@ fn merge_track(prev: &LogicalState, read: &TrackInfo, read_artwork: bool) -> Tra
             read.position_secs
         },
         playback_rate: read.playback_rate,
+        // The type is inherited across poll reads (which never re-report it):
+        // an Unknown read on the same identity keeps the last known type, so
+        // a video session is not demoted to the music glyph by the poll.
+        playback_type: if same_identity && read.playback_type == PlaybackType::Unknown {
+            prev.playback_type
+        } else {
+            read.playback_type
+        },
         position_updated_at: read.position_updated_at,
         // The identity-stable palette is attached at emit time (after the
         // decode), never merged here: the merge inherits the previous track's
         // identity fields, and a stale palette must not carry over.
         palette: None,
     }
+}
+
+/// Maps SMTC's `MediaPlaybackType` onto the overlay's. `Unknown` and any
+/// variant the installed windows crate does not generate map to
+/// `PlaybackType::Unknown`.
+fn map_playback_type(ty: MediaPlaybackType) -> PlaybackType {
+    match ty {
+        MediaPlaybackType::Music => PlaybackType::Music,
+        MediaPlaybackType::Video => PlaybackType::Video,
+        MediaPlaybackType::Image => PlaybackType::Image,
+        _ => PlaybackType::Unknown,
+    }
+}
+
+/// The session's reported content type; `Unknown` when the session is gone
+/// or the OS does not report one.
+fn session_playback_type(session: &GlobalSystemMediaTransportControlsSession) -> PlaybackType {
+    session
+        .GetPlaybackInfo()
+        .ok()
+        .and_then(|info| info.PlaybackType().ok())
+        .and_then(|ty| ty.Value().ok())
+        .map(map_playback_type)
+        .unwrap_or(PlaybackType::Unknown)
 }
 
 /// Whether any displayed content field differs from the stored state.
@@ -1818,6 +1871,7 @@ fn read_track_info(
     session: &GlobalSystemMediaTransportControlsSession,
     read_artwork: bool,
     playback_rate: Option<f64>,
+    playback_type: PlaybackType,
 ) -> Result<TrackInfo> {
     let source_app = read_source_app(session);
     let properties = session.TryGetMediaPropertiesAsync()?.get()?;
@@ -1893,6 +1947,7 @@ fn read_track_info(
         duration_secs,
         position_secs,
         playback_rate,
+        playback_type,
         position_updated_at: Some(position_updated_at),
         track_number,
         track_count,
@@ -2141,6 +2196,74 @@ mod tests {
             ..TrackInfo::default()
         };
         assert!(content_differ(&prev, &album_only));
+    }
+
+    #[test]
+    fn map_playback_type_maps_every_os_variant() {
+        assert_eq!(
+            map_playback_type(windows::Media::MediaPlaybackType::Music),
+            PlaybackType::Music
+        );
+        assert_eq!(
+            map_playback_type(windows::Media::MediaPlaybackType::Video),
+            PlaybackType::Video
+        );
+        assert_eq!(
+            map_playback_type(windows::Media::MediaPlaybackType::Image),
+            PlaybackType::Image
+        );
+        assert_eq!(
+            map_playback_type(windows::Media::MediaPlaybackType::Unknown),
+            PlaybackType::Unknown
+        );
+    }
+
+    #[test]
+    fn merge_track_inherits_playback_type_across_stable_identity() {
+        // A poll read (which never re-reports the type) keeps the last known
+        // type on the same identity: a video session must not be demoted to
+        // the music glyph by the poll.
+        let prev = LogicalState {
+            playback_type: PlaybackType::Video,
+            ..state("Song", "Artist")
+        };
+        assert_eq!(
+            merge_track(&prev, &track("Song", "Artist"), false).playback_type,
+            PlaybackType::Video
+        );
+        // An explicitly reported type always wins over the inherited one.
+        let video_read = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            playback_type: PlaybackType::Music,
+            ..TrackInfo::default()
+        };
+        assert_eq!(
+            merge_track(&prev, &video_read, false).playback_type,
+            PlaybackType::Music
+        );
+        // A different identity never inherits the previous track's type.
+        let other = TrackInfo {
+            title: "Other".into(),
+            artist: "Artist".into(),
+            playback_type: PlaybackType::Unknown,
+            ..TrackInfo::default()
+        };
+        assert_eq!(merge_track(&prev, &other, false).playback_type, PlaybackType::Unknown);
+    }
+
+    #[test]
+    fn content_differ_ignores_playback_type() {
+        // The type only selects the glyph; a type change alone on the same
+        // track must not re-emit (the pill keeps its glyph until the next
+        // track change).
+        let video = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            playback_type: PlaybackType::Video,
+            ..TrackInfo::default()
+        };
+        assert!(!content_differ(&state("Song", "Artist"), &video));
     }
 
     #[test]

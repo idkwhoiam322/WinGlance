@@ -66,6 +66,10 @@ pub struct TrackInfo {
     pub position_secs: Option<f64>,
     /// Playback rate (1.0 = normal). None when not reported.
     pub playback_rate: Option<f64>,
+    /// Content type reported by the source (music / video / image). `Image`
+    /// pills are suppressed by the worker; the type only changes the glyph on
+    /// track-change pills.
+    pub playback_type: PlaybackType,
     /// Monotonic instant captured by the worker at read time; the UI thread
     /// estimates the live position from it. None when position is unknown.
     pub position_updated_at: Option<Instant>,
@@ -227,6 +231,20 @@ pub enum PlaybackState {
     /// Overlay-only "a new track is now playing" state, used to draw the
     /// music-note symbol on track-change pills. Never produced by SMTC.
     NowPlaying,
+}
+
+/// Content type as reported by SMTC's `PlaybackInfo.PlaybackType`. Rendered
+/// only on track-change pills: `Music`/`Unknown` draw the music note, `Video`
+/// draws a video-player glyph, `Image` never renders — the worker suppresses
+/// image pills entirely. State pills (▶/‖/■) ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlaybackType {
+    /// The source did not report a type. Renders like `Music`.
+    #[default]
+    Unknown,
+    Music,
+    Video,
+    Image,
 }
 
 // `TrackChanged` carries the full `TrackInfo` (the other variants are far
