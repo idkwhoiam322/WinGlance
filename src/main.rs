@@ -314,9 +314,11 @@ fn acquire_singleton() -> anyhow::Result<Option<HANDLE>> {
 /// current executable is launched with the `--reload-config` marker (so the
 /// new instance can record the reload in its own log) and this process exits.
 /// Nothing under `%APPDATA%\WinGlance\WinGlance\data\` is deleted, so any
-/// on-disk cache survives; only in-memory caches (icon/track/period) are lost,
-/// as they are on any restart. If the new process cannot be launched, this
-/// instance keeps running rather than disappearing.
+/// on-disk cache survives and the live log is preserved: the reloaded
+/// process appends to it and marks the boundary instead of truncating it.
+/// Only in-memory caches (icon/track/period) are lost, as they are on any
+/// restart. If the new process cannot be launched, this instance keeps
+/// running rather than disappearing.
 pub fn relaunch_self() {
     if let Some(raw) = SINGLETON_HANDLE.get() {
         let handle = HANDLE(*raw as *mut c_void);
@@ -371,8 +373,10 @@ fn main() -> Result<()> {
 
     // Logging initializes before the config loads: a corrupted config.toml now
     // falls back to defaults, and that fallback must be diagnosable through
-    // the log file.
-    logging::init_logging(&config::Config::default().logs_dir());
+    // the log file. The reload marker must be scanned first, because on that
+    // path the live log is preserved (appended to) instead of truncated.
+    let reload_config = std::env::args_os().any(|arg| arg == "--reload-config");
+    logging::init_logging(&config::Config::default().logs_dir(), reload_config);
     let config = config::Config::load()?;
     install_crash_handler(&config.logs_dir());
     install_panic_hook(&config.logs_dir());
@@ -380,10 +384,10 @@ fn main() -> Result<()> {
     info!("starting WinGlance");
 
     // Distinguish a user-requested reload (Settings "Restart app" button)
-    // from a plain launch, tray start or autostart: the old process cannot
-    // log it reliably because the new process truncates the live log at
-    // startup, so the marker is passed as an argument and recorded here.
-    if std::env::args_os().any(|arg| arg == "--reload-config") {
+    // from a plain launch, tray start or autostart: the old process exits
+    // right after spawning the new one, so the marker is passed as an
+    // argument and recorded here in the new process's preserved log.
+    if reload_config {
         info!("started via the Settings 'Restart app' action; applying the on-disk config");
     }
 

@@ -41,8 +41,10 @@ with media playing — cannot be verified headless.
 
 - Config: `%APPDATA%\WinGlance\WinGlance\data\config.toml` (hand-edits need a restart;
   no live reload).
-- Logs: `%APPDATA%\WinGlance\WinGlance\data\logs\log-Live.log`, truncated at startup,
-  at Debug level (session churn, dedup skips and suppressed events are logged
+- Logs: `%APPDATA%\WinGlance\WinGlance\data\logs\log-Live.log`, truncated at startup
+  on plain launches but preserved (appended to, with a restart boundary line)
+  after an in-app "Restart app", at Debug level (session churn, dedup skips
+  and suppressed events are logged
   — use it to answer "why did/didn't a notification fire").
 - Never delete user data under `%APPDATA%\WinGlance\WinGlance\data\` (only the
   log file may be truncated at startup). The Settings pane has a "Copy logs"
