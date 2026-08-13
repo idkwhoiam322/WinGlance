@@ -41,7 +41,6 @@ const WIDTH: i32 = 400;
 const HEADER_H: i32 = 30;
 const ROW_HEIGHT: i32 = 22;
 const MAX_VISIBLE: usize = 12;
-const WS_EX_TOOLWINDOW_STYLE: i32 = 0x80;
 const CLOSE_BTN_SIZE: i32 = 20;
 const BST_CHECKED: usize = 1;
 const BST_UNCHECKED: usize = 0;
@@ -365,7 +364,7 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
     }
 
     let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
-    if ex_style & WS_EX_TOOLWINDOW_STYLE as isize != 0 {
+    if ex_style & windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW.0 as isize != 0 {
         return BOOL(1);
     }
 

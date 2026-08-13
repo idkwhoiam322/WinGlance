@@ -652,8 +652,12 @@ pub(crate) fn set_compact_separate(hwnd: HWND, separate: bool) {
         let state = &mut *state_ptr;
         state.config.overlay.compact_position_separate = separate;
         info!(
-            "overlay compact_position_separate set to {separate} (display: {})",
-            if separate { "OFF" } else { "ON" }
+            "overlay compact_position_separate set to {separate} ({})",
+            if separate {
+                "compact position: independent"
+            } else {
+                "compact position: follows expanded"
+            }
         );
         if !state.preview_if_hidden() {
             state.render();

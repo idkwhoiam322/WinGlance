@@ -125,7 +125,11 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if info.is_null() {
         return 0;
     }
-    let record = unsafe { &*((*info).ExceptionRecord) };
+    let record_ptr = unsafe { (*info).ExceptionRecord };
+    if record_ptr.is_null() {
+        return 0;
+    }
+    let record = unsafe { &*record_ptr };
     if record.ExceptionCode.0 != 0xC000_0005u32 as i32 {
         return 0;
     }

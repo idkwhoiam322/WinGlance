@@ -3347,8 +3347,12 @@ impl MainWindowState {
         // The log keeps the raw field value (greppable) and the displayed
         // polarity (ON = follows Expanded = field false).
         info!(
-            "compact_position_separate set to {separate} (display: {})",
-            if separate { "OFF" } else { "ON" }
+            "compact_position_separate set to {separate} ({})",
+            if separate {
+                "compact position: independent"
+            } else {
+                "compact position: follows expanded"
+            }
         );
         crate::overlay::set_compact_separate(self.overlay_hwnd, separate);
     }
