@@ -426,6 +426,9 @@ struct OverlayState {
     progress_anchor: Option<(Instant, f64)>,
     /// Whether the current content is playing (drives freeze/resume).
     progress_playing: bool,
+    /// Bar fraction painted on the last frame, so a settled pill can skip a
+    /// static-tick repaint when the bar did not move by at least a pixel.
+    last_bar_fraction: Option<f32>,
     /// Cached DIB (DC + bitmap) reused across frames of the same size.
     dib: Option<DibCache>,
     /// Tightly-packed per-frame scratch buffer (stride == the requested
@@ -756,6 +759,7 @@ impl OverlayState {
             progress_rate: None,
             progress_anchor: None,
             progress_playing: false,
+            last_bar_fraction: None,
             dib: None,
             frame_scratch: Vec::new(),
             last_tick: Instant::now(),
@@ -1501,6 +1505,34 @@ impl OverlayState {
         if playing && let (Some((at, base)), Some(rate)) = (self.progress_anchor, self.progress_rate) {
             self.estimated_position_secs = Some(Self::estimate_position(base, rate, at.elapsed().as_secs_f64()));
         }
+        // A settled pill (Phase::Shown, nothing animating) does not repaint on the
+        // static tick — see the render gate below — so a live position advance
+        // would otherwise stay painted at the last `ProgressChanged` sample until
+        // the next content event, freezing the bar for up to ~1 s on slow
+        // samplers. Crawl it here instead, but only when it would actually move by
+        // at least a pixel: at 1x on a long song the per-tick advance is
+        // sub-pixel, so repainting those frames would burn whole-pill rasterizes
+        // for identical pixels. `last_frame_w` is the painted content width, set
+        // each render — used as the bar's pixel span for the 1px threshold.
+        let bar_moved = if playing
+            && self.progress_rate.is_some()
+            && self.progress_anchor.is_some()
+            && let Some(est) = self.estimated_position_secs
+            && let Some(duration) = self.progress_duration_secs
+            && duration > 0
+            && self.last_frame_w > 0
+        {
+            let fraction = (est / duration as f64).clamp(0.0, 1.0) as f32;
+            let threshold = (1.0 / self.last_frame_w as f32).max(1e-4);
+            let moved = self
+                .last_bar_fraction
+                .is_none_or(|prev| (fraction - prev).abs() >= threshold);
+            self.last_bar_fraction = Some(fraction);
+            moved
+        } else {
+            self.last_bar_fraction = None;
+            false
+        };
         // When not playing, estimated_position_secs is left frozen.
         // A layered popup can be hidden by fullscreen transitions or external
         // ShowWindow calls; re-assert visibility and topmost z-order while a
@@ -1746,7 +1778,7 @@ impl OverlayState {
         // tick-cadence gap). The phase half of the condition stays on the
         // top-of-tick value, so a phase transition in this same tick still
         // renders its rest frame, exactly as before.
-        if layout_flipped || animating || self.hover_expand.is_some() || marquee_active {
+        if layout_flipped || animating || self.hover_expand.is_some() || marquee_active || bar_moved {
             self.render();
         }
         // Re-sync the timer to the phase: a static pill drops to the coarse
