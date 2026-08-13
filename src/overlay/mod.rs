@@ -1285,8 +1285,23 @@ impl OverlayState {
         self.progress_duration_secs = duration_secs;
         self.progress_rate = rate;
         if let Some(pos) = position_secs {
-            self.estimated_position_secs = Some(pos);
-            self.progress_anchor = Some((Instant::now(), pos));
+            // Reconcile the live sample against the interpolated estimate instead
+            // of hard-snapping. The OS reports position with latency (the value was
+            // read some ticks ago) and the active rate is only approximate, so a raw
+            // snap makes the bar jerk backward every time a ProgressChanged lands in
+            // the middle of the forward interpolation the tick paints — the visible
+            // "back and forth". Adopt the sample only when it is at or ahead of the
+            // currently displayed position; when it is behind (latency/jitter) keep
+            // the displayed estimate and only forward the anchor time, so the bar
+            // stays monotonic and never jumps backward. A genuine seek also re-emits
+            // a TrackChanged, which re-anchors here to the new position directly.
+            let base = match self.estimated_position_secs {
+                Some(cur) if pos >= cur => pos,
+                Some(cur) => cur,
+                None => pos,
+            };
+            self.estimated_position_secs = Some(base);
+            self.progress_anchor = Some((Instant::now(), base));
         }
     }
 
@@ -7711,5 +7726,32 @@ mod tests {
         // is a data update, never a notification).
         assert!(matches!(state.content, Some(MediaEvent::TrackChanged(t)) if t.title == "Song"));
         assert_eq!(state.pending.len(), 0, "no pill queued for a progress update");
+    }
+
+    #[test]
+    fn progress_changed_does_not_snap_the_bar_backward() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        // The bar has been interpolating forward from its last anchor and now
+        // displays 50.0s; the OS sample arrives late, reporting 45.0s.
+        state.estimated_position_secs = Some(50.0);
+        state.progress_anchor = Some((Instant::now(), 50.0));
+        state.progress_playing = true;
+        state.progress_rate = Some(1.0);
+        state.progress_duration_secs = Some(120);
+
+        // A late sample behind the displayed position must NOT move the bar back;
+        // hard-snapping is what made it oscillate (forward on the interpolation
+        // tick, backward on every ProgressChanged) — the reported "back and forth".
+        state.apply_progress(Some(45.0), Some(120), Some(1.0));
+        assert_eq!(
+            state.estimated_position_secs,
+            Some(50.0),
+            "a lagging sample must not snap the bar backward"
+        );
+
+        // A sample at or ahead of the display is adopted, so the bar still tracks
+        // the OS when it runs ahead (forward seek or a genuine catch-up).
+        state.apply_progress(Some(52.0), Some(120), Some(1.0));
+        assert_eq!(state.estimated_position_secs, Some(52.0));
     }
 }
