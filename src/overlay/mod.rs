@@ -459,6 +459,11 @@ struct OverlayState {
     /// extra move, never a misplacement, since every reposition recomputes the
     /// anchor from scratch.
     last_anchor_edge: Option<RECT>,
+    /// Cached result of `is_cursor_over_pill()` from the last animation tick,
+    /// so `held_expanded()` (called from `receive_events` between ticks) can
+    /// skip the display enumeration the cursor poll triggers. Updated every
+    /// tick; stale by at most one tick period (250 ms static, ~16 ms animated).
+    last_cursor_over_pill: bool,
     /// Source app of the last TrackChanged shown, used as the label fallback
     /// in state pills for current-session playback states so the pill always
     /// names the app that owns the media — never another app's last track.
@@ -739,6 +744,7 @@ impl OverlayState {
             wake: Arc::new(AtomicBool::new(false)),
             hook: None,
             last_anchor_edge: None,
+            last_cursor_over_pill: false,
             current_source: None,
             track_cache: HashMap::new(),
             track_cache_order: VecDeque::new(),
@@ -1439,6 +1445,7 @@ impl OverlayState {
         // Computed here, outside the phase guard, so the `held` gate below
         // can use it.
         let cursor_over = self.is_cursor_over_pill();
+        self.last_cursor_over_pill = cursor_over;
         if cursor_over {
             self.hover_leave_at = None;
         } else if self.hover_leave_at.is_none() {
@@ -1920,7 +1927,7 @@ impl OverlayState {
     /// resolves it. Only the compact→expanded hover morph is an interaction
     /// and gets held — a laid-out expanded pill is never held.
     fn held_expanded(&self) -> bool {
-        let engaged = hover_engaged(self.is_cursor_over_pill(), self.hover_leave_at, Instant::now());
+        let engaged = hover_engaged(self.last_cursor_over_pill, self.hover_leave_at, Instant::now());
         engaged && self.hover_expand.is_some()
     }
 
@@ -6138,6 +6145,7 @@ mod tests {
         });
         state.dismiss_at = Some(Instant::now() - Duration::from_millis(100));
         state.test_cursor_over = Some(true);
+        state.last_cursor_over_pill = true;
 
         state
             .queue
