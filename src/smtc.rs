@@ -12,6 +12,7 @@ use windows::Media::Control::{
     CurrentSessionChangedEventArgs, GlobalSystemMediaTransportControlsSession,
     GlobalSystemMediaTransportControlsSessionManager, GlobalSystemMediaTransportControlsSessionPlaybackStatus,
     MediaPropertiesChangedEventArgs, PlaybackInfoChangedEventArgs, SessionsChangedEventArgs,
+    TimelinePropertiesChangedEventArgs,
 };
 use windows::Storage::Streams::{Buffer, DataReader, InputStreamOptions};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
@@ -26,12 +27,14 @@ enum Signal {
     Sessions,
     MediaProperties(GlobalSystemMediaTransportControlsSession),
     PlaybackInfo(GlobalSystemMediaTransportControlsSession),
+    Timeline(GlobalSystemMediaTransportControlsSession),
 }
 
 struct SessionSubscription {
     session: GlobalSystemMediaTransportControlsSession,
     properties_token: EventRegistrationToken,
     playback_token: EventRegistrationToken,
+    timeline_token: EventRegistrationToken,
 }
 
 /// The last known displayed state of one (source, session). Every field is a
@@ -65,6 +68,10 @@ struct LogicalState {
     /// newer than `SESSION_CHECK_INTERVAL` — their state was just re-read by
     /// the event that woke the worker, so a second read is pure WinRT churn.
     last_read_at: Option<Instant>,
+    /// Last reported playback position in whole seconds, for seek detection.
+    /// Whole seconds (u64) keep LogicalState Eq-derivable; precision is ample
+    /// for a 3 s seek threshold. Does NOT drive rendering (that is TrackInfo).
+    last_position_secs: Option<u64>,
 }
 
 /// Rolling window, threshold and cool-down for the per-source session-churn
@@ -74,6 +81,11 @@ struct LogicalState {
 const CHURN_WINDOW_MS: u64 = 2000;
 const CHURN_THRESHOLD: usize = 5;
 const CHURN_COOLDOWN_MS: u64 = 30_000;
+/// A position jump larger than this (seconds) between reads is treated as a
+/// user seek, not ordinary playback advance, and re-emits the track so the
+/// overlay re-bases its progress estimate. Well above the ~1 s/event cadence
+/// of TimelinePropertiesChanged, so ordinary playback never trips it.
+const SEEK_DELTA_SECS: f64 = 3.0;
 
 /// Maximum time a first-read pill waits for artwork before showing anyway.
 /// SMTC populates the thumbnail a moment after the title (observed ~500ms),
@@ -413,7 +425,7 @@ impl ListenerState {
                 }
                 self.schedule_flush();
             }
-            Signal::MediaProperties(session) | Signal::PlaybackInfo(session) => {
+            Signal::MediaProperties(session) | Signal::PlaybackInfo(session) | Signal::Timeline(session) => {
                 let key = session_key(&session);
                 if !self.should_follow_session(&session) {
                     debug!(
@@ -488,7 +500,8 @@ impl ListenerState {
             );
             return Ok(());
         }
-        let status = session.GetPlaybackInfo()?.PlaybackStatus()?;
+        let playback_info = session.GetPlaybackInfo()?;
+        let status = playback_info.PlaybackStatus()?;
         if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed {
             // Closed does not go through the diff/emit path: it usually fires
             // as the app quits, right after a Stopped/Paused already told the
@@ -531,9 +544,28 @@ impl ListenerState {
         // Content is only diffed while the session is not stopped; a stopped
         // session keeps its stored content (the pill shows the last track).
         if status != GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped {
-            match read_track_info(session, read_artwork) {
+            match read_track_info(
+                session,
+                read_artwork,
+                playback_info.PlaybackRate().ok().and_then(|r| r.Value().ok()),
+            ) {
                 Ok(read) => {
                     let mut merged = merge_track(&prev, &read, read_artwork);
+                    // Record the last reported position (whole seconds) for
+                    // seek detection on the next read; position itself is
+                    // carried to the overlay via TrackInfo, not LogicalState.
+                    next.last_position_secs = read.position_secs.map(|s| s as u64);
+                    // Push a lightweight progress update so the overlay bar tracks
+                    // live position and seeks directly, without waiting for a
+                    // TrackChanged re-emit (which only fires on a content change
+                    // or a detected seek).
+                    if read.position_secs.is_some() {
+                        events.push(MediaEvent::ProgressChanged {
+                            position_secs: read.position_secs,
+                            duration_secs: read.duration_secs,
+                            playback_rate: read.playback_rate,
+                        });
+                    }
                     // Session-recreation recovery: when a source recreates its
                     // session (new key, default prev state) its first event-driven
                     // read often grabs an empty thumbnail stream (SMTC populates art
@@ -934,7 +966,7 @@ impl ListenerState {
         {
             return Ok(());
         }
-        let read = match read_track_info(session, true) {
+        let read = match read_track_info(session, true, None) {
             Ok(read) => read,
             Err(error) => {
                 // Count a failed read against the budget too: a session whose
@@ -1119,10 +1151,32 @@ impl ListenerState {
                 return Err(error.into());
             }
         };
+        // Registered last: if it fails, both earlier handlers are rolled back
+        // so no dangling registration outlives the failed subscribe.
+        let timeline_session = session.clone();
+        let timeline_tx = self.signal_tx.clone();
+        let timeline_handler: TypedEventHandler<
+            GlobalSystemMediaTransportControlsSession,
+            TimelinePropertiesChangedEventArgs,
+        > = TypedEventHandler::new(move |_, _| {
+            if let Err(e) = timeline_tx.try_send(Signal::Timeline(timeline_session.clone())) {
+                debug!("signal dropped | kind=Timeline | {e:?}");
+            }
+            Ok(())
+        });
+        let timeline_token = match session.TimelinePropertiesChanged(&timeline_handler) {
+            Ok(token) => token,
+            Err(error) => {
+                let _ = session.RemoveMediaPropertiesChanged(properties_token);
+                let _ = session.RemovePlaybackInfoChanged(playback_token);
+                return Err(error.into());
+            }
+        };
         Ok(SessionSubscription {
             session: session.clone(),
             properties_token,
             playback_token,
+            timeline_token,
         })
     }
 
@@ -1151,6 +1205,9 @@ impl ListenerState {
             let _ = subscription
                 .session
                 .RemovePlaybackInfoChanged(subscription.playback_token);
+            let _ = subscription
+                .session
+                .RemoveTimelinePropertiesChanged(subscription.timeline_token);
         }
         if self.states.remove(&key).is_some() {
             debug!("evicted SMTC state | key={key}");
@@ -1379,6 +1436,17 @@ fn merge_track(prev: &LogicalState, read: &TrackInfo, read_artwork: bool) -> Tra
         } else {
             read.genre.clone()
         },
+        // Position is re-read on every pass (read_track_info always reads the
+        // timeline). Inherit the last whole-second value only when this pass
+        // returned nothing and the identity is unchanged, so a transient
+        // empty read can't blank an in-flight bar.
+        position_secs: if same_identity {
+            read.position_secs.or_else(|| prev.last_position_secs.map(|s| s as f64))
+        } else {
+            read.position_secs
+        },
+        playback_rate: read.playback_rate,
+        position_updated_at: read.position_updated_at,
     }
 }
 
@@ -1415,7 +1483,15 @@ fn emit_track(prev: &LogicalState, merged: &TrackInfo, read_artwork: bool) -> (b
     let artwork_lost = read_artwork && merged.artwork.is_none() && prev.has_artwork;
     let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
     let defer_first = is_first_read && read_artwork && merged.artwork.is_none();
-    (content_changed && !defer_first || artwork_gained, artwork_lost)
+    // Seek detection: a position jump beyond the threshold (or a presence
+    // flip in reported position) re-emits so the overlay re-bases instead of
+    // drifting from a stale base. Position is excluded from content_differ.
+    let seek = match (merged.position_secs, prev.last_position_secs) {
+        (Some(rp), Some(pp)) => (rp - pp as f64).abs() > SEEK_DELTA_SECS,
+        (Some(_), None) | (None, Some(_)) => true,
+        _ => false,
+    };
+    (content_changed && !defer_first || artwork_gained || seek, artwork_lost)
 }
 
 /// Whether a deferred first pill has waited past the artwork timeout and
@@ -1580,7 +1656,11 @@ fn read_session_state(session: &GlobalSystemMediaTransportControlsSession) -> Pl
     }
 }
 
-fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_artwork: bool) -> Result<TrackInfo> {
+fn read_track_info(
+    session: &GlobalSystemMediaTransportControlsSession,
+    read_artwork: bool,
+    playback_rate: Option<f64>,
+) -> Result<TrackInfo> {
     let source_app = read_source_app(session);
     let properties = session.TryGetMediaPropertiesAsync()?.get()?;
     let title = cap_meta(non_empty(properties.Title()?.to_string(), &source_app));
@@ -1639,9 +1719,9 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_art
         let joined = cap_meta(genres.join(", "));
         if joined.trim().is_empty() { None } else { Some(joined) }
     };
-    // Total duration is static per track (EndTime - StartTime); fine to read
-    // once at track-change time without any continuous timeline updates.
-    let duration_secs = read_duration(session);
+    // One timeline read yields duration + live position + read instant;
+    // position is re-estimated on the UI thread between these reads.
+    let (duration_secs, position_secs, position_updated_at) = read_timeline(session);
     Ok(TrackInfo {
         title,
         artist,
@@ -1653,22 +1733,37 @@ fn read_track_info(session: &GlobalSystemMediaTransportControlsSession, read_art
         app_icon: None,
         source_app,
         duration_secs,
+        position_secs,
+        playback_rate,
+        position_updated_at: Some(position_updated_at),
         track_number,
         track_count,
         genre,
     })
 }
 
-fn read_duration(session: &GlobalSystemMediaTransportControlsSession) -> Option<u64> {
-    let timeline = session.GetTimelineProperties().ok()?;
-    let start = timeline.StartTime().ok()?.Duration;
-    let end = timeline.EndTime().ok()?.Duration;
-    let duration_100ns = end - start;
-    if duration_100ns <= 0 {
-        return None;
+/// Reads duration, live position and the read instant from the session's
+/// timeline in a single `GetTimelineProperties()` call. Returns
+/// `(duration_secs, position_secs, read_instant)`. Any field the source does
+/// not report is `None`; the instant is always now (the monotonic clock the
+/// overlay integrates against).
+fn read_timeline(session: &GlobalSystemMediaTransportControlsSession) -> (Option<u64>, Option<f64>, Instant) {
+    match session.GetTimelineProperties() {
+        Ok(t) => {
+            let start = t.StartTime().ok().map(|ts| ts.Duration);
+            let end = t.EndTime().ok().map(|ts| ts.Duration);
+            let duration = match (start, end) {
+                (Some(s), Some(e)) => {
+                    let d = e - s;
+                    if d > 0 { Some((d / 10_000_000) as u64) } else { None }
+                }
+                _ => None,
+            };
+            let position = t.Position().ok().map(|ts| ts.Duration as f64 / 10_000_000.0);
+            (duration, position, Instant::now())
+        }
+        Err(_) => (None, None, Instant::now()),
     }
-    // TimeSpan.Duration is in 100-nanosecond units.
-    Some((duration_100ns / 10_000_000) as u64)
 }
 
 /// Whether an error is one of the HRESULTs WinRT raises while a session is
@@ -2268,5 +2363,61 @@ mod tests {
         // and the artwork-lost path keep their existing behavior.
         let no_art = track("Battle Symphony", "Linkin Park");
         assert!(!artwork_refresh_absorbed(&paused, &no_art));
+    }
+
+    #[test]
+    fn content_differ_excludes_position() {
+        let prev = LogicalState {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "spotify".into(),
+            ..LogicalState::default()
+        };
+        let read = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "spotify".into(),
+            ..TrackInfo::default()
+        };
+        let mut advanced = read.clone();
+        advanced.position_secs = Some(42.0);
+        // Title/artist/source match prev, so content is unchanged; the only
+        // difference is the live position, which must not trigger a re-emit.
+        assert!(!content_differ(&prev, &read));
+        assert!(!content_differ(&prev, &advanced));
+        // A genuine content change still differs.
+        let mut renamed = read.clone();
+        renamed.title = "Other".into();
+        assert!(content_differ(&prev, &renamed));
+    }
+
+    #[test]
+    fn seek_detection_emits_on_position_jump() {
+        let prev = LogicalState {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "spotify".into(),
+            last_position_secs: Some(10),
+            ..LogicalState::default()
+        };
+        let make = |pos: Option<f64>| TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "spotify".into(),
+            position_secs: pos,
+            ..TrackInfo::default()
+        };
+        // A 40 s jump is a seek → re-emit.
+        assert!(emit_track(&prev, &make(Some(50.0)), false).0);
+        // A normal ~1 s advance is not a seek → no emit (content unchanged).
+        assert!(!emit_track(&prev, &make(Some(11.0)), false).0);
+        // Presence flip (position appeared) → re-emit.
+        let prev_none = LogicalState {
+            last_position_secs: None,
+            ..prev.clone()
+        };
+        assert!(emit_track(&prev_none, &make(Some(5.0)), false).0);
+        // Presence flip (position vanished) → re-emit.
+        assert!(emit_track(&prev, &make(None), false).0);
     }
 }

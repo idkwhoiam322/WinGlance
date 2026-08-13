@@ -415,6 +415,17 @@ struct OverlayState {
     /// artwork re-decodes): the aura gradient and the accent recoloring read
     /// from here, so they always match the cover that is actually displayed.
     palette: Option<Palette>,
+    /// Estimated live playback position (seconds), advanced each animation
+    /// tick from `progress_anchor`. None when the source reports no position.
+    estimated_position_secs: Option<f64>,
+    /// Total duration (seconds) of the current track. None when not reported.
+    progress_duration_secs: Option<u64>,
+    /// Playback rate for position estimation. None when not reported.
+    progress_rate: Option<f64>,
+    /// (anchor instant, anchor position) the estimate integrates from.
+    progress_anchor: Option<(Instant, f64)>,
+    /// Whether the current content is playing (drives freeze/resume).
+    progress_playing: bool,
     /// Cached DIB (DC + bitmap) reused across frames of the same size.
     dib: Option<DibCache>,
     /// Tightly-packed per-frame scratch buffer (stride == the requested
@@ -740,6 +751,11 @@ impl OverlayState {
             decoded_art: None,
             decoded_art_source: None,
             palette: None,
+            estimated_position_secs: None,
+            progress_duration_secs: None,
+            progress_rate: None,
+            progress_anchor: None,
+            progress_playing: false,
             dib: None,
             frame_scratch: Vec::new(),
             last_tick: Instant::now(),
@@ -960,6 +976,25 @@ impl OverlayState {
                         self.enqueue(MediaEvent::TrackChanged(track));
                     }
                 }
+                MediaEvent::ProgressChanged {
+                    position_secs,
+                    duration_secs,
+                    playback_rate,
+                } => {
+                    // A live position update only re-anchors the progress bar; it
+                    // never announces a pill or changes the active content (which
+                    // stays the last TrackChanged/PlaybackStateChanged shown).
+                    self.apply_progress(position_secs, duration_secs, playback_rate);
+                    // The static tick that drives a settled pill does not repaint
+                    // (see `tick`'s render gate), so a live position update — and a
+                    // seek it re-anchors — would otherwise stay stale on screen
+                    // until the next content-driven render. Paint the re-based bar
+                    // right away while the pill is up; skip it when hidden so a
+                    // dismissed pill never gets dragged back to life by a late event.
+                    if !matches!(self.phase, Phase::Hidden) {
+                        self.render();
+                    }
+                }
                 MediaEvent::PlaybackStateChanged(state, source_app)
                     if self.config.behavior.enable_playback_state_change =>
                 {
@@ -1163,7 +1198,9 @@ impl OverlayState {
             }
             // Never queued (receive_events skips it); defensive for
             // exhaustiveness.
-            MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => {}
+            MediaEvent::SessionRejected { .. }
+            | MediaEvent::WorkerFailed { .. }
+            | MediaEvent::ProgressChanged { .. } => {}
         }
         if self.pending.len() >= PENDING_CAP {
             self.pending.pop_front();
@@ -1193,7 +1230,7 @@ impl OverlayState {
             MediaEvent::SessionRejected { .. } => {
                 debug!("session rejected event reached the pill queue; ignoring");
             }
-            MediaEvent::WorkerFailed { .. } => {
+            MediaEvent::WorkerFailed { .. } | MediaEvent::ProgressChanged { .. } => {
                 debug!("worker-failed event reached the pill queue; ignoring");
             }
         }
@@ -1218,6 +1255,43 @@ impl OverlayState {
     /// re-renders. The pill's size is constant — every row band is always
     /// reserved — so a refresh only changes the drawn rows, never the pill's
     /// dimensions.
+    /// Re-bases the progress estimate from a `TrackChanged` event. Called on
+    /// every path a track becomes active content (`update_content` and
+    /// `show_with_duration`), since the latter does not funnel through the
+    /// former. A state pill never touches progress — freeze/resume is handled
+    /// in `tick`.
+    fn apply_track_progress(&mut self, track: &TrackInfo) {
+        self.progress_duration_secs = track.duration_secs;
+        self.progress_rate = track.playback_rate;
+        self.estimated_position_secs = track.position_secs;
+        self.progress_anchor = Some((
+            track.position_updated_at.unwrap_or_else(Instant::now),
+            track.position_secs.unwrap_or(0.0),
+        ));
+        self.progress_playing = true;
+    }
+
+    /// Re-bases the progress estimate from a live `ProgressChanged` update
+    /// (pushed on every timeline refresh). Unlike `apply_track_progress` it does
+    /// not touch `progress_playing` — that is derived from the active content
+    /// each tick — so a position update never changes whether the bar is
+    /// advancing. Re-anchoring to the freshly read position means the bar tracks
+    /// seeks immediately instead of relying on the seek re-emit.
+    fn apply_progress(&mut self, position_secs: Option<f64>, duration_secs: Option<u64>, rate: Option<f64>) {
+        self.progress_duration_secs = duration_secs;
+        self.progress_rate = rate;
+        if let Some(pos) = position_secs {
+            self.estimated_position_secs = Some(pos);
+            self.progress_anchor = Some((Instant::now(), pos));
+        }
+    }
+
+    /// Integrates the live playback position from an anchor: position at the
+    /// anchor plus elapsed seconds times rate, never negative.
+    fn estimate_position(base: f64, rate: f64, elapsed: f64) -> f64 {
+        (base + elapsed * rate).max(0.0)
+    }
+
     fn update_content(&mut self, event: MediaEvent, min_visible: Duration) {
         // An in-place refresh is a meaningful pill update too: re-resolve
         // the layout so a foreground change since the pill appeared takes
@@ -1239,6 +1313,9 @@ impl OverlayState {
             self.sync_anim_timer();
         } else {
             self.content_fade = None;
+        }
+        if let MediaEvent::TrackChanged(ref track) = event {
+            self.apply_track_progress(track);
         }
         self.content = Some(event);
         self.resolve_pill_text();
@@ -1291,6 +1368,9 @@ impl OverlayState {
         // buffers are about to be reused.
         unsafe {
             let _ = KillTimer(self.hwnd, IDLE_BUFFER_TIMER_ID);
+        }
+        if let MediaEvent::TrackChanged(ref track) = event {
+            self.apply_track_progress(track);
         }
         self.content = Some(event);
         self.resolve_pill_text();
@@ -1402,6 +1482,26 @@ impl OverlayState {
         }
         let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.05);
         self.last_tick = now;
+        // Progress estimate: advance the live position from the anchor while
+        // playing; freeze it while paused/stopped and re-anchor on resume so
+        // the bar never crawls or jumps forward.
+        let playing = match &self.content {
+            Some(MediaEvent::TrackChanged(_)) => true,
+            Some(MediaEvent::PlaybackStateChanged(s, _)) => *s == PlaybackState::Playing,
+            _ => false,
+        };
+        if playing && !self.progress_playing {
+            // Resuming after a pause/stop: re-anchor so elapsed restarts from
+            // the frozen position instead of the original anchor.
+            if let Some(est) = self.estimated_position_secs {
+                self.progress_anchor = Some((Instant::now(), est));
+            }
+        }
+        self.progress_playing = playing;
+        if playing && let (Some((at, base)), Some(rate)) = (self.progress_anchor, self.progress_rate) {
+            self.estimated_position_secs = Some(Self::estimate_position(base, rate, at.elapsed().as_secs_f64()));
+        }
+        // When not playing, estimated_position_secs is left frozen.
         // A layered popup can be hidden by fullscreen transitions or external
         // ShowWindow calls; re-assert visibility and topmost z-order while a
         // pill should be up. While the pill is fully shown this is throttled
@@ -7532,5 +7632,52 @@ mod tests {
             bottom: 1080,
         };
         assert!(!anchor_unchanged(Some(edge), moved, false));
+    }
+
+    #[test]
+    fn estimate_position_advances_and_clamps() {
+        // base + elapsed * rate, never negative.
+        assert_eq!(OverlayState::estimate_position(60.0, 1.0, 5.0), 65.0);
+        assert_eq!(OverlayState::estimate_position(0.0, 2.0, 3.0), 6.0);
+        assert_eq!(OverlayState::estimate_position(2.0, 1.0, -5.0), 0.0);
+    }
+
+    #[test]
+    fn progress_changed_rebases_the_bar_without_becoming_content() {
+        let config = Config::default();
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut state = OverlayState::new(config, queue.clone());
+        // Seed the bar with a track at position 10/120s.
+        let track = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "spotify".into(),
+            duration_secs: Some(120),
+            position_secs: Some(10.0),
+            playback_rate: Some(1.0),
+            ..TrackInfo::default()
+        };
+        state.content = Some(MediaEvent::TrackChanged(track.clone()));
+        state.apply_track_progress(&track);
+        assert_eq!(state.estimated_position_secs, Some(10.0));
+
+        // A seek to 90s arrives as a ProgressChanged (no TrackChanged,
+        // because the song identity is unchanged): the bar must jump now,
+        // not wait for a content re-emit.
+        queue.lock().unwrap().push_back(Arc::new(MediaEvent::ProgressChanged {
+            position_secs: Some(90.0),
+            duration_secs: Some(120),
+            playback_rate: Some(1.0),
+        }));
+        state.receive_events();
+
+        // The position updated to the seeked point...
+        assert_eq!(state.estimated_position_secs, Some(90.0));
+        // ...duration was carried through...
+        assert_eq!(state.progress_duration_secs, Some(120));
+        // ...and content is still the original TrackChanged (ProgressChanged
+        // is a data update, never a notification).
+        assert!(matches!(state.content, Some(MediaEvent::TrackChanged(t)) if t.title == "Song"));
+        assert_eq!(state.pending.len(), 0, "no pill queued for a progress update");
     }
 }

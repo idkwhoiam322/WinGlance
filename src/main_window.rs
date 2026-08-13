@@ -1317,6 +1317,9 @@ impl MainWindowState {
                     accepted,
                 } => self.add_session(source_app, title, artist, state, accepted),
                 MediaEvent::WorkerFailed { reason } => self.add_worker_failure(&reason),
+                // A live position refresh is not a notification: it does not add
+                // a history row, only updates the in-memory progress state below.
+                MediaEvent::ProgressChanged { .. } => {}
             }
         }
         if dirty {
@@ -4702,6 +4705,7 @@ mod tests {
             track_number: None,
             track_count: None,
             genre: None,
+            ..TrackInfo::default()
         }
     }
 

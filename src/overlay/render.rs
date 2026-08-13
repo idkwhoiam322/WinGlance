@@ -487,7 +487,9 @@ pub(super) fn draw_pixels(
                     .and_then(|(t, _)| t.decoded_art.clone())
             }
         }
-        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => None,
+        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } | MediaEvent::ProgressChanged { .. } => {
+            None
+        }
     };
     state.ensure_art(decoded.as_ref());
     let inset = state.aura_inset as usize;
@@ -547,6 +549,43 @@ pub(super) fn draw_pixels(
         }
     }
 
+    // Progress bar: a thin accent fill at the pill's bottom edge, masked to
+    // the rounded body so it never paints into the transparent aura ring at
+    // the corners. Present only when the source reports both a position and a
+    // non-zero duration.
+    if let (Some(position), Some(duration)) = (state.estimated_position_secs, state.progress_duration_secs)
+        && duration > 0
+    {
+        let position = position.clamp(0.0, duration as f64);
+        let fraction = (position / duration as f64).clamp(0.0, 1.0) as f32;
+        let bar_h = (2.0 * scale).round().max(1.0) as usize;
+        let bar_y = inset + pill_h.saturating_sub(bar_h);
+        let bar_w = (pill_w as f32 * fraction).round() as usize;
+        let bar_color = aura_palette.primary;
+        let bar_alpha = (bar_color[3] as f32 * 0.6) as u32;
+        for y in bar_y..(bar_y + bar_h).min(height) {
+            for x in inset..(inset + bar_w).min(width) {
+                let cov = round_rect_coverage_supersampled(
+                    (x as i32 - inset as i32) as f32,
+                    (y as i32 - inset as i32) as f32,
+                    pill_w as f32,
+                    pill_h as f32,
+                    radius,
+                );
+                if cov > 0.0 {
+                    composite(
+                        pixels,
+                        width,
+                        x,
+                        y,
+                        [bar_color[0], bar_color[1], bar_color[2]],
+                        bar_alpha,
+                    );
+                }
+            }
+        }
+    }
+
     // Directional edge highlight: white stroke on the pill's own boundary,
     // brighter along the top-left than the bottom-right.
     draw_edge_stroke(pixels, width, inset, pill_w, pill_h, radius, scale);
@@ -592,7 +631,12 @@ pub(super) fn draw_pixels(
                 (art_size, inset + pill_h.saturating_sub(art_size) / 2, 1.0)
             }
             // Never rendered: SessionRejected is filtered out before enqueue.
-            (MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. }, _) => return Ok(()),
+            (
+                MediaEvent::SessionRejected { .. }
+                | MediaEvent::WorkerFailed { .. }
+                | MediaEvent::ProgressChanged { .. },
+                _,
+            ) => return Ok(()),
         };
         if content_alpha > 0.0 {
             let art_radius = art_size as f32 * 0.2;
@@ -1674,7 +1718,7 @@ pub(super) fn draw_expanded_pill_text(
             }
         }
         // Never rendered: SessionRejected is filtered out before enqueue.
-        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => {}
+        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } | MediaEvent::ProgressChanged { .. } => {}
     }
 }
 
@@ -1789,7 +1833,9 @@ pub(super) fn draw_compact_pill(
             }
         }
         // Never rendered: SessionRejected is filtered out before enqueue.
-        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => return,
+        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } | MediaEvent::ProgressChanged { .. } => {
+            return;
+        }
     };
 
     draw_text_line_pixels(
@@ -1907,7 +1953,9 @@ pub(super) fn draw_morph_content(
             }
         }
         // Never rendered: SessionRejected is filtered out before enqueue.
-        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => return,
+        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } | MediaEvent::ProgressChanged { .. } => {
+            return;
+        }
     };
 
     // App icon (compact-only): stays at its compact position and dissolves

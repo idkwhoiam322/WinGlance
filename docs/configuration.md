@@ -15,6 +15,13 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | Key            | Default | Range   | Effect                                            |
 |----------------|---------|---------|---------------------------------------------------|
 | `duration_ms`  | `5000`  | 500–60000 | How long the pill stays visible before collapsing |
+
+> **Progress bar.** When the playing app reports timeline position via SMTC
+> (Spotify, Groove, MusicBee, and a few others — not browsers), the pill draws
+> a thin accent bar along its bottom edge that advances with playback, freezes
+> while paused, and re-bases on a seek. The `⏱` clock glyph in the meta row is
+> suppressed in favor of the bar while it is visible (the `m:ss` text remains).
+> Apps that do not report position show no bar and behave exactly as before.
 | `animation_ms` | `500`   | 100–1000 | Expand/collapse animation length                  |
 | `layout`       | `"expanded"` | `expanded` \| `compact` \| `auto` | Which pill layout is used (see below) |
 | `vertical`     | `"top"` | `top` \| `bottom` | Which monitor edge the pill anchors to |

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
 /// Posted by the event forwarder to wake the main window and the overlay
@@ -51,6 +52,14 @@ pub struct TrackInfo {
     pub track_count: Option<u32>,
     /// Genre, when provided.
     pub genre: Option<String>,
+    /// Playback position in seconds at event time. None when the source does
+    /// not report timeline position.
+    pub position_secs: Option<f64>,
+    /// Playback rate (1.0 = normal). None when not reported.
+    pub playback_rate: Option<f64>,
+    /// Monotonic instant captured by the worker at read time; the UI thread
+    /// estimates the live position from it. None when position is unknown.
+    pub position_updated_at: Option<Instant>,
 }
 
 /// Whether two artwork buffers denote the same cover: the same allocation
@@ -181,6 +190,15 @@ impl TrackInfo {
         {
             self.genre = Some(genre.clone());
         }
+        if incoming.position_secs.is_some() {
+            self.position_secs = incoming.position_secs;
+        }
+        if incoming.playback_rate.is_some() {
+            self.playback_rate = incoming.playback_rate;
+        }
+        if incoming.position_updated_at.is_some() {
+            self.position_updated_at = incoming.position_updated_at;
+        }
     }
 }
 
@@ -202,7 +220,12 @@ pub enum PlaybackState {
     NowPlaying,
 }
 
+// `TrackChanged` carries the full `TrackInfo` (the other variants are far
+// smaller). Boxing it would ripple through every construction and match site
+// for no real gain — the heavy fields are already `Arc`-backed, so cloning
+// the enum copies only cheap pointers plus the small inline `String`/`f64`s.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum MediaEvent {
     TrackChanged(TrackInfo),
     PlaybackStateChanged(PlaybackState, String),
@@ -222,6 +245,16 @@ pub enum MediaEvent {
     /// once by the supervisor. History-only: the overlay never renders it.
     WorkerFailed {
         reason: String,
+    },
+    /// Live playback position update, separate from `TrackChanged` so the
+    /// progress bar can track position and seeks without re-emitting a track
+    /// pill. Carries position, duration and rate; the overlay re-bases its
+    /// estimate from it. Never rendered as a pill and never stored as the
+    /// active content — it is a data update only.
+    ProgressChanged {
+        position_secs: Option<f64>,
+        duration_secs: Option<u64>,
+        playback_rate: Option<f64>,
     },
 }
 
