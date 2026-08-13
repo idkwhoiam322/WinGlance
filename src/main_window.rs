@@ -82,6 +82,8 @@ const MENU_MONITOR_DISPLAY_BASE: usize = 1023;
 const MENU_LAYOUT_EXPANDED: usize = 1024;
 const MENU_LAYOUT_COMPACT: usize = 1025;
 const MENU_LAYOUT_AUTO: usize = 1026;
+/// Duration submenu: shown only when the current duration is not a preset.
+const MENU_DURATION_CUSTOM: usize = 1027;
 const LISTBOX_ID: usize = 2;
 /// History rows are kept in the heap (as entries) and duplicated in the
 /// listbox as UTF-16 row strings, so the cap directly sizes the app's
@@ -3739,50 +3741,30 @@ fn show_tray_menu(state: &mut MainWindowState) {
             return;
         };
         let current_secs = state.cfg().overlay.duration_ms / 1000;
-        let dur_2s_flags = if current_secs == 2 {
-            MF_STRING | MF_CHECKED
-        } else {
-            MF_STRING
-        };
-        let dur_3s_flags = if current_secs == 3 {
-            MF_STRING | MF_CHECKED
-        } else {
-            MF_STRING
-        };
-        let dur_5s_flags = if current_secs == 5 {
-            MF_STRING | MF_CHECKED
-        } else {
-            MF_STRING
-        };
-        let dur_10s_flags = if current_secs == 10 {
-            MF_STRING | MF_CHECKED
-        } else {
-            MF_STRING
-        };
-        let _ = AppendMenuW(
-            duration_menu,
-            dur_2s_flags,
-            MENU_DURATION_2S,
-            PCWSTR(wide("2 seconds").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            duration_menu,
-            dur_3s_flags,
-            MENU_DURATION_3S,
-            PCWSTR(wide("3 seconds").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            duration_menu,
-            dur_5s_flags,
-            MENU_DURATION_5S,
-            PCWSTR(wide("5 seconds").as_ptr()),
-        );
-        let _ = AppendMenuW(
-            duration_menu,
-            dur_10s_flags,
-            MENU_DURATION_10S,
-            PCWSTR(wide("10 seconds").as_ptr()),
-        );
+        let presets: [(u64, usize, &str); 4] = [
+            (2, MENU_DURATION_2S, "2 seconds"),
+            (3, MENU_DURATION_3S, "3 seconds"),
+            (5, MENU_DURATION_5S, "5 seconds"),
+            (10, MENU_DURATION_10S, "10 seconds"),
+        ];
+        let is_preset = presets.iter().any(|(s, _, _)| *s == current_secs);
+        for (secs, id, label) in presets {
+            let flags = if current_secs == secs {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
+            let _ = AppendMenuW(duration_menu, flags, id, PCWSTR(wide(label).as_ptr()));
+        }
+        if !is_preset {
+            let label = format!("Custom ({current_secs}s)");
+            let _ = AppendMenuW(
+                duration_menu,
+                MF_STRING | MF_CHECKED,
+                MENU_DURATION_CUSTOM,
+                PCWSTR(wide(&label).as_ptr()),
+            );
+        }
         let _ = AppendMenuW(
             menu,
             MF_POPUP,
@@ -3893,6 +3875,9 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = 10000);
                     set_duration(state.overlay_hwnd, 10000);
                 }
+                // Custom duration is already the current value; clicking it
+                // is a no-op (the entry just shows what the value is).
+                MENU_DURATION_CUSTOM => {}
                 MENU_MONITOR_ACTIVE => state.apply_monitor(MonitorMode::ActiveWindow),
                 MENU_MONITOR_PRIMARY => state.apply_monitor(MonitorMode::Primary),
                 _ if command >= MENU_MONITOR_DISPLAY_BASE && command < MENU_MONITOR_DISPLAY_BASE + displays.len() => {
