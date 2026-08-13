@@ -40,8 +40,8 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_DOWN, VK_LEFT, VK_RETURN, VK_RIGHT,
-    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN,
+    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -4097,6 +4097,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                             let _ = unsafe { PostMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp) };
                         }
                     }
+                    VK_ESCAPE => {
+                        // Return to the Activity pane and clear the keyboard
+                        // focus highlight so the next Tab starts fresh.
+                        state.active_pane = Pane::Activity;
+                        let old = state.settings_hover;
+                        state.settings_hover = None;
+                        state.apply_pane();
+                        state.invalidate_hover_rows(client_w, old, None);
+                        state.invalidate();
+                    }
                     _ => {}
                 }
                 return LRESULT(0);
@@ -4126,6 +4136,25 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     }
                     if previous != state.active_pane {
                         debug!("switched to the {:?} pane", state.active_pane);
+                        // When entering Settings via mouse, set keyboard focus
+                        // on the first control so the next Tab starts from a
+                        // known position instead of a stale or absent highlight.
+                        if state.active_pane == Pane::Settings {
+                            let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
+                            if let Some(first) = targets.first() {
+                                let new_hover = Some((first.row_index, first.sub));
+                                let old = state.settings_hover;
+                                state.settings_hover = new_hover;
+                                state.invalidate_hover_rows(client_w, old, new_hover);
+                            }
+                        }
+                        // Clear the Settings focus highlight when leaving, so
+                        // it does not persist behind the Activity pane.
+                        if state.active_pane == Pane::Activity {
+                            let old = state.settings_hover;
+                            state.settings_hover = None;
+                            state.invalidate_hover_rows(client_w, old, None);
+                        }
                     }
                     state.apply_pane();
                     state.invalidate();
