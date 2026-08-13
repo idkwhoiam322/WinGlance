@@ -276,9 +276,12 @@ pub enum MediaEvent {
     /// Live playback position update, separate from `TrackChanged` so the
     /// progress bar can track position and seeks without re-emitting a track
     /// pill. Carries position, duration and rate; the overlay re-bases its
-    /// estimate from it. Never rendered as a pill and never stored as the
-    /// active content — it is a data update only.
+    /// estimate from it. `source_app` lets the overlay attribute the update to
+    /// the session that produced it and only apply it to the content on
+    /// screen. Never rendered as a pill and never stored as the active
+    /// content — it is a data update only.
     ProgressChanged {
+        source_app: String,
         position_secs: Option<f64>,
         duration_secs: Option<u64>,
         playback_rate: Option<f64>,

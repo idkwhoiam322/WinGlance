@@ -1132,19 +1132,33 @@ impl OverlayState {
                     position_secs,
                     duration_secs,
                     playback_rate,
+                    source_app,
                 } => {
                     // A live position update only re-anchors the progress bar; it
                     // never announces a pill or changes the active content (which
                     // stays the last TrackChanged/PlaybackStateChanged shown).
-                    self.apply_progress(position_secs, duration_secs, playback_rate);
-                    // The static tick that drives a settled pill does not repaint
-                    // (see `tick`'s render gate), so a live position update — and a
-                    // seek it re-anchors — would otherwise stay stale on screen
-                    // until the next content-driven render. Paint the re-based bar
-                    // right away while the pill is up; skip it when hidden so a
-                    // dismissed pill never gets dragged back to life by a late event.
-                    if !matches!(self.phase, Phase::Hidden) {
-                        self.render();
+                    // Apply it only when it belongs to the content on screen: the
+                    // worker pushes a timeline refresh for every tracked session
+                    // every ~2s, so without this gate a different source's
+                    // advancing position would drive the seekbar under this
+                    // source's pill (e.g. a paused YouTube Music card while a
+                    // Brave playback runs in the background).
+                    let matches_shown = self.content.as_ref().is_some_and(|content| match content {
+                        MediaEvent::TrackChanged(shown) => shown.source_app == source_app,
+                        MediaEvent::PlaybackStateChanged(_, source) => source == &source_app,
+                        _ => false,
+                    });
+                    if matches_shown {
+                        self.apply_progress(position_secs, duration_secs, playback_rate);
+                        // The static tick that drives a settled pill does not repaint
+                        // (see `tick`'s render gate), so a live position update — and a
+                        // seek it re-anchors — would otherwise stay stale on screen
+                        // until the next content-driven render. Paint the re-based bar
+                        // right away while the pill is up; skip it when hidden so a
+                        // dismissed pill never gets dragged back to life by a late event.
+                        if !matches!(self.phase, Phase::Hidden) {
+                            self.render();
+                        }
                     }
                 }
                 MediaEvent::PlaybackStateChanged(state, source_app)
@@ -8761,6 +8775,7 @@ mod tests {
         // because the song identity is unchanged): the bar must jump now,
         // not wait for a content re-emit.
         queue.lock().unwrap().push_back(Arc::new(MediaEvent::ProgressChanged {
+            source_app: "spotify".into(),
             position_secs: Some(90.0),
             duration_secs: Some(120),
             playback_rate: Some(1.0),
@@ -8774,6 +8789,43 @@ mod tests {
         // ...and content is still the original TrackChanged (ProgressChanged
         // is a data update, never a notification).
         assert!(matches!(state.content, Some(MediaEvent::TrackChanged(t)) if t.title == "Song"));
+        assert_eq!(state.pending.len(), 0, "no pill queued for a progress update");
+    }
+
+    #[test]
+    fn progress_from_foreign_source_is_ignored() {
+        let config = Config::default();
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut state = OverlayState::new(config, queue.clone());
+        // Seed the bar with a spotify track at position 10/120s.
+        let track = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "spotify".into(),
+            duration_secs: Some(120),
+            position_secs: Some(10.0),
+            playback_rate: Some(1.0),
+            ..TrackInfo::default()
+        };
+        state.content = Some(MediaEvent::TrackChanged(track.clone()));
+        state.apply_track_progress(&track);
+        assert_eq!(state.estimated_position_secs, Some(10.0));
+
+        // A Brave timeline refresh must not re-anchor the bar under spotify's
+        // pill: each source pushes a progress update every ~2s, so without the
+        // source gate the seekbar would follow whatever session is advancing.
+        queue.lock().unwrap().push_back(Arc::new(MediaEvent::ProgressChanged {
+            source_app: "brave".into(),
+            position_secs: Some(90.0),
+            duration_secs: Some(300),
+            playback_rate: Some(1.0),
+        }));
+        state.receive_events();
+
+        // The foreign sample was dropped entirely: position and duration are
+        // untouched, and nothing was queued.
+        assert_eq!(state.estimated_position_secs, Some(10.0));
+        assert_eq!(state.progress_duration_secs, Some(120));
         assert_eq!(state.pending.len(), 0, "no pill queued for a progress update");
     }
 

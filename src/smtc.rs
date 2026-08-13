@@ -603,6 +603,7 @@ impl ListenerState {
                     // or a detected seek).
                     if read.position_secs.is_some() {
                         events.push(MediaEvent::ProgressChanged {
+                            source_app: read.source_app.clone(),
                             position_secs: read.position_secs,
                             duration_secs: read.duration_secs,
                             playback_rate: read.playback_rate,
