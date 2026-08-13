@@ -37,11 +37,10 @@ const MIN_HUE_DISTANCE: f32 = 30.0;
 const CHANNEL_BITS: u32 = 4;
 const BUCKET_COUNT: usize = 1 << (CHANNEL_BITS * 3);
 /// Fixed grid for the palette's box-average pre-sample. The worker decodes
-/// artwork at a DPI-dependent size (64²–256², see `events::artwork_decode_size`),
-/// so a raw histogram would shift with the decode size and the same cover could
-/// pick a different accent depending on the display DPI. Box-averaging onto a
-/// fixed 16×16 grid first makes the palette converge to the same color
-/// distribution for every decode size.
+/// artwork at the fixed `events::ARTWORK_DECODE`² size, so the histogram input
+/// is stable per cover; the grid additionally dampens the residual resampling
+/// noise from sources that re-encode their thumbnail between reads, so a
+/// near-tie between buckets cannot flip the dominant pick between pill shows.
 const SAMPLE_GRID: usize = 16;
 
 #[derive(Default, Clone, Copy)]
@@ -60,7 +59,8 @@ struct Bucket {
 /// artwork buffer, so no extra image decode is needed — computing the palette
 /// here is ~0.1ms, done once per unique cover in `ensure_art`. Square buffers
 /// are box-averaged onto a fixed 16×16 grid first (see `SAMPLE_GRID`), so the
-/// result does not depend on the worker's DPI-dependent decode size.
+/// pick is stable against resampling noise on top of the worker's fixed-size
+/// decode.
 pub(crate) fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
     // Box-average square artwork onto the fixed grid before histogramming;
     // non-square or sub-grid inputs (tests, degenerate art) histogram as-is.

@@ -343,6 +343,12 @@ struct OverlayState {
     pending: VecDeque<MediaEvent>,
     enabled: bool,
     content: Option<MediaEvent>,
+    /// The identity-stable palette the SMTC worker attached to the current
+    /// track, if any. `palette` is derived from it (when present) instead of
+    /// a fresh per-frame derivation, so a source that re-encodes its
+    /// thumbnail between reads — different bytes, same cover — can never
+    /// shift the pill's accent colors mid-session.
+    content_palette: Option<Palette>,
     last_track: Option<TrackInfo>,
     phase: Phase,
     dismiss_at: Option<Instant>,
@@ -735,6 +741,7 @@ impl OverlayState {
             pending: VecDeque::new(),
             enabled,
             content: None,
+            content_palette: None,
             last_track: None,
             phase: Phase::Hidden,
             dismiss_at: None,
@@ -819,7 +826,13 @@ impl OverlayState {
         }
         self.decoded_art = decoded.and_then(|arc| pm_bgra_to_rgba(arc));
         self.decoded_art_source = decoded.cloned();
-        self.palette = self.decoded_art.as_deref().and_then(crate::palette::palette_from_rgba);
+        // The worker's identity-stable palette wins when present: a re-encoded
+        // thumbnail re-converts the buffer (different bytes, same cover) but
+        // must not shift the accent colors. Without one (state pills, artless
+        // tracks) the palette is derived from the converted buffer as before.
+        self.palette = self
+            .content_palette
+            .or_else(|| self.decoded_art.as_deref().and_then(crate::palette::palette_from_rgba));
     }
 
     fn ensure_anim_timer(&mut self) {
@@ -1362,6 +1375,10 @@ impl OverlayState {
             self.apply_track_progress(track);
         }
         self.content = Some(event);
+        self.content_palette = match &self.content {
+            Some(MediaEvent::TrackChanged(track)) => track.palette,
+            _ => None,
+        };
         self.resolve_pill_text();
         self.reset_scroll();
         if let Some(deadline) = self.dismiss_at {
@@ -1417,6 +1434,10 @@ impl OverlayState {
             self.apply_track_progress(track);
         }
         self.content = Some(event);
+        self.content_palette = match &self.content {
+            Some(MediaEvent::TrackChanged(track)) => track.palette,
+            _ => None,
+        };
         self.resolve_pill_text();
         self.reset_scroll();
         let now = Instant::now();
@@ -2207,6 +2228,7 @@ impl OverlayState {
         self.decoded_art = None;
         self.decoded_art_source = None;
         self.palette = None;
+        self.content_palette = None;
         self.marquee_strips = [None, None, None, None];
         self.pill_text = None;
         // Clear the last-shown source label so a subsequent PlaybackStateChanged
@@ -2797,8 +2819,8 @@ mod tests {
     }
 
     /// A solid-color artwork buffer in the worker's format: premultiplied
-    /// BGRA at `ARTWORK_DECODE`² (the cap the worker's adaptive decode
-    /// targets; the overlay only reads the side from the buffer length).
+    /// BGRA at the fixed `ARTWORK_DECODE`² size (the overlay only reads the
+    /// side from the buffer length).
     fn pm_art(color: [u8; 3]) -> Arc<[u8]> {
         let (b, g, r) = (color[2], color[1], color[0]);
         let px = [b, g, r, 255];
@@ -2848,6 +2870,43 @@ mod tests {
         // A new cover after a recorded failure still converts.
         state.ensure_art(Some(&blue));
         assert_ne!(state.decoded_art.as_ref().map(Vec::len), Some(4));
+    }
+
+    #[test]
+    fn ensure_art_prefers_the_worker_palette_over_recomputation() {
+        let config = Config::default();
+        let mut state = OverlayState::new(config, EventQueue::default());
+        let red = pm_art([200, 40, 40]);
+        let blue = pm_art([40, 40, 200]);
+        // Without a track palette the palette derives from the converted art.
+        state.ensure_art(Some(&red));
+        let derived_red = state.palette.expect("a solid cover must yield a palette");
+        // A worker palette wins and is immune to byte changes: a re-encoded
+        // thumbnail converts a new buffer, but the accent must not shift.
+        let worker_palette = Palette {
+            primary: [0x11, 0x22, 0x33, 0xFF],
+            secondary: [0x44, 0x55, 0x66, 0xFF],
+        };
+        state.content_palette = Some(worker_palette);
+        state.ensure_art(Some(&blue));
+        assert_eq!(state.palette, Some(worker_palette));
+        assert_ne!(
+            state.palette,
+            Some(derived_red),
+            "the worker palette must replace a previously derived one"
+        );
+        // Same art bytes with the worker palette: the early return keeps
+        // both the buffer and the palette stable.
+        let before = state.decoded_art.clone();
+        state.ensure_art(Some(&blue));
+        assert_eq!(state.decoded_art, before);
+        assert_eq!(state.palette, Some(worker_palette));
+        // A state pill (no track palette) with NEW art derives again.
+        state.content_palette = None;
+        let yellow = pm_art([240, 220, 40]);
+        state.ensure_art(Some(&yellow));
+        assert_ne!(state.palette, Some(worker_palette));
+        assert!(state.palette.is_some());
     }
 
     #[test]

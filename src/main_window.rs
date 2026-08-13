@@ -205,15 +205,23 @@ fn mix(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
 /// The settings window's effective accent pair from the playing song's
 /// decoded artwork: the album palette's primary (brightened against the
 /// settings surface so accent text stays readable, like the pill guards its
-/// text) and secondary. When there is no artwork or the pixels yield no
-/// palette, both fall back to the configured accent — the default pink
-/// theme. `decoded_art` is the worker's premultiplied-BGRA decode, the same
-/// buffer the pill palettizes from.
-fn accent_from_art(decoded_art: Option<&[u8]>, fallback: [u8; 4]) -> ([u8; 4], [u8; 4]) {
-    let Some(palette) = decoded_art
-        .and_then(crate::overlay::pm_bgra_to_rgba)
-        .and_then(|rgba| crate::palette::palette_from_rgba(&rgba))
-    else {
+/// text) and secondary. The worker's identity-stable palette (`art_palette`,
+/// derived once from the fixed-size decode) is preferred when present, so a
+/// re-encoded thumbnail — different bytes, same cover — cannot shift the
+/// window accent either; otherwise the palette is derived from
+/// `decoded_art` (the worker's premultiplied-BGRA decode, the same buffer
+/// the pill palettizes from). When neither yields a palette, both fall back
+/// to the configured accent — the default pink theme.
+fn accent_from_art(
+    decoded_art: Option<&[u8]>,
+    art_palette: Option<crate::palette::Palette>,
+    fallback: [u8; 4],
+) -> ([u8; 4], [u8; 4]) {
+    let Some(palette) = art_palette.or_else(|| {
+        decoded_art
+            .and_then(crate::overlay::pm_bgra_to_rgba)
+            .and_then(|rgba| crate::palette::palette_from_rgba(&rgba))
+    }) else {
         return (fallback, fallback);
     };
     (
@@ -983,7 +991,7 @@ impl MainWindowState {
         // active pane, history selection) are dark tints of the secondary
         // accent — the whole theme is accent-based, with no fixed blue/green
         // tones.
-        (self.accent_color, self.accent_secondary) = accent_from_art(None, self.cfg().appearance.accent_color);
+        (self.accent_color, self.accent_secondary) = accent_from_art(None, None, self.cfg().appearance.accent_color);
         self.rebuild_accent_brushes();
 
         self.listbox = unsafe {
@@ -1249,7 +1257,8 @@ impl MainWindowState {
             return;
         }
         self.accent_art_source = art.clone();
-        let (primary, secondary) = accent_from_art(art.as_deref(), self.cfg().appearance.accent_color);
+        let art_palette = self.current.as_ref().and_then(|c| c.track.palette);
+        let (primary, secondary) = accent_from_art(art.as_deref(), art_palette, self.cfg().appearance.accent_color);
         if primary != self.accent_color || secondary != self.accent_secondary {
             self.accent_color = primary;
             self.accent_secondary = secondary;
@@ -1635,8 +1644,8 @@ impl MainWindowState {
 
         // The SMTC worker already decoded the artwork once at event time (see
         // smtc.rs `with_decoded_art`); the UI thread only ever copies the
-        // cached pixels, never decodes an image. The decode side is adaptive
-        // (per-DPI), so derive it from the buffer length.
+        // cached pixels, never decodes an image. The decode side is fixed
+        // (`ARTWORK_DECODE`), so derive it from the buffer length.
         if let Some(current) = &mut self.current
             && current.art_blit.is_none()
             && !current.art_decode_failed
@@ -4730,18 +4739,36 @@ mod tests {
     #[test]
     fn accent_from_art_uses_the_album_palette_and_falls_back() {
         let fallback = [240, 110, 155, 255];
-        // No artwork: the configured accent stands in for both.
-        assert_eq!(accent_from_art(None, fallback), (fallback, fallback));
+        // No artwork, no worker palette: the configured accent stands in for
+        // both.
+        assert_eq!(accent_from_art(None, None, fallback), (fallback, fallback));
         // Truncated/garbage bytes (not pixel-aligned): same fallback.
-        assert_eq!(accent_from_art(Some(&[0, 0, 255]), fallback), (fallback, fallback));
+        assert_eq!(
+            accent_from_art(Some(&[0, 0, 255]), None, fallback),
+            (fallback, fallback)
+        );
         // A solid white cover (premultiplied BGRA) yields a palette: the
         // primary and secondary leave the pink fallback behind, and the
         // monochrome palette keeps both equal.
         let white: Vec<u8> = vec![255u8; 8 * 8 * 4];
-        let (primary, secondary) = accent_from_art(Some(&white), fallback);
+        let (primary, secondary) = accent_from_art(Some(&white), None, fallback);
         assert_ne!(primary, fallback, "a cover must recolor the accent");
         assert_ne!(secondary, fallback, "a cover must recolor the secondary");
         assert_eq!(primary, secondary, "monochrome art keeps primary == secondary");
+        // The worker's identity-stable palette wins over a re-derivation: the
+        // primary still passes through the contrast guard against the
+        // settings surface, the secondary passes untouched.
+        let explicit = crate::palette::Palette {
+            primary: [0x12, 0x34, 0x56, 0xFF],
+            secondary: [0x65, 0x43, 0x21, 0xFF],
+        };
+        assert_eq!(
+            accent_from_art(None, Some(explicit), fallback),
+            (
+                crate::overlay::ensure_contrast(explicit.primary, SETTINGS_SURFACE, crate::overlay::TEXT_CONTRAST_AA),
+                explicit.secondary,
+            )
+        );
     }
 
     #[test]

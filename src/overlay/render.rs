@@ -2559,9 +2559,9 @@ pub(super) fn composite_pm(pixels: &mut [u8], width: usize, x: usize, y: usize, 
     pixels[offset + 3] = (alpha + pixels[offset + 3] as u32 * inv / 255) as u8;
 }
 
-/// Converts the worker's premultiplied BGRA artwork (square, adaptive
-/// per-DPI size) into the straight RGBA buffer the overlay composites and
-/// palettizes from. Shared with the main window, which derives its accent
+/// Converts the worker's premultiplied BGRA artwork (square, fixed
+/// `ARTWORK_DECODE` size) into the straight RGBA buffer the overlay composites
+/// and palettizes from. Shared with the main window, which derives its accent
 /// from the same decode.
 /// Runs once per cover change, keyed by the decoded pixels in `ensure_art`.
 /// The result is always a perfect square; `draw_art_scaled` derives the side

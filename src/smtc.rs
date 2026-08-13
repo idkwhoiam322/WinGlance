@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::events::{MediaEvent, PlaybackState, TrackInfo, decode_artwork_pm};
+use crate::palette::{Palette, palette_from_rgba};
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -17,8 +18,6 @@ use windows::Media::Control::{
 use windows::Storage::Streams::{Buffer, DataReader, InputStreamOptions};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
-use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
-use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 use windows::core::Interface;
 
 enum Signal {
@@ -220,6 +219,14 @@ struct ListenerState {
     /// of a change and may return different bytes for the same cover, which
     /// would otherwise fire a duplicate pill for the same song.
     last_emit_at: HashMap<String, Instant>,
+    /// The two-color palette derived per track identity (source + title +
+    /// artist), from the first trusted artwork decode for that identity. A
+    /// source that re-encodes its thumbnail between reads supplies different
+    /// bytes for the same cover; reusing this cache keeps the pill's accent
+    /// colors stable for the identity. Cleared when a real cover swap is
+    /// detected (the artwork-changed force), so a genuinely new cover
+    /// recomputes its palette.
+    palette_per_identity: HashMap<(String, String, String), Palette>,
 }
 
 pub struct SmtcListener {
@@ -331,6 +338,7 @@ impl ListenerState {
             icon_cache: HashMap::new(),
             cached_allowed: None,
             last_emit_at: HashMap::new(),
+            palette_per_identity: HashMap::new(),
             heartbeat,
             live_generation,
             my_generation,
@@ -579,6 +587,20 @@ impl ListenerState {
                     {
                         merged.artwork = Some(cached);
                     }
+                    // Stale-thumbnail guard: a transition read can pair the NEW
+                    // track identity with the PREVIOUS track's thumbnail bytes
+                    // (SMTC updates the thumbnail stream after the text fields).
+                    // Byte-equal cross-identity art is dropped here — attaching
+                    // it would show the wrong cover and poison the identity-
+                    // keyed artwork and palette caches. Same-identity reads
+                    // always keep their art, so a legitimately shared cover
+                    // within an album survives; the artwork-changed re-emit
+                    // surfaces the real cover once the stream catches up.
+                    if read_artwork && stale_thumbnail(&merged, self.last_track_per_source.get(&merged.source_app)) {
+                        merged.artwork = None;
+                        let label = track_label(&merged);
+                        debug!("stale thumbnail dropped | reason=identity-switch | {label}");
+                    }
                     // App icon extraction: one icon per source app, cached
                     // (keyed by the source_app label, derived from the AUMID).
                     // The AUMID is read from the live session; the icon is
@@ -661,6 +683,15 @@ impl ListenerState {
                                 debug!("artwork refresh absorbed | reason=state-change-in-batch | {label}");
                             } else {
                                 emit = true;
+                                // Genuine cover change for the same identity:
+                                // invalidate the cached palette so the emit
+                                // recomputes from the new bytes instead of
+                                // carrying the old cover's accent colors.
+                                self.palette_per_identity.remove(&(
+                                    merged.source_app.clone(),
+                                    merged.title.clone(),
+                                    merged.artist.clone(),
+                                ));
                                 let label = track_label(&merged);
                                 debug!("track emit forced | reason=artwork-changed | {label}");
                             }
@@ -707,8 +738,14 @@ impl ListenerState {
                     if emit && !placeholder && !session_recreation {
                         let label = track_label(&merged);
                         info!("track changed | {label}");
-                        let cfg = self.config.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let emitted = with_decoded_art(merged.clone(), current_decode_size(&cfg));
+                        let mut emitted = with_decoded_art(merged.clone(), crate::events::ARTWORK_DECODE as usize);
+                        // Attach the identity-stable palette so the overlay does
+                        // not recompute (and drift) from re-encoded thumbnails.
+                        emitted.palette = palette_for_identity(
+                            &mut self.palette_per_identity,
+                            &merged,
+                            emitted.decoded_art.as_deref(),
+                        );
                         events.push(MediaEvent::TrackChanged(emitted));
                         self.last_track_per_source
                             .insert(merged.source_app.clone(), merged.clone());
@@ -1008,11 +1045,10 @@ impl ListenerState {
             info!("track changed | {label}");
             self.last_track_per_source
                 .insert(merged.source_app.clone(), merged.clone());
-            let cfg = self.config.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.emit(MediaEvent::TrackChanged(with_decoded_art(
-                merged.clone(),
-                current_decode_size(&cfg),
-            )));
+            let mut emitted = with_decoded_art(merged.clone(), crate::events::ARTWORK_DECODE as usize);
+            emitted.palette =
+                palette_for_identity(&mut self.palette_per_identity, &merged, emitted.decoded_art.as_deref());
+            self.emit(MediaEvent::TrackChanged(emitted));
             if let Some(state) = self.states.get_mut(&key) {
                 state.deferred_at = None;
             }
@@ -1324,6 +1360,55 @@ fn cached_artwork_for(
     })
 }
 
+/// Whether `merged`'s artwork is likely the PREVIOUS track's thumbnail served
+/// stale during a transition: the track identity (title + artist) differs from
+/// the last emitted track, yet the freshly read bytes are identical to that
+/// track's artwork. SMTC updates the thumbnail stream after the text fields,
+/// so a read inside that window pairs the new identity with the old cover.
+/// Attaching it would show the wrong cover (e.g. the previous song's album
+/// art) and poison the identity-keyed artwork and palette caches, so callers
+/// drop the artwork and let the artwork-changed re-emit surface the real
+/// cover once the stream catches up. Same-identity reads always keep their
+/// art (a legitimately identical album cover across a playlist is correct).
+fn stale_thumbnail(merged: &TrackInfo, last_emitted: Option<&TrackInfo>) -> bool {
+    let Some(last) = last_emitted else {
+        return false;
+    };
+    if last.title == merged.title && last.artist == merged.artist {
+        return false;
+    }
+    match (&merged.artwork, &last.artwork) {
+        (Some(new_b), Some(old_b)) => Arc::ptr_eq(new_b, old_b) || new_b.as_ref() == old_b.as_ref(),
+        _ => false,
+    }
+}
+
+/// The identity-stable palette to attach to an emitted track: reuses the
+/// per-identity (source + title + artist) cache when present, so a source
+/// that re-encodes its thumbnail between reads (different bytes, same cover)
+/// can never shift the pill's accent colors. Otherwise derives the palette
+/// from the freshly decoded buffer (itself deterministic per bytes: the
+/// worker decodes at a fixed size) and caches it. Returns `None` when the
+/// identity has no trusted artwork yet — the UI falls back to computing from
+/// `decoded_art`.
+fn palette_for_identity(
+    cache: &mut HashMap<(String, String, String), Palette>,
+    merged: &TrackInfo,
+    decoded_art: Option<&[u8]>,
+) -> Option<Palette> {
+    let key = (merged.source_app.clone(), merged.title.clone(), merged.artist.clone());
+    if let Some(palette) = cache.get(&key) {
+        return Some(*palette);
+    }
+    let palette = decoded_art
+        .and_then(crate::overlay::pm_bgra_to_rgba)
+        .and_then(|rgba| palette_from_rgba(&rgba));
+    if let Some(palette) = palette {
+        cache.insert(key, palette);
+    }
+    palette
+}
+
 /// Whether a read of `merged` is a session recreation of the last emitted
 /// track `prev_track` (same title + artist, same artwork identity). When
 /// `read_artwork` is false (the 2s poll, which never reads art), the artwork
@@ -1462,6 +1547,10 @@ fn merge_track(prev: &LogicalState, read: &TrackInfo, read_artwork: bool) -> Tra
         },
         playback_rate: read.playback_rate,
         position_updated_at: read.position_updated_at,
+        // The identity-stable palette is attached at emit time (after the
+        // decode), never merged here: the merge inherits the previous track's
+        // identity fields, and a stale palette must not carry over.
+        palette: None,
     }
 }
 
@@ -1524,24 +1613,13 @@ fn defer_expired(deferred_at: Option<Instant>) -> bool {
     deferred_at.is_some_and(|t| t.elapsed() >= ARTWORK_TIMEOUT)
 }
 
-/// Picks the artwork decode size for the current display setup: the pill is
-/// shown on the foreground window's monitor, so that monitor's DPI decides
-/// how large the decoded art must be (system DPI when no foreground window
-/// can be sampled). Runs on the worker at emit time, so a DPI change only
-/// affects the next decoded cover.
-fn current_decode_size(config: &Config) -> usize {
-    let foreground = unsafe { GetForegroundWindow() };
-    let dpi = unsafe { GetDpiForWindow(foreground) };
-    let dpi = if dpi > 0 { dpi } else { unsafe { GetDpiForSystem() } };
-    crate::events::artwork_decode_size(config.appearance.art_size, dpi)
-}
-
-/// Attaches the worker's adaptive artwork decode to a track about to be
+/// Attaches the worker's fixed-size artwork decode to a track about to be
 /// emitted. Called only on the emit paths (never on poll/merge reads), so the
 /// image decode runs once per actually-emitted track — on the worker thread,
-/// never on a window's UI thread. The size matches the display the pill will
-/// appear on; both windows derive the side from the buffer length, so any
-/// size works.
+/// never on a window's UI thread. `ARTWORK_DECODE`² is fixed for every display
+/// (see `events::ARTWORK_DECODE`), so the same cover always decodes to the
+/// same buffer and the palette derived from it cannot shift between pill
+/// shows; both windows derive the side from the buffer length.
 fn with_decoded_art(mut track: TrackInfo, size: usize) -> TrackInfo {
     track.decoded_art = track
         .artwork
@@ -1774,6 +1852,7 @@ fn read_track_info(
         track_number,
         track_count,
         genre,
+        palette: None,
     })
 }
 
@@ -2223,6 +2302,97 @@ mod tests {
 
         // No cached entry → None.
         assert_eq!(cached_artwork_for(&HashMap::new(), "unknown", "Song", "Artist"), None);
+    }
+
+    #[test]
+    fn stale_thumbnail_drops_byte_equal_art_only_for_a_new_identity() {
+        let art_a = Arc::<[u8]>::from(vec![1u8, 2, 3, 4]);
+        let last = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            artwork: Some(art_a.clone()),
+            ..TrackInfo::default()
+        };
+        // A different identity re-reading the previous track's exact bytes is
+        // the stale-thumbnail signature (SMTC updates the thumbnail stream
+        // after the text fields): dropped.
+        let next = TrackInfo {
+            title: "Other".into(),
+            artist: "Artist".into(),
+            artwork: Some(art_a.clone()),
+            ..TrackInfo::default()
+        };
+        assert!(stale_thumbnail(&next, Some(&last)));
+        // Same identity keeps byte-equal art: a legitimately shared album
+        // cover across a playlist must never be dropped.
+        let same_identity = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            artwork: Some(art_a.clone()),
+            ..TrackInfo::default()
+        };
+        assert!(!stale_thumbnail(&same_identity, Some(&last)));
+        // Different bytes for a different identity are the real cover: kept.
+        let real_cover = TrackInfo {
+            title: "Other".into(),
+            artist: "Artist".into(),
+            artwork: Some(Arc::<[u8]>::from(vec![9u8, 8, 7, 6])),
+            ..TrackInfo::default()
+        };
+        assert!(!stale_thumbnail(&real_cover, Some(&last)));
+        // No last emit, or no art on either side: never stale.
+        assert!(!stale_thumbnail(&next, None));
+        let artless_last = TrackInfo {
+            artwork: None,
+            ..last.clone()
+        };
+        assert!(!stale_thumbnail(&next, Some(&artless_last)));
+    }
+
+    #[test]
+    fn palette_for_identity_reuses_the_cached_palette_across_byte_changes() {
+        let mut cache = HashMap::new();
+        // A plausible solid RGBA cover (all white) at the palette grid size:
+        // derives a monochrome palette.
+        let cover: Vec<u8> = vec![255u8; 16 * 16 * 4];
+        let first = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        };
+        let palette =
+            palette_for_identity(&mut cache, &first, Some(&cover)).expect("a valid cover must yield a palette");
+        assert_eq!(cache.len(), 1);
+        // The same identity re-encoded (different bytes, same cover): the
+        // cache serves the original palette instead of recomputing — this is
+        // the guarantee that keeps the pill's accent stable.
+        let reencoded: Vec<u8> = vec![254u8; 16 * 16 * 4];
+        let again = palette_for_identity(&mut cache, &first, Some(&reencoded));
+        assert_eq!(again, Some(palette));
+        assert_eq!(cache.len(), 1, "a re-encode must not replace the cached palette");
+        // A different identity derives and caches its own palette.
+        let other = TrackInfo {
+            title: "Other".into(),
+            artist: "Artist".into(),
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        };
+        let other_palette = palette_for_identity(&mut cache, &other, Some(&cover));
+        assert!(other_palette.is_some());
+        assert_eq!(cache.len(), 2);
+        // A cached identity without fresh decoded art still serves its
+        // palette; an identity that never had art stays None and caches
+        // nothing.
+        assert_eq!(palette_for_identity(&mut cache, &first, None), Some(palette));
+        let artless = TrackInfo {
+            title: "Artless".into(),
+            artist: "Artist".into(),
+            source_app: "youtube-music".into(),
+            ..TrackInfo::default()
+        };
+        assert_eq!(palette_for_identity(&mut cache, &artless, None), None);
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]
