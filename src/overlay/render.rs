@@ -2499,8 +2499,7 @@ pub(super) fn text_scratch_for(
 /// Source-over composite of a premultiplied source (rgb already multiplied by
 /// alpha) onto the premultiplied pill buffer.
 pub(super) fn composite_pm(pixels: &mut [u8], width: usize, x: usize, y: usize, rgb: [u8; 3], alpha: u32) {
-    debug_assert!(width > 0, "composite_pm: width must be > 0 (divide-by-zero guard)");
-    if x >= width || y >= pixels.len() / width / 4 {
+    if width == 0 || x >= width || y >= pixels.len() / width / 4 {
         return;
     }
     let offset = (y * width + x) * 4;
@@ -2541,8 +2540,7 @@ pub(crate) fn pm_bgra_to_rgba(pm: &[u8]) -> Option<Vec<u8>> {
 /// UpdateLayeredWindow(ULW_ALPHA) consumes, so every shape and glyph goes
 /// through this single alpha-correct path.
 pub(super) fn composite(pixels: &mut [u8], width: usize, x: usize, y: usize, rgb: [u8; 3], alpha: u32) {
-    debug_assert!(width > 0, "composite: width must be > 0 (divide-by-zero guard)");
-    if x >= width || y >= pixels.len() / width / 4 {
+    if width == 0 || x >= width || y >= pixels.len() / width / 4 {
         return;
     }
     let offset = (y * width + x) * 4;
