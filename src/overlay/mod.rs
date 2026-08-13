@@ -141,6 +141,8 @@ const STATIC_TICK_MS: u32 = 250;
 /// cadence) and far below a track-length jump; the worker's `SEEK_DELTA_SECS`
 /// covers seeks independently via a `TrackChanged` re-emit.
 const PROGRESS_LATENCY_TOL_SECS: f64 = 3.0;
+/// Duration of the PersistentCompact idle-fade ramp (full opacity → 25% idle).
+const FADE_DURATION_MS: u64 = 300;
 
 /// Posted by the high-resolution animation timer to drive pill frames.
 const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
@@ -921,8 +923,10 @@ impl OverlayState {
     /// polling do not need frame rate, so a shown pill stops waking the UI
     /// thread at monitor refresh rate.
     fn sync_anim_timer(&mut self) {
-        let animating =
-            !matches!(self.phase, Phase::Shown) || self.hover_expand.is_some() || self.content_fade.is_some();
+        let animating = !matches!(self.phase, Phase::Shown)
+            || self.hover_expand.is_some()
+            || self.content_fade.is_some()
+            || self.persistent_fade_active();
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
         let now = Instant::now();
         let raw = if animating || marquee_active {
@@ -967,6 +971,19 @@ impl OverlayState {
             self.delete_anim_timer();
         }
         self.ensure_anim_timer();
+    }
+
+    /// Whether the PersistentCompact idle-fade ramp is currently in progress.
+    /// Returns true only when the pill has already entered the faded (idle)
+    /// state, is not in the collapse-on-dismiss mode (fullscreen/listed
+    /// foreground), and the fade ramp hasn't elapsed yet.
+    fn persistent_fade_active(&self) -> bool {
+        self.config.overlay.layout == LayoutMode::PersistentCompact
+            && self.persistent_faded
+            && !self.persistent_collapse_on_dismiss
+            && self
+                .dismiss_at
+                .is_some_and(|d| d.elapsed() < Duration::from_millis(FADE_DURATION_MS))
     }
 
     fn delete_anim_timer(&mut self) {
@@ -1979,7 +1996,13 @@ impl OverlayState {
         // tick-cadence gap). The phase half of the condition stays on the
         // top-of-tick value, so a phase transition in this same tick still
         // renders its rest frame, exactly as before.
-        if layout_flipped || animating || self.hover_expand.is_some() || marquee_active || bar_moved {
+        if layout_flipped
+            || animating
+            || self.hover_expand.is_some()
+            || marquee_active
+            || bar_moved
+            || self.persistent_fade_active()
+        {
             self.render();
         }
         // Re-sync the timer to the phase: a static pill drops to the coarse
@@ -2140,7 +2163,7 @@ impl OverlayState {
                     // opacity over 300 ms once the dismiss timeout fires.
                     let idle = 64.0_f32; // 0.25 * 255
                     let fade_start = self.dismiss_at.unwrap_or_else(Instant::now);
-                    let t = ((fade_start.elapsed().as_secs_f32() - 0.3) / 0.3).clamp(0.0, 1.0);
+                    let t = (fade_start.elapsed().as_secs_f32() / 0.3).clamp(0.0, 1.0);
                     let alpha = 255.0 - (255.0 - idle) * t;
                     FrameState {
                         alpha: alpha as u8,
@@ -3815,6 +3838,37 @@ mod tests {
             "the pill must be flagged to collapse (not fade to idle) on dismiss"
         );
         assert!(state.held_content.is_some(), "the content must be saved for resume");
+    }
+
+    #[test]
+    fn persistent_idle_fade_renders_on_dismiss() {
+        // Regression: the idle-fade ramp (persistent_faded) must trigger a
+        // render on the static tick — otherwise the pill stays painted at full
+        // opacity and the 0.25 alpha is never applied (paused media, short
+        // titles where bar/marquee don't drive a repaint).
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        let track = track_for("spotify", "Song", "Artist");
+        state.content = Some(MediaEvent::TrackChanged(track));
+        state.phase = Phase::Shown;
+        // dismiss_at just in the past, within the 300ms fade window.
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.persistent_faded = false;
+        state.progress_playing = false; // paused: bar_moved won't drive a render
+        // hover_leave_at must be in the past so the "cursor leaves restart
+        // timer" branch doesn't reset dismiss_at to the future.
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        let before = state.render_count;
+        state.tick();
+
+        assert!(state.persistent_faded, "dismiss_at firing must set persistent_faded");
+        assert!(
+            state.render_count > before,
+            "the idle-fade must be painted, not just flagged"
+        );
     }
 
     #[test]
