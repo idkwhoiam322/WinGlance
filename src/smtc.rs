@@ -206,6 +206,12 @@ struct ListenerState {
     /// its session when the transport buttons are used, so the fresh session's
     /// first state can be the actual transition).
     last_known_playback_per_source: HashMap<String, PlaybackState>,
+    /// The source the last pill (TrackChanged or PlaybackStateChanged) shown
+    /// to the overlay belonged to. The session-recreation dedup below only
+    /// applies while the pill already represents this source: an identical
+    /// re-report after another app's pill is a switch-back and must re-emit
+    /// (the pill needs to come back with the track's artwork), not noise.
+    last_pill_source: Option<String>,
     /// Cached app icons keyed by source_app label (derived from AUMID via
     /// `source_app_label`). Populated on first encounter of a source.
     icon_cache: HashMap<String, Option<Arc<[u8]>>>,
@@ -335,6 +341,7 @@ impl ListenerState {
             rejected_seen: HashSet::new(),
             last_track_per_source: HashMap::new(),
             last_known_playback_per_source: HashMap::new(),
+            last_pill_source: None,
             icon_cache: HashMap::new(),
             cached_allowed: None,
             last_emit_at: HashMap::new(),
@@ -546,7 +553,8 @@ impl ListenerState {
             self.last_known_playback_per_source.insert(source.clone(), state);
             next.playback = Some(state);
             info!("playback state changed | state={state:?} | source={source}");
-            events.push(MediaEvent::PlaybackStateChanged(state, source));
+            events.push(MediaEvent::PlaybackStateChanged(state, source.clone()));
+            self.last_pill_source = Some(source);
         }
 
         // Content is only diffed while the session is not stopped; a stopped
@@ -712,10 +720,18 @@ impl ListenerState {
                     // Out case: same session key, duration drift, poll read art=None
                     // vs last emit art=Some). Cached artwork injection (above) makes
                     // event reads for recreated sessions also see Some==Some.
-                    let session_recreation = self
-                        .last_track_per_source
-                        .get(&merged.source_app)
-                        .is_some_and(|prev_track| is_session_recreation(prev_track, &merged, read_artwork));
+                    // Suppression applies only while the pill already on screen
+                    // belongs to this source (last_pill_source): after another
+                    // app's pill, the identical re-report is a switch-back that
+                    // must re-emit — the overlay's cache for this source may
+                    // already be evicted, so the pill needs the fresh track
+                    // (with injected art) to come back itself.
+                    let session_recreation = should_suppress_recreation(
+                        self.last_track_per_source.get(&merged.source_app),
+                        &merged,
+                        read_artwork,
+                        self.last_pill_source.as_deref(),
+                    );
                     // A recreated session starts from a default LogicalState, so
                     // its first read reports the new session's default playback
                     // state (e.g. Paused while the user never touched anything)
@@ -747,6 +763,7 @@ impl ListenerState {
                             emitted.decoded_art.as_deref(),
                         );
                         events.push(MediaEvent::TrackChanged(emitted));
+                        self.last_pill_source = Some(merged.source_app.clone());
                         self.last_track_per_source
                             .insert(merged.source_app.clone(), merged.clone());
                         self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
@@ -1434,6 +1451,26 @@ fn is_session_recreation(prev_track: &TrackInfo, merged: &TrackInfo, read_artwor
                 _ => false,
             }
         }
+}
+
+/// Whether a same-track re-report should be suppressed as recreation noise.
+/// `is_session_recreation` is time-blind: it compares only against the last
+/// track emitted per source, so a re-report arriving long after that emit
+/// (another app's pill in between — a switch-back) would be wrongly
+/// suppressed. Suppress only while the pill already on screen belongs to the
+/// re-reporting source (`last_pill_source`); after another app's pill, the
+/// re-report is a real re-emit — the overlay's cache for the source may
+/// already be evicted, and the pill needs the fresh track (cached art
+/// injected above) to come back itself.
+fn should_suppress_recreation(
+    last_track: Option<&TrackInfo>,
+    merged: &TrackInfo,
+    read_artwork: bool,
+    last_pill_source: Option<&str>,
+) -> bool {
+    last_track.is_some_and(|prev_track| {
+        is_session_recreation(prev_track, merged, read_artwork) && last_pill_source == Some(merged.source_app.as_str())
+    })
 }
 
 /// Whether a recreated session's first playback report is spurious noise
@@ -2423,6 +2460,57 @@ mod tests {
             &track("Song", "Other"),
             true,
         ));
+    }
+
+    #[test]
+    fn recreation_suppression_only_applies_while_own_pill_is_shown() {
+        // The ZuneMusic -> YouTube Music switch-back case: the last emitted
+        // track for youtube-music ("All Fall Down", 19 min ago) is re-reported
+        // by a recreated session, but the last pill on screen belongs to
+        // ZuneMusic. The re-report must re-emit (the overlay cache was evicted
+        // in the meantime), not be suppressed as recreation noise.
+        let source = "youtube-music";
+        let prev = TrackInfo {
+            source_app: source.into(),
+            ..track("All Fall Down", "OneRepublic")
+        };
+        let same = TrackInfo {
+            source_app: source.into(),
+            ..track("All Fall Down", "OneRepublic")
+        };
+        // Pill already shows this source's track: recreation noise.
+        assert!(should_suppress_recreation(Some(&prev), &same, true, Some(source)));
+        // Another app's pill was the last thing shown: switch-back re-emits.
+        assert!(!should_suppress_recreation(Some(&prev), &same, true, Some("ZuneMusic")));
+        // No pill shown yet (first emit of the session): never suppressed.
+        assert!(!should_suppress_recreation(Some(&prev), &same, true, None));
+        // No prior emit for this source: no dedup baseline.
+        assert!(!should_suppress_recreation(None, &same, true, Some(source)));
+        // A different track is never recreation noise.
+        assert!(!should_suppress_recreation(
+            Some(&prev),
+            &TrackInfo {
+                source_app: source.into(),
+                ..track("Tyrant", "OneRepublic")
+            },
+            true,
+            Some(source)
+        ));
+        // Poll reads (no artwork read) keep the same suppression behavior.
+        assert!(should_suppress_recreation(Some(&prev), &same, false, Some(source)));
+        assert!(!should_suppress_recreation(
+            Some(&prev),
+            &same,
+            false,
+            Some("ZuneMusic")
+        ));
+        // Artwork gained on the re-report is never suppressed: the pill must
+        // refresh with the cover even while its own pill is on screen.
+        let with_art = TrackInfo {
+            artwork: Some(Arc::from(vec![1])),
+            ..same.clone()
+        };
+        assert!(!should_suppress_recreation(Some(&prev), &with_art, true, Some(source)));
     }
 
     #[test]
