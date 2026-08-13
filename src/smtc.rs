@@ -541,6 +541,12 @@ impl ListenerState {
         // path as Playing/Paused and can produce a pill like any other real
         // transition. Transitional statuses leave the stored state untouched.
         let mut known_playback = None;
+        // The session-recreation gate below must see the pill already on
+        // screen BEFORE this batch: the batch's own state event (pushed
+        // below) updates last_pill_source, which would otherwise attribute
+        // the batch to this source prematurely and suppress the switch-back
+        // re-emit it must produce.
+        let pill_source_before = self.last_pill_source.clone();
         if playback != prev.playback
             && let Some(state) = playback
         {
@@ -730,7 +736,7 @@ impl ListenerState {
                         self.last_track_per_source.get(&merged.source_app),
                         &merged,
                         read_artwork,
-                        self.last_pill_source.as_deref(),
+                        pill_source_before.as_deref(),
                     );
                     // A recreated session starts from a default LogicalState, so
                     // its first read reports the new session's default playback
@@ -1461,7 +1467,9 @@ fn is_session_recreation(prev_track: &TrackInfo, merged: &TrackInfo, read_artwor
 /// re-reporting source (`last_pill_source`); after another app's pill, the
 /// re-report is a real re-emit — the overlay's cache for the source may
 /// already be evicted, and the pill needs the fresh track (cached art
-/// injected above) to come back itself.
+/// injected above) to come back itself. The caller passes the value captured
+/// before the current batch's own state event was pushed: that event would
+/// otherwise attribute the batch to this source prematurely.
 fn should_suppress_recreation(
     last_track: Option<&TrackInfo>,
     merged: &TrackInfo,
