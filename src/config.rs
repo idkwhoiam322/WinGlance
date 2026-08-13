@@ -464,7 +464,14 @@ impl Config {
         };
         match toml::from_str::<Config>(&content) {
             Ok(mut config) => {
+                // Report anything normalize() clamped: a value the user's
+                // config.toml declares must never differ from the value in
+                // effect without a visible log line.
+                let before = config.clone();
                 config.normalize();
+                for change in Self::normalized_changes(&before, &config) {
+                    warn!("{change}");
+                }
                 debug!("config loaded from {config_path:?}");
                 Ok(config)
             }
@@ -547,6 +554,112 @@ impl Config {
         self.appearance.font_size_title = self.appearance.font_size_title.clamp(8.0, 32.0);
         self.appearance.font_size_artist = self.appearance.font_size_artist.clamp(8.0, 28.0);
     }
+
+    /// Logs every setting in effect for this run, one line per section in the
+    /// same on-disk form a hand-edited `config.toml` uses, plus a warning for
+    /// each unknown key the file contained (top level or nested under a
+    /// section). Unknown keys are preserved across saves (see `unknown`) and
+    /// must never pass silently. Called once at startup, right after load.
+    pub fn log_settings(&self) {
+        info!("config in effect for this run (persistable={})", self.persistable);
+        info!("config [overlay] {}", toml_line(&self.overlay));
+        info!("config [behavior] {}", toml_line(&self.behavior));
+        info!("config [appearance] {}", toml_line(&self.appearance));
+        warn_unknown_keys("(top level)", &self.unknown);
+        warn_unknown_keys("[overlay]", &self.overlay.unknown);
+        warn_unknown_keys("[behavior]", &self.behavior.unknown);
+        warn_unknown_keys("[appearance]", &self.appearance.unknown);
+    }
+
+    /// Strings describing every numeric setting that `normalize()` moved off
+    /// the value the user wrote, one per clamped field. Pure (no logging), so
+    /// callers control the emission and tests can assert the report.
+    fn normalized_changes(before: &Self, after: &Self) -> Vec<String> {
+        fn diff<T: PartialEq + std::fmt::Debug>(key: &str, before: T, after: T) -> Option<String> {
+            (before != after)
+                .then(|| format!("config {key} was outside its allowed range; normalized {before:?} -> {after:?}"))
+        }
+        [
+            diff(
+                "overlay.duration_ms",
+                before.overlay.duration_ms,
+                after.overlay.duration_ms,
+            ),
+            diff(
+                "overlay.animation_ms",
+                before.overlay.animation_ms,
+                after.overlay.animation_ms,
+            ),
+            diff("overlay.max_width", before.overlay.max_width, after.overlay.max_width),
+            diff(
+                "overlay.max_tick_hz",
+                before.overlay.max_tick_hz,
+                after.overlay.max_tick_hz,
+            ),
+            diff("overlay.margin", before.overlay.margin, after.overlay.margin),
+            diff(
+                "overlay.compact_margin",
+                before.overlay.compact_margin,
+                after.overlay.compact_margin,
+            ),
+            diff(
+                "behavior.debounce_ms",
+                before.behavior.debounce_ms,
+                after.behavior.debounce_ms,
+            ),
+            diff(
+                "appearance.corner_radius",
+                before.appearance.corner_radius,
+                after.appearance.corner_radius,
+            ),
+            diff(
+                "appearance.compact_corner_radius",
+                before.appearance.compact_corner_radius,
+                after.appearance.compact_corner_radius,
+            ),
+            diff(
+                "appearance.padding",
+                before.appearance.padding,
+                after.appearance.padding,
+            ),
+            diff(
+                "appearance.art_size",
+                before.appearance.art_size,
+                after.appearance.art_size,
+            ),
+            diff(
+                "appearance.font_size_title",
+                before.appearance.font_size_title,
+                after.appearance.font_size_title,
+            ),
+            diff(
+                "appearance.font_size_artist",
+                before.appearance.font_size_artist,
+                after.appearance.font_size_artist,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+/// One-line rendering of a config section in its on-disk form, for the
+/// startup dump. Sections serialize through their own serde impls, so the
+/// dump shows exactly the keys and spellings a user's config.toml uses.
+fn toml_line<T: Serialize>(value: &T) -> String {
+    toml::to_string(value)
+        .map(|text| text.replace('\n', " ").trim_end().to_string())
+        .unwrap_or_else(|_| "<unserializable>".to_string())
+}
+
+/// Warns once per unknown key a config file section contained. The keys were
+/// captured into the section's `unknown` table and are preserved on save, but
+/// they must not pass silently at startup.
+fn warn_unknown_keys(section: &str, unknown: &toml::Table) {
+    for key in unknown.keys() {
+        warn!("config {section} holds unknown field {key:?}; it is ignored and preserved on save");
+    }
 }
 
 #[cfg(test)]
@@ -564,6 +677,44 @@ mod tests {
         assert_eq!(config.overlay.max_width, 800);
         assert_eq!(config.appearance.art_size, 24);
         assert_eq!(config.behavior.debounce_ms, 150);
+    }
+
+    #[test]
+    fn normalized_changes_reports_only_clamped_values() {
+        let mut raw = Config::default();
+        raw.overlay.max_width = 1000; // clamps to 800
+        raw.behavior.debounce_ms = 1; // clamps to 150
+        raw.appearance.art_size = 0; // clamps to 24
+        raw.overlay.duration_ms = 12_000; // in range: must not be reported
+        let after = {
+            let mut config = raw.clone();
+            config.normalize();
+            config
+        };
+        let changes = Config::normalized_changes(&raw, &after);
+        assert_eq!(changes.len(), 3, "{changes:#?}");
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("overlay.max_width") && c.contains("1000") && c.contains("800")),
+            "{changes:#?}"
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("behavior.debounce_ms") && c.contains("150")),
+            "{changes:#?}"
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("appearance.art_size") && c.contains("24")),
+            "{changes:#?}"
+        );
+        assert!(
+            !changes.iter().any(|c| c.contains("duration_ms")),
+            "an in-range value must not be reported: {changes:#?}"
+        );
     }
 
     #[test]

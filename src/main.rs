@@ -378,6 +378,7 @@ fn main() -> Result<()> {
     let reload_config = std::env::args_os().any(|arg| arg == "--reload-config");
     logging::init_logging(&config::Config::default().logs_dir(), reload_config);
     let config = config::Config::load()?;
+    config.log_settings();
     install_crash_handler(&config.logs_dir());
     install_panic_hook(&config.logs_dir());
 
