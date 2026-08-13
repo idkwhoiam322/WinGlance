@@ -194,7 +194,6 @@ const SETTINGS_FAINT: [u8; 4] = [0x7A, 0x7A, 0x7A, 0xFF];
 /// below stay in lockstep — a drift between the two would silently recompute
 /// the wrong backdrop for the label guard.
 const SETTINGS_ACCENT_SOFT_WEIGHT: f32 = 0.28;
-const SETTINGS_NEAR_WEIGHT: f32 = 0.55;
 const SETTINGS_ADJUST_HOVER_WEIGHT: f32 = 0.45;
 
 /// Blends `a` over `b` (0.0 = b, 1.0 = a).
@@ -487,9 +486,6 @@ struct SettingsBrushes {
     accent: HBRUSH,
     /// Accent blended toward the surface at 28%, the fill of active segments.
     accent_soft: HBRUSH,
-    /// Accent blended toward the surface at 55%, the fill of approximate
-    /// (non-exact) duration presets.
-    near: HBRUSH,
     /// Accent blended toward the surface at 45%, the hovered Adjust fill.
     adjust_hover: HBRUSH,
     /// Flat dark fill of idle outline buttons.
@@ -691,7 +687,6 @@ struct MainWindowState {
     settings_surface_brush: HBRUSH,
     settings_hover_brush: HBRUSH,
     settings_accent_soft_brush: HBRUSH,
-    settings_near_brush: HBRUSH,
     settings_adjust_hover_brush: HBRUSH,
     settings_small_fill_brush: HBRUSH,
     settings_small_hover_brush: HBRUSH,
@@ -887,7 +882,6 @@ impl MainWindowState {
             settings_surface_brush: HBRUSH::default(),
             settings_hover_brush: HBRUSH::default(),
             settings_accent_soft_brush: HBRUSH::default(),
-            settings_near_brush: HBRUSH::default(),
             settings_adjust_hover_brush: HBRUSH::default(),
             settings_small_fill_brush: HBRUSH::default(),
             settings_small_hover_brush: HBRUSH::default(),
@@ -1217,7 +1211,6 @@ impl MainWindowState {
             for brush in [
                 &mut self.accent_brush,
                 &mut self.settings_accent_soft_brush,
-                &mut self.settings_near_brush,
                 &mut self.settings_adjust_hover_brush,
                 &mut self.settings_small_hover_brush,
                 &mut self.sidebar_highlight_brush,
@@ -1234,7 +1227,6 @@ impl MainWindowState {
                 CreateSolidBrush(colorref(c[0], c[1], c[2]))
             };
             self.settings_accent_soft_brush = soft(SETTINGS_ACCENT_SOFT_WEIGHT);
-            self.settings_near_brush = soft(SETTINGS_NEAR_WEIGHT);
             self.settings_adjust_hover_brush = soft(SETTINGS_ADJUST_HOVER_WEIGHT);
             self.settings_small_hover_brush = soft(0.35);
             let highlight = |weight: f32| -> HBRUSH {
@@ -2157,7 +2149,6 @@ impl MainWindowState {
             hover: self.settings_hover_brush,
             accent: self.accent_brush,
             accent_soft: self.settings_accent_soft_brush,
-            near: self.settings_near_brush,
             adjust_hover: self.settings_adjust_hover_brush,
             small_fill: self.settings_small_fill_brush,
             small_hover: self.settings_small_hover_brush,
@@ -2366,27 +2357,18 @@ impl MainWindowState {
                             );
                         }
                         SettingId::Duration => {
-                            let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
+                            // Four preset tiles plus a Custom tile that opens
+                            // the input dialog; a value outside the presets
+                            // (dialog or hand-edited) activates Custom.
+                            let segments = segment_rects(&control_rect, 5, (4.0 * scale) as i32);
                             let values = [2000u64, 3000, 5000, 10000];
                             let exact = values.contains(&duration_ms);
-                            // Nearest preset, for when the config holds a value
-                            // outside the four presets (e.g. hand-edited).
-                            let nearest = values
-                                .iter()
-                                .enumerate()
-                                .min_by_key(|(_, v)| v.abs_diff(duration_ms))
-                                .map(|(i, _)| i)
-                                .unwrap_or(0);
                             for (i, seg) in segments.iter().enumerate() {
-                                let active = duration_ms == values[i];
-                                let near = !exact && i == nearest;
+                                let is_custom = i == 4;
+                                let active = if is_custom { !exact } else { duration_ms == values[i] };
                                 let seg_hovered = settings_hover == Some((current_row, SettingSub::Seg(i)));
                                 unsafe {
-                                    let _ = FillRect(
-                                        hdc,
-                                        seg,
-                                        if active || near { brushes.accent } else { brushes.border },
-                                    );
+                                    let _ = FillRect(hdc, seg, if active { brushes.accent } else { brushes.border });
                                 }
                                 let s_inner = RECT {
                                     left: seg.left + 1,
@@ -2394,13 +2376,8 @@ impl MainWindowState {
                                     right: seg.right - 1,
                                     bottom: seg.bottom - 1,
                                 };
-                                // Approximate preset: dimmer accent fill than
-                                // the exact match, so "saved but not exact" is
-                                // visible.
                                 let fill = if active {
                                     brushes.accent_soft
-                                } else if near {
-                                    brushes.near
                                 } else if seg_hovered {
                                     brushes.hover
                                 } else {
@@ -2410,20 +2387,15 @@ impl MainWindowState {
                                     let _ = FillRect(hdc, &s_inner, fill);
                                 }
                                 let mut t = s_inner;
-                                let tc = if active || near { SETTINGS_TEXT } else { SETTINGS_MUTED };
-                                // The near-segment fill is a tint of the accent;
-                                // for a light accent that tint can sit too close
-                                // to white text. Clamp the label against the
-                                // actual fill color — a no-op for accents dark
-                                // enough to already pass AA.
-                                let tc = if near {
-                                    let fill = mix(accent, SETTINGS_SURFACE, SETTINGS_NEAR_WEIGHT);
-                                    crate::overlay::ensure_contrast(tc, fill, crate::overlay::TEXT_CONTRAST_AA)
-                                } else {
-                                    tc
-                                };
-                                let label = if near {
-                                    format!("≈{}s", values[i] / 1000)
+                                let tc = if active { SETTINGS_TEXT } else { SETTINGS_MUTED };
+                                // The Custom tile shows the actual value while
+                                // active, like the tray menu's "Custom (Xs)".
+                                let label = if is_custom {
+                                    if exact {
+                                        "Custom".to_string()
+                                    } else {
+                                        format!("{}s", duration_ms as f64 / 1000.0)
+                                    }
                                 } else {
                                     format!("{}s", values[i] / 1000)
                                 };
@@ -2434,7 +2406,7 @@ impl MainWindowState {
                                     &mut t,
                                     (10.0 * scale) as i32,
                                     tc,
-                                    active || near,
+                                    active,
                                     true,
                                 );
                             }
@@ -2800,7 +2772,7 @@ impl MainWindowState {
             {
                 let control_rect = row_split(rect, scale).control;
                 if *id == SettingId::Duration {
-                    let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
+                    let segments = segment_rects(&control_rect, 5, (4.0 * scale) as i32);
                     let seg = segments.iter().position(|s| x >= s.left && x < s.right);
                     // A click or hover in the gap right of the last segment is
                     // not the first segment; the row stays highlighted.
@@ -2889,7 +2861,7 @@ impl MainWindowState {
                 let control_rect = row_split(rect, scale).control;
                 match *id {
                     SettingId::Duration => {
-                        for (i, s) in segment_rects(&control_rect, 4, gap).iter().enumerate() {
+                        for (i, s) in segment_rects(&control_rect, 5, gap).iter().enumerate() {
                             out.push(SettingsFocus {
                                 row_index,
                                 sub: SettingSub::Seg(i),
@@ -3163,7 +3135,6 @@ impl MainWindowState {
                 &self.history_row_even_brush,
                 &self.history_row_odd_brush,
                 &self.settings_accent_soft_brush,
-                &self.settings_near_brush,
                 &self.settings_adjust_hover_brush,
                 &self.settings_small_fill_brush,
                 &self.settings_small_hover_brush,
@@ -3880,15 +3851,20 @@ fn show_tray_menu(state: &mut MainWindowState) {
             };
             let _ = AppendMenuW(duration_menu, flags, id, PCWSTR(wide(label).as_ptr()));
         }
-        if !is_preset {
-            let label = format!("Custom ({current_secs}s)");
-            let _ = AppendMenuW(
-                duration_menu,
-                MF_STRING | MF_CHECKED,
-                MENU_DURATION_CUSTOM,
-                PCWSTR(wide(&label).as_ptr()),
-            );
-        }
+        // Always-available custom duration: plain "Custom" when a preset is
+        // active, checked "Custom (Xs)" when the value is outside the presets.
+        // Both open the input dialog.
+        let custom_label = if is_preset {
+            "Custom".to_string()
+        } else {
+            format!("Custom ({current_secs}s)")
+        };
+        let _ = AppendMenuW(
+            duration_menu,
+            if is_preset { MF_STRING } else { MF_STRING | MF_CHECKED },
+            MENU_DURATION_CUSTOM,
+            PCWSTR(wide(&custom_label).as_ptr()),
+        );
         let _ = AppendMenuW(
             menu,
             MF_POPUP,
@@ -4010,9 +3986,17 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = 10000);
                     set_duration(state.overlay_hwnd, 10000);
                 }
-                // Custom duration is already the current value; clicking it
-                // is a no-op (the entry just shows what the value is).
-                MENU_DURATION_CUSTOM => {}
+                // Custom duration opens a modal dialog so an arbitrary value
+                // can be entered; the change is applied the same way as the
+                // presets, via the overlay message.
+                MENU_DURATION_CUSTOM => {
+                    let current_ms = state.cfg().overlay.duration_ms;
+                    if let Some(duration) = crate::duration_dialog::show_duration_dialog(state.hwnd, current_ms) {
+                        state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
+                        set_duration(state.overlay_hwnd, duration);
+                        info!("custom overlay duration set to {duration} ms");
+                    }
+                }
                 MENU_MONITOR_ACTIVE => state.apply_monitor(MonitorMode::ActiveWindow),
                 MENU_MONITOR_PRIMARY => state.apply_monitor(MonitorMode::Primary),
                 _ if command >= MENU_MONITOR_DISPLAY_BASE && command < MENU_MONITOR_DISPLAY_BASE + displays.len() => {
@@ -4352,14 +4336,27 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                     state.invalidate();
                                 }
                                 SettingId::Duration => {
-                                    let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
+                                    let segments = segment_rects(&control_rect, 5, (4.0 * scale) as i32);
                                     let values = [2000u64, 3000, 5000, 10000];
                                     if let Some((i, _)) =
                                         segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right)
                                     {
-                                        let duration = values[i];
-                                        state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
-                                        set_duration(state.overlay_hwnd, duration);
+                                        // The Custom tile asks for a value; the
+                                        // chosen one is applied like a preset.
+                                        if i == 4 {
+                                            let current_ms = state.cfg().overlay.duration_ms;
+                                            if let Some(duration) =
+                                                crate::duration_dialog::show_duration_dialog(hwnd, current_ms)
+                                            {
+                                                state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
+                                                set_duration(state.overlay_hwnd, duration);
+                                                info!("custom overlay duration set to {duration} ms");
+                                            }
+                                        } else {
+                                            let duration = values[i];
+                                            state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
+                                            set_duration(state.overlay_hwnd, duration);
+                                        }
                                         state.invalidate();
                                     }
                                 }

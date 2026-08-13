@@ -2,6 +2,7 @@
 
 mod autostart;
 mod config;
+mod duration_dialog;
 mod events;
 mod gdi;
 mod icon;
