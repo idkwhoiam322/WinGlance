@@ -116,6 +116,16 @@ const ARTWORK_RETRY_BUDGET: u8 = 3;
 /// re-read by the poll.
 const SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long a source may be absent from the session snapshot before the
+/// worker settles its terminal `Stopped`. YouTube Music tears down and
+/// re-registers its SMTC session on every track change (and periodically
+/// mid-song), leaving a gap where the source is absent from one snapshot;
+/// settling inside that gap fires a spurious STOP followed by a fresh
+/// PLAYING pill for the same song. Twice the check interval: a recreated
+/// session re-registers within one poll, and a genuinely quitting app still
+/// retires its pill ~4s after the last session goes.
+const TERMINAL_STOP_GRACE: Duration = Duration::from_secs(4);
+
 /// Capacity of the signal channel between the WinRT event handlers and the
 /// listener loop. `try_send` drops a signal when the queue is full; that is
 /// safe because every dropped signal is a coalescible wake-up — the dirty-set
@@ -210,9 +220,12 @@ struct ListenerState {
     /// Source apps whose last session reported Closed (or vanished from the
     /// session snapshot between syncs) and still owe the overlay a terminal
     /// `Stopped`, so a persistent pill does not linger at idle opacity
-    /// forever. Settled in `sync_subscriptions`, where the full session
-    /// snapshot decides whether the source is really gone.
-    terminal_pending: HashSet<String>,
+    /// forever. Each entry records when the source was first seen gone;
+    /// `sync_subscriptions` settles the Stopped only once the source has been
+    /// absent for `TERMINAL_STOP_GRACE`, so a source that recreates its
+    /// session (YouTube Music does this on every track change) does not fire
+    /// a spurious STOP in the snapshot gap.
+    terminal_pending: HashMap<String, Instant>,
     /// Heartbeat touched each loop iteration so the supervisor can detect a
     /// stall and restart the listener.
     heartbeat: Arc<Mutex<Instant>>,
@@ -393,7 +406,7 @@ impl ListenerState {
             churn: HashMap::new(),
             churn_cooldown: HashMap::new(),
             rejected_seen: HashSet::new(),
-            terminal_pending: HashSet::new(),
+            terminal_pending: HashMap::new(),
             last_track_per_source: HashMap::new(),
             last_known_playback_per_source: HashMap::new(),
             now_showing,
@@ -585,7 +598,7 @@ impl ListenerState {
             let source = read_source_app(session);
             debug!("SMTC session closed | key={key} | source={source}");
             self.evict(key);
-            self.terminal_pending.insert(source);
+            self.terminal_pending.insert(source, Instant::now());
             return Ok(());
         }
         let playback = match status {
@@ -1184,14 +1197,17 @@ impl ListenerState {
         // vanished sources are collected BEFORE the eviction below, which
         // removes the subscriptions this pass reads; the settlement then uses
         // the full snapshot to decide the source is really gone. Emitted at
-        // most once per disappearance: the per-source cache retention below
-        // drops the warranting playback state for departed sources.
+        // most once per disappearance. A source that simply recreates its
+        // session (YouTube Music does this on every track change) is absent
+        // from one snapshot and then returns; the grace window below keeps its
+        // entry (and its caches, via the retention predicates further down)
+        // alive so no spurious STOP fires in that gap.
         let alive_sources: HashSet<String> = sessions.iter().map(read_source_app).collect();
         for key in &stale {
             if let Some(subscription) = self.subscriptions.get(key) {
                 let source = read_source_app(&subscription.session);
                 if !alive_sources.contains(&source) {
-                    self.terminal_pending.insert(source);
+                    self.terminal_pending.insert(source, Instant::now());
                 }
             }
         }
@@ -1200,17 +1216,19 @@ impl ListenerState {
             self.evict(*key);
         }
         let mut settled: Vec<String> = Vec::new();
-        self.terminal_pending.retain(|source| {
-            if alive_sources.contains(source) {
-                // The source still has an open session: a Closed that leaves
-                // siblings behind is not a disappearance. Keep the entry until
-                // the last session goes, so a Closed that outlived its own
-                // snapshot entry still settles.
-                true
-            } else {
-                settled.push(source.clone());
-                false
+        self.terminal_pending.retain(|source, absent_since| {
+            let alive = alive_sources.contains(source);
+            // A source still open restarts its grace from this scan, so a
+            // later absence is measured from the last time it was actually
+            // seen, not from an earlier Closed report.
+            if alive {
+                *absent_since = Instant::now();
             }
+            let keep = terminal_pending_keep(alive, absent_since.elapsed(), TERMINAL_STOP_GRACE);
+            if !keep {
+                settled.push(source.clone());
+            }
+            keep
         });
         for source in settled {
             // Skip sources whose only report was Stopped (already announced)
@@ -1240,11 +1258,18 @@ impl ListenerState {
         // Evict source-level caches for apps that no longer have an open
         // session: their cached track (with artwork bytes) and icon would
         // otherwise persist forever, growing with every AUMID variant seen.
-        self.last_track_per_source.retain(|source, _| active.contains(source));
+        // A source still inside the terminal-Stop grace keeps its caches:
+        // the settle below reads the last playback state to warrant the
+        // Stopped, and the recreation-suppression compares the cached track
+        // when the recreated session reports the same song again.
+        self.last_track_per_source
+            .retain(|source, _| active.contains(source) || self.terminal_pending.contains_key(source));
         self.last_known_playback_per_source
-            .retain(|source, _| active.contains(source));
-        self.icon_cache.retain(|source, _| active.contains(source));
-        self.last_emit_at.retain(|source, _| active.contains(source));
+            .retain(|source, _| active.contains(source) || self.terminal_pending.contains_key(source));
+        self.icon_cache
+            .retain(|source, _| active.contains(source) || self.terminal_pending.contains_key(source));
+        self.last_emit_at
+            .retain(|source, _| active.contains(source) || self.terminal_pending.contains_key(source));
         // Churn counts for departed sources are worthless and would otherwise
         // accumulate one deque per distinct source ever seen.
         self.churn.retain(|source, _| active.contains(source));
@@ -2597,6 +2622,16 @@ fn terminal_stopped_warranted(last_known: Option<PlaybackState>, on_cooldown: bo
     !on_cooldown && matches!(last_known, Some(PlaybackState::Playing | PlaybackState::Paused))
 }
 
+/// Whether a pending terminal-Stopped entry survives this sync pass. A source
+/// that still has an open session in the snapshot is not gone at all; a source
+/// missing from the snapshot for less than `grace` may simply be mid-way
+/// through recreating its session (YouTube Music tears down and re-registers
+/// on every track change), so it must not be settled yet. Only a source
+/// absent for the full grace settles, retiring a genuine last-source quit.
+fn terminal_pending_keep(alive_in_snapshot: bool, absent_for: Duration, grace: Duration) -> bool {
+    alive_in_snapshot || absent_for < grace
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2614,6 +2649,33 @@ mod tests {
         assert!(!terminal_stopped_warranted(None, false));
         // A churning source stays silent while on the cool-down.
         assert!(!terminal_stopped_warranted(Some(PlaybackState::Playing), true));
+    }
+
+    #[test]
+    fn terminal_pending_keep_walks_the_grace_window() {
+        // A source with an open session is never settled, no matter how long
+        // the entry has been around.
+        assert!(terminal_pending_keep(
+            true,
+            Duration::from_secs(60),
+            TERMINAL_STOP_GRACE
+        ));
+        // A source absent for less than the grace is kept: it may be
+        // mid-recreation (the new session registers within one poll).
+        assert!(terminal_pending_keep(
+            false,
+            TERMINAL_STOP_GRACE / 2,
+            TERMINAL_STOP_GRACE
+        ));
+        // The boundary itself settles: exactly the grace means the source is
+        // really gone.
+        assert!(!terminal_pending_keep(false, TERMINAL_STOP_GRACE, TERMINAL_STOP_GRACE));
+        // Absence beyond the grace settles too.
+        assert!(!terminal_pending_keep(
+            false,
+            TERMINAL_STOP_GRACE + Duration::from_secs(1),
+            TERMINAL_STOP_GRACE
+        ));
     }
 
     #[test]
