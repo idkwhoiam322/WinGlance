@@ -124,6 +124,30 @@ const SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// unbounded queued COM session references.
 const SIGNAL_QUEUE_CAP: usize = 256;
 
+/// Hard admission caps defending the worker against a hostile process that
+/// registers unbounded GSMTC sessions/sources. A single desktop attacker can
+/// create unique sessions and sources at will; without these bounds the
+/// subscription map, per-source caches, and retained 8 MiB thumbnails would
+/// grow with the attacker-controlled set. The caps prioritize the current
+/// session and existing subscriptions, so a compliant active source is never
+/// squeezed out by a storm of new ones.
+const MAX_TRACKED_SESSIONS: usize = 64;
+const MAX_TRACKED_SOURCES: usize = 32;
+
+/// Largest single thumbnail the worker will read from an SMTC session, and the
+/// total retained raw-artwork budget across `last_track_per_source`. The
+/// per-source cap keeps one absurd thumbnail from consuming the whole budget;
+/// the total cap keeps a long-lived session from hoarding art indefinitely.
+/// When the total would be exceeded, artwork bytes are dropped while the
+/// metadata is retained, so the pill renders a placeholder instead of a stale
+/// cover.
+const MAX_THUMBNAIL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RETAINED_ARTWORK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Minimum gap between two overflow warnings, so a hostile storm of rejected
+/// sessions cannot flood the log with one WARN per rejected session.
+const OVERFLOW_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Source labels of every currently open SMTC session, refreshed at each
 /// subscription re-sync. The process picker reads this so media apps that run
 /// without a visible window (tray-only Electron apps, background browser
@@ -230,6 +254,10 @@ struct ListenerState {
     /// Cached app icons keyed by source_app label (derived from AUMID via
     /// `source_app_label`). Populated on first encounter of a source.
     icon_cache: HashMap<String, Option<Arc<[u8]>>>,
+    /// When the last overflow warning fired. Bounds the admission-rejection log
+    /// to one line per `OVERFLOW_WARN_INTERVAL` during a hostile session storm,
+    /// instead of one WARN per rejected session.
+    last_overflow_warn: Option<Instant>,
     /// Last-seen `media_sources` config list plus its pre-normalized
     /// patterns. The per-session check runs on the hot path (every re-sync
     /// of every session), so the clone of the config list and the per-pattern
@@ -373,6 +401,7 @@ impl ListenerState {
             cached_allowed: None,
             last_emit_at: HashMap::new(),
             palette_per_identity: HashMap::new(),
+            last_overflow_warn: None,
             heartbeat,
             live_generation,
             my_generation,
@@ -732,8 +761,12 @@ impl ListenerState {
                             // pill. A later genuine cover swap still re-reads
                             // differently and emits normally.
                             if artwork_refresh_absorbed(&events, &merged) {
-                                self.last_track_per_source
-                                    .insert(merged.source_app.clone(), merged.clone());
+                                store_last_track(
+                                    &mut self.last_track_per_source,
+                                    merged.source_app.clone(),
+                                    merged.clone(),
+                                    MAX_RETAINED_ARTWORK_BYTES,
+                                );
                                 self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
                                 let label = track_label(&merged);
                                 debug!("artwork refresh absorbed | reason=state-change-in-batch | {label}");
@@ -811,8 +844,12 @@ impl ListenerState {
                         // not recompute (and drift) from re-encoded thumbnails.
                         emitted.palette = self.palette_for_identity(&merged, emitted.decoded_art.as_deref());
                         events.push(MediaEvent::TrackChanged(emitted));
-                        self.last_track_per_source
-                            .insert(merged.source_app.clone(), merged.clone());
+                        store_last_track(
+                            &mut self.last_track_per_source,
+                            merged.source_app.clone(),
+                            merged.clone(),
+                            MAX_RETAINED_ARTWORK_BYTES,
+                        );
                         self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
                         next.deferred_at = None;
                     } else if emit && session_recreation {
@@ -944,14 +981,66 @@ impl ListenerState {
             sessions.push(current.clone());
         }
         let before: HashSet<usize> = self.subscriptions.keys().copied().collect();
+        let alive: HashSet<usize> = sessions.iter().map(session_key).collect();
+
+        // Admission priority for the global caps: current session first, then
+        // sessions already subscribed (preserving snapshot order), then
+        // genuinely new sessions. A hostile storm of new sessions therefore
+        // cannot evict existing subscriptions when the caps are applied:
+        // overflow is rejected, and a brand-new *current* session displaces
+        // the weakest survivor(s) instead of being starved
+        // (`displace_survivors`) — the caps still bound the total tracked
+        // set. The allow-list and current-session filters are applied within
+        // the loop; the cap itself only counts sessions that pass those
+        // filters.
+        let mut prioritized: Vec<(GlobalSystemMediaTransportControlsSession, usize, String)> =
+            Vec::with_capacity(sessions.len());
+        if let Some(cur) = current.as_ref() {
+            let cur_key = session_key(cur);
+            if alive.contains(&cur_key) {
+                prioritized.push((cur.clone(), cur_key, read_source_app(cur)));
+            }
+        }
         for session in &sessions {
             let key = session_key(session);
-            let source = read_source_app(session);
+            if Some(key) == current_key {
+                continue;
+            }
+            if before.contains(&key) {
+                prioritized.push((session.clone(), key, read_source_app(session)));
+            }
+        }
+        for session in &sessions {
+            let key = session_key(session);
+            if Some(key) == current_key || before.contains(&key) {
+                continue;
+            }
+            prioritized.push((session.clone(), key, read_source_app(session)));
+        }
+        // Running source/session tallies seeded from subscriptions that
+        // survive this sync, so the caps bound the total tracked set, not
+        // only new additions. A stale subscription being evicted later in
+        // this same sync must not occupy a cap slot: the caps therefore
+        // count survivors only, which keeps the live loop in lockstep with
+        // the `admit_sessions` test model (which also counts survivors and
+        // nothing that is about to be evicted).
+        let mut admitted_sources: HashSet<String> = self
+            .subscriptions
+            .values()
+            .filter(|s| alive.contains(&session_key(&s.session)))
+            .map(|s| read_source_app(&s.session))
+            .collect();
+        let mut admitted_sessions: usize = self
+            .subscriptions
+            .values()
+            .filter(|s| alive.contains(&session_key(&s.session)))
+            .count();
+        let mut rejected_overflow: usize = 0;
+        for (session, key, source) in &prioritized {
             let allowed = self.session_source_allowed(session);
             debug!(
-                "SMTC session {} | key={key} | source={} | media_sources={:?}",
+                "SMTC session {} | key={key} | source={source} | media_sources={:?}",
                 if allowed { "accepted" } else { "rejected" },
-                read_source_app(session),
                 self.config
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -961,7 +1050,7 @@ impl ListenerState {
             if !allowed {
                 // Log rejected sessions once per appearance so the history
                 // shows every media source, not just the tracked ones.
-                if self.rejected_seen.insert(key) {
+                if self.rejected_seen.insert(*key) {
                     let source_app = read_source_app(session);
                     let (title, artist) = read_session_text(session, &source_app);
                     let state = read_session_state(session);
@@ -977,23 +1066,82 @@ impl ListenerState {
                 // source tripped the churn cool-down must not keep its event
                 // subscriptions: it would otherwise keep firing signals that
                 // every path discards.
-                self.evict(key);
+                self.evict(*key);
                 continue;
             }
-            if !session_matches_current_source(key, &source, current_key, current_source.as_deref()) {
+            if !session_matches_current_source(*key, source, current_key, current_source.as_deref()) {
                 debug!("SMTC session ignored | reason=not-current-session | key={key} | source={source}");
                 continue;
             }
             // A previously-rejected session that became allowed (config edit)
             // should re-report as accepted on its next rejection, if any.
-            self.rejected_seen.remove(&key);
-            if !before.contains(&key) {
-                self.record_churn(&read_source_app(session));
+            // Only an allowed AND current session clears the marker: a
+            // session that stays current-ineligible is not "accepted", so a
+            // later rejection after another config change must re-report
+            // instead of being swallowed by the stale marker.
+            self.rejected_seen.remove(key);
+            let is_new = !before.contains(key);
+            // Admission caps: a hostile process can register unbounded
+            // sessions/sources. Skip overflow entries before any metadata/art/icon
+            // read so they never allocate artwork or subscribe handlers. Existing
+            // subscriptions are already counted and so never re-blocked here.
+            if is_new
+                && admission_blocked(
+                    admitted_sessions,
+                    &admitted_sources,
+                    source.as_str(),
+                    MAX_TRACKED_SESSIONS,
+                    MAX_TRACKED_SOURCES,
+                )
+            {
+                // A brand-new *current* session must not be starved by a
+                // saturated set of survivors: the session the user actually
+                // switched to is exactly what the caps exist to protect.
+                // Displace the weakest survivor(s) instead of rejecting it —
+                // bounded, because the tallies updated in place never exceed
+                // the caps and the current session is already admitted now.
+                if Some(*key) == current_key {
+                    let displaced = self.displace_survivors(
+                        &prioritized,
+                        &alive,
+                        *key,
+                        source.as_str(),
+                        &mut admitted_sessions,
+                        &mut admitted_sources,
+                    );
+                    if displaced == 0 {
+                        rejected_overflow += 1;
+                        debug!(
+                            "SMTC current session not admitted | reason=admission-cap-not-relievable | key={key} | source={source} | sessions={} | sources={}",
+                            admitted_sessions,
+                            admitted_sources.len()
+                        );
+                        continue;
+                    }
+                    debug!(
+                        "SMTC current session admitted via survivor displacement | displaced={displaced} | key={key} | source={source}"
+                    );
+                } else {
+                    rejected_overflow += 1;
+                    debug!(
+                        "SMTC session not admitted | reason=admission-cap | key={key} | source={source} | sessions={} | sources={}",
+                        admitted_sessions,
+                        admitted_sources.len()
+                    );
+                    continue;
+                }
             }
-            let is_new = !before.contains(&key);
-            if let Err(error) = self.ensure_subscribed(session) {
-                debug!("subscribe failed for a session: {error:#}");
-            } else if is_new {
+            if is_new {
+                self.record_churn(source);
+            }
+            let subscribed = match self.ensure_subscribed(session) {
+                Ok(subscribed) => subscribed,
+                Err(error) => {
+                    debug!("subscribe failed for a session: {error:#}");
+                    false
+                }
+            };
+            if subscribed && is_new {
                 // Immediately read properties for newly discovered sessions.
                 // A source may fire MediaPropertiesChanged before we finish
                 // registering the event handler (the SessionsChanged event that
@@ -1003,9 +1151,17 @@ impl ListenerState {
                 if let Err(error) = self.refresh_session(session, true) {
                     debug!("initial refresh failed for session {key}: {error:#}");
                 }
+                admitted_sources.insert(source.clone());
+                admitted_sessions += 1;
             }
         }
-        let alive: HashSet<usize> = sessions.iter().map(session_key).collect();
+        if rejected_overflow > 0 && self.may_warn_overflow() {
+            warn!(
+                "SMTC admission cap reached; rejected {rejected_overflow} overflow session(s) \
+                 (max_tracked_sessions={MAX_TRACKED_SESSIONS}, max_tracked_sources={MAX_TRACKED_SOURCES})"
+            );
+            self.last_overflow_warn = Some(Instant::now());
+        }
         let mut stale: Vec<usize> = self
             .subscriptions
             .keys()
@@ -1074,8 +1230,11 @@ impl ListenerState {
         self.churn_cooldown.retain(|_, until| *until > Instant::now());
         // Keep the picker's candidate list in sync with what is actually
         // open, including apps whose sessions were rejected: checking them
-        // is how the user adds them to the allow-list.
-        let active_sources: Vec<String> = sessions.iter().map(read_source_app).collect();
+        // is how the user adds them to the allow-list. Dedup and cap it
+        // separately so a hostile session storm cannot grow the picker list
+        // without bound.
+        let active_sources: Vec<String> =
+            dedup_capped(sessions.iter().map(read_source_app).collect(), MAX_TRACKED_SOURCES);
         let active: HashSet<String> = active_sources.iter().cloned().collect();
         set_active_session_sources(active_sources);
         // Evict source-level caches for apps that no longer have an open
@@ -1171,8 +1330,12 @@ impl ListenerState {
         if emit {
             let label = track_label(&merged);
             info!("track changed | {label}");
-            self.last_track_per_source
-                .insert(merged.source_app.clone(), merged.clone());
+            store_last_track(
+                &mut self.last_track_per_source,
+                merged.source_app.clone(),
+                merged.clone(),
+                MAX_RETAINED_ARTWORK_BYTES,
+            );
             let mut emitted = with_decoded_art(merged.clone(), crate::events::ARTWORK_DECODE as usize);
             emitted.palette = self.palette_for_identity(&merged, emitted.decoded_art.as_deref());
             self.emit(MediaEvent::TrackChanged(emitted));
@@ -1307,6 +1470,13 @@ impl ListenerState {
         }
     }
 
+    /// Whether enough time has elapsed since the last overflow warning to emit
+    /// another, so a hostile session storm logs one WARN per
+    /// `OVERFLOW_WARN_INTERVAL` rather than one per rejected session.
+    fn may_warn_overflow(&self) -> bool {
+        overflow_warn_allowed(self.last_overflow_warn, OVERFLOW_WARN_INTERVAL)
+    }
+
     fn subscribe(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<SessionSubscription> {
         let properties_session = session.clone();
         let playback_session = session.clone();
@@ -1368,15 +1538,106 @@ impl ListenerState {
         })
     }
 
-    fn ensure_subscribed(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<()> {
+    /// Returns `Ok(true)` when the session is (or already was) subscribed and
+    /// `Ok(false)` when a cap rejected it, so callers can tell a deliberate
+    /// cap rejection apart from a successful subscribe: the sync loop must
+    /// not count a cap-rejected session as admitted.
+    fn ensure_subscribed(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> Result<bool> {
         let key = session_key(session);
         if self.subscriptions.contains_key(&key) {
-            return Ok(());
+            return Ok(true);
+        }
+        // The sync loop enforces the global admission caps, but event-driven
+        // subscriptions race ahead of the next sync: cap the session count here
+        // too, so a burst of current-session events for one source cannot exceed
+        // MAX_TRACKED_SESSIONS between syncs.
+        if self.subscriptions.len() >= MAX_TRACKED_SESSIONS {
+            debug!("SMTC session not subscribed | reason=session-cap | key={key}");
+            return Ok(false);
         }
         let subscription = self.subscribe(session)?;
         debug!("subscribed to SMTC session {key} | source={}", read_source_app(session));
         self.subscriptions.insert(key, subscription);
-        Ok(())
+        Ok(true)
+    }
+
+    /// Makes room for a brand-new current session when the admission caps are
+    /// saturated, by displacing survivors working from the weakest: dead
+    /// subscriptions (absent from the live snapshot — the stale prune would
+    /// evict them anyway, so displacing costs nothing) first, then the
+    /// existing subscription furthest from the current session in admission
+    /// order. Stops as soon as the caps would admit `incoming` (and the live
+    /// subscription count is under the session cap again). Returns the number
+    /// displaced; 0 means the caps would still reject `incoming` and nothing
+    /// was evicted.
+    ///
+    /// The admitted tallies are updated in place so the caller keeps counting
+    /// exactly what is now really subscribed. Displacement is itself bounded
+    /// by the caps — the admitted tally never exceeds them, so a hostile
+    /// storm cannot use it to grow the tracked set.
+    fn displace_survivors(
+        &mut self,
+        prioritized: &[(GlobalSystemMediaTransportControlsSession, usize, String)],
+        alive: &HashSet<usize>,
+        incoming: usize,
+        incoming_source: &str,
+        admitted_sessions: &mut usize,
+        admitted_sources: &mut HashSet<String>,
+    ) -> usize {
+        // The distinct-source cap can only be relieved by displacing a
+        // survivor whose source is exclusively subscribed; if no such
+        // survivor exists, displacement cannot help and evicting a live
+        // session for nothing is pure harm. Refuse up front. (The caller
+        // processes the incoming current session first, so nothing has been
+        // evicted yet and `subscriptions` still equals the pre-sync set.)
+        let source_cap_unrelievable = !admitted_sources.contains(incoming_source)
+            && admitted_sources.len() >= MAX_TRACKED_SOURCES
+            && !prioritized.iter().any(|(_, key, source)| {
+                *key != incoming
+                    && self.subscriptions.contains_key(key)
+                    && !self
+                        .subscriptions
+                        .iter()
+                        .any(|(k, s)| k != key && read_source_app(&s.session) == *source)
+            });
+        if source_cap_unrelievable {
+            return 0;
+        }
+        // Weakest-first key order, built once (it never changes during
+        // displacement; `subscribed` below does the shrinking).
+        let weakest_first: Vec<usize> = prioritized.iter().rev().map(|(_, key, _)| *key).collect();
+        let mut displaced = 0;
+        loop {
+            if !admission_blocked(
+                *admitted_sessions,
+                admitted_sources,
+                incoming_source,
+                MAX_TRACKED_SESSIONS,
+                MAX_TRACKED_SOURCES,
+            ) && self.subscriptions.len() < MAX_TRACKED_SESSIONS
+            {
+                break;
+            }
+            let subscribed_keys: HashSet<usize> = self.subscriptions.keys().copied().collect();
+            let Some(victim) = displacement_victim(&weakest_first, alive, &subscribed_keys, incoming) else {
+                break;
+            };
+            let v_source = read_source_app(&self.subscriptions[&victim].session);
+            let v_exclusive = !self
+                .subscriptions
+                .iter()
+                .any(|(key, s)| *key != victim && read_source_app(&s.session) == v_source);
+            let v_alive = alive.contains(&victim);
+            self.evict(victim);
+            displaced += 1;
+            if v_alive {
+                *admitted_sessions = admitted_sessions.saturating_sub(1);
+                if v_exclusive {
+                    admitted_sources.remove(&v_source);
+                }
+            }
+        }
+        displaced
     }
 
     /// Removes a session's subscription and stored state. Called when a
@@ -1518,6 +1779,147 @@ fn stale_thumbnail(merged: &TrackInfo, last_emitted: Option<&TrackInfo>) -> bool
         (Some(new_b), Some(old_b)) => Arc::ptr_eq(new_b, old_b) || new_b.as_ref() == old_b.as_ref(),
         _ => false,
     }
+}
+
+/// Whether admitting one more session of `source` would breach the global SMTC
+/// caps: either the session cap is already at its ceiling, or `source` is a new
+/// identity and the distinct-source cap is already at its ceiling. A source
+/// already counted in `admitted_sources` only consumes a session slot, never a
+/// fresh source slot, so a churning source is bounded by the session cap rather
+/// than the source cap. This is the single cap-decision function: the live sync
+/// loop and the test-only `admit_sessions` model both call it, so they can never
+/// disagree on an admission-cap rejection.
+pub(crate) fn admission_blocked(
+    session_count: usize,
+    admitted_sources: &HashSet<String>,
+    source: &str,
+    session_cap: usize,
+    source_cap: usize,
+) -> bool {
+    session_count >= session_cap || (!admitted_sources.contains(source) && admitted_sources.len() >= source_cap)
+}
+
+/// Weakest survivor to displace when a brand-new current session must be
+/// admitted past a saturated cap. `weakest_first` must list the subscribed
+/// keys in reverse admission priority (weakest first); among them this
+/// prefers a dead survivor (absent from the live snapshot — displacement is
+/// free, the stale prune would evict it anyway), then the survivor furthest
+/// from the current session. `subscribed` is the set of keys still actually
+/// subscribed, which shrinks as displacement evicts. `incoming` is never its
+/// own victim.
+fn displacement_victim(
+    weakest_first: &[usize],
+    alive: &HashSet<usize>,
+    subscribed: &HashSet<usize>,
+    incoming: usize,
+) -> Option<usize> {
+    weakest_first
+        .iter()
+        .copied()
+        .find(|key| subscribed.contains(key) && *key != incoming && !alive.contains(key))
+        .or_else(|| {
+            weakest_first
+                .iter()
+                .copied()
+                .find(|key| subscribed.contains(key) && *key != incoming)
+        })
+}
+
+/// Priority-ordered, cap-enforced admission of an already-filtered (allowed +
+/// current-source) session list. `ordered` must be in admission priority:
+/// current session first, then surviving existing subscriptions, then new
+/// sessions. `existing_keys`/`existing_sources` are the keys/sources the worker
+/// already holds before this sync, and are pre-seeded so the caps bound the
+/// total, not only new additions. Returns the full admitted key set (existing +
+/// newly admitted) and the count of sessions the caps rejected.
+///
+/// Test-only model of the sync loop's admission pass: the live loop applies
+/// `admission_blocked` inline (its decisions interleave with subscription,
+/// displacement and eviction side effects), so this function exists purely to
+/// make the current-first / existing-before-new priority contract directly
+/// testable. The model assumes every admitted session subscribes successfully;
+/// in the live loop a session can still fail to subscribe (cap race with the
+/// event-driven path, or a WinRT error) without the caps reconsidering it here,
+/// and a brand-new *current* session displaces survivors instead of being
+/// rejected (see `displace_survivors`) — neither is modeled.
+#[cfg(test)]
+fn admit_sessions(
+    ordered: &[(usize, String)],
+    existing_keys: &HashSet<usize>,
+    existing_sources: &HashSet<String>,
+    session_cap: usize,
+    source_cap: usize,
+) -> (HashSet<usize>, usize) {
+    let mut admitted_keys: HashSet<usize> = existing_keys.clone();
+    let mut admitted_sources: HashSet<String> = existing_sources.clone();
+    let mut rejected = 0;
+    for (key, source) in ordered {
+        if admitted_keys.contains(key) {
+            continue;
+        }
+        if admission_blocked(admitted_keys.len(), &admitted_sources, source, session_cap, source_cap) {
+            rejected += 1;
+            continue;
+        }
+        admitted_keys.insert(*key);
+        admitted_sources.insert(source.clone());
+    }
+    (admitted_keys, rejected)
+}
+
+/// Total raw-artwork bytes retained across a source-keyed last-emitted track
+/// map. Used to enforce `MAX_RETAINED_ARTWORK_BYTES` on insertion.
+fn retained_art_bytes(last_track: &HashMap<String, TrackInfo>) -> usize {
+    last_track
+        .values()
+        .map(|t| t.artwork.as_ref().map_or(0, |a| a.len()))
+        .sum()
+}
+
+/// Inserts (or replaces) a source's last-emitted track, enforcing the retained
+/// artwork budget: if the new artwork would push the total past
+/// `MAX_RETAINED_ARTWORK_BYTES`, the artwork bytes are dropped (metadata
+/// retained) so the pill renders a placeholder instead of holding stale cover
+/// bytes. Returns whether the artwork was kept (false => placeholder retained).
+fn store_last_track(
+    last_track: &mut HashMap<String, TrackInfo>,
+    source: String,
+    mut track: TrackInfo,
+    budget: usize,
+) -> bool {
+    let existing_art = last_track
+        .get(&source)
+        .and_then(|t| t.artwork.as_ref())
+        .map_or(0, |a| a.len());
+    let new_art = track.artwork.as_ref().map_or(0, |a| a.len());
+    let projected = retained_art_bytes(last_track) - existing_art + new_art;
+    let over_budget = projected > budget && new_art > 0;
+    if over_budget {
+        track.artwork = None;
+    }
+    last_track.insert(source, track);
+    !over_budget
+}
+
+/// Deduplicates a source list (preserving first-occurrence order) and caps it to
+/// `cap` entries, so the picker's candidate list cannot grow with a hostile
+/// session storm.
+fn dedup_capped(mut sources: Vec<String>, cap: usize) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::with_capacity(sources.len());
+    let mut out: Vec<String> = Vec::with_capacity(sources.len().min(cap));
+    for s in sources.drain(..) {
+        if seen.insert(s.clone()) && out.len() < cap {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Whether an overflow warning may fire now: `last` is the instant of the last
+/// warning (or `None` if never), and `window` is the minimum gap between two.
+/// Pure so the warn-rate contract is directly testable without a listener.
+fn overflow_warn_allowed(last: Option<Instant>, window: Duration) -> bool {
+    last.is_none_or(|t| t.elapsed() >= window)
 }
 
 /// The identity-stable palette to attach to an emitted track: reuses the
@@ -2136,7 +2538,7 @@ fn read_thumbnail(
     let size = stream
         .Size()
         .map_err(|e| anyhow::Error::new(e).context("Size failed"))?;
-    if size == 0 || !(1024..=8 * 1024 * 1024).contains(&size) || size > u32::MAX as u64 {
+    if size == 0 || !(1024..=MAX_THUMBNAIL_BYTES).contains(&size) || size > u32::MAX as u64 {
         return Ok(None);
     }
     let size = size as u32;
@@ -3093,5 +3495,212 @@ mod tests {
             ..read
         };
         assert!(emit_track(&prev, &with_art, true).0);
+    }
+
+    #[test]
+    fn admission_blocked_respects_session_and_source_caps() {
+        let empty: HashSet<String> = HashSet::new();
+        // Session cap ceiling hits first.
+        assert!(admission_blocked(64, &empty, "A", 64, 32));
+        assert!(!admission_blocked(63, &empty, "A", 64, 32));
+        // A brand-new source at the source cap is blocked.
+        let full: HashSet<String> = (0..32).map(|i| format!("s{i}")).collect();
+        assert!(admission_blocked(0, &full, "new", 64, 32));
+        // An already-tracked source never trips the source cap.
+        assert!(!admission_blocked(63, &full, "s0", 64, 32));
+    }
+
+    #[test]
+    fn admit_sessions_keeps_current_first_under_a_tight_session_cap() {
+        // The first entry is the current session; with a session cap of 1 it
+        // must be the one retained, not a later new session.
+        let ordered: Vec<(usize, String)> = vec![(1, "A".into()), (2, "A".into()), (3, "A".into())];
+        let (admitted, rejected) = admit_sessions(&ordered, &HashSet::new(), &HashSet::new(), 1, 100);
+        assert!(admitted.contains(&1), "current session must be admitted first");
+        assert!(!admitted.contains(&2));
+        assert_eq!(rejected, 2);
+    }
+
+    #[test]
+    fn admit_sessions_retains_existing_before_new() {
+        // A surviving existing subscription fills its slot; a genuinely new
+        // session is rejected by the cap instead of evicting a live one.
+        let ordered: Vec<(usize, String)> = vec![(2, "A".into())];
+        let existing_keys: HashSet<usize> = [1].into_iter().collect();
+        let existing_sources: HashSet<String> = ["A".to_string()].into_iter().collect();
+        let (admitted, rejected) = admit_sessions(&ordered, &existing_keys, &existing_sources, 1, 100);
+        assert!(admitted.contains(&1), "existing subscription is retained");
+        assert!(!admitted.contains(&2));
+        assert_eq!(rejected, 1);
+    }
+
+    #[test]
+    fn admit_sessions_rejects_the_65th_session_only() {
+        // 65 sessions of one source, session cap 64: 64 admitted, 1 rejected.
+        let ordered: Vec<(usize, String)> = (0..65).map(|k| (k, "youtube-music".to_string())).collect();
+        let (admitted, rejected) = admit_sessions(&ordered, &HashSet::new(), &HashSet::new(), 64, 100);
+        assert_eq!(admitted.len(), 64);
+        assert_eq!(rejected, 1);
+    }
+
+    #[test]
+    fn admit_sessions_rejects_the_33rd_source_only() {
+        // 33 distinct sources, source cap 32: 32 admitted, 1 rejected.
+        let ordered: Vec<(usize, String)> = (0..33).map(|k| (k, format!("src-{k}"))).collect();
+        let (admitted, rejected) = admit_sessions(&ordered, &HashSet::new(), &HashSet::new(), 100, 32);
+        assert_eq!(admitted.len(), 32);
+        assert_eq!(rejected, 1);
+    }
+
+    #[test]
+    fn displacement_victim_prefers_dead_then_weakest() {
+        // Candidate keys in reverse admission priority: the current session
+        // (10) is last; before-group members 3, 2, 1 appear weakest-first;
+        // 9 is a new-group key (never a candidate — it is not subscribed).
+        let weakest_first: Vec<usize> = vec![9, 3, 2, 1, 10];
+        let alive: HashSet<usize> = [1, 3].into_iter().collect();
+        let subscribed: HashSet<usize> = [1, 2, 3].into_iter().collect();
+        // Survivor 2 is dead (subscribed but not alive) → displaced before
+        // the weaker-but-alive 3.
+        assert_eq!(displacement_victim(&weakest_first, &alive, &subscribed, 10), Some(2));
+        // Once 2 is evicted, the weakest alive survivor is next.
+        let subscribed_after: HashSet<usize> = [1, 3].into_iter().collect();
+        assert_eq!(
+            displacement_victim(&weakest_first, &alive, &subscribed_after, 10),
+            Some(3)
+        );
+        // The incoming current session is never its own victim.
+        assert_eq!(displacement_victim(&weakest_first, &alive, &subscribed, 10), Some(2));
+        // Nothing left to displace → none.
+        assert_eq!(displacement_victim(&weakest_first, &alive, &HashSet::new(), 10), None);
+    }
+
+    #[test]
+    fn dedup_capped_keeps_insertion_order_under_cap() {
+        let out = dedup_capped(vec!["b".into(), "a".into(), "b".into(), "c".into(), "a".into()], 2);
+        assert_eq!(out, vec!["b".to_string(), "a".to_string()]);
+    }
+
+    #[test]
+    fn retained_art_bytes_counts_every_entry_even_when_buffers_are_shared() {
+        // The budget is a conservative per-entry sum: it cannot see that two
+        // entries clone the same Arc, so sharing over-counts. Err safe: the
+        // retained bytes never exceed the cap even when buffers are shared.
+        let mut map: HashMap<String, TrackInfo> = HashMap::new();
+        let art: Arc<[u8]> = Arc::from([7u8; 1024]);
+        map.insert(
+            "a".into(),
+            TrackInfo {
+                artwork: Some(art.clone()),
+                ..TrackInfo::default()
+            },
+        );
+        map.insert(
+            "b".into(),
+            TrackInfo {
+                artwork: Some(art.clone()),
+                ..TrackInfo::default()
+            },
+        );
+        assert_eq!(retained_art_bytes(&map), 2048);
+        // A distinct identity with its own artwork adds to the total.
+        map.insert(
+            "c".into(),
+            TrackInfo {
+                artwork: Some(Arc::<[u8]>::from([9u8; 512])),
+                ..TrackInfo::default()
+            },
+        );
+        assert_eq!(retained_art_bytes(&map), 2560);
+    }
+
+    #[test]
+    fn store_last_track_replaces_under_the_art_budget() {
+        let mut map: HashMap<String, TrackInfo> = HashMap::new();
+        let big: Arc<[u8]> = Arc::from(vec![1u8; MAX_RETAINED_ARTWORK_BYTES]);
+        let small: Arc<[u8]> = Arc::from([2u8; 4]);
+        map.insert(
+            "only".into(),
+            TrackInfo {
+                artwork: Some(big),
+                ..TrackInfo::default()
+            },
+        );
+        store_last_track(
+            &mut map,
+            "only".to_string(),
+            TrackInfo {
+                artwork: Some(small),
+                ..TrackInfo::default()
+            },
+            MAX_RETAINED_ARTWORK_BYTES,
+        );
+        assert_eq!(
+            map["only"].artwork,
+            Some(Arc::<[u8]>::from([2u8; 4])),
+            "replacement must overwrite the old entry"
+        );
+        assert_eq!(
+            retained_art_bytes(&map),
+            4,
+            "budget accounting must follow the replacement"
+        );
+    }
+
+    #[test]
+    fn store_last_track_drops_artwork_over_budget_and_keeps_the_placeholder() {
+        // Inserting artwork that would push the total past the budget must
+        // evict the bytes (false) while retaining the metadata, so the pill
+        // renders a placeholder instead of a stale cover. The budget never
+        // grows past the cap even across a replacement.
+        let mut map: HashMap<String, TrackInfo> = HashMap::new();
+        let big: Arc<[u8]> = Arc::from(vec![1u8; MAX_RETAINED_ARTWORK_BYTES]);
+        let full = TrackInfo {
+            artwork: Some(big),
+            ..TrackInfo::default()
+        };
+        store_last_track(&mut map, "only".to_string(), full, MAX_RETAINED_ARTWORK_BYTES);
+        assert_eq!(
+            map["only"].artwork.as_deref().map(<[u8]>::len),
+            Some(MAX_RETAINED_ARTWORK_BYTES)
+        );
+
+        // A second, artwork-bearing track cannot fit within the budget.
+        let kept = store_last_track(
+            &mut map,
+            "second".to_string(),
+            TrackInfo {
+                artwork: Some(Arc::<[u8]>::from([3u8; 8])),
+                ..TrackInfo::default()
+            },
+            MAX_RETAINED_ARTWORK_BYTES,
+        );
+        assert!(!kept, "over-budget artwork must be dropped");
+        assert_eq!(
+            map["second"].artwork, None,
+            "the placeholder retains metadata, never stale cover bytes"
+        );
+        assert_eq!(
+            retained_art_bytes(&map),
+            MAX_RETAINED_ARTWORK_BYTES,
+            "the retained budget must not exceed the cap after eviction"
+        );
+    }
+
+    #[test]
+    fn overflow_warn_allowed_is_unthrottled_without_a_last_warn() {
+        let window = Duration::from_millis(5_000);
+        assert!(overflow_warn_allowed(None, window));
+    }
+
+    #[test]
+    fn overflow_warn_allowed_gates_by_the_warn_window() {
+        let window = Duration::from_millis(5_000);
+        // Just inside the window: still throttled.
+        let recent = Instant::now() - Duration::from_millis(4_999);
+        assert!(!overflow_warn_allowed(Some(recent), window));
+        // Just outside the window: a new warn is allowed.
+        let stale = Instant::now() - Duration::from_millis(5_001);
+        assert!(overflow_warn_allowed(Some(stale), window));
     }
 }
