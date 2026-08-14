@@ -246,8 +246,10 @@ struct ListenerState {
     /// bytes for the same cover; reusing this cache keeps the pill's accent
     /// colors stable for the identity. Cleared when a real cover swap is
     /// detected (the artwork-changed force), so a genuinely new cover
-    /// recomputes its palette.
-    palette_per_identity: HashMap<(String, String, String), Palette>,
+    /// recomputes its palette. Keyed by `palette_cache_key`; bounded by
+    /// `PALETTE_CACHE_CAP` and pruned of departed sources in
+    /// `sync_subscriptions`.
+    palette_per_identity: HashMap<String, Palette>,
 }
 
 pub struct SmtcListener {
@@ -741,10 +743,10 @@ impl ListenerState {
                                 // invalidate the cached palette so the emit
                                 // recomputes from the new bytes instead of
                                 // carrying the old cover's accent colors.
-                                self.palette_per_identity.remove(&(
-                                    merged.source_app.clone(),
-                                    merged.title.clone(),
-                                    merged.artist.clone(),
+                                self.palette_per_identity.remove(&palette_cache_key(
+                                    &merged.source_app,
+                                    &merged.title,
+                                    &merged.artist,
                                 ));
                                 let label = track_label(&merged);
                                 debug!("track emit forced | reason=artwork-changed | {label}");
@@ -1091,6 +1093,11 @@ impl ListenerState {
         // Churn counts for departed sources are worthless and would otherwise
         // accumulate one deque per distinct source ever seen.
         self.churn.retain(|source, _| active.contains(source));
+        // Palette identities of departed sources are dead weight: without
+        // this prune the cache would accumulate one entry per distinct
+        // (source, title, artist) ever seen for the listener's lifetime.
+        self.palette_per_identity
+            .retain(|key, _| active.contains(palette_key_source(key)));
     }
 
     /// YouTube Music and similar browser clients can leave several sessions
@@ -1518,12 +1525,38 @@ fn stale_thumbnail(merged: &TrackInfo, last_emitted: Option<&TrackInfo>) -> bool
 /// worker decodes at a fixed size) and caches it. Returns `None` when the
 /// identity has no trusted artwork yet — the UI falls back to computing from
 /// `decoded_art`.
+/// Upper bound for `palette_per_identity`. `sync_subscriptions` prunes the
+/// entries of departed sources, but a single long-lived source (a 24/7
+/// jukebox) can still accumulate thousands of distinct identities; entries
+/// are recomputable from the decoded artwork, so past the bound an arbitrary
+/// entry is dropped.
+const PALETTE_CACHE_CAP: usize = 256;
+
+/// Composite palette-cache key: source, title, artist, NUL-joined. A single
+/// allocation per lookup instead of the three strings the tuple form needed
+/// (the key is built even on cache hits). Fields read back via
+/// `palette_key_source`.
+fn palette_cache_key(source: &str, title: &str, artist: &str) -> String {
+    let mut key = String::with_capacity(source.len() + title.len() + artist.len() + 2);
+    key.push_str(source);
+    key.push('\0');
+    key.push_str(title);
+    key.push('\0');
+    key.push_str(artist);
+    key
+}
+
+/// The source field of a `palette_cache_key` (everything up to the first NUL).
+fn palette_key_source(key: &str) -> &str {
+    key.split('\0').next().unwrap_or_default()
+}
+
 fn palette_for_identity(
-    cache: &mut HashMap<(String, String, String), Palette>,
+    cache: &mut HashMap<String, Palette>,
     merged: &TrackInfo,
     decoded_art: Option<&[u8]>,
 ) -> Option<Palette> {
-    let key = (merged.source_app.clone(), merged.title.clone(), merged.artist.clone());
+    let key = palette_cache_key(&merged.source_app, &merged.title, &merged.artist);
     if let Some(palette) = cache.get(&key) {
         return Some(*palette);
     }
@@ -1531,6 +1564,13 @@ fn palette_for_identity(
         .and_then(crate::overlay::pm_bgra_to_rgba)
         .and_then(|rgba| palette_from_rgba(&rgba));
     if let Some(palette) = palette {
+        if cache.len() >= PALETTE_CACHE_CAP {
+            // Dropping an arbitrary entry is fine: palettes are recomputable
+            // from `decoded_art` on the next miss.
+            if let Some(stale) = cache.keys().next().cloned() {
+                cache.remove(&stale);
+            }
+        }
         cache.insert(key, palette);
     }
     palette
@@ -2665,6 +2705,57 @@ mod tests {
         };
         assert_eq!(palette_for_identity(&mut cache, &artless, None), None);
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn palette_cache_is_capped_at_the_constant() {
+        let mut cache = HashMap::new();
+        let cover: Vec<u8> = vec![255u8; 16 * 16 * 4];
+        // More distinct identities than the cap, from one long-lived source:
+        // the bound must hold and every miss must still derive a palette.
+        for i in 0..(PALETTE_CACHE_CAP + 10) {
+            let track = TrackInfo {
+                source_app: "youtube-music".into(),
+                title: format!("Song-{i}"),
+                artist: "Artist".into(),
+                ..TrackInfo::default()
+            };
+            let palette = palette_for_identity(&mut cache, &track, Some(&cover));
+            assert!(palette.is_some(), "identity {i} must derive a palette");
+        }
+        assert_eq!(cache.len(), PALETTE_CACHE_CAP);
+    }
+
+    #[test]
+    fn palette_cache_keys_round_trip_the_source_field() {
+        let key = palette_cache_key("youtube-music", "Some Title", "Some Artist");
+        assert_eq!(palette_key_source(&key), "youtube-music");
+        // Exactly three NUL-separated segments: source, title, artist.
+        assert_eq!(key.split('\0').count(), 3);
+        assert_eq!(palette_key_source("no-separator"), "no-separator");
+        assert_eq!(palette_key_source(""), "");
+    }
+
+    #[test]
+    fn palette_cache_prunes_departed_sources_like_sync_subscriptions() {
+        let mut cache = HashMap::new();
+        let cover: Vec<u8> = vec![255u8; 16 * 16 * 4];
+        let track = |source: &str, title: &str| TrackInfo {
+            source_app: source.into(),
+            title: title.into(),
+            artist: "Artist".into(),
+            ..TrackInfo::default()
+        };
+        for (source, title) in [("alpha", "A"), ("alpha", "B"), ("zeta", "Z")] {
+            let _ = palette_for_identity(&mut cache, &track(source, title), Some(&cover));
+        }
+        assert_eq!(cache.len(), 3);
+        // The exact retain the production sync uses: departed source gone,
+        // surviving source's entries kept.
+        let active: HashSet<String> = ["zeta"].into_iter().map(str::to_owned).collect();
+        cache.retain(|key, _| active.contains(palette_key_source(key)));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&palette_cache_key("zeta", "Z", "Artist")));
     }
 
     #[test]
