@@ -20,8 +20,9 @@ max_width = 340
 # window's monitor, default) | "primary" | "index-N" (the (N+1)-th display
 # in Windows' enumeration order).
 monitor = "active-window"
-# Which pill layout is used: "expanded" (default) | "compact" | "auto"
-# (compact while the foreground app is fullscreen or on the
+# Which pill layout is used: "expanded" (default) | "compact" |
+# "persistent-compact" (always-visible compact pill while media plays) |
+# "auto" (compact while the foreground app is fullscreen or on the
 # auto_compact_sources list, expanded otherwise).
 layout = "expanded"
 # Give the Compact layout its own independent position. While false, the
