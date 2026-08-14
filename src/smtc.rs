@@ -809,11 +809,7 @@ impl ListenerState {
                         let mut emitted = with_decoded_art(merged.clone(), crate::events::ARTWORK_DECODE as usize);
                         // Attach the identity-stable palette so the overlay does
                         // not recompute (and drift) from re-encoded thumbnails.
-                        emitted.palette = palette_for_identity(
-                            &mut self.palette_per_identity,
-                            &merged,
-                            emitted.decoded_art.as_deref(),
-                        );
+                        emitted.palette = self.palette_for_identity(&merged, emitted.decoded_art.as_deref());
                         events.push(MediaEvent::TrackChanged(emitted));
                         self.last_track_per_source
                             .insert(merged.source_app.clone(), merged.clone());
@@ -1124,6 +1120,14 @@ impl ListenerState {
         cached_artwork_for(&self.last_track_per_source, source_app, title, artist)
     }
 
+    /// The identity-stable palette for a track (see the free helper of the
+    /// same name). Method form keeps every palette-cache access inside
+    /// `ListenerState`, co-located with the prune in `sync_subscriptions`
+    /// and the cap in `palette_for_identity`.
+    fn palette_for_identity(&mut self, merged: &TrackInfo, decoded_art: Option<&[u8]>) -> Option<Palette> {
+        palette_for_identity(&mut self.palette_per_identity, merged, decoded_art)
+    }
+
     /// Re-reads a session's artwork on the poll path (read_artwork=true), then
     /// re-runs the full refresh so a newly-arrived thumbnail surfaces a
     /// TrackChanged / artwork-gain event in place. The retry counter is bumped
@@ -1170,8 +1174,7 @@ impl ListenerState {
             self.last_track_per_source
                 .insert(merged.source_app.clone(), merged.clone());
             let mut emitted = with_decoded_art(merged.clone(), crate::events::ARTWORK_DECODE as usize);
-            emitted.palette =
-                palette_for_identity(&mut self.palette_per_identity, &merged, emitted.decoded_art.as_deref());
+            emitted.palette = self.palette_for_identity(&merged, emitted.decoded_art.as_deref());
             self.emit(MediaEvent::TrackChanged(emitted));
             if let Some(state) = self.states.get_mut(&key) {
                 state.deferred_at = None;
