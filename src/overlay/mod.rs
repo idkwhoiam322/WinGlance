@@ -1378,9 +1378,11 @@ impl OverlayState {
     /// not played in a long time.
     fn cache_track(&mut self, track: &TrackInfo) {
         let source = track.source_app.clone();
-        if let Some(pos) = self.track_cache_order.iter().position(|s| *s == source) {
-            self.track_cache_order.remove(pos);
-        }
+        // Move the source to the back of the recency order. The keys are
+        // unique, so a single retain pass (instead of position + remove)
+        // dedups in one traversal; it also self-heals a hypothetical
+        // duplicate marker.
+        self.track_cache_order.retain(|s| *s != source);
         self.track_cache_order.push_back(source.clone());
         let now = Instant::now();
         // Insert first so the sweep below sees the fresh entry: a brand-new
