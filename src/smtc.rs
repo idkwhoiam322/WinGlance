@@ -81,7 +81,10 @@ struct LogicalState {
 /// Rolling window, threshold and cool-down for the per-source session-churn
 /// guard. A source creating more than `CHURN_THRESHOLD` new sessions within
 /// `CHURN_WINDOW_MS` (a real client was observed doing ~20 in 8.5s) is
-/// excluded from tracking for the cool-down period.
+/// excluded from tracking for the cool-down period. Churn is charged only for
+/// content-free sessions (see `record_churn`): sessions that never carried a
+/// track are identity garbage, while a source that recreates its session per
+/// real track change (YouTube Music) carries a title and never counts.
 const CHURN_WINDOW_MS: u64 = 2000;
 const CHURN_THRESHOLD: usize = 5;
 const CHURN_COOLDOWN_MS: u64 = 30_000;
@@ -610,6 +613,10 @@ impl ListenerState {
         };
         let prev = self.states.get(&key).cloned().unwrap_or_default();
         let mut next = prev.clone();
+        // True until the first successful read (the stored state is the
+        // default): used for the first-read artwork deferral and to charge
+        // churn only for brand-new content-free sessions.
+        let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
         let mut events: Vec<MediaEvent> = Vec::new();
 
         // Image content (slideshows, photo apps) is not "now playing": no
@@ -716,6 +723,18 @@ impl ListenerState {
                     }
                     let (mut emit, artwork_lost) = emit_track(&prev, &merged, read_artwork);
                     let placeholder = is_placeholder_like(&merged);
+                    // Session churn is charged on a session's first read and
+                    // only for content-free sessions: a newly-created session
+                    // whose title fell back to the source-app label carries no
+                    // track (the Riot signature). A legitimately recreated
+                    // session from a real skip always reports a title on its
+                    // first read and is never counted, so rapid skipping never
+                    // trips the cool-down. Charging here (not at admission,
+                    // where every new session counted) makes the guard match
+                    // what the source actually emitted.
+                    if first_read_counts_toward_churn(is_first_read, &merged) {
+                        self.record_churn(&merged.source_app);
+                    }
                     // A metadata snapshot that is just the source-app fallback (empty
                     // title + empty artist) carries no real track to announce: drop it
                     // everywhere below so it can never flash as a "sample track". A
@@ -882,7 +901,6 @@ impl ListenerState {
                         let label = track_label(&merged);
                         debug!("track emit skipped | reason=artwork-removed | {label}");
                     } else {
-                        let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
                         if is_first_read
                             && read_artwork
                             && !is_placeholder_read(&prev, &merged)
@@ -931,6 +949,14 @@ impl ListenerState {
                     } else {
                         debug!("track read failed | key={key} | {error:#}");
                     }
+                    // A session that never yields a successful first read
+                    // carries no track by definition, so it is content-free:
+                    // charge churn here too, or a storm of sessions that die
+                    // before their first read completes dodges the cool-down
+                    // (they report nothing but still churn the session list).
+                    if is_first_read {
+                        self.record_churn(&read_source_app(session));
+                    }
                 }
             }
         }
@@ -969,7 +995,9 @@ impl ListenerState {
 
     /// Re-syncs the subscription map with the current session list: subscribes
     /// to the current session for an allowed source, drops stale subscriptions
-    /// and stored state, and accounts per-source session churn for the cool-down.
+    /// and stored state. Per-source session churn for the cool-down is charged
+    /// inside `refresh_session` on first read (content-free sessions only), not
+    /// here.
     fn sync_subscriptions(&mut self) {
         let Ok(sessions) = self.manager.GetSessions() else {
             debug!("SMTC GetSessions failed; keeping the current subscription map");
@@ -1143,9 +1171,6 @@ impl ListenerState {
                     );
                     continue;
                 }
-            }
-            if is_new {
-                self.record_churn(source);
             }
             let subscribed = match self.ensure_subscribed(session) {
                 Ok(subscribed) => subscribed,
@@ -1473,9 +1498,14 @@ impl ListenerState {
             .is_some_and(|until| *until > Instant::now())
     }
 
-    /// Counts a newly-created session for its source; trips the cool-down once
-    /// the threshold is exceeded within the window, logging a WARN so the log
-    /// explains the exclusion without manual analysis.
+    /// Counts a newly-created content-free session for its source; trips the
+    /// cool-down once the threshold is exceeded within the window, logging a
+    /// WARN so the log explains the exclusion without manual analysis. Called
+    /// from `refresh_session` on a session's first read — including a failed
+    /// first read, which by definition carries no track — so only sessions
+    /// that carry no track (title fell back to the source-app label) count:
+    /// a source recreating its session per real track change never reaches
+    /// the threshold.
     fn record_churn(&mut self, source: &str) {
         let now = Instant::now();
         let events = self.churn.entry(source.to_string()).or_default();
@@ -2300,6 +2330,16 @@ fn is_placeholder_like(merged: &TrackInfo) -> bool {
     merged.artist.is_empty() && merged.title == merged.source_app
 }
 
+/// Whether a session's first read charges churn for its source. Only
+/// content-free sessions count: a newly-created session whose title fell back
+/// to the source-app label (empty `properties.Title()`) carries no track and
+/// is identity garbage (the Riot Client signature). A legitimately recreated
+/// session from a real track change always reports a title on its first read
+/// and never counts, so rapid skipping cannot trip the cool-down.
+fn first_read_counts_toward_churn(is_first_read: bool, merged: &TrackInfo) -> bool {
+    is_first_read && is_placeholder_like(merged)
+}
+
 fn register_sessions_handler(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
     signal_tx: SyncSender<Signal>,
@@ -2649,6 +2689,40 @@ mod tests {
         assert!(!terminal_stopped_warranted(None, false));
         // A churning source stays silent while on the cool-down.
         assert!(!terminal_stopped_warranted(Some(PlaybackState::Playing), true));
+    }
+
+    #[test]
+    fn first_read_counts_toward_churn_only_for_content_free_sessions() {
+        // A newly-created session whose title fell back to the source-app
+        // label (empty properties.Title(), empty artist) is identity garbage:
+        // charge it on its first read.
+        let trackless = TrackInfo {
+            source_app: "riot".into(),
+            title: "riot".into(), // title fell back to the source label
+            artist: String::new(),
+            ..TrackInfo::default()
+        };
+        assert!(first_read_counts_toward_churn(true, &trackless));
+        // The same read on a later pass (not first) is not new churn.
+        assert!(!first_read_counts_toward_churn(false, &trackless));
+        // A real skip reports a title on its first read: never charged, no
+        // matter how fast the user skips.
+        let real = TrackInfo {
+            source_app: "youtube-music".into(),
+            title: "The Emptiness Machine".into(),
+            artist: "Linkin Park".into(),
+            ..TrackInfo::default()
+        };
+        assert!(!first_read_counts_toward_churn(true, &real));
+        // A session that reports a title but no artist yet is not placeholder
+        // (title != source-app fallback), so it is not charged either.
+        let titled = TrackInfo {
+            source_app: "spotify".into(),
+            title: "Song".into(),
+            artist: String::new(),
+            ..TrackInfo::default()
+        };
+        assert!(!first_read_counts_toward_churn(true, &titled));
     }
 
     #[test]
