@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::Local;
 use log::{LevelFilter, Log, Metadata, Record};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -32,7 +32,7 @@ fn open_live_log(live_path: &Path, preserve: bool) -> std::io::Result<(File, u64
         file.write_all(
             format!(
                 "===== restarted via the Settings 'Restart app' action at {} =====\n",
-                Utc::now().to_rfc3339()
+                Local::now().to_rfc3339()
             )
             .as_bytes(),
         )?;
@@ -88,7 +88,7 @@ impl Log for FileLogger {
         }
         let line = format!(
             "{} [{:<5}] {}: {}\n",
-            Utc::now().to_rfc3339(),
+            Local::now().to_rfc3339(),
             record.level(),
             record.target(),
             record.args()
