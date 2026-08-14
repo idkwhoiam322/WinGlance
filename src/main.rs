@@ -648,6 +648,16 @@ fn worker_budget_exhausted(consecutive_restarts: u32) -> bool {
     consecutive_restarts >= MAX_WORKER_RESTARTS
 }
 
+/// Whether an event must be delivered to the overlay queue. Worker failures
+/// are history-only: the overlay never renders them, so they must not wake
+/// the pill or occupy its queue. Every other event — including
+/// `SessionRejected`, which drives the overlay's retire logic for sources
+/// that leave the allow-list — is forwarded even though rejections are never
+/// rendered as pills.
+fn overlay_bound(event: &MediaEvent) -> bool {
+    !matches!(event, MediaEvent::WorkerFailed { .. })
+}
+
 /// Drains SMTC events into each window's queue and wakes both windows.
 /// Returns the thread handle so main can join it before destroying the
 /// windows. The loop exits within ~200ms of `shutdown` being set. At most one
@@ -700,13 +710,12 @@ fn spawn_event_forwarder(
                     HWND(main_raw as *mut c_void),
                     "main window",
                 );
-                // Rejected sessions and worker failures are history-only: the
-                // overlay never renders them, so they must not wake the pill
-                // or occupy its queue.
-                if !matches!(
-                    event.as_ref(),
-                    MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. }
-                ) {
+                // Worker failures are history-only: the overlay never renders
+                // them, so they must not wake the pill or occupy its queue.
+                // Rejected sessions do reach the overlay: its retire logic
+                // drops a retired source's content from the pill, even though
+                // the rejection itself is never rendered.
+                if overlay_bound(&event) {
                     push_and_wake(
                         &overlay_queue,
                         &overlay_wake,
@@ -955,5 +964,27 @@ mod tests {
             matches!(owned, MediaEvent::PlaybackStateChanged(PlaybackState::Paused, ref s) if s == "youtube-music")
         );
         assert_eq!(Arc::strong_count(&other_holder), 1);
+    }
+
+    #[test]
+    fn overlay_bound_forwards_rejections_but_not_worker_failures() {
+        // SessionRejected drives the overlay's retire logic (content from a
+        // source that left the allow-list must leave the pill), so it must
+        // reach the overlay even though it is never rendered. WorkerFailed is
+        // history-only and must not wake the pill or occupy its queue.
+        let rejected = MediaEvent::SessionRejected {
+            source_app: "Brave".into(),
+            title: "t".into(),
+            artist: "a".into(),
+            state: PlaybackState::Paused,
+            accepted: false,
+        };
+        assert!(overlay_bound(&rejected), "SessionRejected must reach the overlay");
+        let failed = MediaEvent::WorkerFailed {
+            reason: "worker died".into(),
+        };
+        assert!(!overlay_bound(&failed), "WorkerFailed is history-only");
+        let changed = MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "Brave".into());
+        assert!(overlay_bound(&changed), "playback events must reach the overlay");
     }
 }

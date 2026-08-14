@@ -1116,6 +1116,13 @@ impl OverlayState {
         // never copies the event; recover the owned event here (zero-copy
         // when this window is the last holder, a clone otherwise).
         for event in batch.into_iter().map(media_event_into_owned) {
+            // A source retired from the allow-list must drop its content
+            // even while notifications are disabled: hygiene for the next
+            // show, not a notification.
+            if let MediaEvent::SessionRejected { source_app, .. } = &event {
+                self.retire_source(source_app);
+                continue;
+            }
             if !self.enabled {
                 continue;
             }
@@ -1474,6 +1481,87 @@ impl OverlayState {
             return;
         }
         self.show_next();
+    }
+
+    /// The source an event belongs to, for content-ownership checks. None for
+    /// events that never render (rejected sessions, worker failures, progress
+    /// updates).
+    fn event_source(event: &MediaEvent) -> Option<&str> {
+        match event {
+            MediaEvent::TrackChanged(track) => Some(&track.source_app),
+            MediaEvent::PlaybackStateChanged(_, source) => Some(source),
+            _ => None,
+        }
+    }
+
+    /// The most recent cached track from a source other than `retired`
+    /// (recency order, back = newest), skipping entries idle past the cache
+    /// TTL the same way the insert sweep drops them.
+    fn latest_valid_track(&self, retired: &str) -> Option<TrackInfo> {
+        let now = Instant::now();
+        self.track_cache_order.iter().rev().find_map(|source| {
+            if source.as_str() == retired {
+                return None;
+            }
+            let (track, last_used) = self.track_cache.get(source)?;
+            (now.duration_since(*last_used) <= TRACK_CACHE_TTL).then(|| track.clone())
+        })
+    }
+
+    /// A source is no longer allowed (removed from `media_sources`, or its
+    /// session tripped the churn cool-down). Its content must not stay on the
+    /// pill, in the persistent resume hold, behind the settings sample pill,
+    /// or queued for a later notification: swap every holding site to the most
+    /// recent cached track from a source that still matters, and hide the pill
+    /// when nothing valid remains. Runs regardless of the notifications toggle
+    /// — a disabled overlay must not resurrect a retired source's content at
+    /// the next show.
+    fn retire_source(&mut self, retired: &str) {
+        // Queued notifications from the retired source can never show now;
+        // drop them before hide() -> show_next() could re-show one.
+        self.pending.retain(|event| Self::event_source(event) != Some(retired));
+        let content_is_retired = self
+            .content
+            .as_ref()
+            .is_some_and(|event| Self::event_source(event) == Some(retired));
+        let held_is_retired = self
+            .held_content
+            .as_ref()
+            .is_some_and(|event| Self::event_source(event) == Some(retired));
+        let last_is_retired = self
+            .last_track
+            .as_ref()
+            .is_some_and(|track| track.source_app == retired);
+        if !content_is_retired && !held_is_retired && !last_is_retired {
+            return;
+        }
+        let successor = self.latest_valid_track(retired);
+        if content_is_retired {
+            if let Some(track) = &successor {
+                debug!("retired source {retired}: swapping the pill to the most recent valid source");
+                let full = Duration::from_millis(self.config.overlay.duration_ms.max(500));
+                self.current_source = Some(track.source_app.clone());
+                self.last_track = Some(track.clone());
+                self.cache_track(track);
+                self.update_content(MediaEvent::TrackChanged(track.clone()), full);
+            } else {
+                debug!("retired source {retired}: hiding the pill (no valid content remains)");
+                self.held_content = None;
+                self.last_track = None;
+                self.hide();
+                return;
+            }
+        }
+        if held_is_retired {
+            self.held_content = successor.as_ref().map(|track| MediaEvent::TrackChanged(track.clone()));
+        }
+        if self
+            .last_track
+            .as_ref()
+            .is_some_and(|track| track.source_app == retired)
+        {
+            self.last_track = successor.clone();
+        }
     }
     /// Refreshes the shown content in place: keeps the current animation
     /// phase, extends the dismiss deadline to at least `now + min_visible`
@@ -3832,6 +3920,190 @@ mod tests {
         );
         assert!(matches!(state.phase, Phase::Hidden));
         assert!(state.pending.is_empty());
+    }
+
+    fn brave_track(title: &str) -> TrackInfo {
+        track_for("Brave", title, "Brave Artist")
+    }
+
+    fn ytm_track(title: &str) -> TrackInfo {
+        track_for("youtube-music", title, "YTM Artist")
+    }
+
+    fn reject(source: &str) -> MediaEvent {
+        MediaEvent::SessionRejected {
+            source_app: source.into(),
+            title: String::new(),
+            artist: String::new(),
+            state: PlaybackState::Paused,
+            accepted: false,
+        }
+    }
+
+    #[test]
+    fn session_rejected_swaps_shown_content_to_the_latest_valid_track() {
+        // Brave is on screen; YTM's track was shown earlier this run and is
+        // cached. Retiring Brave must swap the pill to YTM's track in place,
+        // not leave stale Brave content behind.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.cache_track(&ytm_track("Last YTM Track"));
+        state.content = Some(MediaEvent::TrackChanged(brave_track("Brave Song")));
+        state.current_source = Some("Brave".into());
+        state.last_track = Some(brave_track("Brave Song"));
+        state.phase = Phase::Shown;
+        state.queue.lock().unwrap().push_back(Arc::new(reject("Brave")));
+        state.receive_events();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::TrackChanged(t))
+                    if t.source_app == "youtube-music" && t.title == "Last YTM Track"
+            ),
+            "the pill must swap to the most recent valid cached track"
+        );
+        assert_eq!(state.current_source.as_deref(), Some("youtube-music"));
+        assert_eq!(
+            state.last_track.as_ref().map(|t| t.source_app.as_str()),
+            Some("youtube-music"),
+            "the sample pill must not render the retired source"
+        );
+        assert!(!matches!(state.phase, Phase::Hidden));
+    }
+
+    #[test]
+    fn session_rejected_hides_the_pill_when_nothing_valid_remains() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.content = Some(MediaEvent::TrackChanged(brave_track("Brave Song")));
+        state.current_source = Some("Brave".into());
+        state.last_track = Some(brave_track("Brave Song"));
+        state.phase = Phase::Shown;
+        state.queue.lock().unwrap().push_back(Arc::new(reject("Brave")));
+        state.receive_events();
+
+        assert!(state.content.is_none());
+        assert!(state.last_track.is_none());
+        assert!(matches!(state.phase, Phase::Hidden));
+    }
+
+    #[test]
+    fn session_rejected_swaps_held_content_while_auto_hidden() {
+        // PersistentCompact auto-hide: the resume hold is Brave's content.
+        // Retiring Brave must swap the hold so the resume re-shows YTM, not
+        // the retired source.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.config.overlay.layout = LayoutMode::PersistentCompact;
+        state.phase = Phase::Hidden;
+        state.held_content = Some(MediaEvent::TrackChanged(brave_track("Brave Song")));
+        state.last_track = Some(brave_track("Brave Song"));
+        state.cache_track(&ytm_track("Last YTM Track"));
+        state.queue.lock().unwrap().push_back(Arc::new(reject("Brave")));
+        state.receive_events();
+
+        assert!(
+            matches!(
+                state.held_content.as_ref(),
+                Some(MediaEvent::TrackChanged(t))
+                    if t.source_app == "youtube-music" && t.title == "Last YTM Track"
+            ),
+            "the resume hold must swap to the latest valid track"
+        );
+        assert_eq!(
+            state.last_track.as_ref().map(|t| t.source_app.as_str()),
+            Some("youtube-music")
+        );
+        assert!(state.content.is_none());
+        assert!(matches!(state.phase, Phase::Hidden));
+    }
+
+    #[test]
+    fn session_rejected_drops_queued_notifications_from_the_retired_source() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state
+            .pending
+            .push_back(MediaEvent::TrackChanged(brave_track("Queued Brave")));
+        state
+            .pending
+            .push_back(MediaEvent::TrackChanged(ytm_track("Queued YTM")));
+        state.queue.lock().unwrap().push_back(Arc::new(reject("Brave")));
+        state.receive_events();
+
+        assert_eq!(state.pending.len(), 1, "only the queued Brave pill must drop");
+        assert!(matches!(
+            state.pending.front(),
+            Some(MediaEvent::TrackChanged(t)) if t.source_app == "youtube-music"
+        ));
+    }
+
+    #[test]
+    fn session_rejected_swaps_last_track_for_the_sample_pill() {
+        // Hidden with no content: the settings sample pill renders last_track.
+        // Retiring the source behind it must point the sample at the most
+        // recent valid track instead of the retired one.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Hidden;
+        state.last_track = Some(brave_track("Brave Song"));
+        state.cache_track(&ytm_track("Last YTM Track"));
+        state.queue.lock().unwrap().push_back(Arc::new(reject("Brave")));
+        state.receive_events();
+
+        assert_eq!(
+            state.last_track.as_ref().map(|t| t.source_app.as_str()),
+            Some("youtube-music"),
+            "the sample pill must never render a retired source"
+        );
+        assert!(state.content.is_none());
+    }
+
+    #[test]
+    fn session_rejected_swaps_content_even_while_notifications_disabled() {
+        // The user's reported case: notifications were off, so nothing ever
+        // updated the held Brave content. The retirement is content hygiene,
+        // not a notification — it must run while the toggle is off so the
+        // next show (or sample pill) never resurrects the retired source.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.enabled = false;
+        state.cache_track(&ytm_track("Last YTM Track"));
+        state.content = Some(MediaEvent::TrackChanged(brave_track("Brave Song")));
+        state.last_track = Some(brave_track("Brave Song"));
+        state.phase = Phase::Shown;
+        state.queue.lock().unwrap().push_back(Arc::new(reject("Brave")));
+        state.receive_events();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "youtube-music"
+            ),
+            "the swap must apply even while notifications are disabled"
+        );
+        assert_eq!(
+            state.last_track.as_ref().map(|t| t.source_app.as_str()),
+            Some("youtube-music")
+        );
+    }
+
+    #[test]
+    fn session_rejected_for_an_unshown_source_leaves_the_pill_alone() {
+        // A source that owns nothing on screen, in the hold, or behind the
+        // sample must not disturb the shown content.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.cache_track(&ytm_track("Last YTM Track"));
+        state.content = Some(MediaEvent::TrackChanged(ytm_track("Last YTM Track")));
+        state.current_source = Some("youtube-music".into());
+        state.last_track = Some(ytm_track("Last YTM Track"));
+        state.phase = Phase::Shown;
+        state.queue.lock().unwrap().push_back(Arc::new(reject("Spotify")));
+        state.receive_events();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "youtube-music"
+            ),
+            "an unrelated rejection must not touch the shown content"
+        );
+        assert!(matches!(state.phase, Phase::Shown));
     }
 
     #[test]
