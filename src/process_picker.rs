@@ -357,7 +357,16 @@ fn pretty_source_label(value: &str) -> String {
 /// corrupting stem characters ending in 'e', 'x', or '.' (which a character-set
 /// trim would do for names like "firefox.exe", "Plex.exe", "Roblox.exe", "code.exe").
 pub(crate) fn strip_exe_suffix(name: &str) -> &str {
-    if name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
+    // `name.len() - 4` is a char boundary exactly when the last four bytes
+    // are the ASCII ".exe" suffix; for any other name the checked `get`
+    // returns None instead of slicing mid-character (a plain index would
+    // panic on e.g. "a€bcd", and this function is called from an
+    // extern "system" callback where a panic aborts the process).
+    if name.len() >= 4
+        && name
+            .get(name.len() - 4..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(".exe"))
+    {
         &name[..name.len() - 4]
     } else {
         name
@@ -1303,5 +1312,11 @@ mod tests {
         assert_eq!(strip_exe_suffix("app.name.exe"), "app.name");
         assert_eq!(strip_exe_suffix("sample"), "sample");
         assert_eq!(strip_exe_suffix(".exe"), "");
+        // Non-.exe names where `len - 4` would land mid-way through a
+        // multi-byte character must not panic and must not strip.
+        assert_eq!(strip_exe_suffix("€€"), "€€");
+        assert_eq!(strip_exe_suffix("a€bcd"), "a€bcd");
+        // A non-ASCII stem with an ASCII ".exe" suffix still strips.
+        assert_eq!(strip_exe_suffix("名前.exe"), "名前");
     }
 }
