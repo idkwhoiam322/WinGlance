@@ -160,10 +160,9 @@ pub struct OverlayConfig {
     pub expand_compact_on_hover: bool,
     /// When `layout = "persistent-compact"`, fade the pill to 25% idle
     /// opacity after `duration_ms` elapses. Off: the pill stays at full
-    /// opacity while media is playing (no idle fade), and hides after
-    /// `duration_ms` when nothing is playing (paused or stopped) instead of
-    /// lingering. Fullscreen/listed-foreground hiding
-    /// (`hide_for_auto_compact_sources`) applies either way. Default: `true`.
+    /// opacity while media is playing or paused (no idle fade), and hides only
+    /// when the source has stopped (tombstone). Fullscreen/listed-foreground
+    /// hiding (`hide_for_auto_compact_sources`) applies either way. Default: `true`.
     pub fade_persistent_pill: bool,
     /// Unknown keys under `[overlay]`, preserved across saves.
     #[serde(flatten)]

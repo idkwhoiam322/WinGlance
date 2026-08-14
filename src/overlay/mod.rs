@@ -1720,6 +1720,21 @@ impl OverlayState {
     }
 
     fn update_content(&mut self, event: MediaEvent, min_visible: Duration) {
+        // PersistentCompact auto-hide: a meaningful update that arrives while the
+        // pill is already hidden for a fullscreen/listed foreground must surface
+        // briefly like a compact notification (full configured duration, then
+        // collapse back into the auto-hidden hold) — otherwise track and state
+        // changes vanish into the held content and never show over fullscreen or
+        // whitelisted apps. `show_with_duration` re-samples the foreground,
+        // saves the latest content for the resume, and — over a still-fullscreen
+        // foreground — flags the dismiss path to collapse into a full hide; the
+        // collapse's `hide()` re-arms the watchdog and keeps the newest
+        // held_content, so the next foreground clear resumes the latest track.
+        if self.config.overlay.layout == LayoutMode::PersistentCompact && self.persistent_auto_hidden() {
+            let full = matches!(event, MediaEvent::TrackChanged(_));
+            self.show(event, full);
+            return;
+        }
         // An in-place refresh is a meaningful pill update too: re-resolve
         // the layout so a foreground change since the pill appeared takes
         // effect with the update rather than on the next static tick.
@@ -1749,14 +1764,12 @@ impl OverlayState {
         if let MediaEvent::TrackChanged(ref track) = event {
             self.apply_track_progress(track);
         }
-        // PersistentCompact auto-hide: keep held_content in sync with the
-        // displayed content so on_foreground_change resumes the latest track,
-        // not a stale one. `persistent_collapse_on_dismiss` covers a pill
-        // about to collapse because of a fullscreen transition;
-        // `persistent_auto_hidden` covers a pill already hidden for a
-        // fullscreen/listed foreground — events swap the held content in
-        // place while it stays hidden.
-        if self.persistent_collapse_on_dismiss || self.persistent_auto_hidden() {
+        // A pill currently shown over a fullscreen/listed foreground is flagged
+        // for collapse-on-dismiss; keep held_content in sync so the resume (when
+        // the foreground clears) restores the latest track, not a stale one. The
+        // auto-hidden case is handled above — it shows briefly instead of
+        // swapping in place while the pill stays hidden.
+        if self.persistent_collapse_on_dismiss {
             self.held_content = Some(event.clone());
         }
         self.content = Some(event);
@@ -2273,14 +2286,12 @@ impl OverlayState {
         // Exception: when persistent_collapse_on_dismiss is set (foreground is
         // fullscreen/listed), skip the idle fade and fall through to the
         // normal collapse path so the pill hides instead of lingering at 0.25.
-        // With the idle fade disabled (fade_persistent_pill = false): the
-        // deadline is a no-op while something is playing (the pill stays at
-        // full opacity), but when nothing is playing a bright stale pill must
-        // not linger — collapse and hide it like any other mode.
+        // With the idle fade off, the deadline is a no-op: the pill stays at
+        // full opacity whether playing or paused — only a Stopped-state pill
+        // (tombstone: source is done) collapses into a full hide below.
         if self.config.overlay.layout == LayoutMode::PersistentCompact && !self.persistent_collapse_on_dismiss {
-            // A Stopped-state pill must not linger at idle opacity either:
-            // its source is done, so the deadline collapses it into a full
-            // hide like any other mode.
+            // A Stopped-state pill must not linger at idle opacity: its source is
+            // done, so the deadline collapses it into a full hide.
             if stopped_shown {
                 if !cursor_over
                     && self.dismiss_at.is_some_and(|deadline| deadline <= now)
@@ -2290,24 +2301,17 @@ impl OverlayState {
                     self.hover_expand = None;
                     debug!("persistent pill hidden (stopped)");
                 }
-            } else if self.config.overlay.fade_persistent_pill {
-                if !self.persistent_faded
-                    && !cursor_over
-                    && self.dismiss_at.is_some_and(|deadline| deadline <= now)
-                    && matches!(self.phase, Phase::Shown)
-                {
-                    self.persistent_faded = true;
-                    debug!("persistent pill faded to idle opacity");
-                }
-            } else if !playing
+            } else if self.config.overlay.fade_persistent_pill
+                && !self.persistent_faded
                 && !cursor_over
                 && self.dismiss_at.is_some_and(|deadline| deadline <= now)
                 && matches!(self.phase, Phase::Shown)
             {
-                self.phase = Phase::Collapsing(now);
-                self.hover_expand = None;
-                debug!("persistent pill hidden (nothing playing, fade disabled)");
+                self.persistent_faded = true;
+                debug!("persistent pill faded to idle opacity");
             }
+            // fade_persistent_pill = false and !stopped_shown: the deadline is a
+            // no-op — the pill stays at full opacity in the Shown phase.
         } else if !held
             && self.dismiss_at.is_some_and(|deadline| deadline <= now)
             && !matches!(self.phase, Phase::Collapsing(_) | Phase::Hidden)
@@ -2337,14 +2341,11 @@ impl OverlayState {
                 // Persistent-compact: the collapse animation shrinks the pill
                 // back to compact size, but the pill stays visible (fades to
                 // idle opacity instead of hiding) — unless
-                // persistent_collapse_on_dismiss is set (foreground is
                 // fullscreen/listed), in which case the pill fully hides.
-                // With the idle fade disabled, a collapse while nothing is
-                // playing (paused/stopped) hides the pill instead of reviving
-                // it at full opacity; a Stopped-state pill hides regardless
-                // of the fade setting, since nothing can revive it.
+                // A Stopped-state pill (tombstone: source is done) also hides
+                // here regardless of the fade setting — nothing can revive it.
                 if self.config.overlay.layout == LayoutMode::PersistentCompact && !self.persistent_collapse_on_dismiss {
-                    if (!self.config.overlay.fade_persistent_pill && !playing) || stopped_shown {
+                    if stopped_shown {
                         self.hide();
                         return;
                     }
@@ -4104,14 +4105,23 @@ mod tests {
     }
 
     #[test]
-    fn persistent_batch_while_auto_hidden_updates_held_content_in_place() {
-        // Auto-hidden (fullscreen/listed foreground): the pill is hidden but
-        // still active. Events must swap the held content in place so the
-        // resume re-shows the latest track, and nothing queues behind it.
+    fn persistent_auto_hidden_surfaces_updates_briefly_over_fullscreen() {
+        // Auto-hidden (fullscreen/listed foreground with hide_for_auto_compact_sources
+        // on): the pill is hidden but still active. A meaningful update must surface
+        // briefly like a compact notification — full configured duration, then
+        // collapse back into the auto-hidden hold — so track changes no longer vanish
+        // over fullscreen/listed apps; the resume must still re-show the latest track
+        // when the foreground clears.
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.config.overlay.layout = LayoutMode::PersistentCompact;
-        state.phase = Phase::Hidden;
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: true,
+        });
+        state.test_cursor_over = Some(false);
+        // Auto-hide hold from a prior track.
         state.held_content = Some(MediaEvent::TrackChanged(track_for("Brave", "Song A", "Artist")));
+        state.phase = Phase::Hidden;
         state
             .queue
             .lock()
@@ -4123,16 +4133,55 @@ mod tests {
             ))));
         state.receive_events();
 
+        // The update must surface the pill, not vanish into the held content.
+        assert!(
+            !matches!(state.phase, Phase::Hidden),
+            "an auto-hidden persistent pill must surface the update, not stay hidden"
+        );
+        assert!(
+            state.content.as_ref().is_some_and(
+                |c| matches!(c, MediaEvent::TrackChanged(t) if t.source_app == "youtube-music" && t.title == "Song B")
+            ),
+            "the latest track must be on screen"
+        );
+        assert!(
+            state.dismiss_at.is_some(),
+            "the surfaced update must have a dismiss deadline"
+        );
+        assert!(
+            state.persistent_collapse_on_dismiss,
+            "dismiss must collapse into a hide over the fullscreen foreground"
+        );
+        assert!(state.pending.is_empty());
+        // The resume hold tracks the latest update so the foreground-clear resume
+        // re-shows it, not the stale prior track.
         assert!(
             matches!(
                 state.held_content.as_ref(),
-                Some(MediaEvent::TrackChanged(t))
-                    if t.source_app == "youtube-music" && t.title == "Song B"
+                Some(MediaEvent::TrackChanged(t)) if t.title == "Song B"
             ),
-            "held content must track the latest event while auto-hidden"
+            "held content must track the latest update for resume"
         );
-        assert!(matches!(state.phase, Phase::Hidden));
-        assert!(state.pending.is_empty());
+
+        // At the deadline the temporary pill takes the collapse-to-hide route
+        // instead of the idle fade, so it does not linger at dimmed opacity over
+        // the fullscreen app; the auto-hidden state is restored with the newest
+        // held content for the resume.
+        state.dismiss_at = Some(Instant::now() - Duration::from_secs(1));
+        state.last_fullscreen = Some(true);
+        // Seed the leave timer into the past so the "cursor leaves, restart the
+        // fade timer" branch does not reset dismiss_at to the future this tick
+        // (the same gotcha the persistent-idle-fade test documents).
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+        state.tick();
+        assert!(
+            !state.persistent_faded,
+            "the idle fade must not engage on the collapse-to-hide path"
+        );
+        assert!(
+            matches!(state.phase, Phase::Collapsing(_) | Phase::Hidden),
+            "the temporary pill must collapse (or finish collapsing) rather than linger"
+        );
     }
 
     fn brave_track(title: &str) -> TrackInfo {
@@ -5034,6 +5083,13 @@ mod tests {
         config.overlay.layout = LayoutMode::PersistentCompact;
         let mut state = OverlayState::new(config, EventQueue::default());
         state.test_cursor_over = Some(false);
+        // Stub the real foreground: the first tick would otherwise route
+        // through on_foreground_change and, when the terminal's window is
+        // fullscreen, hide the pill before the fade logic runs.
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
         let track = track_for("spotify", "Song", "Artist");
         state.content = Some(MediaEvent::TrackChanged(track));
         state.phase = Phase::Shown;
@@ -5065,6 +5121,13 @@ mod tests {
         config.overlay.fade_persistent_pill = false;
         let mut state = OverlayState::new(config, EventQueue::default());
         state.test_cursor_over = Some(false);
+        // Stub the real foreground: the first tick would otherwise route
+        // through on_foreground_change and, when the terminal's window is
+        // fullscreen, hide the pill before the fade logic runs.
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
         state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Song", "Artist")));
         state.phase = Phase::Shown;
         // dismiss_at just in the past; hover_leave_at also in the past so the
@@ -5082,16 +5145,23 @@ mod tests {
     }
 
     #[test]
-    fn fade_disabled_persistent_pill_hides_when_nothing_playing() {
-        // fade_persistent_pill = false + paused: the dismiss deadline
-        // collapses the pill, and the collapse completes into a full hide —
-        // a bright stale pill must not linger over nothing, and must not be
-        // revived at full opacity by the collapse completion.
+    fn fade_disabled_persistent_pill_stays_bright_while_paused() {
+        // fade_persistent_pill = false + paused: the dismiss deadline is a no-op
+        // — the pill stays at full opacity in the Shown phase, not collapsing.
+        // Paused means the source is still alive and the user may resume; only
+        // a Stopped state (tombstone) should hide the pill.
         let mut config = Config::default();
         config.overlay.layout = LayoutMode::PersistentCompact;
         config.overlay.fade_persistent_pill = false;
         let mut state = OverlayState::new(config.clone(), EventQueue::default());
         state.test_cursor_over = Some(false);
+        // Stub the real foreground: the first tick would otherwise route
+        // through on_foreground_change and, when the terminal's window is
+        // fullscreen, hide the pill before the dismiss logic runs.
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
         state.content = Some(MediaEvent::PlaybackStateChanged(
             PlaybackState::Paused,
             "spotify".into(),
@@ -5101,20 +5171,12 @@ mod tests {
         state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
 
         state.tick();
-        assert!(
-            matches!(state.phase, Phase::Collapsing(_)),
-            "a paused persistent pill must collapse with the fade off"
-        );
 
-        // Run the collapse past its animation length: it must complete into a
-        // hide, not back into a bright shown pill.
-        state.phase = Phase::Collapsing(Instant::now() - collapse_duration(&state.config) - Duration::from_millis(1));
-        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
-        state.tick();
         assert!(
-            matches!(state.phase, Phase::Hidden),
-            "the completed collapse must hide the pill"
+            matches!(state.phase, Phase::Shown),
+            "a paused persistent pill must not collapse with the fade off"
         );
+        assert!(!state.persistent_faded, "the idle fade must never arm");
     }
 
     #[test]
@@ -5127,6 +5189,13 @@ mod tests {
         config.overlay.fade_persistent_pill = true;
         let mut state = OverlayState::new(config.clone(), EventQueue::default());
         state.test_cursor_over = Some(false);
+        // Stub the real foreground: the first tick would otherwise route
+        // through on_foreground_change and, when the terminal's window is
+        // fullscreen, hide the pill before the collapse logic runs.
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
         state.content = Some(MediaEvent::PlaybackStateChanged(
             PlaybackState::Stopped,
             "youtube-music".into(),

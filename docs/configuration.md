@@ -42,7 +42,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | `compact_monitor` | `"active-window"` | string | Which display the Compact layout is placed on     |
 | `dismiss_on_hover` | `true` | bool | Hovering a pill in the Expanded layout arms its dismissal (remaining time capped at 500 ms, one-way). For Compact pills it makes the second hover dismiss (see below) |
 | `expand_compact_on_hover` | `true` | bool | Hovering a pill in the Compact layout expands it in place; with `dismiss_on_hover` on, the second hover dismisses (see below) |
-| `fade_persistent_pill` | `true` | bool | With `layout = "persistent-compact"`, fade the pill to idle opacity once `duration_ms` passes without cursor interaction. Off: while media is playing the pill stays at full opacity (no idle fade), and when nothing is playing (paused/stopped) it hides after `duration_ms` instead of lingering. Hiding for fullscreen/listed foregrounds (`hide_for_auto_compact_sources`) applies either way |
+| `fade_persistent_pill` | `true` | bool | With `layout = "persistent-compact"`, fade the pill to idle opacity once `duration_ms` passes without cursor interaction. Off: the pill stays at full opacity while media is playing or paused (no idle fade), and hides only when the source has stopped. Hiding for fullscreen/listed foregrounds (`hide_for_auto_compact_sources`) applies either way |
 
 `layout` accepts one of:
 
@@ -56,10 +56,10 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
   re-sampled at every show and whenever the foreground window changes.
 - `"persistent-compact"` — the pill is always shown, but in the Compact
   layout (a slim, lower-profile pill). Useful for a permanent status
-  indicator that never auto-hides. The pill fades to idle opacity after
-  `duration_ms` of no cursor interaction; with `fade_persistent_pill` off,
-  it stays at full opacity while media plays and hides when nothing is
-  playing instead of fading.
+   indicator that never auto-hides. The pill fades to idle opacity after
+   `duration_ms` of no cursor interaction; with `fade_persistent_pill` off,
+   it stays at full opacity while media plays or is paused and hides only
+   when the source has stopped.
 
 While `compact_position_separate` is `false`, the Compact layout follows the
 live Expanded position — changing `vertical`/`horizontal`/`margin`/`monitor`
