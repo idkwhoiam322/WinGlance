@@ -63,6 +63,13 @@ struct LogicalState {
     /// When the first read was deferred waiting for artwork: the pill shows
     /// anyway once this timestamp is older than `ARTWORK_TIMEOUT`.
     deferred_at: Option<Instant>,
+    /// Whether the pending `deferred_at` deferral was a stale-art drop (a
+    /// same-cover re-read held back for the artwork retry) rather than a
+    /// first-read awaiting-artwork deferral. The poll force must not
+    /// shortcut the stale-art deferral while the retry budget is unconsumed,
+    /// or it would flash an artless pill the retry immediately re-emits
+    /// with art.
+    deferred_for_stale_art: bool,
     /// Number of poll-driven artwork retries attempted for this session. Bounded
     /// by `ARTWORK_RETRY_BUDGET` so a session that never provides a thumbnail is
     /// not re-read indefinitely (the 2s poll interval keeps this cheap).
@@ -701,7 +708,9 @@ impl ListenerState {
                     // always keep their art, so a legitimately shared cover
                     // within an album survives; the artwork-changed re-emit
                     // surfaces the real cover once the stream catches up.
-                    if read_artwork && stale_thumbnail(&merged, self.last_track_per_source.get(&merged.source_app)) {
+                    let stale_dropped =
+                        read_artwork && stale_thumbnail(&merged, self.last_track_per_source.get(&merged.source_app));
+                    if stale_dropped {
                         merged.artwork = None;
                         let label = track_label(&merged);
                         debug!("stale thumbnail dropped | reason=identity-switch | {label}");
@@ -750,7 +759,7 @@ impl ListenerState {
                     // which must not be announced as a "sample track". A real
                     // MediaPropertiesChanged or the poll will surface the actual
                     // track when its metadata lands.
-                    if !emit && !placeholder && defer_expired(prev.deferred_at) {
+                    if !emit && !placeholder && defer_expired(prev.deferred_at) && poll_force_allowed(&prev) {
                         emit = true;
                         let label = track_label(&merged);
                         debug!("track emit forced | reason=artwork-timeout | {label}");
@@ -868,6 +877,26 @@ impl ListenerState {
                     {
                         events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
                     }
+                    // Stale-art emit gate: this read's art was byte-equal to the
+                    // last emitted track and got dropped as stale — a genuinely
+                    // shared album cover, or a transition-window stale buffer.
+                    // Do not flash an artless pill here: the artwork retry
+                    // (~2s, bypasses the stale guard) delivers the cover, so
+                    // the pill appears once, with art. The paired playback
+                    // event is held back like the first-read deferral, so a
+                    // state pill does not render with the source's previous
+                    // track; the deferred track carries the change. A later
+                    // read past ARTWORK_TIMEOUT still forces the pill if the
+                    // thumbnail stream never recovers, preserving the "always
+                    // eventually shows something" guarantee.
+                    if emit && stale_dropped {
+                        emit = false;
+                        next.deferred_at = Some(Instant::now());
+                        next.deferred_for_stale_art = true;
+                        events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
+                        let label = track_label(&merged);
+                        debug!("track emit deferred | reason=stale-art-drop | {label}");
+                    }
                     if emit && !placeholder && !session_recreation {
                         let label = track_label(&merged);
                         info!("track changed | {label}");
@@ -884,6 +913,7 @@ impl ListenerState {
                         );
                         self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
                         next.deferred_at = None;
+                        next.deferred_for_stale_art = false;
                     } else if emit && session_recreation {
                         // Only an emit that would actually fire is worth logging
                         // as suppressed: the 2-second poll re-reads the current
@@ -913,11 +943,15 @@ impl ListenerState {
                             // track carries the change.
                             events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
                             next.deferred_at = Some(Instant::now());
+                            next.deferred_for_stale_art = false;
                             let label = track_label(&merged);
                             debug!("track emit deferred | reason=awaiting-artwork | {label}");
-                        } else if read_artwork {
+                        } else if read_artwork && !stale_dropped {
                             // Event-driven reads only: the 2-second poll re-reads
                             // every session and must not log a duplicate per pass.
+                            // A stale-dropped read is already accounted by the
+                            // deferral above (reason=stale-art-drop), not a
+                            // duplicate of the last emitted track.
                             let label = track_label(&merged);
                             debug!("track emit skipped | reason=duplicate | {label}");
                         }
@@ -1391,6 +1425,7 @@ impl ListenerState {
             self.emit(MediaEvent::TrackChanged(emitted));
             if let Some(state) = self.states.get_mut(&key) {
                 state.deferred_at = None;
+                state.deferred_for_stale_art = false;
             }
         } else if is_placeholder_like(&merged) {
             debug!("track emit skipped | reason=placeholder | source={}", merged.source_app);
@@ -2108,6 +2143,16 @@ fn should_poll_artwork(state: Option<&LogicalState>) -> bool {
         None => return false,
     };
     !prev.has_artwork && prev.artwork_attempts < ARTWORK_RETRY_BUDGET
+}
+
+/// Whether the poll-time "artwork-timeout" force may fire for a deferred
+/// read. A stale-art deferral is resolved by the pending artwork retry in
+/// the same poll pass; forcing an artless emit there flashes a pill the
+/// retry immediately re-emits with art, so it is suppressed while the retry
+/// budget is unconsumed. Every other deferral (first-read awaiting-artwork)
+/// keeps the timeout guarantee: the pill shows anyway after `ARTWORK_TIMEOUT`.
+fn poll_force_allowed(prev: &LogicalState) -> bool {
+    !(prev.deferred_for_stale_art && prev.artwork_attempts < ARTWORK_RETRY_BUDGET)
 }
 
 /// Whether a retry-driven artwork read should emit a TrackChanged. The retry
@@ -3203,6 +3248,67 @@ mod tests {
     }
 
     #[test]
+    fn stale_art_drop_defers_the_emit_until_the_retry_surfaces_the_real_cover() {
+        // The transition window pairs the NEW identity with the PREVIOUS
+        // track's exact thumbnail bytes (SMTC updates the thumbnail stream
+        // after the text fields). The stale guard drops that art, and the
+        // read would otherwise emit an ARTLESS pill for the new track; the
+        // ~2s artwork retry (which bypasses the stale guard) then emits the
+        // SAME track again WITH art — two pills for one transition, the
+        // first coverless. The emit gate must therefore defer the artless
+        // variant. Assert the two predicates the gate composes: the read is
+        // stale-flagged, and the merged read would emit.
+        let art = Arc::<[u8]>::from(vec![1u8, 2, 3, 4]);
+        let last = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            artwork: Some(art.clone()),
+            ..TrackInfo::default()
+        };
+        // New identity (title differs), same byte-equal cover as last emitted.
+        let next = TrackInfo {
+            title: "Other".into(),
+            artist: "Artist".into(),
+            artwork: Some(art),
+            ..TrackInfo::default()
+        };
+        assert!(
+            stale_thumbnail(&next, Some(&last)),
+            "the transition read must be stale-flagged"
+        );
+        // The stale guard drops the art before the emit decision runs.
+        let artless = TrackInfo {
+            artwork: None,
+            ..next.clone()
+        };
+        let prev = LogicalState {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            has_artwork: true,
+            ..LogicalState::default()
+        };
+        assert!(
+            emit_track(&prev, &artless, true).0,
+            "without the gate the dropped-art read would still emit an artless pill"
+        );
+        // The gate defers; it works when the retry reads the REAL cover
+        // (different bytes) for a track not already shown with art: emit.
+        let real_cover = TrackInfo {
+            title: "Other".into(),
+            artist: "Artist".into(),
+            artwork: Some(Arc::<[u8]>::from(vec![9u8, 8, 7, 6])),
+            ..TrackInfo::default()
+        };
+        assert!(retry_should_emit(&real_cover, Some(&last)));
+        // A recreated session re-reporting a track whose cover is already
+        // shown must not re-emit (the duplicate-pill case the gate fixes).
+        assert!(!retry_should_emit(&real_cover, Some(&real_cover)));
+        // No real cover yet (art still absent from the stream): nothing to
+        // surface, so the retry does not emit a second pill.
+        assert!(!retry_should_emit(&artless, Some(&last)));
+    }
+
+    #[test]
     fn palette_for_identity_reuses_the_cached_palette_across_byte_changes() {
         let mut cache = HashMap::new();
         // A plausible solid RGBA cover (all white) at the palette grid size:
@@ -3476,6 +3582,26 @@ mod tests {
         s.artwork_attempts = 0;
         s.has_artwork = true;
         assert!(!should_poll_artwork(Some(&s)));
+    }
+
+    #[test]
+    fn poll_force_defers_stale_art_to_the_retry_within_budget() {
+        // A first-read awaiting-artwork deferral is never gated by the
+        // retry budget: the timeout force still guarantees the pill shows.
+        let s = LogicalState::default();
+        assert!(poll_force_allowed(&s));
+        // A stale-art deferral inside the budget is resolved by the pending
+        // retry in the same poll pass; forcing now would flash an artless
+        // pill the retry immediately re-emits with art.
+        let mut stale = LogicalState {
+            deferred_for_stale_art: true,
+            ..LogicalState::default()
+        };
+        assert!(!poll_force_allowed(&stale));
+        // Budget exhausted → the "always eventually shows something"
+        // guarantee wins over the flash concern.
+        stale.artwork_attempts = ARTWORK_RETRY_BUDGET;
+        assert!(poll_force_allowed(&stale));
     }
 
     #[test]
