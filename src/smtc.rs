@@ -1335,8 +1335,13 @@ impl ListenerState {
         // Palette identities of departed sources are dead weight: without
         // this prune the cache would accumulate one entry per distinct
         // (source, title, artist) ever seen for the listener's lifetime.
-        self.palette_per_identity
-            .retain(|key, _| active.contains(palette_key_source(key)));
+        // A source still inside the terminal-Stop grace keeps its palette,
+        // matching the other source-level caches: the same track can
+        // re-report during the settle and needs its identity-stable palette.
+        self.palette_per_identity.retain(|key, _| {
+            let source = palette_key_source(key);
+            active.contains(source) || self.terminal_pending.contains_key(source)
+        });
     }
 
     /// YouTube Music and similar browser clients can leave several sessions
@@ -1640,13 +1645,25 @@ impl ListenerState {
         // The sync loop enforces the global admission caps, but event-driven
         // subscriptions race ahead of the next sync: cap the session count here
         // too, so a burst of current-session events for one source cannot exceed
-        // MAX_TRACKED_SESSIONS between syncs.
+        // MAX_TRACKED_SESSIONS between syncs. The distinct-source cap is applied
+        // the same way, so a storm of events from many different sources cannot
+        // subscribe more than MAX_TRACKED_SOURCES before the next sync.
         if self.subscriptions.len() >= MAX_TRACKED_SESSIONS {
             debug!("SMTC session not subscribed | reason=session-cap | key={key}");
             return Ok(false);
         }
+        let source = read_source_app(session);
+        let distinct_sources: HashSet<String> = self
+            .subscriptions
+            .values()
+            .map(|s| read_source_app(&s.session))
+            .collect();
+        if !distinct_sources.contains(&source) && distinct_sources.len() >= MAX_TRACKED_SOURCES {
+            debug!("SMTC session not subscribed | reason=source-cap | key={key} | source={source}");
+            return Ok(false);
+        }
         let subscription = self.subscribe(session)?;
-        debug!("subscribed to SMTC session {key} | source={}", read_source_app(session));
+        debug!("subscribed to SMTC session {key} | source={source}");
         self.subscriptions.insert(key, subscription);
         Ok(true)
     }
@@ -2314,14 +2331,20 @@ fn emit_track(prev: &LogicalState, merged: &TrackInfo, read_artwork: bool) -> (b
     // Seek detection: a position jump beyond the threshold (or a presence
     // flip in reported position) re-emits so the overlay re-bases instead of
     // drifting from a stale base. Position is excluded from content_differ.
+    // The threshold scales with the playback rate: a normal advance between
+    // two reads is roughly `rate` times the wall-clock gap, so a fixed delta
+    // would flag a false seek during 2x+ playback (~2 s cadence at 2x moves
+    // ~4 s). Clamp the rate to a floor so a slow/stopped source keeps the
+    // base threshold and a genuine seek is still adopted.
     // A fresh session's first read always shows a position presence flip, so
     // the seek term must not override the artwork deferral: sources that
     // recreate their session per track change would otherwise emit a
     // title-only pill while SMTC populates the thumbnail (~500 ms later), and
     // the cover would then swap in under it. Established sessions have
     // `defer_first == false`, so their seek re-emits are unaffected.
+    let rate = merged.playback_rate.unwrap_or(1.0).max(1.0);
     let seek = match (merged.position_secs, prev.last_position_secs) {
-        (Some(rp), Some(pp)) => (rp - pp as f64).abs() > SEEK_DELTA_SECS,
+        (Some(rp), Some(pp)) => (rp - pp as f64).abs() > SEEK_DELTA_SECS * rate,
         (Some(_), None) | (None, Some(_)) => true,
         _ => false,
     };
@@ -3732,6 +3755,37 @@ mod tests {
         assert!(emit_track(&prev_none, &make(Some(5.0)), false).0);
         // Presence flip (position vanished) → re-emit.
         assert!(emit_track(&prev, &make(None), false).0);
+    }
+
+    #[test]
+    fn seek_delta_scales_with_playback_rate() {
+        let prev = LogicalState {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "spotify".into(),
+            last_position_secs: Some(10),
+            ..LogicalState::default()
+        };
+        let make = |pos: Option<f64>, rate: Option<f64>| TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "spotify".into(),
+            position_secs: pos,
+            playback_rate: rate,
+            ..TrackInfo::default()
+        };
+        // At 2x playback a ~4 s advance between two reads is normal cadence
+        // (~2 s poll gap scaled by the rate), not a seek. The fixed 3.0 s
+        // delta would have flagged it; the rate-scaled threshold (6.0 s) does
+        // not.
+        assert!(!emit_track(&prev, &make(Some(14.0), Some(2.0)), false).0);
+        // The same 4 s delta at 1x IS a genuine seek.
+        assert!(emit_track(&prev, &make(Some(14.0), Some(1.0)), false).0);
+        // A real 10 s jump at 2x clears the scaled threshold and re-emits.
+        assert!(emit_track(&prev, &make(Some(20.0), Some(2.0)), false).0);
+        // No rate reported: the base delta applies unchanged.
+        assert!(!emit_track(&prev, &make(Some(11.0), None), false).0);
+        assert!(emit_track(&prev, &make(Some(50.0), None), false).0);
     }
 
     #[test]
