@@ -183,6 +183,12 @@ struct ListenerState {
     /// rejected session is logged once per appearance instead of on every
     /// re-sync (the 2-second poll re-lists all sessions).
     rejected_seen: HashSet<usize>,
+    /// Source apps whose last session reported Closed (or vanished from the
+    /// session snapshot between syncs) and still owe the overlay a terminal
+    /// `Stopped`, so a persistent pill does not linger at idle opacity
+    /// forever. Settled in `sync_subscriptions`, where the full session
+    /// snapshot decides whether the source is really gone.
+    terminal_pending: HashSet<String>,
     /// Heartbeat touched each loop iteration so the supervisor can detect a
     /// stall and restart the listener.
     heartbeat: Arc<Mutex<Instant>>,
@@ -357,6 +363,7 @@ impl ListenerState {
             churn: HashMap::new(),
             churn_cooldown: HashMap::new(),
             rejected_seen: HashSet::new(),
+            terminal_pending: HashSet::new(),
             last_track_per_source: HashMap::new(),
             last_known_playback_per_source: HashMap::new(),
             now_showing,
@@ -539,9 +546,15 @@ impl ListenerState {
             // Closed does not go through the diff/emit path: it usually fires
             // as the app quits, right after a Stopped/Paused already told the
             // user what happened, so the entry is evicted immediately and
-            // nothing is emitted.
-            debug!("SMTC session closed | key={key} | source={}", read_source_app(session));
+            // nothing is emitted. But an app can also quit without a terminal
+            // state report — the persistent pill would then keep the last
+            // track at idle opacity forever. Remember the source so the next
+            // sync can settle a terminal Stopped once the session (and any
+            // sibling session) is really gone from the snapshot.
+            let source = read_source_app(session);
+            debug!("SMTC session closed | key={key} | source={source}");
             self.evict(key);
+            self.terminal_pending.insert(source);
             return Ok(());
         }
         let playback = match status {
@@ -1010,9 +1023,52 @@ impl ListenerState {
         }
         stale.sort_unstable();
         stale.dedup();
-        for key in stale {
+        // A source whose last subscribed session vanished from the snapshot —
+        // or reported Closed before the snapshot caught up (see
+        // refresh_session) — owes the overlay a terminal Stopped: without one,
+        // a persistent pill keeps the last track at idle opacity forever. The
+        // vanished sources are collected BEFORE the eviction below, which
+        // removes the subscriptions this pass reads; the settlement then uses
+        // the full snapshot to decide the source is really gone. Emitted at
+        // most once per disappearance: the per-source cache retention below
+        // drops the warranting playback state for departed sources.
+        let alive_sources: HashSet<String> = sessions.iter().map(read_source_app).collect();
+        for key in &stale {
+            if let Some(subscription) = self.subscriptions.get(key) {
+                let source = read_source_app(&subscription.session);
+                if !alive_sources.contains(&source) {
+                    self.terminal_pending.insert(source);
+                }
+            }
+        }
+        for key in &stale {
             debug!("SMTC session disappeared | key={key}");
-            self.evict(key);
+            self.evict(*key);
+        }
+        let mut settled: Vec<String> = Vec::new();
+        self.terminal_pending.retain(|source| {
+            if alive_sources.contains(source) {
+                // The source still has an open session: a Closed that leaves
+                // siblings behind is not a disappearance. Keep the entry until
+                // the last session goes, so a Closed that outlived its own
+                // snapshot entry still settles.
+                true
+            } else {
+                settled.push(source.clone());
+                false
+            }
+        });
+        for source in settled {
+            // Skip sources whose only report was Stopped (already announced)
+            // and sources on the churn cool-down (their exit lines are
+            // deliberately silent; the cool-down already excluded them).
+            if terminal_stopped_warranted(
+                self.last_known_playback_per_source.get(&source).copied(),
+                self.source_on_cooldown(&source),
+            ) {
+                info!("playback state changed | state=Stopped | source={source}");
+                self.emit(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, source));
+            }
         }
         // Forget rejected sessions that vanished so a later reappearance is
         // reported again.
@@ -2087,10 +2143,33 @@ fn debounce_duration(config: &Config) -> Duration {
     Duration::from_millis(config.behavior.debounce_ms.clamp(150, 250))
 }
 
+/// Whether a source that just lost its last session still owes the overlay a
+/// terminal `Stopped`: only sources that last reported Playing or Paused need
+/// one (Stopped was already announced, and a source that never reported a
+/// state never showed anything), and a source on the churn cool-down must stay
+/// silent per the cool-down contract.
+fn terminal_stopped_warranted(last_known: Option<PlaybackState>, on_cooldown: bool) -> bool {
+    !on_cooldown && matches!(last_known, Some(PlaybackState::Playing | PlaybackState::Paused))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::anyhow;
+
+    #[test]
+    fn terminal_stopped_warranted_only_for_a_real_last_state_off_cooldown() {
+        // A source that last played or paused owes the overlay a terminal
+        // Stopped when its session vanishes.
+        assert!(terminal_stopped_warranted(Some(PlaybackState::Playing), false));
+        assert!(terminal_stopped_warranted(Some(PlaybackState::Paused), false));
+        // A Stopped state was already announced, and a source that never
+        // reported a state never showed anything.
+        assert!(!terminal_stopped_warranted(Some(PlaybackState::Stopped), false));
+        assert!(!terminal_stopped_warranted(None, false));
+        // A churning source stays silent while on the cool-down.
+        assert!(!terminal_stopped_warranted(Some(PlaybackState::Playing), true));
+    }
 
     #[test]
     fn source_app_label_uses_a_readable_fallback() {

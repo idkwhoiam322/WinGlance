@@ -1218,6 +1218,31 @@ impl OverlayState {
                 MediaEvent::PlaybackStateChanged(state, source_app)
                     if self.config.behavior.enable_playback_state_change =>
                 {
+                    // Persistent-compact: a Stopped that does not belong to
+                    // the source the pill is showing (or holding while
+                    // auto-hidden) is dropped. The in-place swap below would
+                    // otherwise put a dead ⏹ pill on screen whenever a
+                    // background source closes — and with nothing showing, a
+                    // terminal Stopped has nothing to retire, so it must not
+                    // flash a pill either.
+                    let shows_source = self
+                        .content
+                        .as_ref()
+                        .or(self.held_content.as_ref())
+                        .and_then(|content| match content {
+                            MediaEvent::TrackChanged(track) => Some(track.source_app.as_str()),
+                            MediaEvent::PlaybackStateChanged(_, source) => Some(source.as_str()),
+                            _ => None,
+                        });
+                    if matches!(state, PlaybackState::Stopped)
+                        && self.config.overlay.layout == LayoutMode::PersistentCompact
+                        && shows_source != Some(source_app.as_str())
+                    {
+                        debug!(
+                            "playback state pill dropped | reason=cross-source Stopped (persistent pill shows another source) | source={source_app}"
+                        );
+                        continue;
+                    }
                     // Suppress a redundant PlaybackStateChanged pill when:
                     //  - A TrackChanged for the same source is in this batch
                     //    (see the pre-scan above: the state pill would render the
@@ -1951,6 +1976,13 @@ impl OverlayState {
             Some(MediaEvent::PlaybackStateChanged(s, _)) => *s == PlaybackState::Playing,
             _ => false,
         };
+        // A Stopped-state pill is a tombstone: the source behind it is done,
+        // so persistent-compact must not let it linger at idle opacity — it
+        // collapses and hides at its dismiss deadline (see below).
+        let stopped_shown = matches!(
+            &self.content,
+            Some(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, _))
+        );
         if playing && !self.progress_playing {
             // Resuming after a pause/stop: re-anchor so elapsed restarts from
             // the frozen position instead of the original anchor.
@@ -2200,7 +2232,19 @@ impl OverlayState {
         // full opacity), but when nothing is playing a bright stale pill must
         // not linger — collapse and hide it like any other mode.
         if self.config.overlay.layout == LayoutMode::PersistentCompact && !self.persistent_collapse_on_dismiss {
-            if self.config.overlay.fade_persistent_pill {
+            // A Stopped-state pill must not linger at idle opacity either:
+            // its source is done, so the deadline collapses it into a full
+            // hide like any other mode.
+            if stopped_shown {
+                if !cursor_over
+                    && self.dismiss_at.is_some_and(|deadline| deadline <= now)
+                    && matches!(self.phase, Phase::Shown)
+                {
+                    self.phase = Phase::Collapsing(now);
+                    self.hover_expand = None;
+                    debug!("persistent pill hidden (stopped)");
+                }
+            } else if self.config.overlay.fade_persistent_pill {
                 if !self.persistent_faded
                     && !cursor_over
                     && self.dismiss_at.is_some_and(|deadline| deadline <= now)
@@ -2251,9 +2295,10 @@ impl OverlayState {
                 // fullscreen/listed), in which case the pill fully hides.
                 // With the idle fade disabled, a collapse while nothing is
                 // playing (paused/stopped) hides the pill instead of reviving
-                // it at full opacity.
+                // it at full opacity; a Stopped-state pill hides regardless
+                // of the fade setting, since nothing can revive it.
                 if self.config.overlay.layout == LayoutMode::PersistentCompact && !self.persistent_collapse_on_dismiss {
-                    if !self.config.overlay.fade_persistent_pill && !playing {
+                    if (!self.config.overlay.fade_persistent_pill && !playing) || stopped_shown {
                         self.hide();
                         return;
                     }
@@ -4901,6 +4946,120 @@ mod tests {
         assert!(
             matches!(state.phase, Phase::Hidden),
             "the completed collapse must hide the pill"
+        );
+    }
+
+    #[test]
+    fn stopped_persistent_pill_hides_at_deadline_even_with_fade_enabled() {
+        // fade_persistent_pill = true + a Stopped-state pill: the deadline
+        // must collapse the tombstone into a full hide — lingering at idle
+        // opacity would keep a dead ⏹ pill on screen forever.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.overlay.fade_persistent_pill = true;
+        let mut state = OverlayState::new(config.clone(), EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.content = Some(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Stopped,
+            "youtube-music".into(),
+        ));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+        assert!(
+            matches!(state.phase, Phase::Collapsing(_)),
+            "a stopped persistent pill must collapse at its deadline even with the fade enabled"
+        );
+
+        // Run the collapse past its animation length: it must complete into a
+        // hide, not back into a bright shown pill at idle opacity.
+        state.phase = Phase::Collapsing(Instant::now() - collapse_duration(&state.config) - Duration::from_millis(1));
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.tick();
+        assert!(
+            matches!(state.phase, Phase::Hidden),
+            "the completed collapse must hide the stopped pill"
+        );
+    }
+
+    #[test]
+    fn cross_source_stopped_does_not_displace_a_persistent_pill() {
+        // The persistent pill shows Brave's track; YouTube Music closes in
+        // the background. Its terminal Stopped must not swap the pill to a
+        // dead ⏹ state — the in-place swap is reserved for the shown source.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.content = Some(MediaEvent::TrackChanged(brave_track("Brave Song")));
+        state.current_source = Some("Brave".into());
+        state.phase = Phase::Shown;
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Stopped,
+                "youtube-music".into(),
+            )));
+        state.receive_events();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "Brave"
+            ),
+            "the shown pill must survive a cross-source Stopped"
+        );
+    }
+
+    #[test]
+    fn same_source_stopped_refreshes_a_persistent_pill_then_it_hides() {
+        // The source behind the shown track quits: the Stopped must swap the
+        // pill in place (⏹ over the cached track), then the new dismiss
+        // deadline collapses it into a full hide instead of the idle fade.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.overlay.fade_persistent_pill = true;
+        let mut state = OverlayState::new(config.clone(), EventQueue::default());
+        state.cache_track(&ytm_track("Last YTM Track"));
+        state.content = Some(MediaEvent::TrackChanged(ytm_track("Last YTM Track")));
+        state.phase = Phase::Shown;
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Stopped,
+                "youtube-music".into(),
+            )));
+        state.receive_events();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, s)) if s == "youtube-music"
+            ),
+            "a same-source Stopped must refresh the shown pill in place"
+        );
+
+        state.test_cursor_over = Some(false);
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+        state.tick();
+        assert!(
+            matches!(state.phase, Phase::Collapsing(_)),
+            "the refreshed Stopped pill must collapse at its deadline"
+        );
+
+        state.phase = Phase::Collapsing(Instant::now() - collapse_duration(&state.config) - Duration::from_millis(1));
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.tick();
+        assert!(
+            matches!(state.phase, Phase::Hidden),
+            "the completed collapse must hide the stopped pill"
         );
     }
 
