@@ -5081,6 +5081,22 @@ mod tests {
             &config_with_sources(&config, ["YouTube Music"]),
             Some("youtube-music.exe")
         ));
+        assert!(auto_source_matches(
+            &config_with_sources(&config, ["Plex"]),
+            Some("Plex.exe")
+        ));
+        assert!(auto_source_matches(
+            &config_with_sources(&config, ["firefox"]),
+            Some("firefox.exe")
+        ));
+        assert!(auto_source_matches(
+            &config_with_sources(&config, ["Roblox"]),
+            Some("Roblox.exe")
+        ));
+        assert!(auto_source_matches(
+            &config_with_sources(&config, ["code"]),
+            Some("Code.exe")
+        ));
         assert!(!auto_source_matches(
             &config_with_sources(&config, ["spotify"]),
             Some("chrome.exe")

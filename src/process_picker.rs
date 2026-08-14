@@ -353,6 +353,17 @@ fn pretty_source_label(value: &str) -> String {
         .join(" ")
 }
 
+/// Strips the `.exe` (or `.EXE`) suffix from an executable name without
+/// corrupting stem characters ending in 'e', 'x', or '.' (which a character-set
+/// trim would do for names like "firefox.exe", "Plex.exe", "Roblox.exe", "code.exe").
+pub(crate) fn strip_exe_suffix(name: &str) -> &str {
+    if name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
+}
+
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let scan = unsafe { &mut *(lparam.0 as *mut WindowScan) };
 
@@ -390,10 +401,7 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         return BOOL(1);
     }
 
-    let pattern = exe_name
-        .trim_end_matches(".exe")
-        .trim_end_matches(".EXE")
-        .to_lowercase();
+    let pattern = strip_exe_suffix(exe_name).to_lowercase();
 
     scan.found.push((
         pid,
@@ -1283,5 +1291,17 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].pattern, "alpha");
         assert_eq!(list[1].pattern, "zeta");
+    }
+
+    #[test]
+    fn strip_exe_suffix_preserves_stem_ending_in_e_x_or_dot() {
+        assert_eq!(strip_exe_suffix("firefox.exe"), "firefox");
+        assert_eq!(strip_exe_suffix("Plex.exe"), "Plex");
+        assert_eq!(strip_exe_suffix("Roblox.exe"), "Roblox");
+        assert_eq!(strip_exe_suffix("code.exe"), "code");
+        assert_eq!(strip_exe_suffix("explorer.EXE"), "explorer");
+        assert_eq!(strip_exe_suffix("app.name.exe"), "app.name");
+        assert_eq!(strip_exe_suffix("sample"), "sample");
+        assert_eq!(strip_exe_suffix(".exe"), "");
     }
 }

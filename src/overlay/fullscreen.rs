@@ -511,7 +511,7 @@ pub(super) fn auto_source_matches(config: &Config, exe_name: Option<&str>) -> bo
     if patterns.is_empty() {
         return false;
     }
-    let exe = exe.trim_end_matches(".exe").trim_end_matches(".EXE");
+    let exe = crate::process_picker::strip_exe_suffix(exe);
     let n_exe = crate::smtc::normalize_for_match(exe);
     patterns
         .iter()
