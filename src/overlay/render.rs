@@ -978,6 +978,15 @@ pub(super) fn draw_symbol_pixels(
     }
 }
 
+/// Resolves the glyph for a `TrackChanged` snapshot: the playback state
+/// reported by the source in the same `GetPlaybackInfo` read, or the default
+/// `NowPlaying` symbol when the source did not report one (transitional or
+/// unknown statuses). All three layout paths share this so the glyph can never
+/// drift from the snapshot that carries it.
+pub(super) fn playback_state_for_track(track: &TrackInfo) -> PlaybackState {
+    track.playback_state.unwrap_or(PlaybackState::NowPlaying)
+}
+
 /// Draws the video-player glyph shown on track-change pills whose source
 /// reported `Video`: a hollow rounded box with an optically centered play
 /// triangle. The frame is 0.72S × 0.48S; four capsule bars (0.055S thick,
@@ -1721,7 +1730,7 @@ pub(super) fn draw_expanded_pill_text(
                 width,
                 scale,
                 &pill,
-                Some(PlaybackState::NowPlaying),
+                Some(playback_state_for_track(track)),
                 track.playback_type,
                 content_alpha,
                 body_bottom,
@@ -1931,7 +1940,7 @@ pub(super) fn draw_compact_pill(
             let pill = state.pill_text.take().unwrap_or_else(|| pill_text_from_track(track));
             let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
             state.pill_text = Some(pill);
-            (title, app_icon, PlaybackState::NowPlaying, track.playback_type)
+            (title, app_icon, playback_state_for_track(track), track.playback_type)
         }
         MediaEvent::PlaybackStateChanged(playback, source_app) => {
             let pill = state.pill_text.take().or_else(|| {
@@ -2053,7 +2062,7 @@ pub(super) fn draw_morph_content(
             let pill = state.pill_text.take().unwrap_or_else(|| pill_text_from_track(track));
             let (title, app_icon) = (pill.title.clone(), pill.app_icon.clone());
             state.pill_text = Some(pill);
-            (title, app_icon, PlaybackState::NowPlaying, track.playback_type)
+            (title, app_icon, playback_state_for_track(track), track.playback_type)
         }
         MediaEvent::PlaybackStateChanged(playback, source_app) => {
             let pill = state.pill_text.take().or_else(|| {

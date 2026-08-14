@@ -70,6 +70,15 @@ pub struct TrackInfo {
     /// pills are suppressed by the worker; the type only changes the glyph on
     /// track-change pills.
     pub playback_type: PlaybackType,
+    /// The playback state reported by the source in the same `GetPlaybackInfo`
+    /// call that produced this snapshot (Playing / Paused / Stopped). The
+    /// authoritative state for the pill: a `TrackChanged` is emitted alongside a
+    /// `PlaybackStateChanged` only when the two genuinely differ, so the
+    /// snapshot must not default to Playing and swallow a genuine pause/stop.
+    /// None means the source reported a transitional status (Opened/Changing) or
+    /// the read did not capture a state; callers fall back to the remembered
+    /// per-source state, then Playing.
+    pub playback_state: Option<PlaybackState>,
     /// Monotonic instant captured by the worker at read time; the UI thread
     /// estimates the live position from it. None when position is unknown.
     pub position_updated_at: Option<Instant>,
@@ -211,6 +220,11 @@ impl TrackInfo {
         }
         if incoming.position_updated_at.is_some() {
             self.position_updated_at = incoming.position_updated_at;
+        }
+        // The authoritative playback state is read with the rest of the snapshot;
+        // a later read that carries it supersedes a previously stored value.
+        if incoming.playback_state.is_some() {
+            self.playback_state = incoming.playback_state;
         }
     }
 }

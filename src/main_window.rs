@@ -1348,6 +1348,17 @@ impl MainWindowState {
         crate::repost_if_pending(&self.queue, &self.wake, self.hwnd, "main window");
     }
 
+    /// Authoritative playback state for a new activity: the snapshot's own
+    /// state (the worker suppresses the paired event when it emits a
+    /// TrackChanged, so the state must arrive on the track), then the source's
+    /// last remembered state, then Playing.
+    fn resolve_track_state(track: &TrackInfo, source_states: &HashMap<String, PlaybackState>) -> PlaybackState {
+        track
+            .playback_state
+            .or_else(|| source_states.get(&track.source_app).copied())
+            .unwrap_or(PlaybackState::Playing)
+    }
+
     /// Appends a history row and syncs the listbox + tooltips. Artwork, the
     /// app icon and the decoded cover buffer are stripped before storing —
     /// the history is text-only, and the image bytes would be pure waste
@@ -1483,7 +1494,9 @@ impl MainWindowState {
                 let row = history_row(
                     &track,
                     entry.at,
-                    self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing),
+                    track
+                        .playback_state
+                        .unwrap_or_else(|| self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing)),
                 );
                 let row = wide(&row);
                 if !self.listbox.0.is_null() {
@@ -1505,15 +1518,12 @@ impl MainWindowState {
             return;
         }
 
-        // The new activity starts with the source's own last reported state
-        // (the worker suppresses the paired playback event when it emits a
-        // TrackChanged, so inheriting the previous activity's state could
-        // show another app's Playing/Paused/Stopped).
-        let state = self
-            .source_states
-            .get(&track.source_app)
-            .copied()
-            .unwrap_or(PlaybackState::Playing);
+        // The new activity starts with the snapshot's own playback state (the
+        // worker suppresses the paired playback event when it emits a
+        // TrackChanged, so the state must arrive on the track itself to avoid
+        // inheriting another app's Playing/Paused/Stopped), then the source's
+        // last remembered state, then Playing.
+        let state = Self::resolve_track_state(&track, &self.source_states);
         // History row is text-only: strip the artwork bytes before the clone.
         let mut history_track = track.clone();
         history_track.artwork = None;
@@ -4823,6 +4833,37 @@ mod tests {
         // Newest first: the last pushed entry is at the front.
         let titles: Vec<_> = history.iter().map(|entry| entry.track.title.as_str()).collect();
         assert_eq!(titles, ["Track 4", "Track 3", "Track 2"]);
+    }
+
+    #[test]
+    fn resolve_track_state_prefers_snapshot_then_source_cache() {
+        // A new activity derives its state from the authoritative snapshot,
+        // never by defaulting to Playing (which would mask a pause/stop that
+        // rode the TrackChanged because the worker suppressed its paired state
+        // event in the same batch).
+        let mk = |state: Option<PlaybackState>| TrackInfo {
+            source_app: "spotify".to_string(),
+            playback_state: state,
+            ..TrackInfo::default()
+        };
+        let mut cache: HashMap<String, PlaybackState> = HashMap::new();
+        cache.insert("spotify".to_string(), PlaybackState::Paused);
+        // Snapshot wins over the remembered source state.
+        assert_eq!(
+            MainWindowState::resolve_track_state(&mk(Some(PlaybackState::Stopped)), &cache),
+            PlaybackState::Stopped
+        );
+        // A None snapshot falls through to the source cache.
+        assert_eq!(
+            MainWindowState::resolve_track_state(&mk(None), &cache),
+            PlaybackState::Paused
+        );
+        // A None snapshot with no cache falls back to Playing.
+        let empty: HashMap<String, PlaybackState> = HashMap::new();
+        assert_eq!(
+            MainWindowState::resolve_track_state(&mk(None), &empty),
+            PlaybackState::Playing
+        );
     }
 
     #[test]

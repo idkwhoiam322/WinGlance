@@ -611,13 +611,7 @@ impl ListenerState {
             self.terminal_pending.insert(source, Instant::now());
             return Ok(());
         }
-        let playback = match status {
-            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing => Some(PlaybackState::Playing),
-            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused => Some(PlaybackState::Paused),
-            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped => Some(PlaybackState::Stopped),
-            // Opened/Changing and unknown statuses are transitional: ignored.
-            _ => None,
-        };
+        let playback = snapshot_playback_state(status);
         let prev = self.states.get(&key).cloned().unwrap_or_default();
         let mut next = prev.clone();
         // True until the first successful read (the stored state is the
@@ -665,6 +659,7 @@ impl ListenerState {
             match read_track_info(
                 session,
                 read_artwork,
+                playback,
                 playback_info.PlaybackRate().ok().and_then(|r| r.Value().ok()),
                 playback_type,
             ) {
@@ -876,6 +871,11 @@ impl ListenerState {
                         && spurious_recreated_playback(known_playback, playback)
                     {
                         events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
+                        // The TrackChanged carrying this read must not re-introduce
+                        // the spurious state just dropped: `merge_track` copies the
+                        // snapshot state unconditionally, so null it here or the pill
+                        // would show a pause the user never made.
+                        merged.playback_state = None;
                     }
                     // Stale-art emit gate: this read's art was byte-equal to the
                     // last emitted track and got dropped as stale — a genuinely
@@ -1392,7 +1392,34 @@ impl ListenerState {
         {
             return Ok(());
         }
-        let read = match read_track_info(session, true, None, session_playback_type(session)) {
+        // Re-read the authoritative playback state alongside the artwork so
+        // the retry's TrackChanged carries the same snapshot the event path
+        // would (see `snapshot_playback_state`) — without it, the surfaced
+        // track reports `playback_state: None` and the pill infers playing
+        // even when the source is paused.
+        let (playback, rate) = match session.GetPlaybackInfo() {
+            Ok(playback_info) => {
+                let status = playback_info.PlaybackStatus()?;
+                // A session that reported Closed has nothing to surface; the
+                // normal refresh path settles its terminal state.
+                if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed {
+                    return Ok(());
+                }
+                (
+                    snapshot_playback_state(status),
+                    playback_info.PlaybackRate().ok().and_then(|r| r.Value().ok()),
+                )
+            }
+            Err(error) => {
+                // Count a failed prefetch against the retry budget too: a
+                // session whose reads keep failing must not be retried forever.
+                if let Some(state) = self.states.get_mut(&key) {
+                    state.artwork_attempts += 1;
+                }
+                return Err(error.into());
+            }
+        };
+        let read = match read_track_info(session, true, playback, rate, session_playback_type(session)) {
             Ok(read) => read,
             Err(error) => {
                 // Count a failed read against the budget too: a session whose
@@ -2263,6 +2290,7 @@ fn merge_track(prev: &LogicalState, read: &TrackInfo, read_artwork: bool) -> Tra
         } else {
             read.playback_type
         },
+        playback_state: read.playback_state,
         position_updated_at: read.position_updated_at,
         // The identity-stable palette is attached at emit time (after the
         // decode), never merged here: the merge inherits the previous track's
@@ -2526,9 +2554,28 @@ fn read_session_state(session: &GlobalSystemMediaTransportControlsSession) -> Pl
     }
 }
 
+/// A stopped session is "not playing" no matter what status arrives, so the
+/// TrackInfo snapshot always carries a playback state consistent with the
+/// session info it was read alongside. A stopped session is likely torn down
+/// (the app is dying or lost the SMTC connection), so its snapshot must not
+/// claim the pill should be playing.
+fn snapshot_playback_state(status: GlobalSystemMediaTransportControlsSessionPlaybackStatus) -> Option<PlaybackState> {
+    use GlobalSystemMediaTransportControlsSessionPlaybackStatus as S;
+    if status == S::Stopped {
+        return Some(PlaybackState::Stopped);
+    }
+    // Opened/Changing and unknown statuses are transitional: ignored.
+    match status {
+        S::Playing => Some(PlaybackState::Playing),
+        S::Paused => Some(PlaybackState::Paused),
+        _ => None,
+    }
+}
+
 fn read_track_info(
     session: &GlobalSystemMediaTransportControlsSession,
     read_artwork: bool,
+    playback_state: Option<PlaybackState>,
     playback_rate: Option<f64>,
     playback_type: PlaybackType,
 ) -> Result<TrackInfo> {
@@ -2607,6 +2654,7 @@ fn read_track_info(
         position_secs,
         playback_rate,
         playback_type,
+        playback_state,
         position_updated_at: Some(position_updated_at),
         track_number,
         track_count,
@@ -3725,6 +3773,43 @@ mod tests {
         let mut renamed = read.clone();
         renamed.title = "Other".into();
         assert!(content_differ(&prev, &renamed));
+    }
+
+    #[test]
+    fn merge_track_carries_the_snapshot_playback_state() {
+        // The TrackChanged snapshot is authoritative. The playback state
+        // read in the same `GetPlaybackInfo` call travels with the track through
+        // `merge_track`, so the pill never infers it from event ordering.
+        let prev = LogicalState::default();
+        let mut read = track("Song", "Artist");
+        for state in [PlaybackState::Playing, PlaybackState::Paused, PlaybackState::Stopped] {
+            read.playback_state = Some(state);
+            assert_eq!(
+                merge_track(&prev, &read, false).playback_state,
+                Some(state),
+                "merge_track must carry {state:?} out of the read snapshot"
+            );
+        }
+        // Transitional/unknown reads arrive as None and pass through unchanged,
+        // so the caller falls back to the remembered source state, then Playing.
+        read.playback_state = None;
+        assert_eq!(merge_track(&prev, &read, false).playback_state, None);
+    }
+
+    #[test]
+    fn snapshot_playback_state_maps_terminal_statuses_only() {
+        use GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status;
+        assert_eq!(snapshot_playback_state(Status::Playing), Some(PlaybackState::Playing));
+        assert_eq!(snapshot_playback_state(Status::Paused), Some(PlaybackState::Paused));
+        // A stopped session is "not playing": the snapshot must not claim the
+        // pill should play when the session is torn down.
+        assert_eq!(snapshot_playback_state(Status::Stopped), Some(PlaybackState::Stopped));
+        // Transitional and closed statuses carry no authoritative state: the
+        // retry path skips Closed entirely, and a transitional status leaves
+        // the pill with the historical "a track pill plays" behavior.
+        for transitional in [Status::Opened, Status::Changing, Status::Closed] {
+            assert_eq!(snapshot_playback_state(transitional), None);
+        }
     }
 
     #[test]

@@ -1981,7 +1981,12 @@ impl OverlayState {
         // playing; freeze it while paused/stopped and re-anchor on resume so
         // the bar never crawls or jumps forward.
         let playing = match &self.content {
-            Some(MediaEvent::TrackChanged(_)) => true,
+            // The TrackChanged snapshot carries the authoritative playback
+            // state (see `TrackInfo.playback_state`): a paused/stopped pill
+            // must not crawl its bar. A None state (pre-carriage sessions,
+            // spurious-recreation snapshots) keeps the historical behavior
+            // of treating a track pill as playing.
+            Some(MediaEvent::TrackChanged(track)) => track.playback_state.is_none_or(|s| s == PlaybackState::Playing),
             Some(MediaEvent::PlaybackStateChanged(s, _)) => *s == PlaybackState::Playing,
             _ => false,
         };
@@ -3340,8 +3345,8 @@ mod tests {
         FILL_TINT_WEIGHT, blend_frames, blit_packed_rows, circle_coverage, clear_frame_scratch, clock_icon_coverage,
         composite_marquee_strip, contrast_ratio, draw_aura, draw_clock_icon_pixels, draw_compact_pill,
         draw_icon_scaled, draw_symbol_pixels, draw_text_line_pixels, draw_text_pixels, edge_fade_factor, muted_accent,
-        round_rect_coverage, round_rect_coverage_fast, round_rect_coverage_supersampled, rounded_triangle_coverage,
-        scale_frame_about, shrink_frame_scratch, tinted_fill,
+        playback_state_for_track, round_rect_coverage, round_rect_coverage_fast, round_rect_coverage_supersampled,
+        rounded_triangle_coverage, scale_frame_about, shrink_frame_scratch, tinted_fill,
     };
     use crate::events::{ARTWORK_DECODE, PlaybackType};
     use std::ptr::null_mut;
@@ -6700,6 +6705,34 @@ mod tests {
     }
 
     #[test]
+    fn playback_glyph_matches_the_snapshot_state_across_layouts() {
+        // The pill's glyph is resolved from the TrackChanged snapshot's
+        // own playback_state, not a hardcoded NowPlaying. All three layout
+        // paths share `playback_state_for_track`, so a single assertion on the
+        // resolved state covers compact, expanded, and expanded-text.
+        let playing = TrackInfo {
+            playback_state: Some(PlaybackState::Playing),
+            ..TrackInfo::default()
+        };
+        let paused = TrackInfo {
+            playback_state: Some(PlaybackState::Paused),
+            ..TrackInfo::default()
+        };
+        let stopped = TrackInfo {
+            playback_state: Some(PlaybackState::Stopped),
+            ..TrackInfo::default()
+        };
+        let transitional = TrackInfo::default();
+        assert_eq!(playback_state_for_track(&playing), PlaybackState::Playing);
+        assert_eq!(playback_state_for_track(&paused), PlaybackState::Paused);
+        assert_eq!(playback_state_for_track(&stopped), PlaybackState::Stopped);
+        // A source that reported no terminal/transitional state falls back to
+        // the default now-playing symbol — never to Playing, which would mask a
+        // genuine pause that arrived without a TrackChanged in the batch.
+        assert_eq!(playback_state_for_track(&transitional), PlaybackState::NowPlaying);
+    }
+
+    #[test]
     fn lagged_expand_trails_the_leader_and_pins_exactly() {
         // The height follower is the leader's curve delayed and compressed
         // into the rest of the leg: it holds at compact through the lag,
@@ -8026,6 +8059,48 @@ mod tests {
             state.render_count,
             before + 1,
             "the tick that starts the morph must render its first frame"
+        );
+    }
+
+    #[test]
+    fn paused_track_changed_pill_does_not_crawl_the_progress_bar() {
+        // A TrackChanged whose snapshot says Paused must freeze the bar: the
+        // pill shows a paused track, not a playing one, so the tick must not
+        // advance the estimate or flag the progress as playing.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Shown;
+        let mut paused_track = track_for("spotify", "Pause Song", "Artist");
+        paused_track.playback_state = Some(PlaybackState::Paused);
+        state.content = Some(MediaEvent::TrackChanged(paused_track));
+        state.progress_rate = Some(1.0);
+        state.progress_anchor = Some((Instant::now(), 10.0));
+        state.progress_duration_secs = Some(120);
+        state.estimated_position_secs = Some(10.0);
+        state.tick();
+        assert!(
+            !state.progress_playing,
+            "a paused TrackChanged pill must not be treated as playing"
+        );
+        assert_eq!(
+            state.estimated_position_secs,
+            Some(10.0),
+            "the bar must stay frozen for a paused track pill"
+        );
+
+        // A playing snapshot crawls as usual.
+        let mut playing_track = track_for("spotify", "Play Song", "Artist");
+        playing_track.playback_state = Some(PlaybackState::Playing);
+        state.content = Some(MediaEvent::TrackChanged(playing_track));
+        state.tick();
+        assert!(state.progress_playing, "a playing TrackChanged pill must crawl");
+
+        // A stateless snapshot (pre-carriage sessions, spurious recreation)
+        // keeps the historical behavior: a track pill plays.
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "No State", "Artist")));
+        state.tick();
+        assert!(
+            state.progress_playing,
+            "a stateless TrackChanged pill keeps the historical playing behavior"
         );
     }
 
