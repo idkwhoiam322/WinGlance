@@ -21,10 +21,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect,
-    HMENU, IDCANCEL, IDOK, IsDialogMessageW, MB_ICONWARNING, MB_OK, MSG, MessageBoxW, SW_SHOW, SendMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
-    WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_GETTEXT, WM_NCCREATE, WM_SETFONT,
-    WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    HMENU, IDCANCEL, IDOK, IsDialogMessageW, MB_ICONWARNING, MB_OK, MSG, MessageBoxW, PostQuitMessage, SW_SHOW,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_GETTEXT, WM_NCCREATE,
+    WM_SETFONT, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
@@ -195,14 +196,28 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
         let mut msg = MSG::default();
         loop {
             let result = GetMessageW(&mut msg, None, 0, 0);
-            if result.0 <= 0 || data.done {
+            if result.0 <= 0 {
+                // GetMessageW returns 0 on WM_QUIT. A quit posted while this
+                // nested loop runs (e.g. tray Exit with the dialog open) would
+                // otherwise be consumed here, and the main loop — which exits
+                // only on WM_QUIT — would never see it, leaving the app as a
+                // zombie process. Forward it and exit the loop.
+                if result.0 == 0 {
+                    PostQuitMessage(msg.wParam.0 as i32);
+                }
                 break;
             }
-            if IsDialogMessageW(hwnd, &msg).as_bool() {
-                continue;
+            // Enter/Esc set `done` inside IsDialogMessageW, every other
+            // decision message inside DispatchMessageW. Checking after both
+            // paths exits the loop without blocking on a next GetMessageW.
+            let handled = IsDialogMessageW(hwnd, &msg).as_bool();
+            if !handled {
+                let _ = TranslateMessage(&msg);
+                let _ = DispatchMessageW(&msg);
             }
-            let _ = TranslateMessage(&msg);
-            let _ = DispatchMessageW(&msg);
+            if data.done {
+                break;
+            }
         }
 
         let _ = EnableWindow(parent, true);
