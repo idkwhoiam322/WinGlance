@@ -1542,6 +1542,13 @@ impl OverlayState {
     /// — a disabled overlay must not resurrect a retired source's content at
     /// the next show.
     fn retire_source(&mut self, retired: &str) {
+        // The retired source must never surface again from the track cache:
+        // drop its entry and recency marker before the early return below,
+        // so a later successor lookup or re-show cannot resurrect it. The
+        // entry (with its decoded cover) otherwise lingers for the full TTL,
+        // wasting one of the few cache slots.
+        self.track_cache.remove(retired);
+        self.track_cache_order.retain(|source| source != retired);
         // Queued notifications from the retired source can never show now;
         // drop them before hide() -> show_next() could re-show one.
         self.pending.retain(|event| Self::event_source(event) != Some(retired));
@@ -3544,6 +3551,21 @@ mod tests {
             source_app: source.into(),
             ..TrackInfo::default()
         }
+    }
+
+    #[test]
+    fn retire_source_purges_the_retired_source_from_the_track_cache() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.cache_track(&track_for("alpha", "Song A", "Artist"));
+        state.cache_track(&track_for("zeta", "Song Z", "Artist"));
+        assert!(state.track_cache.contains_key("alpha"));
+        // Retiring a source that is not on screen must still drop its cache
+        // entry: the purge runs before the early return.
+        state.retire_source("alpha");
+        assert!(!state.track_cache.contains_key("alpha"));
+        assert!(!state.track_cache_order.iter().any(|s| s == "alpha"));
+        assert!(state.track_cache.contains_key("zeta"));
+        assert!(state.track_cache_order.iter().any(|s| s == "zeta"));
     }
 
     #[test]
