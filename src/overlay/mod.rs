@@ -1022,6 +1022,36 @@ impl OverlayState {
         self.ensure_anim_timer();
     }
 
+    /// Persistent-compact pill currently active: showing, or auto-hidden
+    /// with held content. Must be computed per event — a batch can cross
+    /// the first-show boundary mid-batch (the first event shows the pill,
+    /// changing the phase), so a snapshot taken before the loop would go
+    /// stale and re-queue events behind a pill that never collapses.
+    fn persistent_active(&self) -> bool {
+        self.config.overlay.layout == LayoutMode::PersistentCompact
+            && (!matches!(self.phase, Phase::Hidden) || self.persistent_auto_hidden())
+    }
+
+    /// PersistentCompact auto-hide state: hidden for a fullscreen/listed
+    /// foreground, with content held for the resume. In this state the pill
+    /// is still active — events must update the held content in place rather
+    /// than queue behind it, or the resume would re-show a stale track.
+    fn persistent_auto_hidden(&self) -> bool {
+        self.config.overlay.layout == LayoutMode::PersistentCompact
+            && matches!(self.phase, Phase::Hidden)
+            && self.held_content.is_some()
+    }
+
+    /// PersistentCompact before the first show of this run: hidden with
+    /// nothing held. The batch's first event must show directly — a queued
+    /// event would strand forever, because the pill never collapses and
+    /// show_next only drains while Hidden.
+    fn persistent_pre_first_show(&self) -> bool {
+        self.config.overlay.layout == LayoutMode::PersistentCompact
+            && matches!(self.phase, Phase::Hidden)
+            && self.held_content.is_none()
+    }
+
     /// Whether the PersistentCompact idle-fade ramp is currently in progress.
     /// Returns true only when the pill has already entered the faded (idle)
     /// state, is not in the collapse-on-dismiss mode (fullscreen/listed
@@ -1075,14 +1105,13 @@ impl OverlayState {
                 _ => None,
             })
             .collect();
-        // Persistent-compact never collapses to Hidden on its own, so the
-        // pending queue (drained only while hidden) would hold cross-source
-        // events forever — a source switch would never update the pill.
-        // While such a pill is visible, any event — same or cross-source —
-        // updates it in place; the queue stays for the hidden phase (auto-hide)
-        // and for the notification layouts, where pills still collapse.
-        let persistent_visible =
-            self.config.overlay.layout == LayoutMode::PersistentCompact && !matches!(self.phase, Phase::Hidden);
+        // Persistent-compact never collapses to Hidden on its own, so its
+        // pending queue (drained only while hidden) would hold events
+        // forever — nothing would ever show them. While such a pill is
+        // active — showing, or auto-hidden with held content — any event,
+        // same or cross-source, updates it in place, and the first event
+        // of a run shows directly. The queue remains for the notification
+        // layouts, where pills still collapse and drain it.
         // The queue carries Arc<MediaEvent> so the fan-out to both windows
         // never copies the event; recover the owned event here (zero-copy
         // when this window is the last holder, a clone otherwise).
@@ -1119,7 +1148,7 @@ impl OverlayState {
                         self.last_track = Some(track.clone());
                         self.cache_track(&track);
                         self.update_content(MediaEvent::TrackChanged(track), update_min_duration(&self.config));
-                    } else if self.held_expanded() || same_source_shown || persistent_visible {
+                    } else if self.held_expanded() || same_source_shown || self.persistent_active() {
                         // A new track while the cursor holds an expanded pill, or
                         // a newer track from the same source arriving while any
                         // pill is up, swaps the content in place instead of
@@ -1132,6 +1161,16 @@ impl OverlayState {
                         self.cache_track(&track);
                         let full = Duration::from_millis(self.config.overlay.duration_ms.max(500));
                         self.update_content(MediaEvent::TrackChanged(track), full);
+                    } else if self.persistent_pre_first_show() {
+                        // Persistent-compact before its first show of the
+                        // run: show this event directly. A queued event
+                        // would strand — the pill never collapses, so
+                        // show_next could never drain it. Later events in
+                        // the same batch take the persistent_active path.
+                        self.current_source = Some(track.source_app.clone());
+                        self.last_track = Some(track.clone());
+                        self.cache_track(&track);
+                        self.show(MediaEvent::TrackChanged(track), true);
                     } else {
                         self.enqueue(MediaEvent::TrackChanged(track));
                     }
@@ -1254,7 +1293,7 @@ impl OverlayState {
                         debug!("playback state pill suppressed | reason=replaying same source | source={source_app}");
                         continue;
                     }
-                    if persistent_visible {
+                    if self.persistent_active() {
                         // A cross-source state while a persistent pill is up:
                         // the queue would never drain (the pill fades to idle,
                         // it never hides), so swap the state in place exactly
@@ -1262,6 +1301,12 @@ impl OverlayState {
                         let event = MediaEvent::PlaybackStateChanged(state, source_app);
                         let full = Duration::from_millis(self.config.overlay.duration_ms.max(500));
                         self.update_content(event, full);
+                        continue;
+                    }
+                    if self.persistent_pre_first_show() {
+                        // Mirror the track branch: the first state event of
+                        // the run shows directly instead of queueing.
+                        self.show(MediaEvent::PlaybackStateChanged(state, source_app), false);
                         continue;
                     }
                     self.enqueue(MediaEvent::PlaybackStateChanged(state, source_app));
@@ -1552,8 +1597,12 @@ impl OverlayState {
         }
         // PersistentCompact auto-hide: keep held_content in sync with the
         // displayed content so on_foreground_change resumes the latest track,
-        // not a stale one.
-        if self.persistent_collapse_on_dismiss {
+        // not a stale one. `persistent_collapse_on_dismiss` covers a pill
+        // about to collapse because of a fullscreen transition;
+        // `persistent_auto_hidden` covers a pill already hidden for a
+        // fullscreen/listed foreground — events swap the held content in
+        // place while it stays hidden.
+        if self.persistent_collapse_on_dismiss || self.persistent_auto_hidden() {
             self.held_content = Some(event.clone());
         }
         self.content = Some(event);
@@ -3692,6 +3741,100 @@ mod tests {
     }
 
     #[test]
+    fn persistent_batch_before_first_show_ends_on_the_latest_track() {
+        // Startup burst: two cross-source tracks arrive before the first
+        // pill ever shows. The first must show directly; the second must
+        // swap in place — queueing either would strand it forever.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.config.overlay.layout = LayoutMode::PersistentCompact;
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "Brave", "Song A", "Artist",
+            ))));
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "youtube-music",
+                "Song B",
+                "Artist",
+            ))));
+        state.receive_events();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::TrackChanged(t))
+                    if t.source_app == "youtube-music" && t.title == "Song B"
+            ),
+            "the batch must end on the latest track"
+        );
+        assert!(state.pending.is_empty());
+        assert!(!matches!(state.phase, Phase::Hidden));
+    }
+
+    #[test]
+    fn persistent_state_event_before_first_show_shows_directly() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.config.overlay.layout = LayoutMode::PersistentCompact;
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Paused,
+                "youtube-music".into(),
+            )));
+        state.receive_events();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, s)) if s == "youtube-music"
+            ),
+            "the first state event of a persistent run must show, not queue"
+        );
+        assert!(state.pending.is_empty());
+        assert!(!matches!(state.phase, Phase::Hidden));
+    }
+
+    #[test]
+    fn persistent_batch_while_auto_hidden_updates_held_content_in_place() {
+        // Auto-hidden (fullscreen/listed foreground): the pill is hidden but
+        // still active. Events must swap the held content in place so the
+        // resume re-shows the latest track, and nothing queues behind it.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.config.overlay.layout = LayoutMode::PersistentCompact;
+        state.phase = Phase::Hidden;
+        state.held_content = Some(MediaEvent::TrackChanged(track_for("Brave", "Song A", "Artist")));
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "youtube-music",
+                "Song B",
+                "Artist",
+            ))));
+        state.receive_events();
+
+        assert!(
+            matches!(
+                state.held_content.as_ref(),
+                Some(MediaEvent::TrackChanged(t))
+                    if t.source_app == "youtube-music" && t.title == "Song B"
+            ),
+            "held content must track the latest event while auto-hidden"
+        );
+        assert!(matches!(state.phase, Phase::Hidden));
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
     fn enqueue_keeps_only_the_newest_track_for_a_source() {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.enqueue(MediaEvent::TrackChanged(track_for("youtube-music", "Song A", "Artist")));
@@ -3867,9 +4010,10 @@ mod tests {
     }
 
     #[test]
-    fn persistent_layout_hidden_still_queues_cross_source_track() {
-        // Auto-hide (fullscreen/listed foreground) hides the persistent pill;
-        // while hidden the queue is the correct sink — a later show drains it.
+    fn persistent_layout_event_before_first_show_shows_directly() {
+        // Hidden with nothing held (pre-first-show): the batch's first event
+        // must show directly — queueing it would strand it, because the
+        // persistent pill never collapses and show_next would never drain.
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.config.overlay.layout = LayoutMode::PersistentCompact;
         state.phase = Phase::Hidden;
@@ -3883,11 +4027,15 @@ mod tests {
             ))));
         state.receive_events();
 
-        assert_eq!(state.pending.len(), 1, "a hidden persistent pill must still queue");
-        assert!(matches!(
-            state.pending.front(),
-            Some(MediaEvent::TrackChanged(t)) if t.source_app == "Brave"
-        ));
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "Brave" && t.title == "Song B"
+            ),
+            "the first event of a persistent run must show, not queue"
+        );
+        assert!(state.pending.is_empty());
+        assert!(!matches!(state.phase, Phase::Hidden));
     }
 
     #[test]
