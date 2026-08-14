@@ -513,6 +513,13 @@ struct OverlayState {
     /// `hide()` clears `content`, so `on_foreground_change` can restore it
     /// on the resume path without depending on the queue.
     held_content: Option<MediaEvent>,
+    /// Shared cell the SMTC worker reads for its session-recreation gate
+    /// (see `smtc::ListenerState::now_showing`): the source of the pill
+    /// content most recently displayed. Set on every content display; never
+    /// cleared on dismiss — the pill's last content is still what the user
+    /// last saw, so suppressing a re-report of it stays correct. Attached
+    /// by `create_window`; `None` in tests.
+    now_showing: Option<Arc<Mutex<Option<String>>>>,
     /// When true (PersistentCompact + hide_for_auto_compact_sources, foreground
     /// is fullscreen/listed), the pill collapses to fully hidden on its normal
     /// dismiss instead of fading to idle opacity. Set in `show_with_duration`
@@ -871,6 +878,7 @@ impl OverlayState {
             hook: None,
             last_anchor_edge: None,
             held_content: None,
+            now_showing: None,
             last_cursor_over_pill: false,
             current_source: None,
             track_cache: HashMap::new(),
@@ -1496,6 +1504,27 @@ impl OverlayState {
         (base + elapsed * rate).max(0.0)
     }
 
+    /// Publishes the source of the content just displayed into the shared
+    /// now-showing cell: the SMTC worker's session-recreation gate suppresses
+    /// a same-source re-report only while the pill actually shows that
+    /// source, and this overlay alone knows what that is. Every content
+    /// display funnels through `update_content` or `show_with_duration`, so
+    /// both publish here; a dismiss or collapse never clears the cell (see
+    /// `now_showing`).
+    fn publish_now_showing(&self) {
+        let Some(cell) = &self.now_showing else {
+            return;
+        };
+        let source = match &self.content {
+            Some(MediaEvent::TrackChanged(track)) => Some(track.source_app.clone()),
+            Some(MediaEvent::PlaybackStateChanged(_, source)) if !source.is_empty() => Some(source.clone()),
+            _ => None,
+        };
+        if let Some(source) = source {
+            *cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(source);
+        }
+    }
+
     fn update_content(&mut self, event: MediaEvent, min_visible: Duration) {
         // An in-place refresh is a meaningful pill update too: re-resolve
         // the layout so a foreground change since the pill appeared takes
@@ -1528,6 +1557,7 @@ impl OverlayState {
             self.held_content = Some(event.clone());
         }
         self.content = Some(event);
+        self.publish_now_showing();
         self.content_palette = match &self.content {
             Some(MediaEvent::TrackChanged(track)) => track.palette,
             _ => None,
@@ -1614,6 +1644,7 @@ impl OverlayState {
             self.apply_track_progress(track);
         }
         self.content = Some(event);
+        self.publish_now_showing();
         self.content_palette = match &self.content {
             Some(MediaEvent::TrackChanged(track)) => track.palette,
             _ => None,
@@ -2844,7 +2875,12 @@ static OVERLAY_FG_HWND: AtomicU64 = AtomicU64::new(0);
 
 /// Creates the passive WinGlance overlay window. It owns no message loop: the caller
 /// runs the loop and destroys the window at exit.
-pub(crate) fn create_window(config: Config, queue: EventQueue, wake: Arc<AtomicBool>) -> Result<HWND> {
+pub(crate) fn create_window(
+    config: Config,
+    queue: EventQueue,
+    wake: Arc<AtomicBool>,
+    now_showing: Arc<Mutex<Option<String>>>,
+) -> Result<HWND> {
     let module = unsafe { GetModuleHandleW(None) }.context("getting the process module")?;
     let instance: HINSTANCE = module.into();
     let class_name = wide("WinGlanceOverlayWindow");
@@ -2852,6 +2888,7 @@ pub(crate) fn create_window(config: Config, queue: EventQueue, wake: Arc<AtomicB
 
     let mut state = Box::new(OverlayState::new(config, queue));
     state.wake = wake;
+    state.now_showing = Some(now_showing);
     let state_ptr = Box::into_raw(state);
     OVERLAY_STATE_CLAIMED.reset();
     let hwnd = unsafe {
@@ -3619,6 +3656,38 @@ mod tests {
         assert!(
             matches!(state.phase, Phase::Expanding(_)),
             "the toggle must rescue the collapsing pill by resuming the entrance, not snapping to shown"
+        );
+    }
+
+    #[test]
+    fn displayed_content_publishes_its_source_to_the_shared_cell() {
+        // The SMTC worker's session-recreation gate must compare against the
+        // source the pill actually shows. Every display path — an in-place
+        // swap and a fresh show — publishes the content's source into the
+        // shared cell the worker reads.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        let cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        state.now_showing = Some(cell.clone());
+
+        state.update_content(
+            MediaEvent::TrackChanged(track_for("youtube-music", "Song", "Artist")),
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            *cell.lock().unwrap(),
+            Some("youtube-music".to_string()),
+            "an in-place content swap must publish its source"
+        );
+
+        state.show_with_duration(
+            MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "Brave".into()),
+            false,
+            3000,
+        );
+        assert_eq!(
+            *cell.lock().unwrap(),
+            Some("Brave".to_string()),
+            "a fresh show must publish its source"
         );
     }
 

@@ -427,6 +427,15 @@ fn main() -> Result<()> {
     // updating the shared heartbeat the moment its successor takes over.
     let generation: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let supervisor_generation = generation.clone();
+    // The one source of truth for "which source's pill the overlay is
+    // showing": the overlay publishes to this cell on every content display,
+    // and every SMTC worker reads it for the session-recreation suppression
+    // gate. A worker must not attribute from its own emissions — an emitted
+    // event can be queued or superseded on the overlay side — and the cell
+    // survives worker restarts, so a session recreated after a restart still
+    // compares against what the user actually sees.
+    let now_showing: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let now_showing_supervisor = now_showing.clone();
     // Supervisor: runs the SMTC worker and restarts it when it stalls (a WinRT
     // call can hang under heavy session churn, which would otherwise silently
     // stop all events and pills). The hung worker thread is leaked; a fresh
@@ -469,6 +478,7 @@ fn main() -> Result<()> {
                 let my_generation = supervisor_generation.fetch_add(1, Ordering::SeqCst) + 1;
                 let event_tx_worker = event_tx.clone();
                 let listener_config_worker = listener_config.clone();
+                let now_showing_worker = now_showing_supervisor.clone();
                 let worker_started = Instant::now();
                 let worker = thread::Builder::new()
                     .name("WinGlance-smtc-worker".to_string())
@@ -481,6 +491,7 @@ fn main() -> Result<()> {
                             worker_generation,
                             my_generation,
                             worker_shutdown,
+                            now_showing_worker,
                         )
                         .run();
                     });
@@ -542,7 +553,12 @@ fn main() -> Result<()> {
     let overlay_queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
     let main_wake: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let overlay_wake: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-    let overlay_hwnd = overlay::create_window(config.clone(), overlay_queue.clone(), overlay_wake.clone())?;
+    let overlay_hwnd = overlay::create_window(
+        config.clone(),
+        overlay_queue.clone(),
+        overlay_wake.clone(),
+        now_showing.clone(),
+    )?;
     let main_hwnd = main_window::create_window(
         shared_config.clone(),
         main_queue.clone(),

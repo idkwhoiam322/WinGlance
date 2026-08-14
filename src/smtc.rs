@@ -211,12 +211,16 @@ struct ListenerState {
     /// its session when the transport buttons are used, so the fresh session's
     /// first state can be the actual transition).
     last_known_playback_per_source: HashMap<String, PlaybackState>,
-    /// The source the last pill (TrackChanged or PlaybackStateChanged) shown
-    /// to the overlay belonged to. The session-recreation dedup below only
-    /// applies while the pill already represents this source: an identical
-    /// re-report after another app's pill is a switch-back and must re-emit
-    /// (the pill needs to come back with the track's artwork), not noise.
-    last_pill_source: Option<String>,
+    /// The source the overlay's pill is currently displaying, published by
+    /// the overlay into a shared cell (see `OverlayState::now_showing`). The
+    /// session-recreation dedup below only applies while the pill already
+    /// represents this source: an identical re-report after another app's
+    /// pill is a switch-back and must re-emit (the pill needs to come back
+    /// with the track's artwork), not noise. The overlay owns the truth
+    /// here: an event this worker emitted can be queued or superseded on the
+    /// overlay side, so attributing from this worker's emissions would
+    /// suppress a re-emit whose pill never actually appeared.
+    now_showing: Arc<Mutex<Option<String>>>,
     /// Cached app icons keyed by source_app label (derived from AUMID via
     /// `source_app_label`). Populated on first encounter of a source.
     icon_cache: HashMap<String, Option<Arc<[u8]>>>,
@@ -254,6 +258,11 @@ pub struct SmtcListener {
     /// its receive timeout so the worker unsubscribes and releases COM
     /// promptly instead of running until process termination.
     shutdown: Arc<AtomicBool>,
+    /// Shared now-showing cell (see `ListenerState::now_showing`). Survives
+    /// worker restarts: the supervisor spawns every worker with the same
+    /// cell, so a session recreated after a restart still compares against
+    /// what the user actually sees.
+    now_showing: Arc<Mutex<Option<String>>>,
 }
 
 impl SmtcListener {
@@ -265,6 +274,7 @@ impl SmtcListener {
         live_generation: Arc<AtomicU64>,
         my_generation: u64,
         shutdown: Arc<AtomicBool>,
+        now_showing: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
             output,
@@ -273,6 +283,7 @@ impl SmtcListener {
             live_generation,
             my_generation,
             shutdown,
+            now_showing,
         }
     }
 
@@ -301,6 +312,7 @@ impl SmtcListener {
             self.live_generation,
             self.my_generation,
             self.shutdown,
+            self.now_showing,
         );
 
         state.sync_subscriptions();
@@ -327,6 +339,7 @@ impl ListenerState {
         live_generation: Arc<AtomicU64>,
         my_generation: u64,
         shutdown: Arc<AtomicBool>,
+        now_showing: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
             manager,
@@ -346,7 +359,7 @@ impl ListenerState {
             rejected_seen: HashSet::new(),
             last_track_per_source: HashMap::new(),
             last_known_playback_per_source: HashMap::new(),
-            last_pill_source: None,
+            now_showing,
             icon_cache: HashMap::new(),
             cached_allowed: None,
             last_emit_at: HashMap::new(),
@@ -560,12 +573,6 @@ impl ListenerState {
         // path as Playing/Paused and can produce a pill like any other real
         // transition. Transitional statuses leave the stored state untouched.
         let mut known_playback = None;
-        // The session-recreation gate below must see the pill already on
-        // screen BEFORE this batch: the batch's own state event (pushed
-        // below) updates last_pill_source, which would otherwise attribute
-        // the batch to this source prematurely and suppress the switch-back
-        // re-emit it must produce.
-        let pill_source_before = self.last_pill_source.clone();
         if playback != prev.playback
             && let Some(state) = playback
         {
@@ -579,7 +586,6 @@ impl ListenerState {
             next.playback = Some(state);
             info!("playback state changed | state={state:?} | source={source}");
             events.push(MediaEvent::PlaybackStateChanged(state, source.clone()));
-            self.last_pill_source = Some(source);
         }
 
         // Content is only diffed while the session is not stopped; a stopped
@@ -748,7 +754,7 @@ impl ListenerState {
                     // vs last emit art=Some). Cached artwork injection (above) makes
                     // event reads for recreated sessions also see Some==Some.
                     // Suppression applies only while the pill already on screen
-                    // belongs to this source (last_pill_source): after another
+                    // belongs to this source (the overlay's now-showing cell): after another
                     // app's pill, the identical re-report is a switch-back that
                     // must re-emit — the overlay's cache for this source may
                     // already be evicted, so the pill needs the fresh track
@@ -756,11 +762,12 @@ impl ListenerState {
                     // is only reported when an emit would actually have fired
                     // (see the emit gate below): an unchanged re-read cannot be
                     // "suppressed" and must not be logged as one.
+                    let shown_source = self.shown_source();
                     let session_recreation = should_suppress_recreation(
                         self.last_track_per_source.get(&merged.source_app),
                         &merged,
                         read_artwork,
-                        pill_source_before.as_deref(),
+                        shown_source.as_deref(),
                     );
                     // A recreated session starts from a default LogicalState, so
                     // its first read reports the new session's default playback
@@ -793,7 +800,6 @@ impl ListenerState {
                             emitted.decoded_art.as_deref(),
                         );
                         events.push(MediaEvent::TrackChanged(emitted));
-                        self.last_pill_source = Some(merged.source_app.clone());
                         self.last_track_per_source
                             .insert(merged.source_app.clone(), merged.clone());
                         self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
@@ -1153,6 +1159,16 @@ impl ListenerState {
         }
     }
 
+    /// The source the overlay's pill is currently displaying, if any. Read
+    /// for every session-recreation candidate so the gate compares against
+    /// what the user actually sees, not against what this worker emitted.
+    fn shown_source(&self) -> Option<String> {
+        self.now_showing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// Whether a session's source app is excluded: on the churn cool-down, or
     /// not matching the user's `media_sources` config. When `media_sources`
     /// is empty, all sources are allowed. When non-empty, only sources matching
@@ -1496,20 +1512,18 @@ fn is_session_recreation(prev_track: &TrackInfo, merged: &TrackInfo, read_artwor
 /// track emitted per source, so a re-report arriving long after that emit
 /// (another app's pill in between — a switch-back) would be wrongly
 /// suppressed. Suppress only while the pill already on screen belongs to the
-/// re-reporting source (`last_pill_source`); after another app's pill, the
-/// re-report is a real re-emit — the overlay's cache for the source may
-/// already be evicted, and the pill needs the fresh track (cached art
-/// injected above) to come back itself. The caller passes the value captured
-/// before the current batch's own state event was pushed: that event would
-/// otherwise attribute the batch to this source prematurely.
+/// re-reporting source (`shown_source` — the overlay's published now-showing
+/// cell); after another app's pill, the re-report is a real re-emit — the
+/// overlay's cache for the source may already be evicted, and the pill needs
+/// the fresh track (cached art injected above) to come back itself.
 fn should_suppress_recreation(
     last_track: Option<&TrackInfo>,
     merged: &TrackInfo,
     read_artwork: bool,
-    last_pill_source: Option<&str>,
+    shown_source: Option<&str>,
 ) -> bool {
     last_track.is_some_and(|prev_track| {
-        is_session_recreation(prev_track, merged, read_artwork) && last_pill_source == Some(merged.source_app.as_str())
+        is_session_recreation(prev_track, merged, read_artwork) && shown_source == Some(merged.source_app.as_str())
     })
 }
 
