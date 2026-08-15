@@ -27,7 +27,6 @@ use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, HBITMAP, HDC, HFONT,
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, EVENT_SYSTEM_FOREGROUND, GetCursorPos, GetForegroundWindow,
     GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST, IsWindowVisible, KillTimer, MA_NOACTIVATE, MSG, PM_REMOVE,
@@ -816,6 +815,16 @@ pub(crate) fn set_hide_for_auto_compact_sources(hwnd: HWND, enabled: bool) {
         state.config.behavior.hide_for_auto_compact_sources = enabled;
         info!("overlay hide_for_auto_compact_sources set to {enabled}");
     }
+}
+
+/// Whether the pill's fonts must be rebuilt because the resolved target
+/// monitor's DPI differs from the DPI the current `FontProvider` was built
+/// for. On a mismatch every size derived from the fonts (layout, DIB, hitbox)
+/// is stale for the target, so a plain move would leave a wrong-size pill.
+/// `fonts_dpi` is 0 before the first render (see `OverlayState::new`), which
+/// also counts as "must render".
+fn needs_font_rebuild(fonts_dpi: u32, target_dpi: u32) -> bool {
+    fonts_dpi != target_dpi
 }
 
 impl OverlayState {
@@ -2435,7 +2444,7 @@ impl OverlayState {
         };
         let frame = self.frame();
         let raw_dpi = monitor_dpi(target.handle);
-        if raw_dpi != self.fonts.dpi() {
+        if needs_font_rebuild(self.fonts.dpi(), raw_dpi) {
             self.fonts = FontProvider::new(raw_dpi);
         }
         let dpi = raw_dpi as f32 / 96.0;
@@ -2712,9 +2721,20 @@ impl OverlayState {
         engaged && self.hover_expand.is_some()
     }
 
-    /// Moves the live overlay window to its resolved position without a full redraw.
+    /// Moves the live overlay window to its resolved position without a full
+    /// redraw. When the resolved target's DPI differs from the DPI the current
+    /// fonts were built for, a plain move would keep a stale-size pill and
+    /// hitbox — rerender instead, which rebuilds the fonts and sizes and
+    /// places the window, all against the resolved target.
     fn reposition(&mut self) {
         if matches!(self.phase, Phase::Hidden) {
+            return;
+        }
+        let Some(target) = self.target() else {
+            return;
+        };
+        if needs_font_rebuild(self.fonts.dpi(), monitor_dpi(target.handle)) {
+            self.render();
             return;
         }
         let Some((width, height)) = self.content_size() else {
@@ -2931,11 +2951,21 @@ impl OverlayState {
         }
     }
 
-    /// Current (scaled) pixel size of the shown content, or `None` while hidden.
+    /// Current (scaled) pixel size of the shown content, or `None` while
+    /// hidden. Sized at the resolved target monitor's DPI — the window's own
+    /// DPI can lag the target right after a monitor switch, which would keep
+    /// a stale hitbox. `render()` and `position()` scale with this same value.
     fn content_size(&self) -> Option<(i32, i32)> {
+        let target = self.target()?;
+        self.content_size_at(monitor_dpi(target.handle) as f32 / 96.0)
+    }
+
+    /// The shown content's pixel size at an explicit scale (logical × `dpi`),
+    /// tracking the active morph and the settle bounce so the hitbox matches
+    /// the visible pill. Pure geometry — the caller resolves the DPI.
+    fn content_size_at(&self, dpi: f32) -> Option<(i32, i32)> {
         let content = self.content.as_ref()?;
         let frame = self.frame();
-        let dpi = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         // The hitbox must track the morph, or the cursor would stop being
         // "over" the pill the moment it outgrows the compact size.
         let (logical_width, logical_height, morph_progress) = if let Some(morph) = &self.hover_expand {
@@ -3370,6 +3400,21 @@ mod tests {
         BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DT_NOPREFIX, DT_SINGLELINE,
         DT_VCENTER, DrawTextW, HMONITOR, SetBkMode, SetTextColor, TRANSPARENT,
     };
+
+    #[test]
+    fn needs_font_rebuild_is_true_only_when_the_target_dpi_differs() {
+        // Same DPI on both sides: the pill's fonts already match the target.
+        assert!(!needs_font_rebuild(96, 96));
+        assert!(!needs_font_rebuild(144, 144));
+        // A mismatch — monitor switch, WM_DISPLAYCHANGE, or the window moved
+        // onto a different-DPI display — must force a rerender so the pill is
+        // sized for the target, never for its stale fonts.
+        assert!(needs_font_rebuild(96, 144));
+        assert!(needs_font_rebuild(144, 96));
+        // A font provider that was never built (dpi 0, see `OverlayState::new`)
+        // must also rerender on the first non-hidden frame.
+        assert!(needs_font_rebuild(0, 96));
+    }
 
     #[test]
     fn frame_scratch_is_cleared_when_it_grows() {
@@ -8555,7 +8600,7 @@ mod tests {
             "the pill must stay effectively compact while morphing"
         );
         // The morph size is available for the hitbox and the render.
-        let (width, height) = state.content_size().unwrap();
+        let (width, height) = state.content_size_at(1.0).unwrap();
         assert!(width > 0 && height > 0);
     }
 
