@@ -1627,19 +1627,21 @@ impl ListenerState {
             GlobalSystemMediaTransportControlsSession,
             MediaPropertiesChangedEventArgs,
         > = TypedEventHandler::new(move |_, _| {
-            if let Err(e) = properties_tx.try_send(Signal::MediaProperties(properties_session.clone())) {
-                debug!("signal dropped | kind=MediaProperties | {e:?}");
-            }
-            Ok(())
+            contained_winrt_event("the media-properties handler", || {
+                if let Err(e) = properties_tx.try_send(Signal::MediaProperties(properties_session.clone())) {
+                    debug!("signal dropped | kind=MediaProperties | {e:?}");
+                }
+            })
         });
         let playback_handler: TypedEventHandler<
             GlobalSystemMediaTransportControlsSession,
             PlaybackInfoChangedEventArgs,
         > = TypedEventHandler::new(move |_, _| {
-            if let Err(e) = playback_tx.try_send(Signal::PlaybackInfo(playback_session.clone())) {
-                debug!("signal dropped | kind=PlaybackInfo | {e:?}");
-            }
-            Ok(())
+            contained_winrt_event("the playback-info handler", || {
+                if let Err(e) = playback_tx.try_send(Signal::PlaybackInfo(playback_session.clone())) {
+                    debug!("signal dropped | kind=PlaybackInfo | {e:?}");
+                }
+            })
         });
 
         let properties_token = session.MediaPropertiesChanged(&properties_handler)?;
@@ -1658,10 +1660,11 @@ impl ListenerState {
             GlobalSystemMediaTransportControlsSession,
             TimelinePropertiesChangedEventArgs,
         > = TypedEventHandler::new(move |_, _| {
-            if let Err(e) = timeline_tx.try_send(Signal::Timeline(timeline_session.clone())) {
-                debug!("signal dropped | kind=Timeline | {e:?}");
-            }
-            Ok(())
+            contained_winrt_event("the timeline handler", || {
+                if let Err(e) = timeline_tx.try_send(Signal::Timeline(timeline_session.clone())) {
+                    debug!("signal dropped | kind=Timeline | {e:?}");
+                }
+            })
         });
         let timeline_token = match session.TimelinePropertiesChanged(&timeline_handler) {
             Ok(token) => token,
@@ -2522,16 +2525,37 @@ fn first_read_counts_toward_churn(is_first_read: bool, merged: &TrackInfo) -> bo
     is_first_read && is_placeholder_like(merged)
 }
 
+/// Runs a WinRT event body with panics contained: the handler
+/// answers with an error result instead of unwinding across the WinRT ABI.
+fn contained_winrt_event(context: &str, body: impl FnOnce()) -> windows::core::Result<()> {
+    crate::winutil::catch_callback_panic(context, body)
+        .map_err(|_| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))
+}
+
+#[cfg(test)]
+mod winrt_containment_tests {
+    use super::contained_winrt_event;
+
+    #[test]
+    fn a_panicking_winrt_body_yields_an_error_result() {
+        assert!(contained_winrt_event("test handler", || ()).is_ok());
+        let error = contained_winrt_event("test handler", || panic!("injected"))
+            .expect_err("the panic must surface as an error result");
+        assert_eq!(error.code(), windows::Win32::Foundation::E_FAIL);
+    }
+}
+
 fn register_sessions_handler(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
     signal_tx: SyncSender<Signal>,
 ) -> Result<EventRegistrationToken> {
     let handler: TypedEventHandler<GlobalSystemMediaTransportControlsSessionManager, SessionsChangedEventArgs> =
         TypedEventHandler::new(move |_, _| {
-            if let Err(e) = signal_tx.try_send(Signal::Sessions) {
-                debug!("signal dropped | kind=Sessions | {e:?}");
-            }
-            Ok(())
+            contained_winrt_event("the sessions handler", || {
+                if let Err(e) = signal_tx.try_send(Signal::Sessions) {
+                    debug!("signal dropped | kind=Sessions | {e:?}");
+                }
+            })
         });
     Ok(manager.SessionsChanged(&handler)?)
 }
@@ -2546,10 +2570,11 @@ fn register_current_session_handler(
 ) -> Result<EventRegistrationToken> {
     let handler: TypedEventHandler<GlobalSystemMediaTransportControlsSessionManager, CurrentSessionChangedEventArgs> =
         TypedEventHandler::new(move |_, _| {
-            if let Err(e) = signal_tx.try_send(Signal::Sessions) {
-                debug!("signal dropped | kind=Sessions | {e:?}");
-            }
-            Ok(())
+            contained_winrt_event("the sessions handler", || {
+                if let Err(e) = signal_tx.try_send(Signal::Sessions) {
+                    debug!("signal dropped | kind=Sessions | {e:?}");
+                }
+            })
         });
     Ok(manager.CurrentSessionChanged(&handler)?)
 }

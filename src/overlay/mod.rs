@@ -177,10 +177,13 @@ struct DibCache {
 /// teardown without deadlocking (a blocking callback would wait on the very
 /// thread that is deleting the timer).
 unsafe extern "system" fn animation_timer_proc(parameter: *mut c_void, _fired: BOOLEAN) {
-    let hwnd = HWND(parameter);
-    unsafe {
-        let _ = PostMessageW(hwnd, TIMER_ANIMATION_MSG, WPARAM(0), LPARAM(0));
-    }
+    // A contained panic no-ops the tick; the next tick retries.
+    crate::winutil::guarded_void("the animation timer callback", || {
+        let hwnd = HWND(parameter);
+        unsafe {
+            let _ = PostMessageW(hwnd, TIMER_ANIMATION_MSG, WPARAM(0), LPARAM(0));
+        }
+    });
 }
 
 /// Incoming event transport shared with the main window: an event is
@@ -3229,13 +3232,17 @@ unsafe extern "system" fn foreground_hook_cb(
     _dw_event_thread: u32,
     _dw_ms_event_time: u32,
 ) {
-    let target = OVERLAY_FG_HWND.load(Ordering::Relaxed);
-    if target != 0 {
-        // Post only — never SendMessageW (would block the system foreground
-        // dispatch). A null hwnd (teardown race) is harmless: PostMessageW to
-        // an invalid window simply returns FALSE, which we discard.
-        let _ = PostMessageW(HWND(target as *mut c_void), FOREGROUND_CHANGE_MSG, WPARAM(0), LPARAM(0));
-    }
+    // A contained panic no-ops the hook; the next foreground event
+    // retries.
+    crate::winutil::guarded_void("the foreground WinEvent hook", || {
+        let target = OVERLAY_FG_HWND.load(Ordering::Relaxed);
+        if target != 0 {
+            // Post only — never SendMessageW (would block the system foreground
+            // dispatch). A null hwnd (teardown race) is harmless: PostMessageW to
+            // an invalid window simply returns FALSE, which we discard.
+            let _ = PostMessageW(HWND(target as *mut c_void), FOREGROUND_CHANGE_MSG, WPARAM(0), LPARAM(0));
+        }
+    });
 }
 
 fn register_window_class(instance: HINSTANCE, class_name: &[u16]) -> Result<()> {
@@ -3251,8 +3258,22 @@ fn register_window_class(instance: HINSTANCE, class_name: &[u16]) -> Result<()> 
 
 static REGISTERED: OnceLock<()> = OnceLock::new();
 
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // The body is panic-contained; a panic logs, posts quit (normal
+    // teardown) and answers with DefWindowProcW instead of unwinding across
+    // the ABI.
+    crate::winutil::guarded_wndproc(
+        hwnd,
+        message,
+        wparam,
+        lparam,
+        "the overlay window procedure",
+        || unsafe { window_proc_body(hwnd, message, wparam, lparam) },
+    )
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if message == WM_NCCREATE {
         let create = lparam.0 as *const CREATESTRUCTW;
         if !create.is_null() {

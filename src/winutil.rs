@@ -1,14 +1,15 @@
-use log::{debug, warn};
+use log::{debug, error, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND};
+use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, DeleteObject, GetSysColor, HBRUSH, HGDIOBJ};
 use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+use windows::Win32::UI::Shell::DefSubclassProc;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HCURSOR, IDC_ARROW, LoadCursorW, RegisterClassExW,
-    SPI_GETCLIENTAREAANIMATION, SPI_GETDISABLEOVERLAPPEDCONTENT, SPI_GETFOCUSBORDERWIDTH, SPI_GETHIGHCONTRAST,
-    SPI_GETMESSAGEDURATION, SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowLongPtrW,
-    SystemParametersInfoW, WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC,
+    DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HCURSOR, IDC_ARROW, LoadCursorW, PostQuitMessage,
+    RegisterClassExW, SPI_GETCLIENTAREAANIMATION, SPI_GETDISABLEOVERLAPPEDCONTENT, SPI_GETFOCUSBORDERWIDTH,
+    SPI_GETHIGHCONTRAST, SPI_GETMESSAGEDURATION, SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SetWindowLongPtrW, SystemParametersInfoW, WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -231,6 +232,74 @@ pub(crate) fn system_window_color() -> [u8; 4] {
         ((color >> 16) & 0xFF) as u8,
         0xFF,
     ]
+}
+
+/// Runs a foreign-callback body with panics contained. A Rust
+/// panic that unwinds out of an `extern "system"` fn crosses the OS ABI
+/// boundary, which is undefined behavior on Windows — every callback routes
+/// its body through this guard so a bug degrades into a logged error and a
+/// typed fallback instead. Returns the body's value, or the panic payload
+/// after logging `context`.
+pub(crate) fn catch_callback_panic<T>(
+    context: &str,
+    body: impl FnOnce() -> T,
+) -> Result<T, Box<dyn std::any::Any + Send>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).inspect_err(|panic| {
+        error!("{context} panicked (contained): {panic:?}");
+    })
+}
+
+/// WNDPROC wrapper: on a contained panic it logs, asks the thread's
+/// message loop to quit so the process exits through its normal teardown
+/// path, and answers with the default window procedure's result for the
+/// message so the OS sees a well-formed reply.
+pub(crate) fn guarded_wndproc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    context: &str,
+    body: impl FnOnce() -> LRESULT,
+) -> LRESULT {
+    match catch_callback_panic(context, body) {
+        Ok(result) => result,
+        Err(_) => unsafe {
+            PostQuitMessage(0);
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        },
+    }
+}
+
+/// Subclass-proc wrapper: on a contained panic it defers to the
+/// next subclass in the chain / the original window procedure, so a broken
+/// subclass degrades to default behavior instead of unwinding.
+pub(crate) fn guarded_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    context: &str,
+    body: impl FnOnce() -> LRESULT,
+) -> LRESULT {
+    match catch_callback_panic(context, body) {
+        Ok(result) => result,
+        Err(_) => unsafe { DefSubclassProc(hwnd, message, wparam, lparam) },
+    }
+}
+
+/// Enumeration-callback wrapper: on a contained panic it stops the
+/// enumeration (returns FALSE). Callers that accumulate results keep what
+/// they gathered so far; display/topology caches re-enumerate on the next
+/// change event, so a stopped pass is stale, not corrupt.
+pub(crate) fn guarded_enum(context: &str, body: impl FnOnce() -> BOOL) -> BOOL {
+    catch_callback_panic(context, body).unwrap_or(BOOL(0))
+}
+
+/// Void-callback wrapper for timers, WinEvent hooks and queue-timer
+/// callbacks: on a contained panic it simply no-ops; the next tick or event
+/// retries.
+pub(crate) fn guarded_void(context: &str, body: impl FnOnce()) {
+    let _ = catch_callback_panic(context, body);
 }
 
 /// Tracks whether a window's WM_NCCREATE took ownership of the state box
@@ -795,6 +864,42 @@ pub(crate) fn append_verified_bounded(path: &Path, data: &[u8], cap: u64) -> io:
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn callback_panics_are_contained_and_propagate_the_payload() {
+        // The guard converts a panic into a logged Err instead of an
+        // unwind across the ABI; a calm body passes through untouched.
+        assert_eq!(catch_callback_panic("test callback", || 7).unwrap(), 7);
+        let caught = catch_callback_panic("test callback", || panic!("injected"));
+        let payload = caught.expect_err("the panic must be contained, not unwound");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"injected"));
+    }
+
+    #[test]
+    fn wndproc_panic_falls_back_to_defwindowproc_and_posts_quit() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_NULL;
+        // Reaching the assert at all proves the panic did not abort the
+        // process; DefWindowProcW on a null window answers 0.
+        let result = guarded_wndproc(HWND::default(), WM_NULL, WPARAM(0), LPARAM(0), "test wndproc", || {
+            panic!("injected")
+        });
+        assert_eq!(result.0, 0);
+    }
+
+    #[test]
+    fn enum_panic_stops_the_enumeration_with_false() {
+        assert_eq!(guarded_enum("test enum", || panic!("injected")).0, 0);
+        assert_eq!(guarded_enum("test enum", || BOOL(1)).0, 1);
+    }
+
+    #[test]
+    fn void_panic_no_ops_instead_of_unwinding() {
+        // Reaching the assert proves containment.
+        guarded_void("test timer", || panic!("injected"));
+        let mut ran = false;
+        guarded_void("test timer", || ran = true);
+        assert!(ran);
+    }
 
     #[test]
     fn preference_motion_mapping_requires_animation_and_plain_content() {

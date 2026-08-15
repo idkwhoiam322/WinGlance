@@ -325,8 +325,21 @@ fn hit_close_button(hwnd: HWND, cx: i32, cy: i32) -> bool {
     (width - w - pad..=width - pad).contains(&cx) && (pad..=pad + h).contains(&cy)
 }
 
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Panic-contained; a panic logs, posts quit and falls back to
+    // DefWindowProcW.
+    crate::winutil::guarded_wndproc(
+        hwnd,
+        message,
+        wparam,
+        lparam,
+        "the positioner window procedure",
+        || unsafe { positioner_proc_body(hwnd, message, wparam, lparam) },
+    )
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let state_ptr = window_state::<PositionerState>(hwnd);
     match message {
         WM_NCCREATE => {

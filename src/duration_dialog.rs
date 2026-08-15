@@ -227,8 +227,17 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
     }
 }
 
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe extern "system" fn dialog_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // A contained panic answers "not handled" (0) so the dialog
+    // manager's own default handling continues instead of unwinding.
+    crate::winutil::catch_callback_panic("the duration dialog procedure", || unsafe {
+        dialog_proc_body(hwnd, message, wparam, lparam)
+    })
+    .unwrap_or(LRESULT(0))
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if message == WM_NCCREATE {
         let create = lparam.0 as *const CREATESTRUCTW;
         if !create.is_null() {

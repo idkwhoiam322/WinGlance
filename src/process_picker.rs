@@ -376,6 +376,14 @@ pub(crate) fn strip_exe_suffix(name: &str) -> &str {
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // A contained panic stops the enumeration; the scan keeps what
+    // it gathered.
+    crate::winutil::guarded_enum("the picker's window enumeration", || unsafe {
+        enum_windows_proc_body(hwnd, lparam)
+    })
+}
+
+unsafe fn enum_windows_proc_body(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let scan = unsafe { &mut *(lparam.0 as *mut WindowScan) };
 
     if !unsafe { IsWindowVisible(hwnd).as_bool() } {
@@ -802,7 +810,6 @@ fn hit_test_close(hwnd: HWND, x: i32, y: i32) -> bool {
 /// DefSubclassProc, which dispatches to the original listbox proc that Comctl32
 /// tracks internally — no GWLP_WNDPROC swap or stored original proc is needed.
 /// The subclass is unhooked on WM_NCDESTROY.
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe extern "system" fn listbox_proc(
     lb: HWND,
     message: u32,
@@ -811,6 +818,20 @@ unsafe extern "system" fn listbox_proc(
     _subclass_id: usize,
     ref_data: usize,
 ) -> LRESULT {
+    // Panic-contained; a panic logs and defers to the original
+    // listbox procedure.
+    crate::winutil::guarded_subclass(
+        lb,
+        message,
+        wparam,
+        lparam,
+        "the picker's listbox subclass",
+        || unsafe { listbox_proc_body(lb, message, wparam, lparam, ref_data) },
+    )
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPARAM, ref_data: usize) -> LRESULT {
     let parent = HWND(ref_data as *mut std::ffi::c_void);
     match message {
         WM_NCDESTROY => {
@@ -905,8 +926,21 @@ unsafe extern "system" fn listbox_proc(
     }
 }
 
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Panic-contained; a panic logs, posts quit and falls back to
+    // DefWindowProcW.
+    crate::winutil::guarded_wndproc(
+        hwnd,
+        message,
+        wparam,
+        lparam,
+        "the process picker window procedure",
+        || unsafe { picker_proc_body(hwnd, message, wparam, lparam) },
+    )
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match message {
         WM_NCCREATE => {
             let create = lparam.0 as *const CREATESTRUCTW;

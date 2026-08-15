@@ -4112,17 +4112,27 @@ static REGISTERED: OnceLock<()> = OnceLock::new();
 /// stored as a raw value: `HICON` is not `Send`/`Sync`.
 static TRAY_ICON: OnceLock<isize> = OnceLock::new();
 
-fn tray_icon() -> HICON {
+fn tray_icon() -> Result<HICON> {
     let raw = *TRAY_ICON.get_or_init(|| {
-        unsafe { LoadIconW(None, IDI_APPLICATION) }
-            .expect("the system application icon should always load")
-            .0 as isize
+        match unsafe { LoadIconW(None, IDI_APPLICATION) } {
+            Ok(icon) => icon.0 as isize,
+            Err(error) => {
+                // A failed stock-icon load (broken system resources) is a
+                // normal initialization failure, not a panic. The
+                // failure is cached: a re-add would log the same error.
+                error!("LoadIconW(IDI_APPLICATION) failed: {error}");
+                0
+            }
+        }
     });
-    HICON(raw as *mut c_void)
+    if raw == 0 {
+        anyhow::bail!("the tray icon could not be loaded");
+    }
+    Ok(HICON(raw as *mut c_void))
 }
 
 fn install_tray_icon(hwnd: HWND) -> Result<()> {
-    if !unsafe { Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)) }.as_bool() {
+    if !unsafe { Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)?) }.as_bool() {
         anyhow::bail!("Shell_NotifyIconW(NIM_ADD) failed");
     }
     Ok(())
@@ -4138,32 +4148,38 @@ fn taskbar_created_msg() -> u32 {
 static TASKBAR_CREATED_MSG: OnceLock<u32> = OnceLock::new();
 
 fn remove_tray_icon(hwnd: HWND) {
+    let Ok(data) = tray_data(hwnd) else {
+        return;
+    };
     unsafe {
-        let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
+        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
     }
 }
 
-fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+fn tray_data(hwnd: HWND) -> Result<NOTIFYICONDATAW> {
     let mut data = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: TRAY_ID,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: WM_TRAY,
-        hIcon: tray_icon(),
+        hIcon: tray_icon()?,
         ..Default::default()
     };
     let tip = wide("WinGlance media overlay");
     let count = tip.len().min(data.szTip.len());
     data.szTip[..count].copy_from_slice(&tip[..count]);
-    data
+    Ok(data)
 }
 
 /// Shows a one-shot balloon note on the tray icon (NIF_INFO). Used for the
 /// permanent SMTC worker failure: the note is visible even while the tracking
 /// window is hidden (start in tray), unlike the history row alone.
 fn show_tray_note(hwnd: HWND, title: &str, text: &str) {
-    let mut data = tray_data(hwnd);
+    // Best-effort by design (see below): a missing icon skips the balloon.
+    let Ok(mut data) = tray_data(hwnd) else {
+        return;
+    };
     data.uFlags |= NIF_INFO;
     data.dwInfoFlags = NIIF_ERROR;
     let title_wide = wide(title);
@@ -4778,6 +4794,16 @@ fn apply_settings_row_click(
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // The body is panic-contained; a panic logs, posts quit (normal
+    // teardown) and answers with DefWindowProcW instead of unwinding across
+    // the ABI.
+    crate::winutil::guarded_wndproc(hwnd, message, wparam, lparam, "the main window procedure", || unsafe {
+        window_proc_body(hwnd, message, wparam, lparam)
+    })
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Explorer (re)started and rebuilt the notification area: re-add the
     // tray icon, which Explorer's restart wiped.
     if message == taskbar_created_msg() {
@@ -5926,6 +5952,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_real_window_proc_survives_a_benign_message_without_a_window() {
+        // Drive the actual ABI entry point with a no-op message on a
+        // null window — the state pointer is null (guarded), so the body
+        // falls through to DefWindowProcW. This pins the wrapper/body split:
+        // the extern fn must stay the thin guarded shim.
+        let result = unsafe { window_proc(HWND::default(), WM_NULL, WPARAM(0), LPARAM(0)) };
+        assert_eq!(result.0, 0);
     }
 
     #[test]

@@ -155,6 +155,13 @@ static DISPLAY_CACHE: Mutex<DisplayCacheEntry> = Mutex::new(DisplayCacheEntry(No
 pub(crate) fn enumerate_displays() -> Vec<DisplayInfo> {
     let mut displays: Vec<DisplayInfo> = Vec::new();
     unsafe extern "system" fn collect(monitor: HMONITOR, _hdc: HDC, _rect: *mut RECT, data: LPARAM) -> BOOL {
+        // A contained panic stops the enumeration with what was
+        // gathered; the display cache re-enumerates on the next topology
+        // change.
+        crate::winutil::guarded_enum("the display enumeration", || collect_body(monitor, data))
+    }
+
+    fn collect_body(monitor: HMONITOR, data: LPARAM) -> BOOL {
         let displays = unsafe { &mut *(data.0 as *mut Vec<DisplayInfo>) };
         let mut info = MONITORINFOEXW::default();
         // cbSize must cover the extended structure (with szDevice) or the
