@@ -1616,10 +1616,13 @@ impl OverlayState {
         // must not be compared against the previous track's last sample.
         self.last_progress_position_secs = None;
         self.estimated_position_secs = track.position_secs;
-        self.progress_anchor = Some((
-            track.position_updated_at.unwrap_or_else(Instant::now),
-            track.position_secs.unwrap_or(0.0),
-        ));
+        // A track with no reported position gets no anchor: anchoring at a
+        // fabricated 0.0 would make the tick crawl the bar from zero (and
+        // anchoring at an old position would keep a stale estimate). With no
+        // anchor the bar simply holds.
+        self.progress_anchor = track
+            .position_secs
+            .map(|pos| (track.position_updated_at.unwrap_or_else(Instant::now), pos));
         self.progress_playing = true;
     }
 
@@ -1639,30 +1642,38 @@ impl OverlayState {
     fn apply_progress(&mut self, position_secs: Option<f64>, duration_secs: Option<u64>, rate: Option<f64>) {
         self.progress_duration_secs = duration_secs;
         self.progress_rate = rate;
-        if let Some(pos) = position_secs {
-            // Detect stale SMTC samples: many media apps refresh the OS timeline
-            // position every few seconds rather than on every poll, so consecutive
-            // reads can return the same value while the bar keeps interpolating ahead.
-            // Snapping to an unchanged (stale) value every 3-4s makes the bar jerk
-            // backward on every poll that didn't advance. When the position is
-            // fresh — moved since the last read — the normal reconciliation logic
-            // applies: a small backward jitter is absorbed (monotonic bar), a large
-            // backward jump (seek / new track at 0) is adopted.
-            let stale = self.last_progress_position_secs == Some(pos);
-            let base = match self.estimated_position_secs {
-                Some(cur) if pos >= cur => pos,
-                Some(cur) if !stale && pos >= cur - PROGRESS_LATENCY_TOL_SECS => cur,
-                Some(cur) if stale => cur,
-                _ => pos,
-            };
-            self.estimated_position_secs = Some(base);
-            // Only re-anchor on a fresh sample. A stale sample must not reset the
-            // anchor instant, which would freeze the bar at the stale position.
-            if !stale {
-                self.progress_anchor = Some((Instant::now(), base));
-            }
-            self.last_progress_position_secs = Some(pos);
+        let Some(pos) = position_secs else {
+            // A source that stops reporting a position (or reports none) must
+            // not leave the old estimate or its interpolating anchor behind:
+            // the bar would otherwise keep crawling from a stale base. Clear
+            // it.
+            self.estimated_position_secs = None;
+            self.progress_anchor = None;
+            self.last_progress_position_secs = None;
+            return;
+        };
+        // Detect stale SMTC samples: many media apps refresh the OS timeline
+        // position every few seconds rather than on every poll, so consecutive
+        // reads can return the same value while the bar keeps interpolating ahead.
+        // Snapping to an unchanged (stale) value every 3-4s makes the bar jerk
+        // backward on every poll that didn't advance. When the position is
+        // fresh — moved since the last read — the normal reconciliation logic
+        // applies: a small backward jitter is absorbed (monotonic bar), a large
+        // backward jump (seek / new track at 0) is adopted.
+        let stale = self.last_progress_position_secs == Some(pos);
+        let base = match self.estimated_position_secs {
+            Some(cur) if pos >= cur => pos,
+            Some(cur) if !stale && pos >= cur - PROGRESS_LATENCY_TOL_SECS => cur,
+            Some(cur) if stale => cur,
+            _ => pos,
+        };
+        self.estimated_position_secs = Some(base);
+        // Only re-anchor on a fresh sample. A stale sample must not reset the
+        // anchor instant, which would freeze the bar at the stale position.
+        if !stale {
+            self.progress_anchor = Some((Instant::now(), base));
         }
+        self.last_progress_position_secs = Some(pos);
     }
 
     /// Integrates the live playback position from an anchor: position at the
@@ -9657,6 +9668,46 @@ mod tests {
         // even though it is behind the displayed position.
         state.apply_progress(Some(5.0), Some(120), Some(1.0));
         assert_eq!(state.estimated_position_secs, Some(5.0));
+    }
+
+    #[test]
+    fn absent_progress_position_clears_the_stale_estimate() {
+        // A source that stops reporting a position must not leave the old
+        // estimate or its interpolating anchor behind: the bar would otherwise
+        // keep crawling from a stale base.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.estimated_position_secs = Some(50.0);
+        state.progress_anchor = Some((Instant::now(), 50.0));
+        state.last_progress_position_secs = Some(50.0);
+        state.progress_rate = Some(1.0);
+        state.progress_duration_secs = Some(120);
+
+        state.apply_progress(None, Some(120), Some(1.0));
+        assert_eq!(state.estimated_position_secs, None);
+        assert_eq!(state.progress_anchor, None);
+        assert_eq!(state.last_progress_position_secs, None);
+    }
+
+    #[test]
+    fn track_without_position_sets_no_anchor() {
+        // A track arriving without a reported position must not anchor at a
+        // fabricated 0.0: the tick would crawl the bar from the start of the
+        // song on data we never received.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        let track = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            source_app: "spotify".into(),
+            duration_secs: Some(120),
+            position_secs: None,
+            ..TrackInfo::default()
+        };
+        state.apply_track_progress(&track);
+        assert_eq!(state.estimated_position_secs, None);
+        assert_eq!(
+            state.progress_anchor, None,
+            "no position, no anchor: nothing to interpolate from"
+        );
     }
 
     #[test]

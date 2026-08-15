@@ -1,5 +1,6 @@
 use log::{debug, info, warn};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -466,7 +467,7 @@ impl AppearanceConfig {
 fn read_config_with_retry(config_path: &Path) -> std::io::Result<String> {
     let mut error = None;
     for attempt in 0..Config::READ_RETRIES {
-        match std::fs::read_to_string(config_path) {
+        match read_config_bounded(config_path) {
             Ok(content) => return Ok(content),
             Err(err) => {
                 error = Some(err);
@@ -477,6 +478,29 @@ fn read_config_with_retry(config_path: &Path) -> std::io::Result<String> {
         }
     }
     Err(error.unwrap_or_else(|| std::io::Error::other("read retries exhausted")))
+}
+
+/// One bounded read attempt: buffers at most `MAX_CONFIG_BYTES + 1` bytes,
+/// then decodes them as UTF-8. The callers' post-read length check treats the
+/// result as oversized when it exceeds `MAX_CONFIG_BYTES`, so a hostile file
+/// can never make the process allocate by its declared size.
+fn read_config_bounded(config_path: &Path) -> std::io::Result<String> {
+    let file = std::fs::File::open(config_path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    String::from_utf8(bytes).map_err(|error| std::io::Error::other(format!("config is not valid UTF-8: {error}")))
+}
+
+/// Clamps a finite float into `min..=max`. A non-finite value — `NaN`, `+inf`
+/// or `-inf`, which TOML accepts as float spellings and which `f32::clamp`
+/// would pass straight through (NaN compares false against every bound) —
+/// falls back to the documented `default` instead.
+fn finite_clamp(value: f32, default: f32, min: f32, max: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        default
+    }
 }
 
 impl Config {
@@ -667,12 +691,38 @@ impl Config {
         self.overlay.margin = self.overlay.margin.clamp(0, 500);
         self.overlay.compact_margin = self.overlay.compact_margin.clamp(0, 500);
         self.behavior.debounce_ms = self.behavior.debounce_ms.clamp(150, 250);
-        self.appearance.corner_radius = self.appearance.corner_radius.clamp(4.0, 48.0);
-        self.appearance.compact_corner_radius = self.appearance.compact_corner_radius.clamp(4.0, 48.0);
-        self.appearance.padding = self.appearance.padding.clamp(4.0, 32.0);
+        // f32 appearance fields go through `finite_clamp`: a non-finite value
+        // declared in config.toml (TOML accepts nan/inf spellings) must fall
+        // back to the documented default instead of passing through f32::clamp
+        // untouched. Defaults come from the struct's own Default
+        // impl, so a future default change stays authoritative here too.
+        let appearance_defaults = AppearanceConfig::default();
+        self.appearance.corner_radius = finite_clamp(
+            self.appearance.corner_radius,
+            appearance_defaults.corner_radius,
+            4.0,
+            48.0,
+        );
+        self.appearance.compact_corner_radius = finite_clamp(
+            self.appearance.compact_corner_radius,
+            appearance_defaults.compact_corner_radius,
+            4.0,
+            48.0,
+        );
+        self.appearance.padding = finite_clamp(self.appearance.padding, appearance_defaults.padding, 4.0, 32.0);
         self.appearance.art_size = self.appearance.art_size.clamp(24, 96);
-        self.appearance.font_size_title = self.appearance.font_size_title.clamp(8.0, 32.0);
-        self.appearance.font_size_artist = self.appearance.font_size_artist.clamp(8.0, 28.0);
+        self.appearance.font_size_title = finite_clamp(
+            self.appearance.font_size_title,
+            appearance_defaults.font_size_title,
+            8.0,
+            32.0,
+        );
+        self.appearance.font_size_artist = finite_clamp(
+            self.appearance.font_size_artist,
+            appearance_defaults.font_size_artist,
+            8.0,
+            28.0,
+        );
     }
 
     /// Logs every setting in effect for this run, one line per section in the
@@ -1490,5 +1540,74 @@ nested_appearance = [1, 2, 3]
             missing_in_docs.is_empty(),
             "docs/configuration.md does not cover: {missing_in_docs:?}"
         );
+    }
+
+    #[test]
+    fn finite_clamp_falls_back_to_default_for_non_finite_values() {
+        // NaN and ±inf must not pass through f32::clamp (which leaves NaN
+        // untouched and has no opinion on inf): they fall back to the
+        // documented default.
+        assert_eq!(finite_clamp(f32::NAN, 26.0, 4.0, 48.0), 26.0);
+        assert_eq!(finite_clamp(f32::INFINITY, 26.0, 4.0, 48.0), 26.0);
+        assert_eq!(finite_clamp(f32::NEG_INFINITY, 26.0, 4.0, 48.0), 26.0);
+        // Finite values clamp exactly like f32::clamp, including the
+        // boundaries and a value already in range.
+        assert_eq!(finite_clamp(2.0, 26.0, 4.0, 48.0), 4.0);
+        assert_eq!(finite_clamp(100.0, 26.0, 4.0, 48.0), 48.0);
+        assert_eq!(finite_clamp(26.0, 26.0, 4.0, 48.0), 26.0);
+        // Negative zero is finite and clamps to the floor, like clamp.
+        assert_eq!(finite_clamp(-0.0, 26.0, 4.0, 48.0), 4.0);
+    }
+
+    #[test]
+    fn non_finite_appearance_values_fall_back_to_defaults() {
+        // TOML accepts nan/inf spellings for floats; a config declaring them
+        // must end up at the documented defaults (each reported as a
+        // normalization change), never at a NaN/inf value that would poison
+        // rendering and layout math.
+        let source = r#"
+[appearance]
+corner_radius = nan
+compact_corner_radius = inf
+padding = -inf
+font_size_title = nan
+font_size_artist = inf
+"#;
+        let mut config: Config = toml::from_str(source).unwrap();
+        let before = config.clone();
+        config.normalize();
+        let defaults = AppearanceConfig::default();
+        assert_eq!(config.appearance.corner_radius, defaults.corner_radius);
+        assert_eq!(config.appearance.compact_corner_radius, defaults.compact_corner_radius);
+        assert_eq!(config.appearance.padding, defaults.padding);
+        assert_eq!(config.appearance.font_size_title, defaults.font_size_title);
+        assert_eq!(config.appearance.font_size_artist, defaults.font_size_artist);
+        let changes = Config::normalized_changes(&before, &config);
+        assert_eq!(changes.len(), 5, "{changes:#?}");
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.contains("appearance.corner_radius") && c.contains("NaN")),
+            "{changes:#?}"
+        );
+    }
+
+    #[test]
+    fn config_at_the_exact_size_bound_still_loads() {
+        // MAX_CONFIG_BYTES is an inclusive bound: a valid file of exactly that
+        // size loads normally (persistable, revision captured); only a file
+        // past the bound becomes nonpersistable defaults.
+        let guard = TempDir::new("boundary-config");
+        let config_path = guard.dir.join("config.toml");
+        let head = "[appearance]\npadding = 20.0\ncomment = \"";
+        let pad = MAX_CONFIG_BYTES - head.len() - 1; // the closing quote
+        let source = format!("{head}{}\"", "x".repeat(pad));
+        assert_eq!(source.len(), MAX_CONFIG_BYTES);
+        std::fs::write(&config_path, &source).unwrap();
+
+        let config = Config::load_from_path(&config_path).unwrap();
+        assert!(config.persistable, "an exactly-bound file must still load");
+        assert!(config.revision.is_some());
+        assert_eq!(config.appearance.padding, 20.0);
     }
 }

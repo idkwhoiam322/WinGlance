@@ -2592,23 +2592,69 @@ fn read_source_app(session: &GlobalSystemMediaTransportControlsSession) -> Strin
 /// variant escapes dedup and fires a duplicate pill. Whitespace never renders,
 /// so the trim is invisible; when it does bite, the normalization log line
 /// below makes it auditable.
+///
+/// Every displayed field passes through here — including source labels, see
+/// `source_app_label` — so the C0/C1 and directional-control stripping and
+/// the character cap apply wherever metadata is stored or rendered.
 fn cap_meta(value: String) -> String {
     let trimmed = value.trim();
     if trimmed.len() != value.len() {
+        // The raw value must never be logged in full (it can be arbitrarily
+        // long): a bounded escaped preview plus the omitted count keeps the
+        // log line independent of the raw metadata length.
+        let (preview, omitted) = metadata_preview(trimmed);
+        let omitted_note = if omitted > 0 {
+            format!(" (+{omitted} omitted)")
+        } else {
+            String::new()
+        };
         debug!(
-            "metadata normalized | raw={value:?} ({} chars) | trimmed={trimmed:?} ({} chars)",
+            "metadata normalized | trimmed {} -> {} chars | value={preview}{omitted_note}",
             value.chars().count(),
             trimmed.chars().count()
         );
     }
-    if trimmed.chars().count() > MAX_META_CHARS {
-        trimmed.chars().take(MAX_META_CHARS).collect()
+    let safe: String = trimmed.chars().filter(|c| !display_unsafe(*c)).collect();
+    if safe.chars().count() > MAX_META_CHARS {
+        safe.chars().take(MAX_META_CHARS).collect()
     } else {
-        trimmed.to_string()
+        safe
     }
 }
 
+/// Whether a character must never reach displayed metadata: the C0 control
+/// range, DEL plus the C1 range, and the Unicode directional
+/// formatting/override/isolate command characters (bidi embeddings,
+/// overrides, isolates). Ordinary RTL letters, combining marks, emoji and ZWJ
+/// sequences are all preserved — only the directionality *commands* are
+/// stripped, so a legitimate RTL title still orders right-to-left by its
+/// letters.
+fn display_unsafe(c: char) -> bool {
+    let code = c as u32;
+    (0x0000..=0x001F).contains(&code)
+        || (0x007F..=0x009F).contains(&code)
+        || (0x202A..=0x202E).contains(&code)
+        || (0x2066..=0x2069).contains(&code)
+}
+
 const MAX_META_CHARS: usize = 256;
+
+/// Bounded, escaped preview of a metadata value for a log line: at most
+/// `MAX_PREVIEW_CHARS` scalar values, each escaped so control and invisible
+/// characters are visible, plus the number of characters omitted. Keeps log
+/// formatting allocations independent of the raw metadata length.
+fn metadata_preview(value: &str) -> (String, usize) {
+    let mut preview = String::new();
+    for (i, c) in value.chars().enumerate() {
+        if i >= MAX_PREVIEW_CHARS {
+            return (preview, value.chars().count() - MAX_PREVIEW_CHARS);
+        }
+        preview.extend(c.escape_debug());
+    }
+    (preview, 0)
+}
+
+const MAX_PREVIEW_CHARS: usize = 128;
 
 /// Best-effort title/artist for a session's history row. Reads can fail or
 /// return empty for freshly-created sessions; the title falls back to the
@@ -2723,9 +2769,13 @@ fn read_track_info(
         let joined = cap_meta(genres.join(", "));
         if joined.trim().is_empty() { None } else { Some(joined) }
     };
-    // One timeline read yields duration + live position + read instant;
-    // position is re-estimated on the UI thread between these reads.
-    let (duration_secs, position_secs, position_updated_at) = read_timeline(session);
+    // One timeline read yields the raw duration + live position + read
+    // instant; position is re-estimated on the UI thread between these reads.
+    // The raw tick values are normalized through `normalize_timeline` (checked
+    // subtraction, finite/clamp) here, at the worker boundary.
+    let (start_100ns, end_100ns, position_100ns, position_updated_at) = read_timeline(session);
+    let (duration_secs, position_secs, playback_rate) =
+        normalize_timeline(start_100ns, end_100ns, position_100ns, playback_rate);
     Ok(TrackInfo {
         title,
         artist,
@@ -2749,28 +2799,68 @@ fn read_track_info(
     })
 }
 
-/// Reads duration, live position and the read instant from the session's
-/// timeline in a single `GetTimelineProperties()` call. Returns
-/// `(duration_secs, position_secs, read_instant)`. Any field the source does
-/// not report is `None`; the instant is always now (the monotonic clock the
-/// overlay integrates against).
-fn read_timeline(session: &GlobalSystemMediaTransportControlsSession) -> (Option<u64>, Option<f64>, Instant) {
+/// Reads the session's timeline raw fields in one `GetTimelineProperties()`
+/// call. Returns `(start_100ns, end_100ns, position_100ns, read_instant)` —
+/// the raw 100 ns tick values Windows reports and the monotonic instant the
+/// read happened at. Nothing here is normalized: checked subtraction,
+/// finite checks and clamping are the pure `normalize_timeline`'s job, so the
+/// hostile-value policy lives in one testable place.
+fn read_timeline(
+    session: &GlobalSystemMediaTransportControlsSession,
+) -> (Option<i64>, Option<i64>, Option<i64>, Instant) {
     match session.GetTimelineProperties() {
-        Ok(t) => {
-            let start = t.StartTime().ok().map(|ts| ts.Duration);
-            let end = t.EndTime().ok().map(|ts| ts.Duration);
-            let duration = match (start, end) {
-                (Some(s), Some(e)) => {
-                    let d = e - s;
-                    if d > 0 { Some((d / 10_000_000) as u64) } else { None }
-                }
-                _ => None,
-            };
-            let position = t.Position().ok().map(|ts| ts.Duration as f64 / 10_000_000.0);
-            (duration, position, Instant::now())
-        }
-        Err(_) => (None, None, Instant::now()),
+        Ok(t) => (
+            t.StartTime().ok().map(|ts| ts.Duration),
+            t.EndTime().ok().map(|ts| ts.Duration),
+            t.Position().ok().map(|ts| ts.Duration),
+            Instant::now(),
+        ),
+        Err(_) => (None, None, None, Instant::now()),
     }
+}
+
+/// One pure normalization pass over the raw timeline a source reports. All
+/// inputs are Windows `TimeSpan` tick counts (100 ns units) except `rate`,
+/// which is the playback rate as reported. Returns `(duration_secs,
+/// position_secs, rate)`:
+///
+/// - The duration uses `checked_sub`, so `end - start` cannot wrap or panic
+///   on extreme values; a span of `<= 0` is no duration, and the whole-second
+///   duration is only reported when it is at least 1 second (a sub-second
+///   span has no whole-second duration).
+/// - The position must be finite and stays inside `0..=duration` when a
+///   duration is known, `0..` otherwise — a hostile negative or past-the-end
+///   position can never reach the overlay.
+/// - The rate must be finite and within `0.0..=16.0`; anything else is
+///   dropped. An absurd or non-finite rate would otherwise poison the
+///   overlay's `estimate_position` interpolation.
+fn normalize_timeline(
+    start_100ns: Option<i64>,
+    end_100ns: Option<i64>,
+    position_100ns: Option<i64>,
+    rate: Option<f64>,
+) -> (Option<u64>, Option<f64>, Option<f64>) {
+    let duration_secs = match (start_100ns, end_100ns) {
+        (Some(start), Some(end)) => end
+            .checked_sub(start)
+            .filter(|span| *span > 0)
+            .map(|span| (span / 10_000_000) as u64)
+            .filter(|secs| *secs >= 1),
+        _ => None,
+    };
+    let position_secs = position_100ns
+        .map(|ticks| ticks as f64 / 10_000_000.0)
+        .filter(|pos| pos.is_finite())
+        .map(|pos| {
+            let bounded = if let Some(duration) = duration_secs {
+                pos.min(duration as f64)
+            } else {
+                pos
+            };
+            bounded.max(0.0)
+        });
+    let rate = rate.filter(|r| r.is_finite() && (0.0..=16.0).contains(r));
+    (duration_secs, position_secs, rate)
 }
 
 /// Whether an error is one of the HRESULTs WinRT raises while a session is
@@ -2840,7 +2930,10 @@ fn source_app_label(value: &str) -> String {
     } else {
         value
     };
-    non_empty(value.to_string(), "Media")
+    // Same display normalization every other field gets: a hostile AUMID must
+    // not smuggle control characters or unbounded length into the label
+    // as well.
+    cap_meta(non_empty(value.to_string(), "Media"))
 }
 
 /// Normalizes a string for fuzzy matching against AUMIDs and derived labels.
@@ -2973,6 +3066,121 @@ mod tests {
             normalize_for_match("com.github.th-ch.youtube-music"),
             "comgithubthchyoutubemusic"
         );
+    }
+
+    #[test]
+    fn normalize_timeline_is_safe_on_extreme_and_missing_values() {
+        // checked_sub: end - start over the whole i64 span must be None, never
+        // a panic or a wrapped value.
+        let (duration, _, _) = normalize_timeline(Some(i64::MIN), Some(i64::MAX), None, None);
+        assert_eq!(duration, None);
+        // A span that ends before it starts (negative) is no duration.
+        let (duration, _, _) = normalize_timeline(Some(200), Some(100), None, None);
+        assert_eq!(duration, None);
+        // A sub-second span has no whole-second duration.
+        let (duration, _, _) = normalize_timeline(Some(0), Some(5_000_000), None, None);
+        assert_eq!(duration, None);
+        // Exactly one second is the lower bound of the reported range.
+        let (duration, _, _) = normalize_timeline(Some(0), Some(10_000_000), None, None);
+        assert_eq!(duration, Some(1));
+        // 300_000_000_000 ticks = 30 000 seconds.
+        let (duration, _, _) = normalize_timeline(Some(0), Some(300_000_000_000), None, None);
+        assert_eq!(duration, Some(30_000));
+        // A missing boundary yields no duration.
+        let (duration, _, _) = normalize_timeline(None, Some(100), None, None);
+        assert_eq!(duration, None);
+    }
+
+    #[test]
+    fn normalize_timeline_clamps_position_and_cleans_rate() {
+        // A negative position (timeline before the start mark) clamps to 0.0.
+        let (_, position, _) = normalize_timeline(None, None, Some(-50_000_000), None);
+        assert_eq!(position, Some(0.0));
+        // A position past the end clamps to the duration.
+        let (duration, position, _) = normalize_timeline(
+            Some(0),
+            Some(120_000_000_000),       // 12 000 s
+            Some(1_000_000_000_000_000), // 100 000 000 s, far past the end
+            None,
+        );
+        assert_eq!(duration, Some(12_000));
+        assert_eq!(position, Some(12_000.0));
+        // Without a duration, an in-range position is clamped to >= 0 only.
+        let (duration, position, _) = normalize_timeline(None, None, Some(50_000_000), None);
+        assert_eq!(duration, None);
+        assert_eq!(position, Some(5.0));
+        // A position inside the track passes through unchanged.
+        let (_, position, _) = normalize_timeline(Some(0), Some(120_000_000_000), Some(65_000_000), None);
+        assert_eq!(position, Some(6.5));
+
+        // Rates outside 0.0..=16.0, or non-finite, are dropped entirely.
+        assert_eq!(normalize_timeline(None, None, None, Some(f64::NAN)).2, None);
+        assert_eq!(normalize_timeline(None, None, None, Some(f64::INFINITY)).2, None);
+        assert_eq!(normalize_timeline(None, None, None, Some(f64::NEG_INFINITY)).2, None);
+        assert_eq!(normalize_timeline(None, None, None, Some(-1.0)).2, None);
+        assert_eq!(normalize_timeline(None, None, None, Some(17.5)).2, None);
+        // The accepted band is inclusive at both ends.
+        assert_eq!(normalize_timeline(None, None, None, Some(0.0)).2, Some(0.0));
+        assert_eq!(normalize_timeline(None, None, None, Some(16.0)).2, Some(16.0));
+        assert_eq!(normalize_timeline(None, None, None, Some(2.0)).2, Some(2.0));
+    }
+
+    #[test]
+    fn metadata_preview_is_bounded_and_escaped() {
+        // Control characters are escaped, so raw control bytes never reach
+        // the log output verbatim. `escape_debug` writes NUL as `\0`.
+        let (preview, omitted) = metadata_preview("a\u{0}b\nc");
+        assert_eq!(preview, "a\\0b\\nc");
+        assert_eq!(omitted, 0);
+        // A long value is cut at the preview cap and reports what was left
+        // out.
+        let (preview, omitted) = metadata_preview(&"x".repeat(300));
+        assert_eq!(preview, "x".repeat(128));
+        assert_eq!(omitted, 172);
+        // The boundary itself: exactly MAX_PREVIEW_CHARS omits nothing.
+        let (preview, omitted) = metadata_preview(&"y".repeat(128));
+        assert_eq!(preview, "y".repeat(128));
+        assert_eq!(omitted, 0);
+    }
+
+    #[test]
+    fn cap_meta_strips_display_unsafe_controls_and_preserves_unicode() {
+        // C0 controls: NUL and newline must never reach a displayed field.
+        assert_eq!(cap_meta("So\u{0}ng\nArtist".into()), "SongArtist");
+        // DEL (0x7F) and the C1 range are stripped too.
+        assert_eq!(cap_meta("So\u{7f}ng".into()), "Song");
+        assert_eq!(cap_meta("Song\u{85}padded".into()), "Songpadded");
+        // Bidi formatting / override / isolate commands are removed...
+        assert_eq!(cap_meta("S\u{202E}ong".into()), "Song");
+        assert_eq!(cap_meta("Sp\u{202D}otify".into()), "Spotify");
+        assert_eq!(cap_meta("S\u{2066}ong".into()), "Song");
+        // ...while ordinary RTL letters, combining marks, emoji and ZWJ
+        // sequences are preserved: only directionality commands are stripped,
+        // never scripts or joiners.
+        let rtl = "سلام عليكم";
+        assert_eq!(cap_meta(rtl.into()), rtl);
+        let combining = "e\u{301}";
+        assert_eq!(cap_meta(combining.into()), combining);
+        let emoji = "🎵💿";
+        assert_eq!(cap_meta(emoji.into()), emoji);
+        let zwj = "👨\u{200D}👩\u{200D}👧";
+        assert_eq!(cap_meta(zwj.into()), zwj);
+        // The character cap still applies after stripping.
+        let long = format!("{}\u{0}", "x".repeat(300));
+        assert_eq!(cap_meta(long).chars().count(), MAX_META_CHARS);
+    }
+
+    #[test]
+    fn source_app_label_is_capped_and_sanitized() {
+        // A hostile AUMID with none of the shrinking separators falls back to
+        // the same cap as every other metadata field.
+        let label = source_app_label(&"A".repeat(500));
+        assert_eq!(label.chars().count(), MAX_META_CHARS);
+        // Control characters cannot smuggle into the label.
+        assert_eq!(source_app_label("Publisher!Spo\u{0}tify"), "Spotify");
+        // A label derived from a huge suffix is capped too.
+        let label = source_app_label(&format!("Spotify;{}", "0".repeat(300)));
+        assert_eq!(label.chars().count(), MAX_META_CHARS);
     }
 
     #[test]
