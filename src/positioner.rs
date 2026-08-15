@@ -5,8 +5,9 @@ use std::sync::{Mutex, OnceLock};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreatePen, CreateSolidBrush, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetMonitorInfoW, HBRUSH, HDC, HGDIOBJ, HPEN, LineTo, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromWindow, MoveToEx, PAINTSTRUCT, PS_SOLID, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    FillRect, GetMonitorInfoW, HBRUSH, HDC, HGDIOBJ, HPEN, InvalidateRect, LineTo, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MonitorFromWindow, MoveToEx, PAINTSTRUCT, PS_SOLID, SelectObject, SetBkMode, SetTextColor,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -14,8 +15,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect, HWND_TOPMOST,
     PostMessageW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos,
-    ShowWindow, WM_CLOSE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    ShowWindow, WM_CLOSE, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
@@ -26,6 +27,9 @@ const SNAP_THRESHOLD: i32 = 30;
 const CLOSE_BTN_W: i32 = 28;
 const CLOSE_BTN_H: i32 = 28;
 const DEFAULT_MARGIN: f32 = 8.0;
+/// Logical width of the close-button cross pen, scaled by the window's DPI so
+/// the drawn lines keep the same visual weight on any display.
+const PEN_W: f32 = 2.0;
 
 /// Tracks the currently open positioner window and its overlay, so the settings
 /// Reset action can move the adjustor back to the default spot. Stored as raw
@@ -37,7 +41,6 @@ static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
 
 struct PositionerState {
     owner: HWND,
-    overlay: HWND,
     /// Which position the commit applies to: `POSITION_MSG` for the expanded
     /// pill, `COMPACT_POSITION_MSG` for the independent compact position.
     /// The message routes through the main window (the single config owner),
@@ -88,23 +91,22 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
         }
         close_existing();
 
+        // Create the window at the owner's DPI so the sample box, its close
+        // button and the cross pen are sized like the rest of the UI on
+        // high-DPI displays.
+        let scale = GetDpiForWindow(owner).max(96) as f32 / 96.0;
         let state = Box::new(PositionerState {
             owner,
-            overlay,
             result_msg,
             dragging: false,
             drag_offset: POINT::default(),
             last_commit: None,
             bg_brush: CreateSolidBrush(COLORREF(0x00121212)),
             x_brush: CreateSolidBrush(COLORREF(0x333333)),
-            pen: CreatePen(PS_SOLID, 2, COLORREF(0x999999)),
+            pen: CreatePen(PS_SOLID, (PEN_W * scale).round().max(1.0) as i32, COLORREF(0x999999)),
         });
         let state_ptr = Box::into_raw(state);
         POSITIONER_STATE_CLAIMED.reset();
-        // The positioner sits on the owner's monitor: create it at the owner's
-        // DPI so the sample box and its close button are sized like the rest
-        // of the UI on high-DPI displays.
-        let scale = GetDpiForWindow(owner).max(96) as f32 / 96.0;
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             PCWSTR(class_name.as_ptr()),
@@ -261,8 +263,13 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
         debug!("positioner GetWindowRect failed: {error}");
         return;
     }
-    let scale = unsafe { GetDpiForWindow(state.overlay).max(96) } as f32 / 96.0;
-    let work = monitor_work_area(state.overlay);
+    // The sample lives on the positioner's own monitor — not the pill's — so
+    // the snap edges, threshold and the physical-to-logical conversion must
+    // all come from this window's DPI and work area. Using the overlay's
+    // values would scale and anchor a drag made on a different-DPI monitor
+    // against the wrong monitor.
+    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+    let work = monitor_work_area(hwnd);
     let sample_w = (WIDTH as f32 * scale).round() as i32;
     let sample_h = (HEIGHT as f32 * scale).round() as i32;
 
@@ -386,6 +393,40 @@ unsafe extern "system" fn positioner_proc(hwnd: HWND, message: u32, wparam: WPAR
         }
         WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
             let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            // The user dragged the sample onto a display with a different DPI.
+            // Rebuild the DPI-sized resources: the cross pen is a fixed GDI
+            // object cached on the state (brushes are solid colors and need no
+            // rebuild), and the window grows to the new physical size. The
+            // top-left is kept where the user placed it; the paint and
+            // close-button paths read the DPI live, so they follow along.
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                let new_dpi = (wparam.0 >> 16) as u32;
+                let scale = new_dpi.max(96) as f32 / 96.0;
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(state.pen.0));
+                }
+                state.pen = unsafe { CreatePen(PS_SOLID, (PEN_W * scale).round().max(1.0) as i32, COLORREF(0x999999)) };
+                let w = (WIDTH as f32 * scale).round() as i32;
+                let h = (HEIGHT as f32 * scale).round() as i32;
+                let mut rect = RECT::default();
+                let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+                let _ = unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        rect.left,
+                        rect.top,
+                        w,
+                        h,
+                        SWP_NOACTIVATE | SWP_NOZORDER,
+                    )
+                };
+                let _ = unsafe { InvalidateRect(hwnd, None, true) };
+            }
             LRESULT(0)
         }
         WM_PAINT => {
