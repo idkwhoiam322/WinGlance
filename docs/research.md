@@ -55,10 +55,19 @@ useful artifact. Key takeaways:
 
 Prioritized by impact/effort.
 
-**Scope constraint (decision):** WinGlance stays a passive, state-change-driven
-notification overlay. No clickable in-pill controls (play/pause/next/stop) and no
-continuous visual updates (progress bar / timeline). The pill appears and changes
-only when the media state changes (track change, play/pause/stop).
+**Scope constraint (decision, research date 2026-08):** WinGlance stays a
+passive, state-change-driven notification overlay. No clickable in-pill
+controls (play/pause/next/stop) and no continuous visual updates (progress
+bar / timeline). The pill appears and changes only when the media state
+changes (track change, play/pause/stop).
+
+> **Later revision:** the "no progress bar / timeline" half of this decision
+> was subsequently superseded — a bounded SMTC progress bar (a thin accent
+> bar advancing with playback, frozen while paused, driven by the source's
+> reported position rather than per-frame animation) was implemented and is
+> documented in `docs/configuration.md`. The pill remains click-through and
+> focus-free with no transport controls; that half of the constraint is
+> still current.
 
 1. **Source-app icon** — obtain a real app icon from `SourceAppUserModelId`:
    resolve the AUMID to a display name + icon via
@@ -73,9 +82,11 @@ only when the media state changes (track change, play/pause/stop).
 5. **Taskbar deskband / compact widget** — long term, a mini always-visible
    indicator using the Deskband11Lib approach (config-only, no interaction).
 
-Explicitly **not** planned (per scope constraint): progress bar/timeline,
-clickable transport controls, shuffle/repeat/stop in the pill, per-frame visual
-updates while playing.
+Explicitly **not** planned (per the scope constraint above): clickable
+transport controls, shuffle/repeat/stop in the pill, per-frame visual updates
+while playing. (Progress bar/timeline was listed here at research time; the
+bounded SMTC progress bar described above later replaced that exclusion — see
+the revision note.)
 
 ## What we already do that matches or beats the reference
 

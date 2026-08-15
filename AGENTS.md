@@ -95,4 +95,6 @@ with media playing — cannot be verified headless.
 ## Git
 
 - Imperative-mood commit subjects, one logical change per commit.
-- The repo is committed on `main`; do not push unless asked.
+- Day-to-day work is committed on `dev` (the checked development branch);
+  `main` is the default/release branch. Do not push either branch unless
+  asked.
