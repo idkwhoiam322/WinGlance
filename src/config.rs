@@ -1,7 +1,53 @@
 use log::{debug, info, warn};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Upper bound on the config file size, in bytes. A file above this bound is
+/// treated as unreadable: defaults apply in memory, the file is left
+/// untouched, and persistence is disabled — so a hostile or corrupt
+/// oversized file can neither be parsed nor be overwritten by a save.
+pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+
+/// Byte-identical snapshot of `config.toml` as it was loaded (or as it was
+/// last written). `save_checked` re-reads the current file and compares it
+/// against this snapshot, so an external edit — a hand-edit, or another
+/// instance that saved after us — is detected as a conflict instead of being
+/// silently overwritten. The bytes are kept as-is: no hash, so no
+/// collision risk and no new dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRevision {
+    bytes: Arc<[u8]>,
+}
+
+impl ConfigRevision {
+    /// Captures the exact file bytes. `file_bytes` must already be bounded by
+    /// `MAX_CONFIG_BYTES`; an unbounded buffer is never captured here.
+    fn captured(file_bytes: impl Into<Arc<[u8]>>) -> Self {
+        Self {
+            bytes: file_bytes.into(),
+        }
+    }
+
+    fn matches(&self, file_bytes: &[u8]) -> bool {
+        &*self.bytes == file_bytes
+    }
+}
+
+/// The verdict of a `save_checked` call. `Saved` carries the revision of the
+/// bytes just written, so the caller can install it as the new shared
+/// revision only after the write actually succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveOutcome {
+    Saved(ConfigRevision),
+    /// The file changed on disk since it was loaded: nothing was written and
+    /// the in-memory change applies for this session only.
+    Conflict,
+    /// The startup file was invalid, unreadable, or oversized: it is left
+    /// untouched and nothing is ever persisted this run.
+    PersistenceDisabled,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -20,6 +66,11 @@ pub struct Config {
     /// for that run and nothing is persisted. Never serialized.
     #[serde(skip)]
     pub persistable: bool,
+    /// The byte snapshot the last load or save was based on (absent when
+    /// persistence is disabled). `save_checked` compares the live file against
+    /// it and refuses to write on a mismatch. Never serialized.
+    #[serde(skip)]
+    pub revision: Option<ConfigRevision>,
 }
 
 impl Default for Config {
@@ -30,6 +81,7 @@ impl Default for Config {
             appearance: AppearanceConfig::default(),
             unknown: toml::Table::new(),
             persistable: true,
+            revision: None,
         }
     }
 }
@@ -439,19 +491,39 @@ impl Config {
         Self::load_from_path(&Self::config_path()?)
     }
 
+    /// Rejects a config path whose declared length exceeds `MAX_CONFIG_BYTES`
+    /// without buffering the file, so the bound also limits load-time memory
+    /// (the post-read length check stays as the authoritative gate against a
+    /// file that grows between the metadata query and the read). A missing
+    /// file or an undetectable length falls through to the read, which
+    /// reports its own error.
+    fn exceeds_size_bound(config_path: &Path) -> bool {
+        std::fs::metadata(config_path)
+            .map(|meta| meta.len() > MAX_CONFIG_BYTES as u64)
+            .unwrap_or(false)
+    }
+
     /// Loads the config from `config_path`. When the file does not exist, a
     /// fresh default is written there. When it exists but cannot be read
-    /// (after retries) or parsed, the file is left completely untouched and
-    /// defaults apply in memory for this run with persistence disabled — an
-    /// existing user config must never be moved, overwritten, or replaced
-    /// with defaults, not even under a backup name.
+    /// (after retries), parsed, or fits within `MAX_CONFIG_BYTES`, the file
+    /// is left completely untouched and defaults apply in memory for this run
+    /// with persistence disabled — an existing user config must never be
+    /// moved, overwritten, or replaced with defaults, not even under a backup
+    /// name.
     fn load_from_path(config_path: &Path) -> anyhow::Result<Self> {
         if !config_path.exists() {
             let mut config = Config::default();
             config.normalize();
-            config.save_to(config_path)?;
+            let bytes = config.serialized()?;
+            Self::write_temp_and_rename(config_path, &bytes)?;
+            config.revision = Some(ConfigRevision::captured(bytes));
             info!("no config at {config_path:?}; wrote defaults");
             return Ok(config);
+        }
+        if Self::exceeds_size_bound(config_path) {
+            return Ok(Self::defaults_in_memory(&format!(
+                "exceeds the {MAX_CONFIG_BYTES} byte size bound"
+            )));
         }
         let content = match read_config_with_retry(config_path) {
             Ok(content) => content,
@@ -462,8 +534,17 @@ impl Config {
                 )));
             }
         };
+        if content.len() > MAX_CONFIG_BYTES {
+            return Ok(Self::defaults_in_memory(&format!(
+                "exceeds the {MAX_CONFIG_BYTES} byte size bound"
+            )));
+        }
         match toml::from_str::<Config>(&content) {
             Ok(mut config) => {
+                // The revision snapshots the exact bytes this load was based
+                // on, so `save_checked` can prove the file was not edited
+                // between now and the next save.
+                config.revision = Some(ConfigRevision::captured(content.into_bytes()));
                 // Report anything normalize() clamped: a value the user's
                 // config.toml declares must never differ from the value in
                 // effect without a visible log line.
@@ -490,30 +571,81 @@ impl Config {
         config
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
-        if !self.persistable {
+    /// Persists the config only when the on-disk file still matches the
+    /// revision this load/save cycle captured. A mismatch — anyone
+    /// edited the file after we read it — is a `Conflict`: nothing is written
+    /// and the in-memory change applies for this run only. `PersistenceDisabled`
+    /// mirrors the legacy `persistable` guard: the startup file was invalid,
+    /// unreadable, or oversized and is left untouched. On `Saved`, the shared
+    /// revision is updated with the bytes just written.
+    pub fn save_checked(&mut self) -> anyhow::Result<SaveOutcome> {
+        let config_path = Self::config_path()?;
+        self.save_checked_to(&config_path)
+    }
+
+    /// `save_checked` against an explicit path (shared by the tests, which run
+    /// against temp dirs instead of real `%APPDATA%`).
+    pub fn save_checked_to(&mut self, config_path: &Path) -> anyhow::Result<SaveOutcome> {
+        let Some(revision) = self.revision.clone() else {
             warn!(
                 "config.toml is not persistable this run (it was invalid or unreadable and was left untouched); settings apply until the app exits"
             );
-            return Ok(());
+            return Ok(SaveOutcome::PersistenceDisabled);
+        };
+        // Re-read the current file (bounded, retried like load). A re-read
+        // failure means the file could not be verified — treat it as a
+        // conflict rather than write blind. A file that has grown past the
+        // size bound is also a conflict (it changed), detected here without
+        // buffering it.
+        if Self::exceeds_size_bound(config_path) {
+            warn!(
+                "config.toml has grown beyond the {MAX_CONFIG_BYTES} byte size bound; keeping the change in memory and NOT saving"
+            );
+            return Ok(SaveOutcome::Conflict);
         }
-        self.save_to(&Self::config_path()?)
+        let current = match read_config_with_retry(config_path) {
+            Ok(content) => content,
+            Err(error) => {
+                warn!(
+                    "could not verify config.toml before writing ({error}); keeping the change in memory and NOT saving"
+                );
+                return Ok(SaveOutcome::Conflict);
+            }
+        };
+        if current.len() > MAX_CONFIG_BYTES || !revision.matches(current.as_bytes()) {
+            warn!(
+                "config.toml changed on disk since it was loaded (or the file has grown); keeping the change in memory and NOT saving"
+            );
+            return Ok(SaveOutcome::Conflict);
+        }
+        let bytes = self.serialized()?;
+        Self::write_temp_and_rename(config_path, &bytes)?;
+        let saved = ConfigRevision::captured(bytes);
+        self.revision = Some(saved.clone());
+        Ok(SaveOutcome::Saved(saved))
+    }
+
+    /// The deterministic serialized form `save` writes; kept separate so the
+    /// freshly written bytes can also seed the next revision.
+    fn serialized(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(toml::to_string_pretty(self)?.into_bytes())
     }
 
     /// Writes `config.toml` via a co-located temp file + same-volume rename,
     /// so a crash mid-write cannot leave a truncated config behind (the
     /// rename atomically replaces an existing file). The file is synced
     /// before the rename so a power loss cannot lose the settings change.
-    fn save_to(&self, config_path: &Path) -> anyhow::Result<()> {
+    /// A08 replaces this primitive with the handle-verified writer; the
+    /// `save_checked` protocol around it is unchanged.
+    fn write_temp_and_rename(config_path: &Path, content: &[u8]) -> anyhow::Result<()> {
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = toml::to_string_pretty(self)?;
         let tmp_path = config_path.with_extension("toml.tmp");
         {
             let mut f = std::fs::File::create(&tmp_path)?;
             use std::io::Write;
-            f.write_all(content.as_bytes())?;
+            f.write_all(content)?;
             f.sync_all()?;
         }
         if let Err(e) = std::fs::rename(&tmp_path, config_path) {
@@ -833,15 +965,20 @@ nested_appearance = [1, 2, 3]
         let original = b"this is not valid toml {{{ [unclosed".to_vec();
         std::fs::write(&config_path, &original).unwrap();
 
-        let config = Config::load_from_path(&config_path).unwrap();
+        let mut config = Config::load_from_path(&config_path).unwrap();
         // Defaults apply in memory only...
         assert!(!config.persistable);
         // ...and the user's file is byte-identical, with no backup or temp
         // file created next to it.
         assert_eq!(std::fs::read(&config_path).unwrap(), original);
         assert_eq!(sibling_names(&guard.dir), vec!["config.toml"]);
-        // The non-persistable guard makes save() a no-op that must not error.
-        assert!(config.save().is_ok());
+        // The non-persistable guard makes save_checked report disabled
+        // without touching the file and without erroring.
+        assert_eq!(
+            config.save_checked_to(&config_path).unwrap(),
+            SaveOutcome::PersistenceDisabled
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), original);
     }
 
     #[test]
@@ -862,12 +999,20 @@ nested_appearance = [1, 2, 3]
         let config_path = guard.dir.join("config.toml");
         std::fs::write(&config_path, "overlay.duration_ms = 1000\n").unwrap();
 
-        let mut config = Config::default();
+        let mut config = Config::load_from_path(&config_path).unwrap();
         config.overlay.duration_ms = 5000;
-        config.save_to(&config_path).unwrap();
-        // Saving twice in a row must replace, never append or corrupt.
+        assert!(
+            matches!(config.save_checked_to(&config_path).unwrap(), SaveOutcome::Saved(_)),
+            "first save against the freshly loaded revision must succeed"
+        );
+        // Saving twice in a row must replace, never append or corrupt, and the
+        // revision must track the newest written bytes (own consecutive saves
+        // update the revision).
         config.overlay.duration_ms = 7000;
-        config.save_to(&config_path).unwrap();
+        assert!(
+            matches!(config.save_checked_to(&config_path).unwrap(), SaveOutcome::Saved(_)),
+            "a second save with no external edit must still succeed"
+        );
 
         let reloaded: Config = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(reloaded.overlay.duration_ms, 7000);
@@ -882,6 +1027,143 @@ nested_appearance = [1, 2, 3]
     fn default_monitor_mode_is_active_window() {
         let config = Config::default();
         assert_eq!(config.overlay.monitor, MonitorMode::ActiveWindow);
+    }
+
+    #[test]
+    fn save_checked_conflicts_on_an_external_known_value_edit() {
+        // An external writer changes a KNOWN field after we loaded: the save
+        // must refuse and the external version must stay on disk.
+        let guard = TempDir::new("conflict-known");
+        let config_path = guard.dir.join("config.toml");
+        std::fs::write(&config_path, "overlay.duration_ms = 4000\n").unwrap();
+        let mut config = Config::load_from_path(&config_path).unwrap();
+        config.overlay.duration_ms = 5000;
+        // The external edit lands after our load.
+        std::fs::write(&config_path, "overlay.duration_ms = 9000\n").unwrap();
+
+        assert_eq!(
+            config.save_checked_to(&config_path).unwrap(),
+            SaveOutcome::Conflict,
+            "a hand-edited file must never be silently overwritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "overlay.duration_ms = 9000\n"
+        );
+        assert_eq!(sibling_names(&guard.dir), vec!["config.toml"]);
+    }
+
+    #[test]
+    fn save_checked_conflicts_on_an_external_unknown_field_edit() {
+        // An external writer adds an UNKNOWN key (a newer build or a hand
+        // edit). The save must refuse and keep the unknown key on disk; the
+        // in-memory config already preserves it via the unknown table, and a
+        // blind save would still have been a silent clobber of the edit.
+        let guard = TempDir::new("conflict-unknown");
+        let config_path = guard.dir.join("config.toml");
+        std::fs::write(&config_path, "overlay.duration_ms = 4000\n").unwrap();
+        let mut config = Config::load_from_path(&config_path).unwrap();
+        config.overlay.duration_ms = 5000;
+        std::fs::write(&config_path, "overlay.duration_ms = 4000\nfuture_key = 1\n").unwrap();
+
+        assert_eq!(config.save_checked_to(&config_path).unwrap(), SaveOutcome::Conflict);
+        assert!(
+            std::fs::read_to_string(&config_path)
+                .unwrap()
+                .contains("future_key = 1")
+        );
+    }
+
+    #[test]
+    fn oversized_config_is_left_untouched_and_nonpersistable() {
+        // A config file beyond the size bound is never parsed, never captured
+        // into a revision, and never overwritten.
+        let guard = TempDir::new("oversized-config");
+        let config_path = guard.dir.join("config.toml");
+        let blob = vec![b'x'; MAX_CONFIG_BYTES + 1];
+        std::fs::write(&config_path, &blob).unwrap();
+
+        let mut config = Config::load_from_path(&config_path).unwrap();
+        assert!(!config.persistable);
+        assert!(config.revision.is_none());
+        assert_eq!(std::fs::read(&config_path).unwrap(), blob);
+        assert_eq!(
+            config.save_checked_to(&config_path).unwrap(),
+            SaveOutcome::PersistenceDisabled
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), blob);
+    }
+
+    #[test]
+    fn replacement_failure_leaves_the_original() {
+        // The rename cannot replace a directory with a file: the write must
+        // fail, clean up its temp, and leave the original directory entry
+        // exactly as it was.
+        let guard = TempDir::new("replace-fail");
+        let config_path = guard.dir.join("config.toml");
+        std::fs::create_dir(&config_path).unwrap();
+        std::fs::write(guard.dir.join("other"), b"keep").unwrap();
+
+        assert!(Config::write_temp_and_rename(&config_path, b"[overlay]\n").is_err());
+        assert!(config_path.is_dir(), "the target must be left as-is");
+        assert_eq!(
+            sibling_names(&guard.dir),
+            vec!["config.toml", "other"],
+            "no temp file may remain after a failed replace"
+        );
+    }
+
+    #[test]
+    fn failed_write_leaves_no_temp_state() {
+        // The parent of the target is a regular FILE, so the earliest
+        // write-through step (creating the parent directory, then the temp
+        // next to it) fails: whatever step of the write-through path fails,
+        // no partial state may remain behind.
+        let guard = TempDir::new("write-fail");
+        let blocker = guard.dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let config_path = blocker.join("config.toml");
+
+        assert!(Config::write_temp_and_rename(&config_path, b"[overlay]\n").is_err());
+        assert_eq!(
+            sibling_names(&guard.dir),
+            vec!["blocker"],
+            "no temp file may exist after the failed write"
+        );
+    }
+
+    #[test]
+    fn deleted_config_is_reported_as_conflict() {
+        // The file vanishes between load and save: the verification re-read
+        // fails, which must surface as a conflict (never a blind write) and
+        // must not re-create the file.
+        let guard = TempDir::new("deleted-config");
+        let config_path = guard.dir.join("config.toml");
+        std::fs::write(&config_path, "overlay.duration_ms = 4000\n").unwrap();
+        let mut config = Config::load_from_path(&config_path).unwrap();
+        config.overlay.duration_ms = 5000;
+        std::fs::remove_file(&config_path).unwrap();
+
+        assert_eq!(config.save_checked_to(&config_path).unwrap(), SaveOutcome::Conflict);
+        assert!(!config_path.exists(), "a deleted config must not be re-created");
+        assert_eq!(sibling_names(&guard.dir), Vec::<String>::new());
+    }
+
+    #[test]
+    fn grown_config_at_save_conflicts_and_is_untouched() {
+        // The file is replaced by one past the size bound after load: the
+        // save must refuse to touch it (the metadata pre-check avoids even
+        // buffering it) and report a conflict.
+        let guard = TempDir::new("grown-config");
+        let config_path = guard.dir.join("config.toml");
+        std::fs::write(&config_path, "overlay.duration_ms = 4000\n").unwrap();
+        let mut config = Config::load_from_path(&config_path).unwrap();
+        config.overlay.duration_ms = 5000;
+        let blob = vec![b'x'; MAX_CONFIG_BYTES + 1];
+        std::fs::write(&config_path, &blob).unwrap();
+
+        assert_eq!(config.save_checked_to(&config_path).unwrap(), SaveOutcome::Conflict);
+        assert_eq!(std::fs::read(&config_path).unwrap(), blob);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::autostart;
-use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, VerticalPosition};
+use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, SaveOutcome, VerticalPosition};
 use crate::events::{
     COMPACT_POSITION_MSG, MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo,
     media_event_into_owned,
@@ -142,6 +142,21 @@ enum Pane {
     Settings,
 }
 
+/// Persistent settings-pane status about config persistence. Painted as a
+/// warning banner with the Open config / Restart app actions directly below
+/// it, every repaint, until the situation clears (a later successful save
+/// clears `Conflict`; `PersistenceDisabled` lasts the whole run — the startup
+/// file was invalid and is deliberately left untouched).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigStatus {
+    /// The on-disk file was edited outside the app after load: the session's
+    /// settings changes are kept in memory only, nothing was written.
+    Conflict,
+    /// The startup file was invalid, unreadable, or oversized: nothing is
+    /// ever persisted this run.
+    PersistenceDisabled,
+}
+
 /// Settings rows: section headers with label-left / control-right card rows.
 #[derive(Clone, Copy, PartialEq)]
 enum SettingId {
@@ -166,8 +181,20 @@ enum SettingId {
 }
 
 enum SettingsItem {
-    Header { text: &'static str, rect: RECT },
-    Row { id: SettingId, rect: RECT },
+    Header {
+        text: &'static str,
+        rect: RECT,
+    },
+    Row {
+        id: SettingId,
+        rect: RECT,
+    },
+    /// Non-interactive warning banner above the config/restart actions; it is
+    /// never a row (hover and focus enumerations skip it like headers).
+    Banner {
+        text: &'static str,
+        rect: RECT,
+    },
 }
 
 /// A keyboard-focusable Settings-pane control. `cx`/`cy` is the window client
@@ -188,6 +215,22 @@ const SETTINGS_HOVER: [u8; 4] = [0x24, 0x24, 0x24, 0xFF];
 const SETTINGS_TEXT: [u8; 4] = [0xF0, 0xF0, 0xF0, 0xFF];
 const SETTINGS_MUTED: [u8; 4] = [0xC8, 0xC8, 0xC8, 0xFF];
 const SETTINGS_FAINT: [u8; 4] = [0x7A, 0x7A, 0x7A, 0xFF];
+/// Warm amber for the config-persistence warning banner.
+const SETTINGS_WARN: [u8; 4] = [0xFF, 0xB7, 0x4D, 0xFF];
+
+/// Banner text for a `ConfigStatus`; both variants describe the current
+/// persistence state and point at the Open config / Restart app actions
+/// directly below the banner.
+fn banner_text(status: ConfigStatus) -> &'static str {
+    match status {
+        ConfigStatus::Conflict => {
+            "config.toml was edited on disk; changes apply in memory only — open it or restart to pick up the other edits"
+        }
+        ConfigStatus::PersistenceDisabled => {
+            "config.toml could not be saved; settings apply in memory only for this run"
+        }
+    }
+}
 
 /// Mix weights (toward `SETTINGS_SURFACE`) for the accent soft fills. Kept
 /// as named constants so the brush rebuild and the render-time contrast guard
@@ -723,6 +766,10 @@ struct MainWindowState {
     logs_opened_at: Option<Instant>,
     /// Timestamp of the last "Open config" press, for the "Opened" feedback.
     config_opened_at: Option<Instant>,
+    /// Persistent warning when the config cannot be (or was not) persisted;
+    /// painted as a banner in the Settings pane until a save succeeds or the
+    /// run ends. None while persistence works normally.
+    config_status: Option<ConfigStatus>,
     /// Shared slot for the process picker's confirmed allow-list patterns. The
     /// picker writes the result here and posts a bare `PICKER_RESULT_MSG`; no
     /// pointer ever crosses the message boundary.
@@ -840,24 +887,58 @@ impl MainWindowState {
         self.config.read().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Mutates the config under a single write-lock scope, then persists it.
-    /// Never call `self.cfg()` (a read lock) from inside `mutate`. The lock
-    /// is released before `save()`: the disk write would otherwise stall
-    /// every config read (the SMTC worker's flush decisions, the overlay's
-    /// behavior flags) for its duration. The clone is safe because the main
-    /// window is the single writer — no other site can change the config
-    /// between the lock release and the save.
+    /// Mutates the config under a single write-lock scope, then persists it
+    /// through `save_checked` (which refuses to clobber a file edited on disk
+    /// since load). Never call `self.cfg()` (a read lock) from inside
+    /// `mutate`. The lock is released before `save_checked`: the disk write
+    /// would otherwise stall every config read (the SMTC worker's flush
+    /// decisions, the overlay's behavior flags) for its duration. The clone is
+    /// safe because the main window is the single writer — no other site can
+    /// change the config between the lock release and the save.
     fn mutate_config(&mut self, mutate: impl FnOnce(&mut Config)) {
         // A poisoned lock still yields the (possibly stale) config;
         // recovering beats panicking on the UI thread for the rest of
         // the run.
-        let changed = {
+        let mut changed = {
             let mut cfg = self.config.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             mutate(&mut cfg);
             cfg.clone()
         };
-        if let Err(error) = changed.save() {
-            error!("saving config after a settings change failed: {error}");
+        self.persist_change(&mut changed);
+    }
+
+    /// Runs `save_checked` on the already-mutated clone and mirrors the
+    /// outcome into `config_status` (the persistent Settings banner) and back
+    /// into the shared config's revision on success. Logs the outcome so a
+    /// conflict or disabled persistence is never silent.
+    fn persist_change(&mut self, changed: &mut Config) {
+        match changed.save_checked() {
+            Ok(SaveOutcome::Saved(revision)) => {
+                self.config
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .revision = Some(revision);
+                if self.config_status.is_some() {
+                    self.config_status = None;
+                    self.invalidate();
+                }
+            }
+            Ok(SaveOutcome::Conflict) => {
+                warn!(
+                    "config.toml changed on disk since it was loaded; this settings change applies in memory only, nothing was written"
+                );
+                if self.config_status != Some(ConfigStatus::Conflict) {
+                    self.config_status = Some(ConfigStatus::Conflict);
+                    self.invalidate();
+                }
+            }
+            Ok(SaveOutcome::PersistenceDisabled) => {
+                if self.config_status != Some(ConfigStatus::PersistenceDisabled) {
+                    self.config_status = Some(ConfigStatus::PersistenceDisabled);
+                    self.invalidate();
+                }
+            }
+            Err(error) => error!("saving config after a settings change failed: {error}"),
         }
     }
 
@@ -900,6 +981,7 @@ impl MainWindowState {
             logs_copied_at: None,
             logs_opened_at: None,
             config_opened_at: None,
+            config_status: None,
             picker_result: Arc::new(Mutex::new(None)),
             auto_sources_result: Arc::new(Mutex::new(None)),
             source_states: HashMap::new(),
@@ -2087,6 +2169,19 @@ impl MainWindowState {
             },
         });
         y += row_h + gap;
+        if let Some(status) = self.config_status {
+            items.push(SettingsItem::Banner {
+                text: banner_text(status),
+                rect: RECT {
+                    left,
+                    top: y,
+                    right,
+                    bottom: y + row_h,
+                },
+            });
+            y += row_h + gap;
+            y += (8.0 * scale) as i32;
+        }
         items.push(SettingsItem::Row {
             id: SettingId::OpenConfig,
             rect: RECT {
@@ -2757,6 +2852,42 @@ impl MainWindowState {
                         }
                     }
                 }
+                SettingsItem::Banner { text, rect } => {
+                    if rects_intersect(invalid, rect) {
+                        // Card like the rows (surface inner on a border fill),
+                        // with the warning text in amber. Never interactive:
+                        // `settings_hover_at` and `focus_targets` ignore
+                        // Banner items entirely.
+                        unsafe {
+                            let _ = FillRect(hdc, rect, brushes.border);
+                        }
+                        let inner = RECT {
+                            left: rect.left + 1,
+                            top: rect.top + 1,
+                            right: rect.right - 1,
+                            bottom: rect.bottom - 1,
+                        };
+                        unsafe {
+                            let _ = FillRect(hdc, &inner, brushes.surface);
+                        }
+                        let mut tr = RECT {
+                            left: rect.left + (12.0 * scale) as i32,
+                            top: rect.top,
+                            right: rect.right - (12.0 * scale) as i32,
+                            bottom: rect.bottom,
+                        };
+                        draw_string(
+                            &self.fonts,
+                            hdc,
+                            text,
+                            &mut tr,
+                            (12.0 * scale) as i32,
+                            SETTINGS_WARN,
+                            true,
+                            false,
+                        );
+                    }
+                }
             }
         }
     }
@@ -3423,9 +3554,9 @@ impl MainWindowState {
     /// `config::OverlayConfig::compact_is_default`.
     fn set_compact_separate(&mut self, separate: bool) {
         // Same lock discipline as `mutate_config`: the write guard covers only
-        // the in-memory mutation, and `save()` runs after the lock is released
-        // so the disk write never stalls other config readers.
-        let changed = {
+        // the in-memory mutation, and `save_checked` runs after the lock is
+        // released so the disk write never stalls other config readers.
+        let mut changed = {
             let mut cfg = self.config.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             if separate {
                 if cfg.overlay.compact_is_default() {
@@ -3442,9 +3573,7 @@ impl MainWindowState {
             }
             cfg.clone()
         };
-        if let Err(error) = changed.save() {
-            error!("saving config after the compact position follow toggle change failed: {error}");
-        }
+        self.persist_change(&mut changed);
         // The log keeps the raw field value (greppable) and the displayed
         // polarity (ON = follows Expanded = field false).
         info!(
