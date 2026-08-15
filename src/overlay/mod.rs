@@ -43,6 +43,10 @@ mod render;
 
 pub(crate) use fullscreen::{enumerate_displays_cached, invalidate_display_cache};
 pub(crate) use render::{TEXT_CONTRAST_AA, ensure_contrast, pm_bgra_to_rgba};
+// Tests outside this module assert contrast ratios through the shared
+// helper; the binary itself never names it.
+#[cfg(test)]
+pub(crate) use render::contrast_ratio;
 
 use fullscreen::{
     ForegroundVerdict, TargetMonitor, anchor_unchanged, decide_layout, effective_position_rect,
@@ -52,7 +56,7 @@ use fullscreen::{
 use morph::{
     ENTRANCE_GROW, HoverExpand, HoverStep, HoverTick, MorphDirection, MorphProgress, animation_duration, bounce_scale,
     collapse_duration, content_size_of, ease_out_quint, hover_engaged, hover_progress, hover_step, lagged_collapse,
-    lagged_expand, morph_duration, morph_size, reversal_seed, spring_collapse,
+    lagged_expand, morph_duration, morph_size, normalized_elapsed, reversal_seed, spring_collapse,
 };
 use render::{AURA_HALO_LOGICAL, pill_text_from_track, render_layered};
 
@@ -1721,8 +1725,13 @@ impl OverlayState {
         // the new content (see `ContentFade`) — the snapshot is the last
         // rendered frame, and the animation timer keeps the dissolve
         // ticking. Any animated state (entrance, collapse, hover morph)
-        // swaps instantly instead.
-        if matches!(self.phase, Phase::Shown) && self.hover_expand.is_none() && !self.frame_scratch.is_empty() {
+        // swaps instantly instead — and so does every swap while system
+        // preferences disable animation.
+        if matches!(self.phase, Phase::Shown)
+            && self.hover_expand.is_none()
+            && !self.frame_scratch.is_empty()
+            && crate::winutil::animations_enabled()
+        {
             let from = std::mem::take(&mut self.frame_scratch);
             self.content_fade = Some(ContentFade {
                 start: Instant::now(),
@@ -2350,9 +2359,11 @@ impl OverlayState {
 
         // Advance marquee offsets (driven by this same tick, entirely
         // independent of the dismiss countdown). Time-based so the scroll
-        // speed is identical at any frame rate. The DPI scale is queried
-        // only while a line is actually scrolling: a static pill repaints
-        // nothing, so its coarse tick must not pay for a per-tick DPI call.
+        // speed is identical at any frame rate. With animations disabled the
+        // offsets never advance: overflowing lines render statically
+        // . The DPI scale is queried only while a line is actually
+        // scrolling: a static pill repaints nothing, so its coarse tick must
+        // not pay for a per-tick DPI call.
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
         let scale = if marquee_active {
             self.fonts.dpi().max(96) as f32 / 96.0
@@ -2360,14 +2371,16 @@ impl OverlayState {
             1.0
         };
         let per_tick = MARQUEE_SPEED * scale * dt;
-        for line in &mut self.scroll {
-            if let Some(started) = line.started_at
-                && started.elapsed() >= MARQUEE_HOLD
-            {
-                if line.offset == 0.0 {
-                    debug!("marquee scroll started | offset advancing");
+        if crate::winutil::animations_enabled() {
+            for line in &mut self.scroll {
+                if let Some(started) = line.started_at
+                    && started.elapsed() >= MARQUEE_HOLD
+                {
+                    if line.offset == 0.0 {
+                        debug!("marquee scroll started | offset advancing");
+                    }
+                    line.offset += per_tick;
                 }
-                line.offset += per_tick;
             }
         }
         // Foreground re-check: a foreground change flips the Auto pill between
@@ -2543,8 +2556,7 @@ impl OverlayState {
         match self.phase {
             Phase::Hidden => FrameState { alpha: 0, morph: None },
             Phase::Expanding(start) => {
-                let total_dur = animation_duration(&self.config).as_secs_f32();
-                let t = (start.elapsed().as_secs_f32() / total_dur).clamp(0.0, 1.0);
+                let t = normalized_elapsed(&start, animation_duration(&self.config));
                 // The live-pill reveal: the pill appears solid immediately
                 // (opacity lands within the first ~15 % of the leg — the
                 // geometry, not the fade, is the animation) and grows in
@@ -2567,7 +2579,13 @@ impl OverlayState {
                 }
             }
             Phase::Light(start) => {
-                let progress = ease_out_quint(start.elapsed().as_secs_f32() / LIGHT_DURATION.as_secs_f32());
+                // A quick opacity reveal; with animations disabled the pill is
+                // simply solid.
+                let progress = if crate::winutil::animations_enabled() {
+                    ease_out_quint(start.elapsed().as_secs_f32() / LIGHT_DURATION.as_secs_f32())
+                } else {
+                    1.0
+                };
                 FrameState {
                     alpha: (64.0 + progress * 191.0) as u8,
                     morph: None,
@@ -2576,10 +2594,15 @@ impl OverlayState {
             Phase::Shown => {
                 if self.config.overlay.layout == LayoutMode::PersistentCompact && self.persistent_faded {
                     // Persistent-compact idle fade: ramp from full to idle
-                    // opacity over 300 ms once the dismiss timeout fires.
+                    // opacity over 300 ms once the dismiss timeout fires;
+                    // with animations disabled the idle level applies at once.
                     let idle = 64.0_f32; // 0.25 * 255
                     let fade_start = self.dismiss_at.unwrap_or_else(Instant::now);
-                    let t = (fade_start.elapsed().as_secs_f32() / 0.3).clamp(0.0, 1.0);
+                    let t = if crate::winutil::animations_enabled() {
+                        (fade_start.elapsed().as_secs_f32() / 0.3).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
                     let alpha = 255.0 - (255.0 - idle) * t;
                     FrameState {
                         alpha: alpha as u8,
@@ -2593,8 +2616,7 @@ impl OverlayState {
                 }
             }
             Phase::Collapsing(start) => {
-                let total_dur = collapse_duration(&self.config).as_secs_f32();
-                let t = (start.elapsed().as_secs_f32() / total_dur).clamp(0.0, 1.0);
+                let t = normalized_elapsed(&start, collapse_duration(&self.config));
                 // The exit runs the reveal backwards: the pill springs closed
                 // to its compact shape on the mirrored release curve — the
                 // width collapsing first, the height lingering behind it —
@@ -3396,9 +3418,9 @@ mod tests {
     // modules and the windows APIs below are used only by the tests).
     use super::fullscreen::{DisplayInfo, auto_source_matches, rect_covers_monitor};
     use super::morph::{
-        EXPAND_SPRING, art_edge_gate, compact_alpha, compact_metrics, compact_size, compact_title_viewport,
-        content_size, dim_color, expanded_alpha, lag_progress, morph_art_tile, morph_icon_pos, morph_radius,
-        morph_symbol_pos, morph_title_band, row_unveil_alpha, spring_expand,
+        EXPAND_SPRING, animation_duration_with, art_edge_gate, compact_alpha, compact_metrics, compact_size,
+        compact_title_viewport, content_size, dim_color, expanded_alpha, lag_progress, morph_art_tile, morph_icon_pos,
+        morph_radius, morph_symbol_pos, morph_title_band, row_unveil_alpha, spring_expand,
     };
     use super::render::{
         FILL_TINT_WEIGHT, blend_frames, blit_packed_rows, circle_coverage, clear_frame_scratch, clock_icon_coverage,
@@ -6728,6 +6750,23 @@ mod tests {
             assert!(v >= last - 1e-6, "quint must be non-decreasing");
             last = v;
         }
+    }
+
+    #[test]
+    fn disabled_animation_completes_a_leg_on_its_first_frame() {
+        // While system preferences disallow motion, every leg derived
+        // from the base animation duration is zero-length, and a zero-length
+        // leg is already complete — the first frame renders the settled
+        // state, so states switch immediately instead of animating.
+        let mut config = Config::default();
+        config.overlay.animation_ms = 500;
+        assert_eq!(animation_duration_with(&config, true), Duration::from_millis(500));
+        assert_eq!(animation_duration_with(&config, false), Duration::ZERO);
+        assert_eq!(morph::normalized_elapsed(&Instant::now(), Duration::ZERO), 1.0);
+        // The springs evaluate a completed leg at the pinned endpoint (1.0),
+        // so the completed first frame is the steady state.
+        assert!((ENTRANCE_GROW.value_at(1.0, 0.0, 0.0) - 1.0).abs() < 1e-6);
+        assert!((spring_expand(1.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use super::{
     CONTENT_FADE_DURATION, ContentFade, DibCache, MARQUEE_FADE, MARQUEE_GAP, MARQUEE_HOLD, MarqueeCtx, MarqueeStrip,
     OverlayState, PillText, ROW_HEIGHT, TextScratch,
 };
-use crate::config::Config;
+use crate::config::{AppearanceConfig, Config};
 use crate::events::{MediaEvent, PlaybackState, PlaybackType, TrackInfo};
 use crate::palette::Palette;
 use anyhow::{Context, Result};
@@ -19,9 +19,10 @@ use std::ptr::null_mut;
 use std::sync::Arc;
 use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DT_CALCRECT,
-    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DrawTextW, ETO_CLIPPED, ExtTextOutW, GdiFlush,
-    HBITMAP, HDC, HFONT, HGDIOBJ, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, COLOR_HIGHLIGHT, COLOR_WINDOWTEXT, CreateCompatibleDC,
+    CreateDIBSection, DIB_RGB_COLORS, DT_CALCRECT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
+    DrawTextW, ETO_CLIPPED, ExtTextOutW, GdiFlush, GetSysColor, HBITMAP, HDC, HFONT, HGDIOBJ, SelectObject, SetBkMode,
+    SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowPos, ULW_ALPHA};
 use windows::core::PCWSTR;
@@ -1307,7 +1308,12 @@ pub(crate) const TEXT_CONTRAST_AA: f32 = 4.5;
 /// palette is available, otherwise the configured background exactly. Both
 /// the drawing (`render`) and the text contrast checks consume this single
 /// source, so the check cannot drift from what is actually painted.
+/// A high-contrast theme replaces all of it with the opaque system window
+/// color: no palette tint, no translucency.
 pub(super) fn pill_fill_bg(state: &OverlayState) -> [u8; 4] {
+    if crate::winutil::system_preferences().high_contrast {
+        return crate::winutil::system_window_color();
+    }
     match state.palette {
         Some(palette) => tinted_fill(
             state.config.appearance.background_color,
@@ -1316,6 +1322,37 @@ pub(super) fn pill_fill_bg(state: &OverlayState) -> [u8; 4] {
         ),
         None => state.config.appearance.background_color,
     }
+}
+
+/// The effective pill text color: the configured color normally, the system
+/// window-text color under a high-contrast theme.
+pub(super) fn pill_text_color(appearance: &AppearanceConfig) -> [u8; 4] {
+    if crate::winutil::system_preferences().high_contrast {
+        let text = unsafe { GetSysColor(COLOR_WINDOWTEXT) };
+        return [
+            (text & 0xFF) as u8,
+            ((text >> 8) & 0xFF) as u8,
+            ((text >> 16) & 0xFF) as u8,
+            0xFF,
+        ];
+    }
+    appearance.text_color
+}
+
+/// The palette fallback/accent base for symbols and secondary rows: the
+/// artwork palette's primary normally, the system highlight color under a
+/// high-contrast theme (the palette is disabled there).
+pub(super) fn pill_accent_base(state: &OverlayState, appearance: &AppearanceConfig) -> [u8; 4] {
+    if crate::winutil::system_preferences().high_contrast {
+        let highlight = unsafe { GetSysColor(COLOR_HIGHLIGHT) };
+        return [
+            (highlight & 0xFF) as u8,
+            ((highlight >> 8) & 0xFF) as u8,
+            ((highlight >> 16) & 0xFF) as u8,
+            0xFF,
+        ];
+    }
+    state.palette.map(|p| p.primary).unwrap_or(appearance.accent_color)
 }
 
 /// Relative luminance of an sRGB color, linearized per the WCAG 2.x formula
@@ -1335,7 +1372,7 @@ pub(super) fn relative_luminance([r, g, b]: [u8; 3]) -> f32 {
 }
 
 /// WCAG 2.x contrast ratio between two opaque colors, in 1..=21.
-pub(super) fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
+pub(crate) fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
     let la = relative_luminance(a);
     let lb = relative_luminance(b);
     let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
@@ -1443,7 +1480,7 @@ pub(super) fn draw_pill_text_rows(
     // render exactly as before. The muted tier ("muted_accent", used by the
     // artist and app-name rows) and the meta row share `accent_base`, so a
     // palette-less pill tracks the user's accent in both tiers alike.
-    let accent_base = state.palette.map(|p| p.primary).unwrap_or(appearance.accent_color);
+    let accent_base = pill_accent_base(state, appearance);
     let fill = pill_fill_bg(state);
     let accent = dim_color(ensure_contrast(accent_base, fill, TEXT_CONTRAST_AA), content_alpha);
     let muted = dim_color(
@@ -1525,7 +1562,7 @@ pub(super) fn draw_pill_text_rows(
                 &title_narrow,
                 font_title,
                 h_title,
-                dim_color(appearance.text_color, content_alpha * unveil),
+                dim_color(pill_text_color(appearance), content_alpha * unveil),
                 scale,
                 Some(MarqueeCtx {
                     scroll: &mut state.scroll[0],
@@ -1774,7 +1811,7 @@ pub(super) fn draw_expanded_pill_text(
                 let right = width - inset - padding;
                 let fs_title = appearance.font_size_title * scale;
                 let fs_artist = appearance.font_size_artist * scale;
-                let text_color = dim_color(appearance.text_color, content_alpha);
+                let text_color = dim_color(pill_text_color(appearance), content_alpha);
                 let accent_color = dim_color(appearance.accent_color, content_alpha);
                 let pad = appearance.padding;
                 let (font_title, h_title) = state.fonts.font_for(fs_title as i32, true);
@@ -1984,7 +2021,7 @@ pub(super) fn draw_compact_pill(
         &title_rect,
         font_title,
         h_title,
-        dim_color(appearance.text_color, content_alpha),
+        dim_color(pill_text_color(appearance), content_alpha),
         scale,
         Some(MarqueeCtx {
             scroll: &mut state.scroll[0],
@@ -2132,7 +2169,7 @@ pub(super) fn draw_morph_content(
             &band,
             font_title,
             h_title,
-            appearance.text_color,
+            pill_text_color(appearance),
             scale,
             Some(MarqueeCtx {
                 scroll: &mut state.scroll[0],
@@ -2144,7 +2181,7 @@ pub(super) fn draw_morph_content(
     // The traveling playback symbol: from the compact trailing chain to the
     // expanded title row's right slot. Both layouts draw the same size; the
     // color matches the expanded steady state (contrast-checked).
-    let accent_base = state.palette.map(|p| p.primary).unwrap_or(appearance.accent_color);
+    let accent_base = pill_accent_base(state, appearance);
     let accent = ensure_contrast(accent_base, pill_fill_bg(state), TEXT_CONTRAST_AA);
     let (symbol_right, symbol_y, symbol_size) = morph_symbol_pos(&state.config, inset, width, scale, progress);
     draw_symbol_pixels(
@@ -2321,9 +2358,12 @@ pub(super) fn draw_text_line_pixels(
             // fully-shown pill has no overflowing line, the animation tick
             // skips repainting. The threshold is the draw rect itself (the
             // symbol- or icon-narrowed width) — text that is cut off by the
-            // badge must scroll rather than sit truncated.
+            // badge must scroll rather than sit truncated. With animations
+            // disabled the marquee never runs: overflowing lines render
+            // statically, end-ellipsized.
+            let motion = crate::winutil::animations_enabled();
             let was_scrolling = ctx.scroll.scrolling;
-            ctx.scroll.scrolling = text_w > rw;
+            ctx.scroll.scrolling = text_w > rw && motion;
             if ctx.scroll.scrolling && !was_scrolling {
                 debug!("marquee overflow | text_w={text_w} | draw_w={rw} | title={value}");
             }
@@ -2331,7 +2371,7 @@ pub(super) fn draw_text_line_pixels(
             // Edge-fade width in the rendering coordinate space (the same
             // scale the row rects live in), 12 logical px per side.
             let fade_w = MARQUEE_FADE * scale;
-            if text_w <= rw {
+            if text_w <= rw || !motion {
                 // Text fits: render once statically (no scrolling needed).
                 let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
             } else {

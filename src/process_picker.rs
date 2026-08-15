@@ -41,7 +41,9 @@ const WIDTH: i32 = 400;
 const HEADER_H: i32 = 30;
 const ROW_HEIGHT: i32 = 22;
 const MAX_VISIBLE: usize = 12;
-const CLOSE_BTN_SIZE: i32 = 20;
+/// 24 logical px so the close target clears the WCAG 2.2 minimum target size
+/// even at 100% scaling. It was widened from 20 px to meet the accessibility benchmark.
+const CLOSE_BTN_SIZE: i32 = 24;
 const BST_CHECKED: usize = 1;
 const BST_UNCHECKED: usize = 0;
 /// Checkbox square size in pixels.

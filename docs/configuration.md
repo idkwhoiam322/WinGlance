@@ -15,6 +15,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | Key            | Default | Range   | Effect                                            |
 |----------------|---------|---------|---------------------------------------------------|
 | `duration_ms`  | `5000`  | 500–60000 | How long the pill stays visible before collapsing |
+| `respect_system_message_duration` | `true` | bool | While on, the pill stays up at least as long as Windows' "show notifications for" preference (the larger of it and `duration_ms` wins). `false` makes `duration_ms` the exact duration |
 
 > **Progress bar.** When the playing app reports timeline position via SMTC
 > (Spotify, Groove, MusicBee, and a few others — not browsers), the pill draws

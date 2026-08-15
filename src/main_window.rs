@@ -25,10 +25,10 @@ use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HINSTANCE, HWND, 
 use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BeginPaint, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FillRect, GetStockObject, HBITMAP,
-    HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SelectObject, SetBkColor,
-    SetTextColor,
+    CLIP_DEFAULT_PRECIS, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOWFRAME, COLOR_WINDOWTEXT, CreateCompatibleDC,
+    CreateDIBSection, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC,
+    DeleteObject, EndPaint, FF_DONTCARE, FillRect, FrameRect, GetStockObject, GetSysColor, HBITMAP, HBRUSH, HDC, HFONT,
+    HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SYS_COLOR_INDEX, SelectObject, SetBkColor, SetTextColor,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
@@ -66,8 +66,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT,
-    WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
-    WS_VSCROLL,
+    WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -240,6 +240,70 @@ const SETTINGS_MUTED: [u8; 4] = [0xC8, 0xC8, 0xC8, 0xFF];
 const SETTINGS_FAINT: [u8; 4] = [0x7A, 0x7A, 0x7A, 0xFF];
 /// Warm amber for the config-persistence warning banner.
 const SETTINGS_WARN: [u8; 4] = [0xFF, 0xB7, 0x4D, 0xFF];
+
+/// An sRGB system color as an opaque RGBA array.
+fn sys_color_rgba(index: SYS_COLOR_INDEX) -> [u8; 4] {
+    let color = unsafe { GetSysColor(index) };
+    [
+        (color & 0xFF) as u8,
+        ((color >> 8) & 0xFF) as u8,
+        ((color >> 16) & 0xFF) as u8,
+        0xFF,
+    ]
+}
+
+/// The Settings pane's effective color set. Normally the
+/// fixed dark theme, except the faint state text is lifted through the
+/// shared contrast helper to the 4.5:1 AA floor against the surface it is
+/// actually painted on (the raw `SETTINGS_FAINT` manages only ~4.0:1). Under
+/// a high-contrast theme the system colors take over: window surface, window
+/// text, gray text, and the window frame as border, with the same contrast
+/// helper re-checking every derived value against the system surface.
+#[derive(Clone, Copy)]
+struct SettingsColors {
+    surface: [u8; 4],
+    border: [u8; 4],
+    hover: [u8; 4],
+    text: [u8; 4],
+    muted: [u8; 4],
+    faint: [u8; 4],
+    warn: [u8; 4],
+    /// The keyboard-focus outline color (checked at 3:1 against both the
+    /// surface and the hover fill).
+    focus: [u8; 4],
+}
+
+fn settings_colors_for(prefs: &crate::winutil::SystemPreferences) -> SettingsColors {
+    if prefs.high_contrast {
+        let surface = crate::winutil::system_window_color();
+        let text = sys_color_rgba(COLOR_WINDOWTEXT);
+        SettingsColors {
+            border: sys_color_rgba(COLOR_WINDOWFRAME),
+            hover: mix(sys_color_rgba(COLOR_HIGHLIGHT), surface, 0.25),
+            faint: crate::overlay::ensure_contrast(
+                sys_color_rgba(COLOR_GRAYTEXT),
+                surface,
+                crate::overlay::TEXT_CONTRAST_AA,
+            ),
+            muted: crate::overlay::ensure_contrast(text, surface, crate::overlay::TEXT_CONTRAST_AA),
+            warn: crate::overlay::ensure_contrast(SETTINGS_WARN, surface, crate::overlay::TEXT_CONTRAST_AA),
+            focus: crate::overlay::ensure_contrast(sys_color_rgba(COLOR_HIGHLIGHT), surface, 3.0),
+            surface,
+            text,
+        }
+    } else {
+        SettingsColors {
+            surface: SETTINGS_SURFACE,
+            border: SETTINGS_BORDER,
+            hover: SETTINGS_HOVER,
+            text: SETTINGS_TEXT,
+            muted: SETTINGS_MUTED,
+            faint: crate::overlay::ensure_contrast(SETTINGS_FAINT, SETTINGS_SURFACE, crate::overlay::TEXT_CONTRAST_AA),
+            warn: SETTINGS_WARN,
+            focus: crate::overlay::ensure_contrast(SETTINGS_TEXT, SETTINGS_SURFACE, 3.0),
+        }
+    }
+}
 
 /// Banner text for a `ConfigStatus`; both variants describe the current
 /// persistence state and point at the Open config / Restart app actions
@@ -770,6 +834,12 @@ struct MainWindowState {
     settings_border_brush: HBRUSH,
     settings_surface_brush: HBRUSH,
     settings_hover_brush: HBRUSH,
+    /// The Settings pane's effective colors (see `settings_colors_for`),
+    /// snapshotted whenever the brushes are (re)built so the paint reads one
+    /// consistent set per frame.
+    settings_colors: SettingsColors,
+    /// Brush for the dedicated keyboard-focus outline.
+    settings_focus_brush: HBRUSH,
     settings_accent_soft_brush: HBRUSH,
     settings_adjust_hover_brush: HBRUSH,
     settings_small_fill_brush: HBRUSH,
@@ -1013,6 +1083,8 @@ impl MainWindowState {
             settings_border_brush: HBRUSH::default(),
             settings_surface_brush: HBRUSH::default(),
             settings_hover_brush: HBRUSH::default(),
+            settings_colors: settings_colors_for(&crate::winutil::SystemPreferences::DEFAULT),
+            settings_focus_brush: HBRUSH::default(),
             settings_accent_soft_brush: HBRUSH::default(),
             settings_adjust_hover_brush: HBRUSH::default(),
             settings_small_fill_brush: HBRUSH::default(),
@@ -1107,12 +1179,9 @@ impl MainWindowState {
         // (a settings repaint previously created ~40 brushes).
         self.black_brush = unsafe { CreateSolidBrush(COLORREF(0)) };
         self.sidebar_bg_brush = unsafe { CreateSolidBrush(COLORREF(0x0A0A0A)) };
-        self.settings_border_brush =
-            unsafe { CreateSolidBrush(colorref(SETTINGS_BORDER[0], SETTINGS_BORDER[1], SETTINGS_BORDER[2])) };
-        self.settings_surface_brush =
-            unsafe { CreateSolidBrush(colorref(SETTINGS_SURFACE[0], SETTINGS_SURFACE[1], SETTINGS_SURFACE[2])) };
-        self.settings_hover_brush =
-            unsafe { CreateSolidBrush(colorref(SETTINGS_HOVER[0], SETTINGS_HOVER[1], SETTINGS_HOVER[2])) };
+        // The settings brushes (surface/border/hover/focus) come from the
+        // effective color set — see `rebuild_settings_appearance`.
+        self.rebuild_settings_appearance();
         self.settings_small_fill_brush = unsafe { CreateSolidBrush(COLORREF(0x00121212)) };
         // History-row brushes: a fixed four-color set, created once instead of
         // per owner-draw row (every scroll tick repaints every visible row).
@@ -1363,6 +1432,50 @@ impl MainWindowState {
             };
             self.source_states.remove(&oldest);
         }
+    }
+
+    /// Recomputes the Settings pane's effective colors from
+    /// the live system preferences and rebuilds the settings brushes — the
+    /// surface/border/hover cards and the dedicated focus-outline brush — so
+    /// a `WM_SETTINGCHANGE` (e.g. toggling a high-contrast theme) repaints
+    /// correctly without a restart. Called once at creation as well.
+    fn rebuild_settings_appearance(&mut self) {
+        let colors = settings_colors_for(&crate::winutil::system_preferences());
+        self.settings_colors = colors;
+        unsafe {
+            for brush in [
+                &mut self.settings_border_brush,
+                &mut self.settings_surface_brush,
+                &mut self.settings_hover_brush,
+                &mut self.settings_focus_brush,
+            ] {
+                if !brush.0.is_null() {
+                    let _ = DeleteObject(HGDIOBJ(brush.0));
+                }
+            }
+            let solid = |c: [u8; 4]| -> HBRUSH { CreateSolidBrush(colorref(c[0], c[1], c[2])) };
+            self.settings_border_brush = solid(colors.border);
+            self.settings_surface_brush = solid(colors.surface);
+            self.settings_hover_brush = solid(colors.hover);
+            self.settings_focus_brush = solid(colors.focus);
+        }
+    }
+
+    /// Pushes the effective pill duration to the overlay: the
+    /// configured value, or — while `respect_system_message_duration` is on —
+    /// the larger of it and the system message-duration preference. Called on
+    /// every duration change, at creation, and when the preference changes.
+    fn push_effective_duration(&self) {
+        let (duration_ms, respect) = {
+            let cfg = self.cfg();
+            (cfg.overlay.duration_ms, cfg.overlay.respect_system_message_duration)
+        };
+        let effective = crate::config::effective_display_duration(
+            duration_ms,
+            crate::winutil::system_preferences().message_duration_ms,
+            respect,
+        );
+        set_duration(self.overlay_hwnd, effective);
     }
 
     /// Recreates the accent-derived brushes from the current effective
@@ -2356,6 +2469,9 @@ impl MainWindowState {
         let hide_for_auto_compact = cfg.behavior.hide_for_auto_compact_sources;
         let fade_persistent_pill = cfg.overlay.fade_persistent_pill;
         let display_count = enumerate_displays_cached().len();
+        // The effective Settings color set: AA-lifted state
+        // text normally, system colors under a high-contrast theme.
+        let colors = self.settings_colors;
 
         let mut hdr = RECT {
             left: content_left + pad,
@@ -2401,7 +2517,7 @@ impl MainWindowState {
                             text,
                             &mut hr,
                             (9.0 * scale) as i32,
-                            SETTINGS_FAINT,
+                            colors.faint,
                             true,
                             false,
                         );
@@ -2448,7 +2564,7 @@ impl MainWindowState {
                             } else {
                                 "OFF".to_string()
                             },
-                            if notifications_enabled { accent } else { SETTINGS_FAINT },
+                            if notifications_enabled { accent } else { colors.faint },
                         ),
                         SettingId::StartOnLogin => (
                             "Start on login",
@@ -2457,7 +2573,7 @@ impl MainWindowState {
                             } else {
                                 "OFF".to_string()
                             },
-                            if start_on_login { accent } else { SETTINGS_FAINT },
+                            if start_on_login { accent } else { colors.faint },
                         ),
                         SettingId::CloseToTray => (
                             "Close to tray",
@@ -2466,11 +2582,11 @@ impl MainWindowState {
                             } else {
                                 "OFF".to_string()
                             },
-                            if close_to_tray { accent } else { SETTINGS_FAINT },
+                            if close_to_tray { accent } else { colors.faint },
                         ),
-                        SettingId::Duration => ("Duration", format!("{}s", duration_ms / 1000), SETTINGS_MUTED),
-                        SettingId::Layout => ("Layout", String::new(), SETTINGS_MUTED),
-                        SettingId::Position => ("Expanded Position", position_label.clone(), SETTINGS_MUTED),
+                        SettingId::Duration => ("Duration", format!("{}s", duration_ms / 1000), colors.muted),
+                        SettingId::Layout => ("Layout", String::new(), colors.muted),
+                        SettingId::Position => ("Expanded Position", position_label.clone(), colors.muted),
                         SettingId::SeparateCompact => (
                             // Displayed polarity is inverted from the persisted
                             // `compact_position_separate` field so the label
@@ -2485,10 +2601,10 @@ impl MainWindowState {
                             } else {
                                 "ON".to_string()
                             },
-                            if compact_separate { SETTINGS_FAINT } else { accent },
+                            if compact_separate { colors.faint } else { accent },
                         ),
                         SettingId::CompactPosition => {
-                            ("Compact position", compact_position_label.clone(), SETTINGS_MUTED)
+                            ("Compact position", compact_position_label.clone(), colors.muted)
                         }
                         SettingId::DismissOnHover => (
                             "Dismiss on hover",
@@ -2497,7 +2613,7 @@ impl MainWindowState {
                             } else {
                                 "OFF".to_string()
                             },
-                            if dismiss_on_hover { accent } else { SETTINGS_FAINT },
+                            if dismiss_on_hover { accent } else { colors.faint },
                         ),
                         SettingId::ExpandCompactOnHover => (
                             "Expand compact on hover",
@@ -2506,11 +2622,7 @@ impl MainWindowState {
                             } else {
                                 "OFF".to_string()
                             },
-                            if expand_compact_on_hover {
-                                accent
-                            } else {
-                                SETTINGS_FAINT
-                            },
+                            if expand_compact_on_hover { accent } else { colors.faint },
                         ),
                         SettingId::AutoCompactApps => (
                             "Auto-compact apps",
@@ -2522,7 +2634,7 @@ impl MainWindowState {
                             } else {
                                 format!("Full screen apps, {auto_compact_sources}")
                             },
-                            SETTINGS_MUTED,
+                            colors.muted,
                         ),
                         SettingId::HideForAutoCompactSources => (
                             "Hide Persistent Compact Pill for Auto-compact Apps",
@@ -2531,7 +2643,7 @@ impl MainWindowState {
                             } else {
                                 "OFF".to_string()
                             },
-                            if hide_for_auto_compact { accent } else { SETTINGS_FAINT },
+                            if hide_for_auto_compact { accent } else { colors.faint },
                         ),
                         SettingId::FadePersistentPill => (
                             "Fade Persistent Compact Pill after duration",
@@ -2540,9 +2652,9 @@ impl MainWindowState {
                             } else {
                                 "No".to_string()
                             },
-                            if fade_persistent_pill { accent } else { SETTINGS_FAINT },
+                            if fade_persistent_pill { accent } else { colors.faint },
                         ),
-                        SettingId::Monitor => ("Monitor", monitor_label(&cfg, display_count), SETTINGS_MUTED),
+                        SettingId::Monitor => ("Monitor", monitor_label(&cfg, display_count), colors.muted),
                         SettingId::AllowedApps => (
                             "Allowed apps",
                             if media_sources.is_empty() {
@@ -2550,11 +2662,11 @@ impl MainWindowState {
                             } else {
                                 media_sources.clone()
                             },
-                            SETTINGS_MUTED,
+                            colors.muted,
                         ),
-                        SettingId::ShowSample => ("Preview Notification", String::new(), SETTINGS_MUTED),
-                        SettingId::CopyLogs => ("Logs", String::new(), SETTINGS_MUTED),
-                        SettingId::OpenConfig => ("Config", String::new(), SETTINGS_MUTED),
+                        SettingId::ShowSample => ("Preview Notification", String::new(), colors.muted),
+                        SettingId::CopyLogs => ("Logs", String::new(), colors.muted),
+                        SettingId::OpenConfig => ("Config", String::new(), colors.muted),
                     };
                     let mut lbl_rect = label_rect;
                     draw_string(
@@ -2563,7 +2675,7 @@ impl MainWindowState {
                         label,
                         &mut lbl_rect,
                         (11.0 * scale) as i32,
-                        SETTINGS_MUTED,
+                        colors.muted,
                         false,
                         false,
                     );
@@ -2623,7 +2735,7 @@ impl MainWindowState {
                                     let _ = FillRect(hdc, &s_inner, fill);
                                 }
                                 let mut t = s_inner;
-                                let tc = if active { SETTINGS_TEXT } else { SETTINGS_MUTED };
+                                let tc = if active { colors.text } else { colors.muted };
                                 // The Custom tile shows the actual value while
                                 // active, like the tray menu's "Custom (Xs)".
                                 let label = if is_custom {
@@ -2681,7 +2793,7 @@ impl MainWindowState {
                                     let _ = FillRect(hdc, &s_inner, fill);
                                 }
                                 let mut t = s_inner;
-                                let tc = if active { SETTINGS_TEXT } else { SETTINGS_MUTED };
+                                let tc = if active { colors.text } else { colors.muted };
                                 draw_string(
                                     &self.fonts,
                                     hdc,
@@ -2717,7 +2829,7 @@ impl MainWindowState {
                                 &value_text,
                                 &mut v,
                                 (10.0 * scale) as i32,
-                                SETTINGS_FAINT,
+                                colors.faint,
                                 false,
                                 false,
                             );
@@ -2822,7 +2934,7 @@ impl MainWindowState {
                                 &value_text,
                                 &mut v,
                                 (10.0 * scale) as i32,
-                                SETTINGS_FAINT,
+                                colors.faint,
                                 false,
                                 false,
                             );
@@ -2982,6 +3094,26 @@ impl MainWindowState {
                             );
                         }
                     }
+                    // The dedicated keyboard-focus outline: the row
+                    // the keyboard cursor is on gets a border whose color is
+                    // checked against the painted surface at 3:1, instead of
+                    // relying on the low-delta hover fill. The width follows
+                    // the user's focus-border metric, clamped to a sane 1-3
+                    // px so a huge metric cannot swallow a 34 px row.
+                    if settings_hover.is_some_and(|(r, _)| r == current_row) {
+                        let width = crate::winutil::system_preferences().focus_border_px.clamp(1, 3) as i32;
+                        for inset in 0..width {
+                            let outline = RECT {
+                                left: rect.left + inset,
+                                top: rect.top + inset,
+                                right: rect.right - inset,
+                                bottom: rect.bottom - inset,
+                            };
+                            unsafe {
+                                let _ = FrameRect(hdc, &outline, self.settings_focus_brush);
+                            }
+                        }
+                    }
                 }
                 SettingsItem::Banner { text, rect } => {
                     if rects_intersect(invalid, rect) {
@@ -3013,7 +3145,7 @@ impl MainWindowState {
                             text,
                             &mut tr,
                             (12.0 * scale) as i32,
-                            SETTINGS_WARN,
+                            colors.warn,
                             true,
                             false,
                         );
@@ -4299,19 +4431,19 @@ fn show_tray_menu(state: &mut MainWindowState) {
                 }
                 MENU_DURATION_2S => {
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = 2000);
-                    set_duration(state.overlay_hwnd, 2000);
+                    state.push_effective_duration();
                 }
                 MENU_DURATION_3S => {
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = 3000);
-                    set_duration(state.overlay_hwnd, 3000);
+                    state.push_effective_duration();
                 }
                 MENU_DURATION_5S => {
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = 5000);
-                    set_duration(state.overlay_hwnd, 5000);
+                    state.push_effective_duration();
                 }
                 MENU_DURATION_10S => {
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = 10000);
-                    set_duration(state.overlay_hwnd, 10000);
+                    state.push_effective_duration();
                 }
                 // Custom duration opens a modal dialog so an arbitrary value
                 // can be entered; the change is applied the same way as the
@@ -4320,7 +4452,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     let current_ms = state.cfg().overlay.duration_ms;
                     if let Some(duration) = crate::duration_dialog::show_duration_dialog(state.hwnd, current_ms) {
                         state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
-                        set_duration(state.overlay_hwnd, duration);
+                        state.push_effective_duration();
                         info!("custom overlay duration set to {duration} ms");
                     }
                 }
@@ -4451,13 +4583,13 @@ fn apply_settings_row_click(
                     let current_ms = state.cfg().overlay.duration_ms;
                     if let Some(duration) = crate::duration_dialog::show_duration_dialog(hwnd, current_ms) {
                         state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
-                        set_duration(state.overlay_hwnd, duration);
+                        state.push_effective_duration();
                         info!("custom overlay duration set to {duration} ms");
                     }
                 } else {
                     let duration = values[i];
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
-                    set_duration(state.overlay_hwnd, duration);
+                    state.push_effective_duration();
                 }
                 state.invalidate();
             }
@@ -4672,6 +4804,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_CREATE => {
             if !state_ptr.is_null() {
                 (*state_ptr).create_children();
+                // The overlay received the raw config at creation; apply the
+                // system message-duration preference to its copy now.
+                (*state_ptr).push_effective_duration();
             }
             // Color the window title bar with the effective accent so the
             // app reads as one theme. Applied here, after the frame is
@@ -5295,6 +5430,23 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             LRESULT(0)
         }
+        WM_SETTINGCHANGE => {
+            // A system preference changed: re-sample animation,
+            // overlapped-content, high-contrast and message-duration
+            // preferences, rebuild the settings chrome from the new colors,
+            // and re-check the effective pill duration — all without a
+            // restart. The overlay consults the shared preference snapshot at
+            // render time, so the next pill frame picks the change up.
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                let prefs = crate::winutil::refresh_system_preferences();
+                debug!("re-sampled system preferences after WM_SETTINGCHANGE: {prefs:?}");
+                state.rebuild_settings_appearance();
+                state.push_effective_duration();
+                state.invalidate();
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
         WM_DESTROY => {
             // Disconnect the UIA provider while the window and its state still
             // exist, so UIA core releases its references instead of calling
@@ -5774,6 +5926,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn settings_state_text_reaches_the_aa_floor_and_the_focus_outline_reaches_3_to_1() {
+        // The raw faint gray managed only ~4.0:1 against the surface;
+        // the effective color set lifts it through the shared contrast
+        // helper to the 4.5:1 AA floor, and the dedicated focus outline
+        // clears the 3:1 non-text benchmark — both against the surface AND
+        // the hover fill the outline can sit on.
+        let colors = settings_colors_for(&crate::winutil::SystemPreferences::DEFAULT);
+        let ratio = |a: [u8; 4], b: [u8; 4]| crate::overlay::contrast_ratio([a[0], a[1], a[2]], [b[0], b[1], b[2]]);
+        assert!(
+            ratio(colors.faint, colors.surface) >= 4.5,
+            "faint {} vs surface",
+            ratio(colors.faint, colors.surface)
+        );
+        assert!(
+            ratio(colors.muted, colors.surface) >= 4.5,
+            "muted {} vs surface",
+            ratio(colors.muted, colors.surface)
+        );
+        assert!(
+            ratio(colors.warn, colors.surface) >= 4.5,
+            "warn {} vs surface",
+            ratio(colors.warn, colors.surface)
+        );
+        assert!(ratio(colors.focus, colors.surface) >= 3.0);
+        assert!(ratio(colors.focus, colors.hover) >= 3.0);
+        // The raw constant documents why the lift exists.
+        assert!(ratio(SETTINGS_FAINT, SETTINGS_SURFACE) < 4.5);
+    }
+
+    #[test]
+    fn high_contrast_preferences_switch_the_settings_colors_to_system_values() {
+        // A high-contrast preference replaces the fixed dark theme
+        // with the live system window surface and re-derives every checked
+        // color against it (the ratios still hold by construction).
+        let mut prefs = crate::winutil::SystemPreferences::DEFAULT;
+        prefs.high_contrast = true;
+        let colors = settings_colors_for(&prefs);
+        assert_eq!(colors.surface, crate::winutil::system_window_color());
+        assert_ne!(colors.surface, SETTINGS_SURFACE);
+        let ratio = |a: [u8; 4], b: [u8; 4]| crate::overlay::contrast_ratio([a[0], a[1], a[2]], [b[0], b[1], b[2]]);
+        assert!(ratio(colors.faint, colors.surface) >= 4.5);
+        assert!(ratio(colors.muted, colors.surface) >= 4.5);
+        assert!(ratio(colors.focus, colors.surface) >= 3.0);
     }
 
     #[test]

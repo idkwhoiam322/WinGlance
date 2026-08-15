@@ -217,8 +217,8 @@ pub(super) fn morph_duration(config: &Config, direction: MorphDirection) -> Dura
 /// pill may travel a little farther before turning — and both axes settle
 /// exactly at compact.
 pub(super) fn hover_progress(morph: &HoverExpand, config: &Config) -> MorphProgress {
-    let total = morph_duration(config, morph.direction).as_secs_f32();
-    let t = (morph.start.elapsed().as_secs_f32() / total).clamp(0.0, 1.0);
+    let total = morph_duration(config, morph.direction);
+    let t = normalized_elapsed(&morph.start, total);
     match morph.direction {
         MorphDirection::Expand => MorphProgress {
             width: spring_expand(t),
@@ -553,8 +553,32 @@ pub(super) fn morph_icon_pos(config: &Config, inset: i32, scale: f32) -> (i32, i
     (x, y, icon)
 }
 
+/// The base animation duration. Zero while system preferences disable
+/// client-area animation: every leg derived from it — entrance,
+/// exit, hover morph — then completes on its first tick, so the pill
+/// switches states immediately instead of moving.
 pub(super) fn animation_duration(config: &Config) -> Duration {
+    animation_duration_with(config, crate::winutil::animations_enabled())
+}
+
+/// `animation_duration` with the motion preference supplied by the caller,
+/// so the disabled-animation contract is testable without touching the
+/// process-wide preference snapshot.
+pub(super) fn animation_duration_with(config: &Config, motion_allowed: bool) -> Duration {
+    if !motion_allowed {
+        return Duration::ZERO;
+    }
     Duration::from_millis(config.overlay.animation_ms.clamp(100, 1000))
+}
+
+/// Normalized elapsed fraction of `total` since `start`, clamped to 0..=1.
+/// A zero total is already complete (1.0) — the disabled-animation path —
+/// rather than a division by zero.
+pub(super) fn normalized_elapsed(start: &Instant, total: Duration) -> f32 {
+    if total.is_zero() {
+        return 1.0;
+    }
+    (start.elapsed().as_secs_f32() / total.as_secs_f32()).clamp(0.0, 1.0)
 }
 
 /// The exit leg's duration: shorter than the entrance — a confident close

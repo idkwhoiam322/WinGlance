@@ -1,13 +1,16 @@
-use log::warn;
+use log::{debug, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
-use windows::Win32::Foundation::{HINSTANCE, HWND};
-use windows::Win32::Graphics::Gdi::{DeleteObject, HBRUSH, HGDIOBJ};
+use std::sync::{Mutex, OnceLock, RwLock};
+use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND};
+use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, DeleteObject, GetSysColor, HBRUSH, HGDIOBJ};
+use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HCURSOR, IDC_ARROW, LoadCursorW, RegisterClassExW,
-    SetWindowLongPtrW, WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC,
+    SPI_GETCLIENTAREAANIMATION, SPI_GETDISABLEOVERLAPPEDCONTENT, SPI_GETFOCUSBORDERWIDTH, SPI_GETHIGHCONTRAST,
+    SPI_GETMESSAGEDURATION, SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowLongPtrW,
+    SystemParametersInfoW, WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC,
 };
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 /// Registers a window class exactly once per window type (guarded by `guard`).
 /// The shared boilerplate lives here: arrow cursor, default style and extra
@@ -78,6 +81,156 @@ pub(crate) fn clear_window_state(hwnd: HWND) {
 /// null when the slot is empty or was cleared.
 pub(crate) fn window_state<T>(hwnd: HWND) -> *mut T {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut T }
+}
+
+/// System accessibility/appearance preferences, sampled at startup
+/// and re-sampled on every `WM_SETTINGCHANGE`. A `Copy`-sized snapshot behind
+/// a lock, so any thread reads the current values cheaply; an SPI query that
+/// fails keeps the documented default rather than failing the sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SystemPreferences {
+    /// `SPI_GETCLIENTAREAANIMATION`: the user allows animated client-area
+    /// content. `false` disables every WinGlance motion.
+    pub client_area_animation: bool,
+    /// `SPI_GETDISABLEOVERLAPPEDCONTENT`: the user asked to minimize
+    /// translucent/overlapped decoration.
+    pub disable_overlapped_content: bool,
+    /// `SPI_GETHIGHCONTRAST` with `HCF_HIGHCONTRASTON`: a high-contrast
+    /// theme is active.
+    pub high_contrast: bool,
+    /// `SPI_GETMESSAGEDURATION`: how long the user wants transient messages
+    /// on screen, in milliseconds.
+    pub message_duration_ms: u32,
+    /// `SPI_GETFOCUSBORDERWIDTH`/`-HEIGHT`: the focus indication thickness
+    /// the user chose, in pixels (1 when the query fails).
+    pub focus_border_px: u32,
+}
+
+impl SystemPreferences {
+    /// The safe defaults every failed query falls back to: animation and
+    /// color allowed, no overlapped-content restriction, Windows' 5 s toast
+    /// default, a 1 px focus border.
+    pub(crate) const DEFAULT: SystemPreferences = SystemPreferences {
+        client_area_animation: true,
+        disable_overlapped_content: false,
+        high_contrast: false,
+        message_duration_ms: 5_000,
+        focus_border_px: 1,
+    };
+
+    /// Motion is allowed only when the user has not turned client-area
+    /// animation off and has not asked for overlapped/translucent content to
+    /// be minimized; either preference alone makes every animation
+    /// immediate/static.
+    pub(crate) fn animations_enabled(&self) -> bool {
+        self.client_area_animation && !self.disable_overlapped_content
+    }
+
+    /// Queries the live system preferences. Every query failure keeps the
+    /// corresponding default and logs at debug level: preference sampling
+    /// must never be a startup failure.
+    pub(crate) fn sample() -> Self {
+        let mut prefs = Self::DEFAULT;
+        unsafe {
+            query_bool(SPI_GETCLIENTAREAANIMATION, &mut prefs.client_area_animation);
+            query_bool(SPI_GETDISABLEOVERLAPPEDCONTENT, &mut prefs.disable_overlapped_content);
+            let mut high_contrast = HIGHCONTRASTW {
+                cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+                dwFlags: HCF_HIGHCONTRASTON,
+                lpszDefaultScheme: PWSTR::null(),
+            };
+            if let Ok(()) = SystemParametersInfoW(
+                SPI_GETHIGHCONTRAST,
+                0,
+                Some(&mut high_contrast as *mut _ as *mut _),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            ) {
+                prefs.high_contrast = (high_contrast.dwFlags & HCF_HIGHCONTRASTON).0 != 0;
+            } else {
+                debug!("SPI_GETHIGHCONTRAST failed; keeping the default");
+            }
+            let mut duration: u32 = 0;
+            // SPI_GETMESSAGEDURATION reports whole seconds (the live system
+            // answers 5 for Windows' default "5 seconds" toast duration).
+            if let Ok(()) = SystemParametersInfoW(
+                SPI_GETMESSAGEDURATION,
+                0,
+                Some(&mut duration as *mut u32 as *mut _),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            ) && duration > 0
+            {
+                prefs.message_duration_ms = duration.saturating_mul(1000);
+            }
+            let mut border: u32 = 0;
+            if let Ok(()) = SystemParametersInfoW(
+                SPI_GETFOCUSBORDERWIDTH,
+                0,
+                Some(&mut border as *mut u32 as *mut _),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            ) && border > 0
+            {
+                prefs.focus_border_px = border;
+            }
+        }
+        prefs
+    }
+}
+
+/// Reads a boolean SPI into `out` on success; a failure keeps the default.
+unsafe fn query_bool(action: SYSTEM_PARAMETERS_INFO_ACTION, out: &mut bool) {
+    let mut value = BOOL(0);
+    let queried = unsafe {
+        SystemParametersInfoW(
+            action,
+            0,
+            Some(&mut value as *mut _ as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if queried.is_ok() {
+        *out = value.as_bool();
+    } else {
+        debug!("SystemParametersInfoW({action:?}) failed; keeping the default");
+    }
+}
+
+static SYSTEM_PREFERENCES: RwLock<SystemPreferences> = RwLock::new(SystemPreferences::DEFAULT);
+
+/// Re-samples the system preferences, stores them, and returns the snapshot.
+/// Called at startup and from `WM_SETTINGCHANGE`.
+pub(crate) fn refresh_system_preferences() -> SystemPreferences {
+    let sampled = SystemPreferences::sample();
+    match SYSTEM_PREFERENCES.write() {
+        Ok(mut slot) => *slot = sampled,
+        Err(poisoned) => *poisoned.into_inner() = sampled,
+    }
+    sampled
+}
+
+/// The most recently sampled system preferences.
+pub(crate) fn system_preferences() -> SystemPreferences {
+    match SYSTEM_PREFERENCES.read() {
+        Ok(slot) => *slot,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+/// Whether motion is currently allowed (client-area animation on, overlapped
+/// content not minimized).
+pub(crate) fn animations_enabled() -> bool {
+    system_preferences().animations_enabled()
+}
+
+/// The current system window color as an opaque RGBA array (high-contrast
+/// themes repaint their surfaces through this).
+pub(crate) fn system_window_color() -> [u8; 4] {
+    let color = unsafe { GetSysColor(COLOR_WINDOW) };
+    [
+        (color & 0xFF) as u8,
+        ((color >> 8) & 0xFF) as u8,
+        ((color >> 16) & 0xFF) as u8,
+        0xFF,
+    ]
 }
 
 /// Tracks whether a window's WM_NCCREATE took ownership of the state box
@@ -642,6 +795,56 @@ pub(crate) fn append_verified_bounded(path: &Path, data: &[u8], cap: u64) -> io:
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn preference_motion_mapping_requires_animation_and_plain_content() {
+        // Motion needs client-area animation allowed AND overlapped content
+        // not minimized; either restriction alone makes animations
+        // immediate/static when system preferences disallow motion.
+        assert!(SystemPreferences::DEFAULT.animations_enabled());
+        let base = SystemPreferences::DEFAULT;
+        assert!(
+            !SystemPreferences {
+                client_area_animation: false,
+                ..base
+            }
+            .animations_enabled()
+        );
+        assert!(
+            !SystemPreferences {
+                disable_overlapped_content: true,
+                ..base
+            }
+            .animations_enabled()
+        );
+        assert!(
+            !SystemPreferences {
+                client_area_animation: false,
+                disable_overlapped_content: true,
+                ..base
+            }
+            .animations_enabled()
+        );
+    }
+
+    #[test]
+    fn sampled_preferences_stay_within_sane_bounds() {
+        // Sampling runs in the live session: values outside these bounds
+        // would mean a broken query result, not a user preference.
+        let prefs = SystemPreferences::sample();
+        assert!(prefs.message_duration_ms > 0 && prefs.message_duration_ms <= 600_000);
+        assert!(prefs.focus_border_px >= 1 && prefs.focus_border_px <= 32);
+    }
+
+    #[test]
+    fn refresh_returns_and_stores_the_same_snapshot() {
+        let sampled = refresh_system_preferences();
+        let read_back = system_preferences();
+        assert_eq!(sampled, read_back);
+        // Restore whatever the session actually reports so other tests (and
+        // this one, re-run) observe live values, not this test's write.
+        refresh_system_preferences();
+    }
 
     /// A uniquely-named temporary directory removed on drop.
     struct TestDir {

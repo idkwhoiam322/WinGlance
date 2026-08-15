@@ -91,6 +91,13 @@ impl Default for Config {
 #[serde(default)]
 pub struct OverlayConfig {
     pub duration_ms: u64,
+    /// While true (the default), the effective pill duration is the larger of
+    /// the configured `duration_ms` and the system message-duration preference
+    /// (`SPI_GETMESSAGEDURATION`), so a user who asked Windows for
+    /// longer messages is not snapped back by a shorter WinGlance value.
+    /// Setting it false makes `duration_ms` the explicit user override.
+    /// Configurable only via config.toml, not the Settings UI.
+    pub respect_system_message_duration: bool,
     pub animation_ms: u64,
     pub vertical: VerticalPosition,
     pub horizontal: HorizontalPosition,
@@ -311,6 +318,7 @@ impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             duration_ms: 5000,
+            respect_system_message_duration: true,
             animation_ms: 500,
             vertical: VerticalPosition::Top,
             horizontal: HorizontalPosition::Center,
@@ -832,6 +840,19 @@ fn warn_unknown_keys(section: &str, unknown: &toml::Table) {
     }
 }
 
+/// The effective pill display duration: the configured value, or —
+/// while `respect_system_message_duration` is on — the larger of the
+/// configured and the system message-duration values. `false` is the explicit
+/// user override. The overlay clamps the result to its accepted range on
+/// receipt.
+pub(crate) fn effective_display_duration(config_ms: u64, system_message_ms: u32, respect_system: bool) -> u64 {
+    if respect_system {
+        config_ms.max(system_message_ms as u64)
+    } else {
+        config_ms
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,6 +967,12 @@ nested_appearance = [1, 2, 3]
         config.overlay.duration_ms = 5000;
         let saved = toml::to_string_pretty(&config).unwrap();
         let reloaded: Config = toml::from_str(&saved).unwrap();
+        // The additive key defaults on when the source omitted it,
+        // survives a round trip, and an explicit false loads through.
+        assert!(reloaded.overlay.respect_system_message_duration);
+        let explicit_off = "[overlay]\nrespect_system_message_duration = false\n";
+        let config_off: Config = toml::from_str(explicit_off).unwrap();
+        assert!(!config_off.overlay.respect_system_message_duration);
         assert_eq!(
             reloaded.unknown.get("future_feature").and_then(|v| v.as_bool()),
             Some(true)
@@ -1609,5 +1636,19 @@ font_size_artist = inf
         assert!(config.persistable, "an exactly-bound file must still load");
         assert!(config.revision.is_some());
         assert_eq!(config.appearance.padding, 20.0);
+    }
+
+    #[test]
+    fn effective_display_duration_prefers_the_larger_value_only_when_respecting_the_system() {
+        // Respect on: the larger of the two values wins in both directions.
+        assert_eq!(effective_display_duration(2000, 5000, true), 5000);
+        assert_eq!(effective_display_duration(8000, 5000, true), 8000);
+        assert_eq!(effective_display_duration(5000, 5000, true), 5000);
+        // Respect off: the configured value is the explicit override, even
+        // when shorter than the system preference.
+        assert_eq!(effective_display_duration(2000, 5000, false), 2000);
+        assert_eq!(effective_display_duration(8000, 5000, false), 8000);
+        // A zero/degenerate system sample must never shorten the pill.
+        assert_eq!(effective_display_duration(3000, 0, true), 3000);
     }
 }

@@ -785,6 +785,12 @@ fn main() -> Result<()> {
     let overlay_queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
     let main_wake: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let overlay_wake: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    // Sample the system accessibility preferences before any window exists:
+    // the overlay's very first frame must already honor animation,
+    // overlapped-content and high-contrast settings. Later changes
+    // arrive through WM_SETTINGCHANGE.
+    let prefs = winutil::refresh_system_preferences();
+    debug!("sampled system preferences at startup: {prefs:?}");
     let overlay_hwnd = overlay::create_window(
         config.clone(),
         overlay_queue.clone(),

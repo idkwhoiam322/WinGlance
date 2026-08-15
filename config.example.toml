@@ -1,5 +1,9 @@
 [overlay]
 duration_ms = 5000
+# While true, the pill stays up at least as long as Windows' "show
+# notifications for" preference (Settings > Accessibility > Notifications);
+# false makes duration_ms the exact, explicit duration.
+respect_system_message_duration = true
 animation_ms = 500
 # Vertical edge: "top" | "bottom".
 vertical = "top"
