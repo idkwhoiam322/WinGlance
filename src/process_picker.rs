@@ -29,10 +29,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, LB_ADDSTRING,
     LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT, LB_GETTOPINDEX, LB_SETCURSEL, LB_SETITEMDATA, LB_SETITEMHEIGHT,
     LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, PostMessageW, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowPos, ShowWindow, WINDOW_STYLE, WM_APP,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETFONT, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowPos, ShowWindow, WINDOW_STYLE,
+    WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -578,42 +578,7 @@ pub(crate) fn open(
         // (WM_PAINT only reads them) and freed in WM_NCDESTROY.
         let state_ref = &mut *state_ptr;
         state_ref.scale = scale;
-        state_ref.header_font = CreateFontW(
-            -((14.0 * scale).round() as i32),
-            0,
-            0,
-            0,
-            700,
-            0,
-            0,
-            0,
-            0x01,
-            0,
-            0,
-            0x02,
-            0x00,
-            PCWSTR(wide("Segoe UI Semibold").as_ptr()),
-        );
-        // Listbox font: same Segoe UI metrics the global cache used (13 px,
-        // regular weight, quality 0x02) but owned by the picker. The global
-        // cache flushes its handles on DPI change, which would leave the
-        // listbox with a dangling HFONT.
-        state_ref.list_font = CreateFontW(
-            -((13.0 * scale).round() as i32).max(1),
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            0x01,
-            0,
-            0,
-            0x02,
-            0x00,
-            PCWSTR(wide("Segoe UI").as_ptr()),
-        );
+        rebuild_picker_fonts(state_ref, scale);
         state_ref.header_brush = CreateSolidBrush(COLORREF(0x002D2D2D));
         state_ref.close_brush = CreateSolidBrush(COLORREF(0x00333333));
         state_ref.close_hover_brush = CreateSolidBrush(COLORREF(0x00404040));
@@ -703,6 +668,64 @@ pub(crate) fn open(
         debug!("process picker opened");
         true
     }
+}
+
+/// (Re)creates the picker's chrome fonts at `scale` — the 14 px semibold title
+/// and 13 px regular list rows, matching the metrics the earlier global font
+/// cache used. Brushes are solid colors and DPI-independent, so only the fonts
+/// travel with a DPI change. Any previous handles are deleted first, so
+/// WM_NCDESTROY always frees exactly the current set.
+fn rebuild_picker_fonts(state: &mut PickerState, scale: f32) {
+    if !state.header_font.0.is_null() {
+        unsafe {
+            let _ = DeleteObject(state.header_font);
+        }
+    }
+    if !state.list_font.0.is_null() {
+        unsafe {
+            let _ = DeleteObject(state.list_font);
+        }
+    }
+    state.header_font = unsafe {
+        CreateFontW(
+            -((14.0 * scale).round() as i32),
+            0,
+            0,
+            0,
+            700,
+            0,
+            0,
+            0,
+            0x01,
+            0,
+            0,
+            0x02,
+            0x00,
+            PCWSTR(wide("Segoe UI Semibold").as_ptr()),
+        )
+    };
+    // Listbox font: same Segoe UI metrics the global cache used (13 px,
+    // regular weight, quality 0x02) but owned by the picker. The global
+    // cache flushes its handles on DPI change, which would leave the
+    // listbox with a dangling HFONT.
+    state.list_font = unsafe {
+        CreateFontW(
+            -((13.0 * scale).round() as i32).max(1),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            0x01,
+            0,
+            0,
+            0x02,
+            0x00,
+            PCWSTR(wide("Segoe UI").as_ptr()),
+        )
+    };
 }
 
 fn read_checked(hwnd: HWND, lb: HWND) -> Vec<String> {
@@ -893,6 +916,59 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_CREATE => LRESULT(0),
+        WM_DPICHANGED => {
+            // The owner was dragged to a display with a different DPI while
+            // the picker was open (or the picker followed it there). Rebuild
+            // the DPI-sized chrome — fonts, row height, window and listbox
+            // geometry — and apply the system's suggested rect, which
+            // preserves the picker's logical position across the transition.
+            // `state.scale` is updated first so the paint and hit-testing
+            // paths agree with the new row height immediately.
+            let state_ptr = window_state::<PickerState>(hwnd);
+            if !state_ptr.is_null() && lparam.0 != 0 {
+                let suggested = unsafe { &*(lparam.0 as *const RECT) };
+                let new_dpi = (wparam.0 >> 16) as u32;
+                let scale = new_dpi.max(96) as f32 / 96.0;
+                let state = unsafe { &mut *state_ptr };
+                let rows = state.list.len().min(MAX_VISIBLE);
+                let row_h = (ROW_HEIGHT as f32 * scale).round() as i32;
+                let header_h = (HEADER_H as f32 * scale).round() as i32;
+                let phys_w = suggested.right - suggested.left;
+                let phys_h = suggested.bottom - suggested.top;
+                rebuild_picker_fonts(state, scale);
+                state.scale = scale;
+                let _ = unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        suggested.left,
+                        suggested.top,
+                        phys_w,
+                        phys_h,
+                        SWP_NOACTIVATE,
+                    )
+                };
+                // The listbox re-flows at the new row height and tracks the
+                // new window size; LB_SETITEMHEIGHT makes its scrollbar
+                // recalculate.
+                if !state.listbox.0.is_null() {
+                    let _ = unsafe {
+                        SetWindowPos(
+                            state.listbox,
+                            None,
+                            0,
+                            header_h,
+                            phys_w,
+                            rows as i32 * row_h,
+                            SWP_NOACTIVATE | SWP_NOZORDER,
+                        )
+                    };
+                    let _ = unsafe { SendMessageW(state.listbox, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(row_h as isize)) };
+                }
+                let _ = unsafe { InvalidateRect(hwnd, None, true) };
+            }
+            LRESULT(0)
+        }
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
