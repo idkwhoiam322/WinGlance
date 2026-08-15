@@ -34,8 +34,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_WRITE_DATA, GetFileSize, OPEN_ALWAYS, SetEndOfFile, SetFilePointer, WriteFile,
+    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, GetFileSize, OPEN_ALWAYS, SetEndOfFile, SetFilePointer,
+    WriteFile,
 };
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
@@ -188,7 +189,14 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 None,
                 OPEN_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL,
+                // FILE_FLAG_OPEN_REPARSE_POINT: the entry is opened without
+                // following a pre-created crash.log symlink, so a hostile link
+                // can redirect the crash write to nothing (the link entry
+                // itself gets appended to or fails) — never to an
+                // attacker-chosen target. This handler cannot verify the
+                // surrounding path (allocation-free); the logs dir itself is
+                // verified at startup by init_logging.
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
                 HANDLE::default(),
             )
         };
@@ -239,25 +247,11 @@ fn install_panic_hook(logs_dir: &Path) {
         let location = info.location().map(|l| l.to_string()).unwrap_or_default();
         let message = format!("PANIC {payload} at {location}\n");
         let path = dir.join("crash.log");
-        let _ = std::fs::create_dir_all(&dir);
-        if std::fs::metadata(&path)
-            .map(|m| m.len() > CRASH_LOG_CAP)
-            .unwrap_or(false)
-        {
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&path);
-        }
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut f| {
-                use std::io::Write;
-                f.write_all(message.as_bytes())
-            });
+        // Verified append — the parent's identity is checked and the
+        // final component is opened without following a pre-created link. The
+        // cap truncates the file when a crash loop would otherwise grow it
+        // without bound.
+        let _ = crate::winutil::append_verified_bounded(&path, message.as_bytes(), CRASH_LOG_CAP);
     }));
 }
 
@@ -559,17 +553,13 @@ fn main() -> Result<()> {
             // Fail closed: running without the singleton would let a second
             // instance truncate the live log or rewrite config while the
             // first is running. Logging is not initialized yet, so record the
-            // failure in crash.log and exit.
+            // failure in crash.log and exit. Verified append (parent
+            // identity checked, no reparse follow).
             if let Some(dir) = config::Config::data_dir().ok().map(|d| d.join("logs")) {
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(dir.join("crash.log"))
-                    .and_then(|mut f| {
-                        use std::io::Write;
-                        f.write_all(format!("could not acquire the single-instance mutex: {error:#}\n").as_bytes())
-                    });
+                let _ = crate::winutil::append_verified(
+                    &dir.join("crash.log"),
+                    format!("could not acquire the single-instance mutex: {error:#}\n").as_bytes(),
+                );
             }
             return Err(error);
         }

@@ -155,3 +155,640 @@ pub(crate) fn close_registered<T>(slot: &OnceLock<Mutex<T>>, extract: impl FnOnc
 pub(crate) fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Verified app-data writes (reparse-safe: the data root and temp file are identity-checked)
+//
+// The threat model: path-based opens follow reparse points. A junction swapped
+// into the data/log directory, or a symlink pre-created at a fixed temp name,
+// can redirect a write to a location the user did not approve (confused
+// deputy). Every write in the app therefore lands either verified or not at
+// all:
+//   - the target's parent is opened WITHOUT `FILE_SHARE_DELETE`, pinning it so
+//     it cannot be renamed or removed for the duration of the operation, and
+//     with `FILE_FLAG_OPEN_REPARSE_POINT` so the opened object's own reparse
+//     attribute is visible;
+//   - the opened parent is rejected if it IS a reparse point, is not a
+//     directory, or its canonical final handle path does not equal the
+//     caller's expected path (this comparison also rejects any junction in an
+//     intermediate component — the final path would resolve to the link
+//     target, not the expected path);
+//   - temp files use randomized `CREATE_NEW` names with
+//     `FILE_FLAG_OPEN_REPARSE_POINT`, so a pre-created link at that name can
+//     never be followed (the create fails instead);
+//   - the commit is a rename of the temp onto the target name through
+//     `SetFileInformationByHandle(FileRenameInfo)` with `ReplaceIfExists`,
+//     which exchanges the directory entry atomically without following the
+//     target's own reparse point. Windows rejects the root-relative rename
+//     forms (`FileRenameInfoEx`/`FileRenameInfo` with `RootDirectory` set
+//     return ERROR_INVALID_PARAMETER), so the documented full `\\?\` path
+//     form is used; the parent held pinned for the transaction makes the path
+//     un-redirectable while the commit runs. The parent directory handle is
+//     then flushed (opened with `FILE_WRITE_DATA`/`FILE_APPEND_DATA`
+//     directory-equivalents so the flush is permitted) for the rename's
+//     write-through durability);
+//   - on any pre-commit failure the temp is deleted via its handle and the
+//     error is returned; callers log it and never fall back to a plain
+//     relative path.
+// ────────────────────────────────────────────────────────────────────────────
+
+use std::ffi::OsString;
+use std::io;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::RawHandle;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
+use std::time::{SystemTime, UNIX_EPOCH};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FlushFileBuffers, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+    OPEN_ALWAYS, OPEN_EXISTING, SetFileInformationByHandle, WriteFile,
+};
+
+/// `FILE_DELETE_CHILD` (0x0040); `windows` 0.58 does not export it. Needed on
+/// the pinned parent so a rename-with-replace may exchange a child entry.
+const FILE_DELETE_CHILD: u32 = 0x0000_0040;
+
+/// The Win32 DELETE access right (0x0001_0000); `windows` 0.58 does not export
+/// it. Needed so the temp's handle can also delete it (disposition delete).
+const DELETE_ACCESS: u32 = 0x0001_0000;
+/// `FILE_DISPOSITION_FLAG_DELETE` from winnt.h; not exported by `windows`
+/// 0.58.
+const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
+/// `SetFileInformationByHandle` disposition-ex information class from winnt.h.
+/// The `windows` crate exports the `FileDispositionInfoEx` *value* but not
+/// the struct definition it pairs with, so both live here (documented, stable
+/// ABI: 21 = disposition-ex).
+const DISPOSITION_INFO_EX_CLASS: i32 = 21;
+
+/// `FileDispositionInfoEx` (winnt.h).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FileDispositionInfoEx {
+    flags: u32,
+}
+
+/// Converts a `windows`-crate error into a `std::io::Error`, extracting the
+/// Win32 code (facility 7) so callers see the underlying OS error.
+fn to_io(error: windows::core::Error) -> io::Error {
+    let code = error.code().0 as u32;
+    if code & 0xFFFF_0000 == 0x8007_0000 {
+        io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+    } else {
+        io::Error::other(error)
+    }
+}
+
+/// True when the Win32 error carries the given Win32 code.
+fn is_win32_code(error: &windows::core::Error, code: u32) -> bool {
+    let raw = error.code().0 as u32;
+    raw & 0xFFFF_0000 == 0x8007_0000 && raw & 0xFFFF == code
+}
+
+/// ASCII-insensitive comparison of two paths on their UTF-16 forms, so a
+/// `\\?\C:\...` final handle path compares equal to the caller's expected
+/// path regardless of casing.
+pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
+    let wa = a.as_os_str().encode_wide().collect::<Vec<_>>();
+    let wb = b.as_os_str().encode_wide().collect::<Vec<_>>();
+    fn fold(unit: u16) -> u16 {
+        if (0x41..=0x5A).contains(&unit) {
+            unit + 0x20
+        } else {
+            unit
+        }
+    }
+    wa.len() == wb.len() && wa.iter().zip(wb.iter()).all(|(x, y)| fold(*x) == fold(*y))
+}
+
+/// The `\\?\` extended-length form of `path`, the form
+/// `GetFinalPathNameByHandleW` yields, so the two are directly comparable.
+pub(crate) fn extended_path(path: &Path) -> PathBuf {
+    let raw = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let already_extended = raw.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+    if already_extended {
+        path.to_path_buf()
+    } else {
+        let mut prefixed = Vec::with_capacity(raw.len() + 4);
+        prefixed.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+        prefixed.extend_from_slice(&raw);
+        PathBuf::from(OsString::from_wide(&prefixed))
+    }
+}
+
+/// Canonical final path (`\\?\C:\...`) of an open handle, via
+/// `GetFinalPathNameByHandleW`. The call describes the opened object itself —
+/// it never re-resolves the path through the filesystem — so a handle opened
+/// with `FILE_FLAG_OPEN_REPARSE_POINT` reports the link's own path, and a
+/// handle opened normally reports the resolved target.
+fn final_path_of_raw(handle: HANDLE) -> io::Result<PathBuf> {
+    let mut capacity = 256u32;
+    loop {
+        let mut buf = vec![0u16; capacity as usize];
+        let len = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                &mut buf,
+                windows::Win32::Storage::FileSystem::GETFINALPATHNAMEBYHANDLE_FLAGS(0),
+            )
+        };
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (len as usize) < buf.len() {
+            let mut units = &buf[..len as usize];
+            if units.last() == Some(&0) {
+                units = &units[..units.len() - 1];
+            }
+            return Ok(PathBuf::from(OsString::from_wide(units)));
+        }
+        capacity = len + 1;
+    }
+}
+
+/// `final_path_of_raw` for any Rust handle (e.g. a `std::fs::File`).
+pub(crate) fn final_path_of(raw: RawHandle) -> io::Result<PathBuf> {
+    final_path_of_raw(HANDLE(raw))
+}
+
+/// A pinned, verified directory handle. While the guard lives the directory
+/// cannot be renamed or removed (opened without `FILE_SHARE_DELETE`) and the
+/// opened object is a plain directory (no reparse attribute).
+pub(crate) struct DirGuard {
+    handle: HANDLE,
+}
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Opens `dir`, pinned and verified, as the root for a write transaction.
+/// Rejects: a missing directory (caller creates it first), a reparse point,
+/// a non-directory, or a final handle path that differs from the expected
+/// path (which also flags junctions in intermediate components).
+pub(crate) fn open_pinned_parent(dir: &Path) -> io::Result<DirGuard> {
+    let desired = (FILE_LIST_DIRECTORY
+        | FILE_READ_ATTRIBUTES
+        | FILE_WRITE_ATTRIBUTES
+        | FILE_TRAVERSE
+        | FILE_WRITE_DATA // = FILE_ADD_FILE: lets the flush write directory entries through
+        | FILE_APPEND_DATA // = FILE_ADD_SUBDIRECTORY
+        | windows::Win32::Storage::FileSystem::FILE_ACCESS_RIGHTS(FILE_DELETE_CHILD))
+    .0;
+    let wide = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            desired,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(to_io)?;
+
+    let reject = |message: &str| {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        Err(io::Error::other(format!("{message} ({})", dir.display())))
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if let Err(error) = unsafe { GetFileInformationByHandle(handle, &mut info) } {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Err(to_io(error));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return reject("refusing to write through a reparse point");
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
+        return reject("write root is not a directory");
+    }
+    let final_path = final_path_of_raw(handle)?;
+    if !paths_equal(&final_path, &extended_path(dir)) {
+        return reject(&format!(
+            "write root final path does not match the expected path (resolved to {})",
+            final_path.display()
+        ));
+    }
+    Ok(DirGuard { handle })
+}
+
+/// Randomized temp name: pid + sequence + subsecond clock, so no fixed name
+/// can be pre-armed (CREATE_NEW + OPEN_REPARSE_POINT defeat a guessed link
+/// anyway).
+fn temp_name() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("wg-{:x}-{:x}-{:x}.tmp", std::process::id(), seq, nanos)
+}
+
+/// Deletes the temp through its own handle (disposition-delete) and closes
+/// it. Only called on failure paths; best-effort.
+fn delete_temp(handle: HANDLE) {
+    let info = FileDispositionInfoEx {
+        flags: FILE_DISPOSITION_FLAG_DELETE,
+    };
+    unsafe {
+        let _ = SetFileInformationByHandle(
+            handle,
+            windows::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS(DISPOSITION_INFO_EX_CLASS),
+            (&info as *const FileDispositionInfoEx).cast(),
+            std::mem::size_of::<FileDispositionInfoEx>() as u32,
+        );
+        let _ = CloseHandle(handle);
+    }
+}
+
+/// Atomically replaces `target` with `content` under the verified-write
+/// discipline above. On any pre-commit failure the temp is deleted and `Err`
+/// returns; the existing `target` entry is untouched. The write is durable
+/// through the rename: the data is flushed, the directory entry is exchanged
+/// relative to the held parent, and the parent directory handle is flushed
+/// for the metadata change.
+pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<()> {
+    let name = target
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no file name"))?;
+    let name_units = name.encode_wide().collect::<Vec<u16>>();
+    if name_units.is_empty()
+        || name_units.len() > 255
+        || name_units.contains(&0)
+        || name_units.contains(&(b'\\' as u16))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target name is not a single path component",
+        ));
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no parent directory"))?;
+    if !parent.exists() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let guard = open_pinned_parent(parent)?;
+
+    for _ in 0..4 {
+        let tmp_name = temp_name();
+        let tmp_path = parent.join(&tmp_name);
+        let wide = tmp_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let temp_handle = match unsafe {
+            CreateFileW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                FILE_GENERIC_WRITE.0 | DELETE_ACCESS,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        } {
+            Ok(handle) => handle,
+            Err(error) if is_win32_code(&error, 183) => continue, // ERROR_ALREADY_EXISTS: name collision, retry
+            Err(error) => return Err(to_io(error)),
+        };
+
+        // Belt and braces: the temp we just created resolves exactly where the
+        // pinned parent says it should. Unreachable in practice (the parent
+        // cannot move and CREATE_NEW cannot follow a link), kept as a hard
+        // invariant. The expected path is the temp's own entry inside the
+        // pinned parent, not the final target name.
+        let temp_expected = extended_path(&tmp_path);
+        let fail = move |message: &str, handle: HANDLE| {
+            delete_temp(handle);
+            Err(io::Error::other(message))
+        };
+        let temp_final = match final_path_of_raw(temp_handle) {
+            Ok(path) => path,
+            Err(error) => {
+                delete_temp(temp_handle);
+                return Err(error);
+            }
+        };
+        if !paths_equal(&temp_final, &temp_expected) {
+            return fail(
+                &format!(
+                    "temp file resolved outside the verified parent ({} vs {})",
+                    temp_final.display(),
+                    temp_expected.display()
+                ),
+                temp_handle,
+            );
+        }
+
+        if let Err(error) = unsafe { WriteFile(temp_handle, Some(content), None, None) } {
+            delete_temp(temp_handle);
+            return Err(to_io(error));
+        }
+        if let Err(error) = unsafe { FlushFileBuffers(temp_handle) } {
+            delete_temp(temp_handle);
+            return Err(to_io(error));
+        }
+
+        // Commit: rename the temp onto the target name. Windows rejects the
+        // root-relative form of the rename info (classes 3 and 22 return
+        // ERROR_INVALID_PARAMETER with `RootDirectory` set on this build), so
+        // the documented full-path form is used: `FileRenameInfo` (class 3,
+        // the layout the `tempfile` ecosystem relies on) with the target's
+        // `\\?\`-extended path. Replacing the existing target entry (if any)
+        // is atomic and never follows the target's own reparse point; the
+        // parent was verified and is held pinned, so the path cannot be
+        // redirected under the caller.
+        let target_units = extended_path(target).as_os_str().encode_wide().collect::<Vec<u16>>();
+        let mut raw = vec![0u8; 20 + target_units.len() * 2];
+        raw[0] = 1; // ReplaceIfExists
+        // raw[8..16] stays zero: RootDirectory = NULL (full path).
+        raw[16..20].copy_from_slice(&(target_units.len() as u32 * 2).to_le_bytes());
+        for (i, unit) in target_units.iter().enumerate() {
+            let offset = 20 + i * 2;
+            raw[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        if let Err(error) = unsafe {
+            SetFileInformationByHandle(
+                temp_handle,
+                windows::Win32::Storage::FileSystem::FILE_INFO_BY_HANDLE_CLASS(
+                    windows::Win32::Storage::FileSystem::FileRenameInfo.0,
+                ),
+                raw.as_ptr().cast(),
+                raw.len() as u32,
+            )
+        } {
+            delete_temp(temp_handle);
+            return Err(io::Error::other(format!("rename commit failed: {}", to_io(error))));
+        }
+
+        // Durability of the directory-entry change (the rename's write-through
+        // intent): flush the parent directory handle.
+        if let Err(error) = unsafe { FlushFileBuffers(guard.handle) } {
+            unsafe {
+                let _ = CloseHandle(temp_handle);
+            }
+            return Err(io::Error::other(format!("parent flush failed: {}", to_io(error))));
+        }
+        unsafe {
+            let _ = CloseHandle(temp_handle);
+        }
+        return Ok(());
+    }
+    Err(io::Error::other("could not create a unique temp file after 4 attempts"))
+}
+
+/// Appends `data` to `path`, verifying the parent's identity and opening the
+/// final component with `FILE_FLAG_OPEN_REPARSE_POINT` so a pre-created
+/// symlink is never followed (an append goes to the link's own entry or
+/// fails, never to the link target). Used by the crash.log writers, which
+/// run where a full temp+rename transaction is not warranted.
+pub(crate) fn append_verified(path: &Path, data: &[u8]) -> io::Result<()> {
+    append_verified_bounded(path, data, u64::MAX)
+}
+
+/// `append_verified` with a size cap: when the file already exceeds `cap`,
+/// it is truncated to zero before the append, so a crash loop cannot grow it
+/// without bound (matches the cap applied on the allocation-free handler
+/// path).
+pub(crate) fn append_verified_bounded(path: &Path, data: &[u8], cap: u64) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _guard = open_pinned_parent(parent)?;
+    }
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            (FILE_APPEND_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(to_io)?;
+    let result = (|| -> io::Result<()> {
+        let final_path = final_path_of_raw(handle)?;
+        if !paths_equal(&final_path, &extended_path(path)) {
+            return Err(io::Error::other(format!(
+                "append target final path does not match the expected path (resolved to {})",
+                final_path.display()
+            )));
+        }
+        if cap != u64::MAX {
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(to_io)?;
+            let size = ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64;
+            if size > cap {
+                unsafe {
+                    let _ = windows::Win32::Storage::FileSystem::SetFilePointer(
+                        handle,
+                        0,
+                        None,
+                        windows::Win32::Storage::FileSystem::FILE_BEGIN,
+                    );
+                    let _ = windows::Win32::Storage::FileSystem::SetEndOfFile(handle);
+                }
+            }
+        }
+        // With FILE_WRITE_DATA granted (needed for the truncation above) the
+        // OS no longer writes at EOF automatically, so position the pointer
+        // explicitly before every append.
+        unsafe {
+            let _ = windows::Win32::Storage::FileSystem::SetFilePointer(
+                handle,
+                0,
+                None,
+                windows::Win32::Storage::FileSystem::FILE_END,
+            );
+        }
+        unsafe { WriteFile(handle, Some(data), None, None) }.map_err(to_io)
+    })();
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A uniquely-named temporary directory removed on drop.
+    struct TestDir {
+        dir: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("winglance-winutil-{tag}-{}-{stamp}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn sibling_names(dir: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn normal_replace_writes_content_and_leaves_no_temp() {
+        let guard = TestDir::new("replace");
+        let target = guard.dir.join("config.toml");
+        std::fs::write(&target, b"old").unwrap();
+
+        atomic_replace_file(&target, b"new content").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new content");
+        assert_eq!(sibling_names(&guard.dir), vec!["config.toml"], "no temp may remain");
+    }
+
+    #[test]
+    fn replace_creates_a_missing_parent_chain() {
+        let guard = TestDir::new("deep");
+        let target = guard.dir.join("a").join("b").join("config.toml");
+        atomic_replace_file(&target, b"x").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"x");
+    }
+
+    #[test]
+    fn replace_over_a_directory_fails_and_cleans_the_temp() {
+        let guard = TestDir::new("over-dir");
+        let target = guard.dir.join("config.toml");
+        std::fs::create_dir(&target).unwrap();
+
+        assert!(atomic_replace_file(&target, b"x").is_err());
+        assert!(target.is_dir(), "the target entry must be left as-is");
+        assert_eq!(sibling_names(&guard.dir), vec!["config.toml"], "no temp may remain");
+    }
+
+    #[test]
+    fn replace_rejects_a_reparse_point_parent() {
+        // Needs SeCreateSymbolicLinkPrivilege (Developer Mode / admin);
+        // skipped when the OS refuses to create the link.
+        let guard = TestDir::new("reparse-parent");
+        let link = guard.dir.join("evil");
+        let real = guard.dir.join("real");
+        std::fs::create_dir_all(real.join("target")).unwrap();
+        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+            return;
+        }
+
+        let target = link.join("config.toml");
+        assert!(atomic_replace_file(&target, b"x").is_err());
+        assert!(
+            !real.join("target").join("config.toml").exists(),
+            "nothing may be written through the link"
+        );
+    }
+
+    #[test]
+    fn replace_rejects_a_reparse_point_in_an_intermediate_component() {
+        // `evil` is a directory link whose target is `real`: the write root
+        // `evil\sub` resolves through the link, so its final handle path is
+        // `real\sub` — the identity check must reject it even though the
+        // opened component itself is an ordinary directory.
+        let guard = TestDir::new("reparse-mid");
+        let real = guard.dir.join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let evil = guard.dir.join("evil");
+        if std::os::windows::fs::symlink_dir(&real, &evil).is_err() {
+            return;
+        }
+
+        let target = evil.join("sub").join("config.toml");
+        assert!(atomic_replace_file(&target, b"x").is_err());
+        assert!(
+            !real.join("sub").join("config.toml").exists(),
+            "nothing may be written through the link"
+        );
+    }
+
+    #[test]
+    fn replace_replaces_a_target_symlink_without_following_it() {
+        let guard = TestDir::new("target-link");
+        let real = guard.dir.join("real-file");
+        std::fs::write(&real, b"target").unwrap();
+        let target = guard.dir.join("config.toml");
+        if std::os::windows::fs::symlink_file(&real, &target).is_err() {
+            return;
+        }
+
+        atomic_replace_file(&target, b"x").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"x", "the link entry must be replaced");
+        assert_eq!(
+            std::fs::read(&real).unwrap(),
+            b"target",
+            "the link target must never receive the write"
+        );
+    }
+
+    #[test]
+    fn append_verified_writes_and_obeys_the_cap() {
+        let guard = TestDir::new("append");
+        let path = guard.dir.join("crash.log");
+
+        append_verified_bounded(&path, b"first\n", 100).unwrap();
+        append_verified_bounded(&path, b"second\n", 100).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\nsecond\n");
+
+        // A file past the cap is truncated before the next append, so a crash
+        // loop stays bounded: the file ends with only the latest line.
+        append_verified_bounded(&path, b"third\n", 6).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
+    }
+
+    #[test]
+    fn append_verified_rejects_a_reparse_point_parent() {
+        let guard = TestDir::new("append-reparse");
+        let link = guard.dir.join("evil");
+        let real = guard.dir.join("real");
+        std::fs::create_dir_all(real.join("target")).unwrap();
+        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+            return;
+        }
+
+        assert!(append_verified(&link.join("crash.log"), b"x").is_err());
+        assert!(!real.join("target").join("crash.log").exists());
+    }
+}

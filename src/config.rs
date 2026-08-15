@@ -631,27 +631,15 @@ impl Config {
         Ok(toml::to_string_pretty(self)?.into_bytes())
     }
 
-    /// Writes `config.toml` via a co-located temp file + same-volume rename,
-    /// so a crash mid-write cannot leave a truncated config behind (the
-    /// rename atomically replaces an existing file). The file is synced
-    /// before the rename so a power loss cannot lose the settings change.
-    /// A08 replaces this primitive with the handle-verified writer; the
-    /// `save_checked` protocol around it is unchanged.
+    /// Writes `config.toml` through `winutil::atomic_replace_file`: the
+    /// parent is pinned and identity-verified (no reparse point, final handle
+    /// path equals the expected data root), the temp is a randomized
+    /// CREATE_NEW name that cannot be pre-armed as a link, the commit is a
+    /// rename relative to the held parent handle, and the parent directory
+    /// flush makes the exchange durable. Any pre-commit failure deletes the
+    /// temp and leaves the existing file byte-identical.
     fn write_temp_and_rename(config_path: &Path, content: &[u8]) -> anyhow::Result<()> {
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp_path = config_path.with_extension("toml.tmp");
-        {
-            let mut f = std::fs::File::create(&tmp_path)?;
-            use std::io::Write;
-            f.write_all(content)?;
-            f.sync_all()?;
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, config_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
-        }
+        crate::winutil::atomic_replace_file(config_path, content)?;
         Ok(())
     }
 

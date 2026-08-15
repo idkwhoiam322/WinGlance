@@ -2,6 +2,7 @@ use chrono::Local;
 use log::{LevelFilter, Log, Metadata, Record};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -19,7 +20,19 @@ const LIVE_LOG_CAP: u64 = 1024 * 1024;
 /// restart boundary. Returns the file and the byte count the size cap must
 /// count from: the file's length at open, so the cap bounds the total file
 /// and repeated restarts with short sessions cannot grow it without bound.
+///
+/// The parent directory is pinned and identity-verified before the
+/// open (a junction swapped into the logs dir rejects the launch), and the
+/// opened file's final handle path must match the expected path, so a
+/// pre-created `log-Live.log` symlink cannot redirect the session's writes.
 fn open_live_log(live_path: &Path, preserve: bool) -> std::io::Result<(File, u64)> {
+    if let Some(parent) = live_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Held only for the open: the file handle is the anchor from here on.
+        let _guard = crate::winutil::open_pinned_parent(parent)?;
+    }
     let mut options = OpenOptions::new();
     options.create(true).write(true);
     if preserve {
@@ -28,6 +41,14 @@ fn open_live_log(live_path: &Path, preserve: bool) -> std::io::Result<(File, u64
         options.truncate(true);
     }
     let mut file = options.open(live_path)?;
+    let final_path = crate::winutil::final_path_of(file.as_raw_handle())?;
+    if !crate::winutil::paths_equal(&final_path, &crate::winutil::extended_path(live_path)) {
+        return Err(std::io::Error::other(format!(
+            "live log resolved outside the expected path ({} vs {})",
+            final_path.display(),
+            live_path.display()
+        )));
+    }
     if preserve {
         file.write_all(
             format!(
