@@ -1,4 +1,4 @@
-use log::warn;
+use log::{debug, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, mpsc};
 use std::thread;
@@ -133,6 +133,40 @@ fn extract_from_aumid(aumid: &str, size: usize) -> Option<Vec<u8>> {
     try_parsing_name(&apps_path, size)
 }
 
+/// Bounded escaped preview for untrusted strings in log output (R-04).
+/// Mirrors the `metadata_preview` pattern in `smtc.rs` so the log line is
+/// independent of the raw input length.
+const ICON_LOG_PREVIEW: usize = 128;
+
+fn log_preview(value: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in value.chars().enumerate() {
+        if i >= ICON_LOG_PREVIEW {
+            let omitted = value.chars().count() - ICON_LOG_PREVIEW;
+            use std::fmt::Write;
+            let _ = write!(out, " (+{omitted} omitted)");
+            return out;
+        }
+        out.extend(c.escape_debug());
+    }
+    out
+}
+
+/// Accepts only AUMIDs that match the Windows app-user-model grammar: 1-128
+/// ASCII characters from the legal shell-identifier set. Everything else —
+/// UNC/device/drive paths, URLs, traversal, control characters, whitespace —
+/// is rejected so a hostile `source_app` can never become an arbitrary
+/// `SHCreateItemFromParsingName` argument. `shell:AppsFolder\` is the
+/// only parsing-name form a validated AUMID is ever combined with.
+fn valid_aumid(value: &str) -> bool {
+    let len = value.chars().count();
+    (1..=128).contains(&len)
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'!'))
+}
+
 /// The single icon worker's job sender, started lazily on first use. All
 /// extraction in the process funnels through this one thread. A failed
 /// spawn caches `None` so it is only attempted (and logged) once.
@@ -177,20 +211,28 @@ fn icon_worker(job_rx: mpsc::Receiver<IconJob>) {
             if !initialized {
                 return None;
             }
-            if let Some(pixels) = extract_from_aumid(&job.aumid, job.size) {
-                Some(pixels)
-            } else if job.aumid.contains('\\') || job.aumid.contains("/.") {
-                try_parsing_name(&job.aumid, job.size)
-            } else {
-                None
+            // An untrusted AUMID never reaches Shell parsing. Invalid
+            // IDs are skipped before any `SHCreateItemFromParsingName` call,
+            // so a malformed ID costs no worker time and no raw parsing-name
+            // fallback exists (a path-shaped AUMID is simply not trusted).
+            if !valid_aumid(&job.aumid) {
+                debug!(
+                    "app-icon skipped | reason=invalid-aumid | aumid={}",
+                    log_preview(&job.aumid)
+                );
+                return None;
             }
+            extract_from_aumid(&job.aumid, job.size)
         });
         match result {
             Ok(pixels) => {
                 let _ = job.reply.send(pixels);
             }
             Err(_) => {
-                warn!("app-icon extraction panicked for {}; continuing", job.aumid);
+                warn!(
+                    "app-icon extraction panicked for {}; continuing",
+                    log_preview(&job.aumid)
+                );
                 let _ = job.reply.send(None);
             }
         }
@@ -234,6 +276,47 @@ pub(crate) fn extract_app_icon(aumid: &str, target_size: usize) -> Option<Vec<u8
                 );
             }
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_aumid_accepts_packaged_and_unpackaged_grammar() {
+        // Packaged AUMIDs carry the package-family suffix plus the `!` splitter;
+        // unpackaged apps use a plain dotted identifier. Both are 1-128 ASCII
+        // shell-identifier characters and must pass the gate.
+        for id in [
+            "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify",
+            "Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic",
+            "Obsidian.Obsidian",
+            "Google.Chrome",
+            "a",
+            "a".repeat(128).as_str(),
+        ] {
+            assert!(valid_aumid(id), "{id:?} must be a valid AUMID");
+        }
+    }
+
+    #[test]
+    fn valid_aumid_rejects_paths_urls_and_untrusted_shape() {
+        // None of these may ever reach a Shell parsing call: every one is a
+        // parsing-name escape hatch, not an app identifier.
+        for id in [
+            r"\\server\share\app.exe",       // UNC
+            r"C:\Program Files\App\App.exe", // drive-absolute
+            r"\\.\pipe\name",                // device namespace
+            "https://evil.example/x",        // URL/SSRF-ish
+            r"..\..\secret",                 // traversal
+            "Spot\u{0}ify.AB",               // control character
+            "Google Chrome",                 // whitespace
+            "",                              // empty
+            "a".repeat(129).as_str(),        // over the 128-char cap
+        ] {
+            assert!(!valid_aumid(id), "{id:?} must be rejected");
         }
     }
 }
