@@ -32,6 +32,7 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0,
     WAIT_TIMEOUT, WPARAM,
 };
+use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FILE_WRITE_DATA, GetFileSize, OPEN_ALWAYS, SetEndOfFile, SetFilePointer, WriteFile,
@@ -40,7 +41,9 @@ use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, ReleaseMutex, SetEvent, WaitForSingleObject,
+};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW, TranslateMessage,
@@ -261,91 +264,292 @@ fn install_panic_hook(logs_dir: &Path) {
 /// Upper bound on `crash.log` before the next panic truncates it.
 const CRASH_LOG_CAP: u64 = 1024 * 1024;
 
-/// Holds the raw value of the single-instance mutex handle for the lifetime of
-/// the process so the "Restart app" button can release it before spawning
-/// the next instance. A relaunch must free it first, otherwise the freshly
-/// launched process would see a live owner (this one) and exit immediately.
-/// Stored as `isize` because `HANDLE` is neither `Send` nor `Sync` and cannot
-/// live in a `static` directly.
-static SINGLETON_HANDLE: OnceLock<isize> = OnceLock::new();
+/// Bounded waits for the restart handoff protocol. The old process gives the
+/// successor at most `RESTART_READY_TIMEOUT` to signal ready, and the
+/// successor (child) waits at most `RESTART_READY_WAIT` on the mutex the old
+/// process releases on success.
+const RESTART_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const RESTART_READY_WAIT: Duration = Duration::from_secs(15);
 
-/// Acquires the single-instance mutex for the process lifetime. Returns the
-/// handle while the caller holds it, or `None` when another instance already
-/// owns the mutex. The handle must be kept alive until process exit; releasing
-/// it would allow a second instance to start.
-fn acquire_singleton() -> anyhow::Result<Option<HANDLE>> {
-    unsafe {
-        let name = wide("WinGlanceSingleInstance");
-        let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr()))?;
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            // The mutex already exists, so either a live instance owns it or
-            // the previous instance died without releasing it (crash or kill),
-            // which leaves the mutex abandoned. A zero-timeout wait tells the
-            // cases apart: an abandoned mutex grants ownership immediately,
-            // a live owner returns WAIT_TIMEOUT. Without this, the first
-            // relaunch after a crash would exit, requiring a second launch.
-            match WaitForSingleObject(handle, 0) {
-                WAIT_ABANDONED | WAIT_OBJECT_0 => {
-                    let _ = SINGLETON_HANDLE.set(handle.0 as isize);
-                    Ok(Some(handle))
-                }
-                WAIT_TIMEOUT => {
-                    let _ = CloseHandle(handle);
-                    Ok(None)
-                }
-                WAIT_FAILED => {
-                    let _ = CloseHandle(handle);
-                    anyhow::bail!("WaitForSingleObject failed on the single-instance mutex");
-                }
-                _ => {
-                    let _ = CloseHandle(handle);
-                    anyhow::bail!("unexpected wait result on the single-instance mutex");
-                }
-            }
-        } else {
-            let _ = SINGLETON_HANDLE.set(handle.0 as isize);
-            Ok(Some(handle))
-        }
-    }
+/// Owns the single-instance mutex handle for the process lifetime. The handle
+/// is closed exactly once: either by `release` during a successful restart
+/// handoff, or by the OS when the process ends (the guard is held in a
+/// `static`, which is never dropped by the runtime, so `Drop` covers the
+/// take-then-fail windows inside `relaunch_self` and nothing else). Stored
+/// as a raw `isize` because `HANDLE` is neither `Send` nor `Sync`; the guard
+/// is only ever touched on the main/UI thread, and the numeric value alone is
+/// shareable through the `SINGLETON_GUARD` slot the restart path reads.
+struct SingletonGuard {
+    raw: isize,
 }
 
-/// Restarts the app in place so it reloads `config.toml` from disk. The
-/// single-instance mutex is released first (see `SINGLETON_HANDLE`), then the
-/// current executable is launched with the `--reload-config` marker (so the
-/// new instance can record the reload in its own log) and this process exits.
-/// Nothing under `%APPDATA%\WinGlance\WinGlance\data\` is deleted, so any
-/// on-disk cache survives and the live log is preserved: the reloaded
-/// process appends to it and marks the boundary instead of truncating it.
-/// Only in-memory caches (icon/track/period) are lost, as they are on any
-/// restart. If the new process cannot be launched, this instance keeps
-/// running rather than disappearing.
-pub fn relaunch_self() {
-    if let Some(raw) = SINGLETON_HANDLE.get() {
-        let handle = HANDLE(*raw as *mut c_void);
+impl SingletonGuard {
+    fn new(handle: HANDLE) -> Self {
+        Self { raw: handle.0 as isize }
+    }
+
+    /// Releases the mutex and closes the handle. Once released, the guard
+    /// holds nothing: a later `Drop` is a no-op, so the handle cannot be
+    /// released or closed twice.
+    fn release(&mut self) {
+        let handle = HANDLE(self.raw as *mut c_void);
         unsafe {
             let _ = ReleaseMutex(handle);
             let _ = CloseHandle(handle);
         }
+        self.raw = 0;
     }
-    match env::current_exe() {
-        Ok(exe) => {
-            if process::Command::new(exe).arg("--reload-config").spawn().is_ok() {
-                process::exit(0);
+}
+
+impl Drop for SingletonGuard {
+    fn drop(&mut self) {
+        if self.raw != 0 {
+            self.release();
+        }
+    }
+}
+
+/// The singleton guard's raw handle value, mirrored so the UI-thread restart
+/// path (`relaunch_self`) can hand the mutex to the successor process. The
+/// value is taken out of the slot for the handoff and put back on any
+/// failure, so `main` keeps exactly one live guard at all times.
+static SINGLETON_GUARD: Mutex<Option<SingletonGuard>> = Mutex::new(None);
+
+/// Acquires the single-instance mutex for the process lifetime. Returns the
+/// guard while the caller holds it, or `None` when another instance already
+/// owns the mutex. On the restart-handoff path (`restart_nonce` is `Some`),
+/// the successor waits on the mutex the old process releases after the ready
+/// handshake instead of treating the live owner as a duplicate.
+fn acquire_singleton(restart_nonce: Option<&str>) -> anyhow::Result<Option<SingletonGuard>> {
+    unsafe {
+        let name = wide("WinGlanceSingleInstance");
+        let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr()))?;
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            return Ok(Some(SingletonGuard::new(handle)));
+        }
+        // The mutex already exists, so either a live instance owns it or the
+        // previous instance died without releasing it (crash or kill), which
+        // leaves the mutex abandoned.
+        if let Some(nonce) = restart_nonce {
+            // A handoff only ever carries a well-formed random nonce; any
+            // other argument is not a handoff and falls through to the plain
+            // conflict path below.
+            if nonce_shape_ok(nonce) {
+                // Restart handoff: the old process keeps ownership until
+                // we signal ready — it releases the mutex and exits only after.
+                // Signal ready first (so the old process stops waiting), then wait
+                // (bounded) for the mutex it is about to release. If the event is
+                // gone, the old process died before the handoff: fall through to
+                // the plain conflict path, whose abandoned-mutex takeover covers
+                // a crashed predecessor.
+                let event_name = wide(&format!("WinGlanceRestartReady-{nonce}"));
+                match OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(event_name.as_ptr())) {
+                    Ok(ready) => {
+                        let _ = SetEvent(ready);
+                        let _ = CloseHandle(ready);
+                        return match WaitForSingleObject(handle, RESTART_READY_WAIT.as_millis() as u32) {
+                            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(SingletonGuard::new(handle))),
+                            WAIT_TIMEOUT | WAIT_FAILED => {
+                                // The old process never handed off (it failed the
+                                // ready wait and kept running): this launch is a
+                                // duplicate after all.
+                                let _ = CloseHandle(handle);
+                                Ok(None)
+                            }
+                            _ => {
+                                let _ = CloseHandle(handle);
+                                anyhow::bail!("unexpected wait result on the single-instance mutex")
+                            }
+                        };
+                    }
+                    Err(_) => {
+                        // The old process died before the handoff; fall through to
+                        // the plain conflict path, whose abandoned-mutex takeover
+                        // covers a crashed predecessor.
+                    }
+                }
             }
-            error!("reload config: launching the new process failed; keeping this instance running");
         }
-        Err(error) => {
-            error!("reload config: resolving the current executable path failed: {error:#}");
+        // A zero-timeout wait tells the cases apart: an abandoned mutex grants
+        // ownership immediately, a live owner returns WAIT_TIMEOUT. Without
+        // this, the first relaunch after a crash would exit, requiring a
+        // second launch.
+        match WaitForSingleObject(handle, 0) {
+            WAIT_ABANDONED | WAIT_OBJECT_0 => Ok(Some(SingletonGuard::new(handle))),
+            WAIT_TIMEOUT => {
+                let _ = CloseHandle(handle);
+                Ok(None)
+            }
+            WAIT_FAILED => {
+                let _ = CloseHandle(handle);
+                anyhow::bail!("WaitForSingleObject failed on the single-instance mutex");
+            }
+            _ => {
+                let _ = CloseHandle(handle);
+                anyhow::bail!("unexpected wait result on the single-instance mutex");
+            }
         }
     }
+}
+
+/// Scans the process arguments for the restart-handoff nonce. Every other
+/// argument (the `--reload-config` marker, the icon-worker probe) is left
+/// alone; the handoff path only needs the value following the flag.
+fn restart_nonce_arg(args: &[String]) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == "--winglance-restart-nonce")
+        .and_then(|index| args.get(index + 1).cloned())
+}
+
+/// Whether a nonce has the shape this app produces: exactly 32 hex digits.
+/// Anything else is not a handoff: a foreign or corrupted argument must never
+/// make the child open a named event it cannot own. (Kernel object names are
+/// case-insensitive, so both cases of hex are accepted.)
+fn nonce_shape_ok(nonce: &str) -> bool {
+    nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A fresh 128-bit (32 hex digit) nonce for the restart handoff. The ready
+/// event's name is derived from it, so a process that did not see this
+/// command line cannot predict or race the event before the successor
+/// signals it. Failure to obtain randomness aborts the restart and keeps the
+/// current instance running: a restart with a guessable nonce would hand the
+/// singleton to whoever signals the event first.
+fn random_restart_nonce() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    unsafe {
+        let status = BCryptGenRandom(None, &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if !status.is_ok() {
+            error!("restart: BCryptGenRandom failed: {status:?}");
+            return None;
+        }
+    }
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Restarts the app in place so it reloads `config.toml` from disk. Unlike the
+/// old release-then-spawn sequence, the single-instance mutex stays owned
+/// until the successor signals it is ready, then the old process releases the
+/// mutex and exits. Any spawn or ready failure leaves the guard — and this
+/// instance — intact and running, so a failed handoff never leaves two
+/// instances able to run or this one unprotected. The handoff nonce is a
+/// fresh 128-bit random value, so the ready event's name cannot be predicted
+/// — or signaled — before the successor itself signals it; and the guard is
+/// released only while the successor is verifiably alive, so a stale signal
+/// can never drop the singleton into an unowned gap. Nothing under
+/// `%APPDATA%\WinGlance\WinGlance\data\` is deleted, so any on-disk cache
+/// survives and the live log is preserved: the reloaded process appends to it
+/// and marks the boundary instead of truncating it. Only in-memory caches
+/// (icon/track/period) are lost, as they are on any restart.
+pub fn relaunch_self() {
+    // Take the guard out of the shared slot; every failure path puts it back.
+    let Some(mut guard) = SINGLETON_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        error!("restart: the single-instance guard is not held; refusing to restart");
+        return;
+    };
+    let Ok(exe) = env::current_exe() else {
+        error!("restart: resolving the current executable path failed; keeping this instance running");
+        *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+        return;
+    };
+    let Some(nonce) = random_restart_nonce() else {
+        error!("restart: generating the handoff nonce failed; keeping this instance running");
+        *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+        return;
+    };
+    // The ready event must exist before the child starts so the child can
+    // open it by name; auto-reset (bManualReset = false) so the single wait
+    // consumes the signal.
+    let event_name = wide(&format!("WinGlanceRestartReady-{nonce}"));
+    let ready = match unsafe { CreateEventW(None, false, false, PCWSTR(event_name.as_ptr())) } {
+        Ok(event) => event,
+        Err(error) => {
+            error!("restart: creating the ready event failed: {error}; keeping this instance running");
+            *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+            return;
+        }
+    };
+    let spawned = process::Command::new(&exe)
+        .arg("--reload-config")
+        .arg("--winglance-restart-nonce")
+        .arg(&nonce)
+        .spawn();
+    let Ok(mut child) = spawned else {
+        error!("restart: launching the new process failed; keeping this instance running");
+        unsafe {
+            let _ = CloseHandle(ready);
+        }
+        *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+        return;
+    };
+    // Wait for the successor to signal ready. On success the mutex is
+    // released and this process exits; on timeout the successor never came
+    // up, so the guard stays and this instance keeps running as the owner.
+    match unsafe { WaitForSingleObject(ready, RESTART_READY_TIMEOUT.as_millis() as u32) } {
+        WAIT_OBJECT_0 | WAIT_ABANDONED => {}
+        WAIT_TIMEOUT | WAIT_FAILED => {
+            error!("restart: the new process did not signal ready in time; keeping this instance running");
+            unsafe {
+                let _ = CloseHandle(ready);
+            }
+            *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+            return;
+        }
+        _ => {
+            error!("restart: unexpected wait result on the ready event; keeping this instance running");
+            unsafe {
+                let _ = CloseHandle(ready);
+            }
+            *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+            return;
+        }
+    }
+    // Handoff accepted by the wait, but a signal alone does not prove the
+    // handoff completed: a stale or forged ready signal must never drop the
+    // guard into a gap nothing can take. Release only while the successor is
+    // verifiably alive (`try_wait` is non-blocking here; a running child
+    // reports `Ok(None)`).
+    if let Ok(Some(_)) = child.try_wait() {
+        error!("restart: the new process exited before the handoff completed; keeping this instance running");
+        unsafe {
+            let _ = CloseHandle(ready);
+        }
+        *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+        return;
+    }
+    // Handoff accepted: the successor is alive and signaled. Release the
+    // mutex and exit; the child's bounded wait acquires ownership. The child
+    // keeps running, so it must not be waited on.
+    guard.release();
+    unsafe {
+        let _ = CloseHandle(ready);
+    }
+    drop(child);
+    process::exit(0);
 }
 
 fn main() -> Result<()> {
     // The single-instance guard must come before any side effects: logging
     // truncates the live log and config recovery touches the user's file, so a
-    // duplicate launch must not get that far.
-    let _singleton = match acquire_singleton() {
-        Ok(Some(handle)) => Some(handle),
+    // duplicate launch must not get that far. A restart-handoff child carries
+    // the nonce it was spawned with; every other launch does not.
+    let restart_nonce = restart_nonce_arg(
+        &env::args_os()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+    );
+    match acquire_singleton(restart_nonce.as_deref()) {
+        Ok(Some(guard)) => {
+            // Mirror the guard into the shared slot so the Settings/restart
+            // path can hand the mutex to a successor. The slot is the sole
+            // owner from here on; `relaunch_self` takes the guard out of it
+            // for a handoff and puts it back if the handoff fails.
+            *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+        }
         Ok(None) => {
             // Another instance holds the mutex; exit without touching its
             // log or config.
@@ -480,6 +684,18 @@ fn main() -> Result<()> {
                 let listener_config_worker = listener_config.clone();
                 let now_showing_worker = now_showing_supervisor.clone();
                 let worker_started = Instant::now();
+                // A replacement worker starts with a fresh heartbeat:
+                // the supervisor may still be reading the previous worker's
+                // stale heartbeat at the first 1 s check, and the successor
+                // must get the full stall window to reach its event loop.
+                *supervisor_heartbeat
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+                // One-shot completion channel: the worker signals it
+                // once `run` has fully returned — COM cleanup included — so a
+                // shutdown can join a responsive worker within a bound instead
+                // of detaching it blindly.
+                let (done_tx, done_rx) = mpsc::channel::<()>();
                 let worker = thread::Builder::new()
                     .name("WinGlance-smtc-worker".to_string())
                     .stack_size(1024 * 1024)
@@ -494,6 +710,7 @@ fn main() -> Result<()> {
                             now_showing_worker,
                         )
                         .run();
+                        let _ = done_tx.send(());
                     });
                 let Ok(worker) = worker else {
                     // A failed spawn consumes the same restart budget as a
@@ -506,10 +723,22 @@ fn main() -> Result<()> {
                     sleep_interruptible(delay, &supervisor_shutdown);
                     continue;
                 };
-                let mut stalled = false;
-                while !worker.is_finished() {
+                let exit = loop {
                     if supervisor_shutdown.load(Ordering::SeqCst) {
-                        break;
+                        // Bounded shutdown join: a responsive worker
+                        // finishes — COM cleanup included — within the grace
+                        // and is joined; a stuck one is detached only after
+                        // the grace expires.
+                        match done_rx.recv_timeout(WORKER_SHUTDOWN_GRACE) {
+                            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break WorkerExit::Joined,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                warn!(
+                                    "SMTC worker did not stop within {}s; detaching it",
+                                    WORKER_SHUTDOWN_GRACE.as_secs()
+                                );
+                                break WorkerExit::Detached;
+                            }
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(1000));
                     if worker_started.elapsed() > Duration::from_secs(120) {
@@ -518,34 +747,46 @@ fn main() -> Result<()> {
                     let last = *supervisor_heartbeat
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if last.elapsed() > Duration::from_secs(30) {
-                        stalled = true;
+                    if worker_is_stalled(worker_started.elapsed(), last.elapsed()) {
+                        break WorkerExit::Stalled;
+                    }
+                    if worker.is_finished() {
+                        break WorkerExit::Completed;
+                    }
+                };
+                match exit {
+                    WorkerExit::Stalled => {
+                        // Do not join: the worker may be blocked inside COM forever.
+                        consecutive_restarts += 1;
+                        let delay = worker_restart_delay(consecutive_restarts);
+                        error!("SMTC worker stalled; restarting it in {}s", delay.as_secs());
+                        sleep_interruptible(delay, &supervisor_shutdown);
+                        continue;
+                    }
+                    WorkerExit::Completed => {
+                        match worker.join() {
+                            Ok(()) => {}
+                            Err(panic) => {
+                                let payload = panic.downcast_ref::<&str>().copied().unwrap_or("unknown panic");
+                                error!("SMTC worker panicked: {payload}");
+                            }
+                        }
+                        // The worker exited on its own (an error or a panic): restart it.
+                        consecutive_restarts += 1;
+                        let delay = worker_restart_delay(consecutive_restarts);
+                        warn!("SMTC worker exited; restarting it in {}s", delay.as_secs());
+                        sleep_interruptible(delay, &supervisor_shutdown);
+                    }
+                    // Shutdown paths: the worker finished inside the grace
+                    // (reaped here) or is a stuck detach left for the OS. In
+                    // both cases the supervisor exits so main can join it and
+                    // destroy the windows.
+                    WorkerExit::Joined => {
+                        let _ = worker.join();
                         break;
                     }
+                    WorkerExit::Detached => break,
                 }
-                if supervisor_shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
-                if stalled {
-                    // Do not join: the worker may be blocked inside COM forever.
-                    consecutive_restarts += 1;
-                    let delay = worker_restart_delay(consecutive_restarts);
-                    error!("SMTC worker stalled; restarting it in {}s", delay.as_secs());
-                    sleep_interruptible(delay, &supervisor_shutdown);
-                    continue;
-                }
-                match worker.join() {
-                    Ok(()) => {}
-                    Err(panic) => {
-                        let payload = panic.downcast_ref::<&str>().copied().unwrap_or("unknown panic");
-                        error!("SMTC worker panicked: {payload}");
-                    }
-                }
-                // The worker exited on its own (an error or a panic): restart it.
-                consecutive_restarts += 1;
-                let delay = worker_restart_delay(consecutive_restarts);
-                warn!("SMTC worker exited; restarting it in {}s", delay.as_secs());
-                sleep_interruptible(delay, &supervisor_shutdown);
             }
         })?;
 
@@ -646,6 +887,36 @@ fn worker_restart_delay(consecutive: u32) -> Duration {
 /// and stops restarting.
 fn worker_budget_exhausted(consecutive_restarts: u32) -> bool {
     consecutive_restarts >= MAX_WORKER_RESTARTS
+}
+
+/// Stall threshold for the SMTC worker: both the time since spawn and the
+/// time since the last heartbeat must exceed this before the supervisor
+/// declares a stall and restarts the worker.
+const WORKER_STALL_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// How long shutdown waits for a responsive worker to finish (COM cleanup
+/// included) before detaching it as demonstrably stuck.
+const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+/// Whether the SMTC worker is stalled. Both the spawn age and the heartbeat
+/// age must exceed the threshold: a freshly spawned replacement
+/// always gets the full startup window even while the supervisor is still
+/// reading the previous worker's stale heartbeat, and a worker that ran past
+/// its spawn age but keeps beating is alive.
+fn worker_is_stalled(worker_age: Duration, heartbeat_age: Duration) -> bool {
+    worker_age > WORKER_STALL_THRESHOLD && heartbeat_age > WORKER_STALL_THRESHOLD
+}
+
+/// How a worker ended, as seen by the supervisor watchdog.
+enum WorkerExit {
+    /// Restart: the worker stopped beating long enough (see `worker_is_stalled`).
+    Stalled,
+    /// Restart: the worker ended on its own and is joinable.
+    Completed,
+    /// Shutdown: the worker finished inside the grace and was joined.
+    Joined,
+    /// Shutdown: the worker stayed stuck past the grace and was detached.
+    Detached,
 }
 
 /// Whether an event must be delivered to the overlay queue. Worker failures
@@ -833,6 +1104,121 @@ mod tests {
         // delay up to the slow 60 s plateau.
         assert!(worker_restart_delay(1) < worker_restart_delay(3));
         assert_eq!(worker_restart_delay(3), worker_restart_delay(4));
+    }
+
+    #[test]
+    fn worker_is_stalled_requires_both_ages_past_the_threshold() {
+        // The stall verdict needs BOTH the spawn age and the heartbeat age
+        // past the threshold: a replacement worker must always get
+        // its full startup window even if the supervisor is still reading
+        // the previous worker's stale heartbeat.
+        let young = Duration::from_secs(1);
+        let old = WORKER_STALL_THRESHOLD + Duration::from_secs(1);
+        assert!(!worker_is_stalled(young, young), "a fresh worker is never stalled");
+        assert!(
+            !worker_is_stalled(old, young),
+            "a fresh heartbeat keeps a freshly spawned worker alive"
+        );
+        assert!(
+            !worker_is_stalled(young, old),
+            "a worker past its spawn age that keeps beating is alive"
+        );
+        assert!(worker_is_stalled(old, old), "only a true 31 s stall is restarted");
+    }
+
+    #[test]
+    fn restart_nonce_is_scanned_from_the_arguments() {
+        // Plain launches carry no nonce; the handoff flag must pair with a
+        // value, and the first occurrence wins.
+        assert_eq!(restart_nonce_arg(&[]), None);
+        assert_eq!(restart_nonce_arg(&["--reload-config".to_string()]), None);
+        assert_eq!(
+            restart_nonce_arg(&["--winglance-restart-nonce".to_string()]),
+            None,
+            "a flag without a value is not a handoff"
+        );
+        assert_eq!(
+            restart_nonce_arg(&[
+                "--reload-config".to_string(),
+                "--winglance-restart-nonce".to_string(),
+                "42-1".to_string(),
+            ]),
+            Some("42-1".to_string())
+        );
+        assert_eq!(
+            restart_nonce_arg(&[
+                "--winglance-restart-nonce".to_string(),
+                "a-1".to_string(),
+                "--winglance-restart-nonce".to_string(),
+                "b-2".to_string(),
+            ]),
+            Some("a-1".to_string()),
+            "the first value wins"
+        );
+    }
+
+    #[test]
+    fn handoff_nonce_is_random_hex() {
+        let first = random_restart_nonce().expect("the RNG must succeed");
+        let second = random_restart_nonce().expect("the RNG must succeed");
+        assert_eq!(first.len(), 32, "a 128-bit nonce renders as 32 hex digits");
+        assert!(nonce_shape_ok(&first));
+        assert_ne!(first, second, "two handoffs must never share a nonce");
+    }
+
+    #[test]
+    fn nonce_shape_rejects_every_non_handoff_argument() {
+        assert!(nonce_shape_ok("0123456789abcdef0123456789abcdef"));
+        // Kernel object names are case-insensitive, so upper-case hex is
+        // accepted; only hex, and only exactly 32 digits.
+        assert!(nonce_shape_ok("0123456789ABCDEF0123456789ABCDEF"));
+        for bad in [
+            "",
+            "42-1",
+            "a-1",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789abcdef0123456789abcdef ",
+            "0123456789abcdef0123456789abcdeX",
+        ] {
+            assert!(!nonce_shape_ok(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn singleton_guard_release_frees_a_held_mutex() {
+        // A real mutex object backs the guard. While the guard holds
+        // it, a second handle opened in the same test sees the mutex owned;
+        // after `release` the same handle acquires it immediately, and a
+        // following `Drop` must be a no-op, so the handle is never released
+        // or closed twice. The owner probe runs on another thread because the
+        // owning thread could recursively acquire its own mutex and mask the
+        // ownership state.
+        let name = format!("WinGlanceTestSingleton-{}", process::id());
+        unsafe {
+            let name_wide = wide(&name);
+            let first = CreateMutexW(None, true, PCWSTR(name_wide.as_ptr())).unwrap();
+            let mut guard = SingletonGuard::new(first);
+            let second = CreateMutexW(None, true, PCWSTR(name_wide.as_ptr())).unwrap();
+            // `HANDLE` is not `Send`; probe through its numeric value.
+            let second_raw = second.0 as usize;
+            let wait_on_other_thread = || {
+                let probe = move || WaitForSingleObject(HANDLE(second_raw as *mut c_void), 0);
+                thread::spawn(probe).join().unwrap()
+            };
+            assert_eq!(
+                wait_on_other_thread(),
+                WAIT_TIMEOUT,
+                "an unreleased guard owns the mutex"
+            );
+            guard.release();
+            assert_eq!(
+                wait_on_other_thread(),
+                WAIT_OBJECT_0,
+                "release hands the mutex back, so a later Drop is a no-op"
+            );
+            let _ = CloseHandle(second);
+        }
     }
 
     #[test]
