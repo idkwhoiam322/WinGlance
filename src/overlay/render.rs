@@ -21,7 +21,7 @@ use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DT_CALCRECT,
     DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DrawTextW, ETO_CLIPPED, ExtTextOutW, GdiFlush,
-    HBITMAP, HDC, HFONT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    HBITMAP, HDC, HFONT, HGDIOBJ, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowPos, ULW_ALPHA};
 use windows::core::PCWSTR;
@@ -2283,6 +2283,14 @@ pub(super) fn draw_text_line_pixels(
     scratch_utf16.extend(value.encode_utf16());
     unsafe {
         let old_font = SelectObject(hdc, font);
+        // Guard restores the previous selection on every exit path. The
+        // overflow branch below restores explicitly BEFORE the strip build:
+        // `build_marquee_strip` may replace/drop this scratch DC, and any
+        // restore after that would target the wrong DC. Leaving our
+        // font current in the live scratch would also make the next frame
+        // treat it as its `old_font` — a stale handle once the DPI-scoped
+        // provider drops it.
+        let mut font_guard = SelectedObjectGuard::new(hdc, old_font);
         SetBkMode(hdc, TRANSPARENT);
         // Draw in pure white so the scratch RGB channels hold exactly the glyph
         // coverage (gray antialiasing keeps R == G == B); the requested text
@@ -2340,6 +2348,9 @@ pub(super) fn draw_text_line_pixels(
                 // composite below replaces the general glyph composite at the
                 // end of this function.
                 let total = text_w + MARQUEE_GAP as i32;
+                // Unselect our font before the strip build may replace or
+                // drop this scratch DC; the guard becomes a no-op.
+                font_guard.restore();
                 build_marquee_strip(
                     ctx.strip,
                     text_scratch,
@@ -2373,7 +2384,8 @@ pub(super) fn draw_text_line_pixels(
         } else {
             let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
         }
-        SelectObject(hdc, old_font);
+        // `font_guard` restores the previous selection here on the static
+        // paths; the overflow branch already restored and the Drop is a no-op.
     }
 
     // CreateDIBSection's documented contract: GDI must finish any drawing
@@ -2455,6 +2467,9 @@ pub(super) fn build_marquee_strip(
     scratch_utf16.extend(value.encode_utf16());
     unsafe {
         let old_font = SelectObject(hdc, font);
+        // Same structural restore as the draw path: the strip's DC must never
+        // keep a live font selected across returns.
+        let _font_guard = SelectedObjectGuard::new(hdc, old_font);
         SetBkMode(hdc, TRANSPARENT);
         // Draw in pure white so the scratch RGB channels hold exactly the glyph
         // coverage; the requested text color is applied when premultiplying.
@@ -2478,7 +2493,6 @@ pub(super) fn build_marquee_strip(
         // CreateDIBSection's documented contract: GDI must finish any drawing
         // into the DIB before the application reads the bit values directly.
         let _ = GdiFlush();
-        let _ = SelectObject(hdc, old_font);
     }
     let mut pixels = vec![0u8; text_w as usize * rh as usize * 4];
     // No edge mask: the strip keeps the full raster, and the fade is applied
@@ -2647,6 +2661,46 @@ pub(super) fn composite_glyphs(
                 alpha,
             );
         }
+    }
+}
+
+/// RAII restore of a previously-selected GDI object into its DC. Restores in
+/// `Drop` (or on an explicit `restore`), so a font selection can never stay
+/// current in a long-lived scratch DC across frames: the next
+/// frame's `SelectObject` would read that font as its `old_font`, and if a
+/// DPI swap has deleted it in the meantime, the restore would hand the DC a
+/// dangling handle. Callers that hand the DC to code which may replace it
+/// (`text_scratch_for` drops the scratch on growth) call `restore` first:
+/// afterwards the Drop is a no-op, because restoring against a replaced DC
+/// would select into the wrong object.
+struct SelectedObjectGuard {
+    hdc: HDC,
+    previous: HGDIOBJ,
+    restored: bool,
+}
+
+impl SelectedObjectGuard {
+    fn new(hdc: HDC, previous: HGDIOBJ) -> Self {
+        Self {
+            hdc,
+            previous,
+            restored: false,
+        }
+    }
+
+    fn restore(&mut self) {
+        if !self.restored {
+            unsafe {
+                let _ = SelectObject(self.hdc, self.previous);
+            }
+            self.restored = true;
+        }
+    }
+}
+
+impl Drop for SelectedObjectGuard {
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 
@@ -3125,6 +3179,140 @@ pub(super) fn draw_placeholder(pixels: &mut [u8], width: usize, x: usize, y: usi
                 let alpha = (color[3] as f32 * coverage) as u32;
                 composite(pixels, width, px, py, [color[0], color[1], color[2]], alpha);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::winutil::wide;
+    use windows::Win32::Foundation::FALSE;
+    use windows::Win32::Graphics::Gdi::{
+        ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DeleteObject,
+        FF_DONTCARE, GetCurrentObject, OBJ_FONT, OUT_DEFAULT_PRECIS,
+    };
+
+    /// A real Segoe UI HFONT sized like the pill's drawing fonts.
+    unsafe fn test_font() -> HFONT {
+        let name = wide("Segoe UI");
+        unsafe {
+            CreateFontW(
+                -16,
+                0,
+                0,
+                0,
+                600,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_DEFAULT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                ANTIALIASED_QUALITY.0 as u32,
+                DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+                PCWSTR(name.as_ptr()),
+            )
+        }
+    }
+
+    #[test]
+    fn selected_object_guard_restores_the_prior_selection_on_drop() {
+        // The overflow branch used to return without restoring its
+        // selection, so the live draw font stayed current in the persistent
+        // scratch DC. The next frame's `SelectObject` then read that font as
+        // its `old_font`, and a DPI swap could delete the very font the DC
+        // still named. The guard must put the prior object back: the DC's
+        // current font after the guard is the pre-select one, and the
+        // swapped-in font is unselected and deletable.
+        unsafe {
+            let hdc = CreateCompatibleDC(None);
+            assert!(!hdc.0.is_null());
+            let font = test_font();
+            let before = GetCurrentObject(hdc, OBJ_FONT);
+            let old_font = SelectObject(hdc, font);
+            assert_ne!(
+                GetCurrentObject(hdc, OBJ_FONT).0,
+                before.0,
+                "the font must be current while selected"
+            );
+            {
+                let _guard = SelectedObjectGuard::new(hdc, old_font);
+            }
+            assert_eq!(
+                GetCurrentObject(hdc, OBJ_FONT).0,
+                before.0,
+                "the guard must restore the prior selection on drop"
+            );
+            assert!(DeleteObject(font) != FALSE, "an unselected font must delete cleanly");
+            let _ = DeleteDC(hdc);
+        }
+    }
+
+    #[test]
+    fn overflow_branch_restores_before_the_scratch_replacement() {
+        // The marquee overflow path must unselect its font BEFORE the strip
+        // rebuild: `text_scratch_for` drops the scratch (and its DC) when the
+        // strip needs a wider buffer, and a restore after that would select
+        // into a replaced DC. The guard's restored flag pins the
+        // ordering — no GDI handle-table allocation luck involved — and the
+        // font must never be left selected somewhere undeletable.
+        unsafe {
+            let font = test_font();
+            let mut scratch: Option<TextScratch> = None;
+            let (hdc, _, _, _) = text_scratch_for(&mut scratch, 32, 16).unwrap();
+            let old_font = SelectObject(hdc, font);
+            let mut guard = SelectedObjectGuard::new(hdc, old_font);
+            guard.restore();
+            assert!(
+                guard.restored,
+                "the overflow branch must restore before the strip rebuild"
+            );
+            // The strip rebuild needs a text_w-wide scratch, which grows the
+            // scratch and replaces its DC.
+            let (hdc2, _, _, _) = text_scratch_for(&mut scratch, 320, 16).unwrap();
+            assert_eq!(
+                scratch.as_ref().unwrap().width,
+                320,
+                "the scratch must have been replaced with the wider buffer"
+            );
+            // The guard is a no-op from here (already restored), so the Drop
+            // never touches the replaced DC.
+            drop(guard);
+            assert!(
+                GetCurrentObject(hdc2, OBJ_FONT).0 != font.0,
+                "the fresh strip DC must not carry our font"
+            );
+            assert!(DeleteObject(font) != FALSE, "the font must delete cleanly");
+        }
+    }
+
+    #[test]
+    fn repeated_font_swaps_leave_no_selection_stuck_in_the_scratch() {
+        // A hundred DPI-style swaps against ONE persistent scratch DC (like
+        // the real one): each generation restores the baseline selection and
+        // deletes its font. A frame that skipped its restore would leave the
+        // generation's font current in the long-lived DC, so the next frame's
+        // `SelectObject` would read it as `old_font` — a stale handle once the
+        // provider drops it (scenario 6).
+        unsafe {
+            let hdc = CreateCompatibleDC(None);
+            assert!(!hdc.0.is_null());
+            let baseline = GetCurrentObject(hdc, OBJ_FONT);
+            for i in 0..100 {
+                let font = test_font();
+                let old_font = SelectObject(hdc, font);
+                {
+                    let _guard = SelectedObjectGuard::new(hdc, old_font);
+                }
+                assert_eq!(
+                    GetCurrentObject(hdc, OBJ_FONT).0,
+                    baseline.0,
+                    "generation {i} left its font current in the scratch DC"
+                );
+                assert!(DeleteObject(font) != FALSE, "generation {i}'s font failed to delete");
+            }
+            let _ = DeleteDC(hdc);
         }
     }
 }
