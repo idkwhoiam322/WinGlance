@@ -12,6 +12,21 @@ use windows::core::PCWSTR;
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const VALUE_NAME: &str = "WinGlance";
 
+/// The ownership marker written into this app's Run command:
+/// `"<exact exe>" --winglance-autostart`. The token is accepted and ignored
+/// by `main` (which only scans for `--winglance-restart-nonce` and
+/// `--reload-config`), so an autostart launch behaves exactly like a plain
+/// one. Ownership rules:
+///
+/// - A stored command naming this installation's exact executable is ours
+///   (unmarked legacy entries included; enabling upgrades them to the marked
+///   form).
+/// - Any other command — a different live path, a deleted path, a relative
+///   command — is ours only when it carries this exact token AND its
+///   executable shares our file name: the marker alone among foreign-named
+///   commands proves nothing, and the file name alone proves nothing.
+pub(crate) const AUTOSTART_MARKER: &str = "--winglance-autostart";
+
 /// What the Run key currently holds for this app's value name.
 enum RunValue {
     /// No value present.
@@ -38,11 +53,9 @@ pub fn apply(enabled: bool) -> Result<()> {
     // Quote the path: Windows splits an unquoted Run-key command line on
     // spaces when resolving the executable, so an install path containing a
     // space could fail to launch at logon or resolve to a different program.
-    let target = format!("\"{}\"", exe.to_string_lossy());
+    // The command carries the ownership marker (see `AUTOSTART_MARKER`).
+    let target = format!("\"{}\" {AUTOSTART_MARKER}", exe.to_string_lossy());
     let target_wide = wide(&target);
-    // Ownership is keyed on the full executable path, with a file-name
-    // fallback: a stale entry pointing at a WinGlance.exe that has since
-    // moved still identifies as ours.
     let exe_path = exe.clone();
     let exe_name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let value = wide(VALUE_NAME);
@@ -65,9 +78,10 @@ pub fn apply(enabled: bool) -> Result<()> {
                         // Already in the desired state.
                         WIN32_ERROR(0)
                     } else {
-                        // Repair the stale command (the exe moved, or the
-                        // entry gained arguments). The value is ours, so
-                        // rewriting it cannot clobber another program's entry.
+                        // Repair the stale command (an unmarked legacy entry,
+                        // or one from before the exe moved). The value is
+                        // ours, so rewriting it cannot clobber another
+                        // program's entry.
                         let data = std::slice::from_raw_parts(target_wide.as_ptr().cast::<u8>(), target_wide.len() * 2);
                         RegSetValueExW(key, PCWSTR(value.as_ptr()), 0, REG_SZ, Some(data))
                     }
@@ -139,51 +153,50 @@ fn read_run_value(key: HKEY, name: &[u16]) -> RunValue {
     }
 }
 
-/// Whether a stored Run value belongs to this installation. The full
-/// executable path decides first (case-insensitive, as Path equality is on
-/// Windows): an entry naming this exact installation is ours no matter what
-/// its file name is. When the stored absolute path is a *different* live
-/// executable, the entry is foreign and never touched — a foreign app that
-/// merely shares the file name must not be clobbered. The executable file
-/// name only decides (case-insensitive) for relative commands and for
-/// absolute paths that no longer exist: an entry left behind by a
-/// WinGlance.exe that has since moved is still recognized as ours.
+/// Whether a stored Run value belongs to this installation.
+///
+/// - The stored command's executable token naming this installation's exact
+///   path decides first (case-insensitive): an entry naming this exact
+///   installation is ours no matter its arguments — legacy unmarked entries
+///   included, and enabling upgrades them to the marked form.
+/// - Everything else is ours only when the command carries the exact
+///   `--winglance-autostart` token AND its executable shares our file name
+///   (case-insensitive): a marked entry from before the exe moved, or a
+///   second WinGlance installation. The file name alone never decides (a
+///   deleted foreign same-name entry is left untouched), and the marker
+///   alone never decides (a foreign command that merely embeds our token is
+///   left untouched). Lookalike tokens (`--winglance-autostart2`,
+///   `--winglance-autostart=x`) do not count: the argument must be exactly
+///   the marker.
 fn owned_by(current_exe: &Path, current_exe_name: &str, stored: &str) -> bool {
     let stored = stored.trim();
-    let token = if let Some(rest) = stored.strip_prefix('"') {
+    let (token, rest) = if let Some(after_quote) = stored.strip_prefix('"') {
         // Quoted command: take up to the closing quote, so a path with
         // spaces is not split.
-        let end = rest.find('"').unwrap_or(rest.len());
-        &rest[..end]
+        let end = after_quote.find('"').unwrap_or(after_quote.len());
+        let token = &after_quote[..end];
+        let rest = after_quote.get(end + 1..).unwrap_or("");
+        (token, rest)
     } else {
         // Unquoted command: take up to the first space.
         let end = stored.find(' ').unwrap_or(stored.len());
-        &stored[..end]
+        (&stored[..end], &stored[end..])
     };
     if token.is_empty() {
         return false;
     }
     let stored_path = Path::new(token);
-    if stored_path.is_absolute() {
-        if stored_path == current_exe {
-            return true;
-        }
-        // A live executable at a different path is a different program, even
-        // with the same file name. Only a stored path that no longer exists
-        // can be a stale entry of this installation.
-        if std::fs::metadata(stored_path).is_ok() {
-            return false;
-        }
+    if stored_path.is_absolute()
+        && stored_path
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&current_exe.to_string_lossy())
+    {
+        return true;
     }
+    // Not our exact path: the marker plus our file name must both be present.
+    let marked = rest.split_whitespace().any(|arg| arg == AUTOSTART_MARKER);
     let name = stored_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    // Documented trade-off of the basename fallback: a *deleted* foreign
-    // program whose entry survives in the Run key with the same file name
-    // would be treated as owned. The Run value is only ever rewritten or
-    // removed when the user toggles WinGlance autostart, so the blast radius
-    // is a single stale foreign entry, accepted in exchange for cleaning up
-    // entries left by a WinGlance.exe that has since moved. Stronger
-    // ownership would need an installation marker in the command line.
-    !name.is_empty() && name.eq_ignore_ascii_case(current_exe_name)
+    marked && !name.is_empty() && name.eq_ignore_ascii_case(current_exe_name)
 }
 
 #[cfg(test)]
@@ -244,7 +257,7 @@ mod tests {
     #[test]
     fn full_path_wins_over_a_different_file_name() {
         // The full path is identical even though the file name differs
-        // (case-insensitive Path equality on Windows).
+        // (case-insensitive path comparison on Windows).
         assert!(owned_by(
             exe(),
             "WinGlance.exe",
@@ -253,21 +266,67 @@ mod tests {
     }
 
     #[test]
-    fn live_same_name_file_at_a_different_path_stays_foreign() {
-        // A different installation with the same exe name exists: never ours.
+    fn live_same_name_file_at_a_different_path_stays_foreign_without_the_marker() {
+        // A different installation with the same exe name exists: without the
+        // marker it is never ours (the file name alone never
+        // decides).
         let guard = TempDir::new();
         let foreign = guard.file("WinGlance.exe", true);
         let stored = format!("\"{}\"", foreign.to_string_lossy());
         assert!(!owned_by(exe(), "WinGlance.exe", &stored));
+        // With the marker it is a WinGlance installation (ours to repair).
+        let stored = format!("\"{}\" {AUTOSTART_MARKER}", foreign.to_string_lossy());
+        assert!(owned_by(exe(), "WinGlance.exe", &stored));
     }
 
     #[test]
-    fn moved_exe_is_still_ours_via_the_file_name_fallback() {
-        // Stale entry from before the exe moved: the stored absolute path no
-        // longer exists, so the file name decides.
+    fn deleted_foreign_same_name_path_is_not_owned_anymore() {
+        // The old basename fallback owned a deleted same-name entry; the
+        // marker rule closes that hole — an unmarked stale entry of any
+        // origin is left untouched.
         let guard = TempDir::new();
         let stale = guard.file("old/WinGlance.exe", false);
         let stored = format!("\"{}\" --minimized", stale.to_string_lossy());
+        assert!(!owned_by(exe(), "WinGlance.exe", &stored));
+    }
+
+    #[test]
+    fn moved_marked_path_is_still_ours() {
+        // Stale entry from before the exe moved, carrying the marker: ours.
+        let guard = TempDir::new();
+        let stale = guard.file("old/WinGlance.exe", false);
+        let stored = format!("\"{}\" {AUTOSTART_MARKER}", stale.to_string_lossy());
+        assert!(owned_by(exe(), "WinGlance.exe", &stored));
+    }
+
+    #[test]
+    fn exact_old_unmarked_path_is_owned_and_upgrades() {
+        // Legacy pre-marker entry naming the current executable: owned, and
+        // the enable path rewrites it into the marked form (the target
+        // string includes the marker, so `current != target` triggers the
+        // rewrite).
+        let legacy = r#""C:\Program Files\WinGlance\WinGlance.exe""#;
+        assert!(owned_by(exe(), "WinGlance.exe", legacy));
+        let upgraded = format!("\"{}\" {AUTOSTART_MARKER}", exe().to_string_lossy());
+        assert_ne!(legacy, upgraded);
+        assert!(owned_by(exe(), "WinGlance.exe", &upgraded));
+    }
+
+    #[test]
+    fn lookalike_marker_arguments_do_not_count() {
+        let guard = TempDir::new();
+        let stale = guard.file("old/WinGlance.exe", false);
+        for lookalike in [
+            "--winglance-autostart2",
+            "--winglance-autostart=x",
+            "--winglance-autostarts",
+            "-winglance-autostart",
+        ] {
+            let stored = format!("\"{}\" {lookalike}", stale.to_string_lossy());
+            assert!(!owned_by(exe(), "WinGlance.exe", &stored), "{lookalike} must not own");
+        }
+        // The exact token among other arguments still counts.
+        let stored = format!("\"{}\" --minimized {AUTOSTART_MARKER} --other", stale.to_string_lossy());
         assert!(owned_by(exe(), "WinGlance.exe", &stored));
     }
 
@@ -280,11 +339,19 @@ mod tests {
         ));
         assert!(!owned_by(exe(), "WinGlance.exe", "notepad.exe"));
         assert!(!owned_by(exe(), "WinGlance.exe", ""));
+        // The marker alone never decides: a foreign-named command carrying
+        // our exact token stays foreign.
+        assert!(!owned_by(
+            exe(),
+            "WinGlance.exe",
+            r#""C:\Program Files\Other\other.exe" --winglance-autostart"#
+        ));
     }
 
     #[test]
-    fn relative_command_uses_the_file_name() {
-        assert!(owned_by(exe(), "WinGlance.exe", "WinGlance.exe --silent"));
-        assert!(!owned_by(exe(), "WinGlance.exe", "winthing.exe --x"));
+    fn relative_command_needs_the_marker_and_our_file_name() {
+        assert!(!owned_by(exe(), "WinGlance.exe", "WinGlance.exe --silent"));
+        assert!(owned_by(exe(), "WinGlance.exe", "WinGlance.exe --winglance-autostart"));
+        assert!(!owned_by(exe(), "WinGlance.exe", "winthing.exe --winglance-autostart"));
     }
 }
