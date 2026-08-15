@@ -163,6 +163,11 @@ const MAX_TRACKED_SOURCES: usize = 32;
 /// cover.
 const MAX_THUMBNAIL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RETAINED_ARTWORK_BYTES: usize = 64 * 1024 * 1024;
+/// Cap for the recoverable output retry mailbox (`pending_output`). The
+/// mailbox exists so a briefly-full output channel cannot make a committed
+/// state transition permanently invisible: events wait here and are re-sent
+/// at the next event-loop turn. 256 matches the per-window queue caps.
+const OUTPUT_RETRY_CAP: usize = 256;
 
 /// Minimum gap between two overflow warnings, so a hostile storm of rejected
 /// sessions cannot flood the log with one WARN per rejected session.
@@ -192,6 +197,12 @@ struct ListenerState {
     manager: GlobalSystemMediaTransportControlsSessionManager,
     config: Arc<RwLock<Config>>,
     output: SyncSender<Arc<MediaEvent>>,
+    /// Recoverable retry mailbox for events the bounded output channel could
+    /// not accept immediately. Bounded; coalesced by (kind, source) with the
+    /// newest superseding, drained in arrival order at every event-loop turn.
+    /// Never blocks the worker: overflow drops the oldest superseded event,
+    /// and the 2-second safety-net poll repairs state on top.
+    pending_output: VecDeque<Arc<MediaEvent>>,
     signal_tx: SyncSender<Signal>,
     /// Every open session's event subscriptions, keyed by session pointer.
     subscriptions: HashMap<usize, SessionSubscription>,
@@ -404,6 +415,7 @@ impl ListenerState {
             manager,
             config,
             output,
+            pending_output: VecDeque::new(),
             signal_tx,
             subscriptions: HashMap::new(),
             states: HashMap::new(),
@@ -499,8 +511,15 @@ impl ListenerState {
                         self.poll_sessions();
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // The forwarder is gone; nothing queued can be delivered.
+                    self.pending_output.clear();
+                    break;
+                }
             }
+            // Recoverable delivery runs once per turn, after the debounce
+            // flush and safety-net poll and before the next blocking receive.
+            self.flush_output();
         }
         Ok(())
     }
@@ -1814,27 +1833,94 @@ impl ListenerState {
     /// after its successor took over. The event travels as one shared `Arc`
     /// allocation that the forwarder clones into both window queues, so the
     /// fan-out never copies it. The channel is bounded and never blocks the
-    /// worker: when the forwarder cannot keep up, the event is dropped at
-    /// the source with a log line instead of growing the buffer or stalling
-    /// SMTC callbacks.
-    fn emit(&self, event: MediaEvent) {
+    /// worker: when the forwarder cannot keep up, the event waits in the
+    /// bounded retry mailbox (`pending_output`) and is re-sent at the next
+    /// event-loop turn instead of being permanently dropped.
+    fn emit(&mut self, event: MediaEvent) {
         if !self.is_current_generation() {
             return;
         }
         match self.output.try_send(Arc::new(event)) {
             Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                warn!("SMTC event dropped: the event channel is full (UI is not keeping up)");
+            Err(mpsc::TrySendError::Full(returned)) => {
+                let dropped = coalesce_pending_event(&mut self.pending_output, returned, OUTPUT_RETRY_CAP);
+                if dropped > 0 && self.may_warn_overflow() {
+                    warn!(
+                        "SMTC output retry mailbox overflowed: {dropped} queued event(s) dropped \
+                         (UI is not keeping up)"
+                    );
+                    self.last_overflow_warn = Some(Instant::now());
+                }
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.pending_output.clear();
                 debug!("signal dropped | kind=MediaEvent | reason=closed");
             }
+        }
+    }
+
+    /// Re-sends every queued event, oldest first, after the event loop's
+    /// regular work for this turn. Stops at the first full send so arrival
+    /// order (across sources and kinds) is preserved; a disconnected channel
+    /// drops the mailbox — the forwarder is gone, nothing can be delivered.
+    fn flush_output(&mut self) {
+        if drain_pending_to_channel(&mut self.pending_output, &self.output) {
+            self.pending_output.clear();
         }
     }
 
     fn is_current_generation(&self) -> bool {
         self.live_generation.load(Ordering::SeqCst) == self.my_generation
     }
+}
+
+/// Coalesce key for the retry mailbox: two events that would render/replace
+/// the same downstream state (same kind, same source) may be superseded by
+/// the newest of the pair. `WorkerFailed` has no source and is only ever
+/// emitted once by the supervisor, so it never collides.
+fn event_coalesce_key(event: &MediaEvent) -> (&'static str, Option<&str>) {
+    match event {
+        MediaEvent::TrackChanged(track) => ("track", Some(track.source_app.as_str())),
+        MediaEvent::PlaybackStateChanged(_, source) => ("playback", Some(source.as_str())),
+        MediaEvent::SessionRejected { source_app, .. } => ("rejected", Some(source_app.as_str())),
+        MediaEvent::ProgressChanged { source_app, .. } => ("progress", Some(source_app.as_str())),
+        MediaEvent::WorkerFailed { .. } => ("worker-failed", None),
+    }
+}
+
+/// Inserts an event into the bounded retry mailbox. An older event with the
+/// same coalesce key is superseded in place — the newest authoritative state
+/// wins — while events for different sources/kinds keep their arrival order.
+/// On over-cap the oldest queued event is dropped, never the newest; returns
+/// how many were dropped so the caller can report the overflow.
+fn coalesce_pending_event(queue: &mut VecDeque<Arc<MediaEvent>>, event: Arc<MediaEvent>, cap: usize) -> usize {
+    let key = event_coalesce_key(&event);
+    if let Some(index) = queue.iter().position(|queued| event_coalesce_key(queued) == key) {
+        queue.remove(index);
+    }
+    queue.push_back(event);
+    let mut dropped = 0;
+    while queue.len() > cap {
+        queue.pop_front();
+        dropped += 1;
+    }
+    dropped
+}
+
+/// Drains a retry mailbox into the output channel, oldest first. Stops at the
+/// first full send so ordering is preserved; returns true when the channel
+/// disconnected so the caller can clear the mailbox.
+fn drain_pending_to_channel(queue: &mut VecDeque<Arc<MediaEvent>>, output: &SyncSender<Arc<MediaEvent>>) -> bool {
+    while let Some(event) = queue.front().cloned() {
+        match output.try_send(event) {
+            Ok(()) => {
+                queue.pop_front();
+            }
+            Err(mpsc::TrySendError::Full(_)) => return false,
+            Err(mpsc::TrySendError::Disconnected(_)) => return true,
+        }
+    }
+    false
 }
 
 /// Every field that is actually displayed, for diagnosable logs.
@@ -4103,5 +4189,185 @@ mod tests {
         // Just outside the window: a new warn is allowed.
         let stale = Instant::now() - Duration::from_millis(5_001);
         assert!(overflow_warn_allowed(Some(stale), window));
+    }
+
+    #[test]
+    fn coalesce_pending_event_newest_replaces_older_for_same_source() {
+        // Two playback states for the same source supersede to the newest:
+        // the retry mailbox must never deliver the older one after the newer
+        // one was committed, or the UI would regress to a stale state.
+        let mut queue = VecDeque::new();
+        let first = Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "src".into()));
+        let second = Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "src".into()));
+        coalesce_pending_event(&mut queue, first, OUTPUT_RETRY_CAP);
+        coalesce_pending_event(&mut queue, second.clone(), OUTPUT_RETRY_CAP);
+        assert_eq!(queue.len(), 1, "the superseded event must be removed");
+        assert!(Arc::ptr_eq(&queue[0], &second), "the newest event must be the survivor");
+        // Progress updates for one source coalesce the same way (latest position wins).
+        let mut queue = VecDeque::new();
+        coalesce_pending_event(
+            &mut queue,
+            Arc::new(MediaEvent::ProgressChanged {
+                source_app: "src".into(),
+                position_secs: Some(5.0),
+                duration_secs: Some(10),
+                playback_rate: Some(1.0),
+            }),
+            OUTPUT_RETRY_CAP,
+        );
+        coalesce_pending_event(
+            &mut queue,
+            Arc::new(MediaEvent::ProgressChanged {
+                source_app: "src".into(),
+                position_secs: Some(9.0),
+                duration_secs: Some(10),
+                playback_rate: Some(1.0),
+            }),
+            OUTPUT_RETRY_CAP,
+        );
+        assert_eq!(queue.len(), 1, "progress coalesces per source");
+        match queue[0].as_ref() {
+            MediaEvent::ProgressChanged { position_secs, .. } => assert_eq!(*position_secs, Some(9.0)),
+            other => panic!("expected ProgressChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coalesce_keeps_cross_source_order_and_drops_oldest_on_overflow() {
+        // TrackChanged for different sources is distinct state: both must be
+        // kept, in arrival order.
+        let mut queue = VecDeque::new();
+        let mut ta = track("A", "1");
+        ta.source_app = "src-a".into();
+        let mut tb = track("B", "1");
+        tb.source_app = "src-b".into();
+        let track_a = Arc::new(MediaEvent::TrackChanged(ta));
+        let track_b = Arc::new(MediaEvent::TrackChanged(tb));
+        coalesce_pending_event(&mut queue, track_a.clone(), OUTPUT_RETRY_CAP);
+        coalesce_pending_event(&mut queue, track_b.clone(), OUTPUT_RETRY_CAP);
+        assert_eq!(queue.len(), 2, "cross-source tracks keep arrival order");
+        assert!(Arc::ptr_eq(&queue[0], &track_a), "first-arrived track stays first");
+
+        // Over-cap drops the oldest queued event, never the newest
+        // authoritative state just committed.
+        let mut queue = VecDeque::new();
+        coalesce_pending_event(
+            &mut queue,
+            Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "a".into())),
+            2,
+        );
+        coalesce_pending_event(
+            &mut queue,
+            Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "b".into())),
+            2,
+        );
+        coalesce_pending_event(
+            &mut queue,
+            Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "c".into())),
+            2,
+        );
+        assert_eq!(queue.len(), 2, "cap must hold");
+        match queue[0].as_ref() {
+            MediaEvent::PlaybackStateChanged(_, source) => {
+                assert_eq!(source, "b", "the oldest ('a') is dropped, newest survive")
+            }
+            other => panic!("expected PlaybackStateChanged, got {other:?}"),
+        }
+        match queue[1].as_ref() {
+            MediaEvent::PlaybackStateChanged(_, source) => {
+                assert_eq!(source, "c", "the newest authoritative state must survive")
+            }
+            other => panic!("expected PlaybackStateChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_output_channel_replays_latest_state_after_drain() {
+        // Capacity-1 channel: fill it, commit two playback states (the newer
+        // supersedes the older in the mailbox), drain the channel, then flush.
+        // Acceptance: the latest authoritative state arrives; nothing is
+        // permanently invisible just because the channel was briefly full.
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.try_send(Arc::new(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Stopped,
+            "occupy".into(),
+        )))
+        .unwrap();
+        let mut queue = VecDeque::new();
+        coalesce_pending_event(
+            &mut queue,
+            Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "src".into())),
+            OUTPUT_RETRY_CAP,
+        );
+        coalesce_pending_event(
+            &mut queue,
+            Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "src".into())),
+            OUTPUT_RETRY_CAP,
+        );
+        assert_eq!(queue.len(), 1, "the older Paused was superseded in the mailbox");
+        let _ = rx.recv().unwrap();
+        assert!(
+            !drain_pending_to_channel(&mut queue, &tx),
+            "channel is live again after the drain"
+        );
+        assert!(queue.is_empty(), "the queued state was delivered");
+        match rx.try_recv() {
+            Ok(event) => match event.as_ref() {
+                MediaEvent::PlaybackStateChanged(PlaybackState::Playing, source) => assert_eq!(source, "src"),
+                other => panic!("expected the newest Playing state, got {other:?}"),
+            },
+            Err(_) => panic!("the committed state must be delivered once the channel drains"),
+        }
+    }
+
+    #[test]
+    fn drain_stops_at_the_first_full_send_and_preserves_order() {
+        // Capacity-1: A is sent, filling the channel; B stays queued. After
+        // the receiver drains A, the next flush delivers B — in order.
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut queue = VecDeque::new();
+        coalesce_pending_event(
+            &mut queue,
+            Arc::new(MediaEvent::TrackChanged(track("A", "1"))),
+            OUTPUT_RETRY_CAP,
+        );
+        coalesce_pending_event(
+            &mut queue,
+            Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "a".into())),
+            OUTPUT_RETRY_CAP,
+        );
+        assert!(
+            !drain_pending_to_channel(&mut queue, &tx),
+            "A filled the channel, B stays"
+        );
+        assert_eq!(queue.len(), 1, "only B is still queued");
+        assert!(!drain_pending_to_channel(&mut queue, &tx), "channel still holds A");
+        let _ = rx.recv().unwrap();
+        assert!(!drain_pending_to_channel(&mut queue, &tx));
+        assert!(queue.is_empty(), "B delivered after A was read");
+        match rx.try_recv() {
+            Ok(event) => match event.as_ref() {
+                MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, source) => assert_eq!(source, "a"),
+                other => panic!("expected B, got {other:?}"),
+            },
+            Err(_) => panic!("B must arrive after the channel drains"),
+        }
+    }
+
+    #[test]
+    fn drain_on_disconnected_channel_reports_so_the_mailbox_is_cleared() {
+        // The forwarder is gone: nothing queued can ever be delivered, so the
+        // caller clears the mailbox instead of retrying forever.
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut queue = VecDeque::new();
+        coalesce_pending_event(
+            &mut queue,
+            Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "src".into())),
+            OUTPUT_RETRY_CAP,
+        );
+        drop(rx);
+        assert!(drain_pending_to_channel(&mut queue, &tx), "disconnect must be reported");
+        queue.clear();
+        assert!(queue.is_empty());
     }
 }
