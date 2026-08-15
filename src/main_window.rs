@@ -753,6 +753,12 @@ struct MainWindowState {
     settings_hover: Option<(usize, SettingSub)>,
     /// Native TOOLTIPS_CLASS control showing full history details on hover.
     tooltip_ctrl: HWND,
+    /// UTF-16 buffer backing the native tooltip's `lpszText` pointer. The
+    /// tooltip control requests text on demand via `TTN_GETDISPINFO` and reads
+    /// the pointer while shown; a single window-owned buffer is enough because
+    /// the previous tooltip is already hidden when the next request arrives.
+    /// `winutil::wide` appends the trailing NUL.
+    tooltip_text: Vec<u16>,
     /// Currently registered tool range [start, end) in the native tooltip:
     /// the visible band of listbox rows. Unchanged (count, top, size) skips
     /// the sync; a scroll only touches the rows that crossed the band.
@@ -976,6 +982,7 @@ impl MainWindowState {
             active_pane: Pane::Activity,
             settings_hover: None,
             tooltip_ctrl: HWND::default(),
+            tooltip_text: Vec::new(),
             tooltip_range: None,
             tooltips_dirty: false,
             logs_copied_at: None,
@@ -1255,6 +1262,33 @@ impl MainWindowState {
         }
     }
 
+    /// Where the listbox should rest after a history row has been inserted at
+    /// the top (after the header). Follow the newest row when the reader was
+    /// already at the top (top indices 0 and 1, where the insert is always
+    /// visible), so the activity stream stays in view; otherwise shift the view
+    /// down by one row so the row the reader was looking at stays under the
+    /// cursor instead of being yanked to the newest row on every track change.
+    /// `item_count` is the pre-insert row count; the result clamps to the
+    /// post-insert last index so a reader parked at the very bottom does not
+    /// scroll past the end.
+    fn history_top_after_insert(old_top: usize, item_count: usize) -> usize {
+        if old_top <= 1 {
+            old_top
+        } else {
+            (old_top + 1).min(item_count)
+        }
+    }
+
+    /// Fills `buffer` with the NUL-terminated UTF-16 tooltip text and returns a
+    /// pointer to it for `NMTTDISPINFOW.lpszText`. The buffer must stay alive
+    /// while the tooltip is shown; the caller keeps it on the window state, so
+    /// the previous tooltip is already gone by the time the next request
+    /// overwrites it.
+    fn tooltip_text_buffer(buffer: &mut Vec<u16>, text: &str) -> PWSTR {
+        *buffer = wide(text);
+        PWSTR(buffer.as_mut_ptr())
+    }
+
     /// Text for the native tooltip: the column header for row 0, otherwise
     /// the full details of the entry at the given row.
     fn tooltip_text_for(&self, row: usize) -> Option<String> {
@@ -1441,14 +1475,15 @@ impl MainWindowState {
             .unwrap_or(PlaybackState::Playing)
     }
 
-    /// Appends a history row and syncs the listbox + tooltips. Artwork, the
-    /// app icon and the decoded cover buffer are stripped before storing —
-    /// the history is text-only, and the image bytes would be pure waste
-    /// across hundreds of rows.
-    fn push_history(&mut self, mut track: TrackInfo, state: PlaybackState, accepted: bool) {
-        track.artwork = None;
-        track.app_icon = None;
-        track.decoded_art = None;
+    /// Appends a history row and syncs the listbox + tooltips. The track is
+    /// converted to its text-only form first (artwork, its decode, the app
+    /// icon and the palette stripped) — the history renders text only, and
+    /// `Arc`-pinned image buffers would be pure waste across hundreds of rows.
+    /// The listbox top stays where the reader left it: rows above the new one
+    /// only shift by one, so a scroll position mid-history is not yanked back
+    /// to the newest row on every track change.
+    fn push_history(&mut self, track: TrackInfo, state: PlaybackState, accepted: bool) {
+        let track = track.into_history_text();
         let at = Local::now();
         let at_label = at.format("%H:%M:%S").to_string();
         let row = history_row(&track, at, state);
@@ -1471,10 +1506,14 @@ impl MainWindowState {
         }
         if !self.listbox.0.is_null() {
             unsafe {
-                // Insert after the header row (index 0), so the newest entry
-                // is the first data row.
+                let count = SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
+                // Where the reader was before the insert: follow only when the
+                // new row would be visible anyway (top rows), otherwise shift
+                // the view down by one so the row under the cursor stays put.
+                let old_top = SendMessageW(self.listbox, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)).0 as usize;
                 let _ = SendMessageW(self.listbox, LB_INSERTSTRING, WPARAM(1), LPARAM(row.as_ptr() as isize));
-                let _ = SendMessageW(self.listbox, LB_SETTOPINDEX, WPARAM(0), LPARAM(0));
+                let new_top = Self::history_top_after_insert(old_top, count);
+                let _ = SendMessageW(self.listbox, LB_SETTOPINDEX, WPARAM(new_top), LPARAM(0));
             }
         }
         // Tooltip rebuilds are coalesced per event batch (receive_events) or
@@ -1495,11 +1534,10 @@ impl MainWindowState {
         if duplicate_state_row(&self.history.entries, current, state) {
             return;
         }
-        // Clone text-only: the artwork and icon bytes (up to MBs) are stripped
-        // before the clone so they are never copied just to be discarded.
-        let mut track = current.track.clone();
-        track.artwork = None;
-        track.app_icon = None;
+        // Convert to the history's text-only form before the clone so the
+        // image buffers (Arc-pinned covers, app icon, palette) are never copied
+        // just to be discarded.
+        let track = current.track.clone().into_history_text();
         self.push_history(track, state, true);
     }
 
@@ -1569,8 +1607,7 @@ impl MainWindowState {
             });
             if let Some(index) = entry_index {
                 let entry = &mut self.history.entries[index];
-                entry.track = track.clone();
-                entry.track.artwork = None;
+                entry.track = track.clone().into_history_text();
                 // Keep the row's original timestamp: only the metadata
                 // refreshed, and the tooltip formats from the same `at`.
                 let row = history_row(
@@ -1606,9 +1643,8 @@ impl MainWindowState {
         // inheriting another app's Playing/Paused/Stopped), then the source's
         // last remembered state, then Playing.
         let state = Self::resolve_track_state(&track, &self.source_states);
-        // History row is text-only: strip the artwork bytes before the clone.
-        let mut history_track = track.clone();
-        history_track.artwork = None;
+        // History row is text-only: drop the image buffers (consume a clone).
+        let history_track = track.clone().into_history_text();
         self.push_history(history_track, state, true);
         self.current = Some(CurrentActivity {
             track,
@@ -4290,12 +4326,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                 if header.code == TTN_GETDISPINFOW {
                     let state = &mut *state_ptr;
                     if let Some(text) = state.tooltip_text_for(header.idFrom) {
-                        let wide = wide(&text);
                         let info = unsafe { &mut *(lparam.0 as *mut NMTTDISPINFOW) };
-                        let copy = wide.len().min(info.szText.len() - 1);
-                        info.szText[..copy].copy_from_slice(&wide[..copy]);
-                        info.szText[copy] = 0;
-                        info.lpszText = PWSTR::null();
+                        // Point lpszText at a window-owned buffer instead of
+                        // copying into the built-in szText (bounded at 80 u16):
+                        // a long details string would otherwise truncate at 79
+                        // chars. The buffer stays valid until the next tooltip
+                        // request overwrites it, by which point this tooltip is
+                        // no longer being shown.
+                        info.lpszText = MainWindowState::tooltip_text_buffer(&mut state.tooltip_text, &text);
                         info.hinst = HINSTANCE::default();
                     }
                 }
@@ -5122,5 +5160,38 @@ mod tests {
         let titled = track("Song");
         let row = history_row(&titled, Local::now(), PlaybackState::Paused);
         assert!(row.contains("The Artist"));
+    }
+
+    #[test]
+    fn history_top_after_insert_follows_new_rows_at_top_and_holds_position() {
+        // At the top (header or first data row) the newest row stays in view.
+        assert_eq!(MainWindowState::history_top_after_insert(0, 10), 0);
+        assert_eq!(MainWindowState::history_top_after_insert(1, 10), 1);
+        // Reading lower down: the row under the cursor shifts down by one, not
+        // to the newest row.
+        assert_eq!(MainWindowState::history_top_after_insert(2, 10), 3);
+        assert_eq!(MainWindowState::history_top_after_insert(5, 10), 6);
+        // A reader at the very bottom clamps to the post-insert last index.
+        assert_eq!(MainWindowState::history_top_after_insert(9, 10), 10);
+        // An empty listbox (no rows yet) keeps the top at 0.
+        assert_eq!(MainWindowState::history_top_after_insert(0, 0), 0);
+    }
+
+    #[test]
+    fn tooltip_text_buffer_holds_the_full_string_and_is_nul_terminated() {
+        let mut buffer = Vec::new();
+        // A 256-char details string must not be truncated by the built-in
+        // szText (bounded at 80 u16) — the window-owned buffer keeps it whole.
+        let long = "x".repeat(256);
+        let ptr = MainWindowState::tooltip_text_buffer(&mut buffer, &long);
+        assert!(!ptr.is_null());
+        assert_eq!(buffer.len(), 257, "256 chars plus the trailing NUL");
+        assert_eq!(buffer[256], 0);
+        assert_eq!(String::from_utf16_lossy(&buffer[..256]), long);
+        // A later, shorter request reuses the same buffer in place.
+        let short = "y".repeat(40);
+        let _ = MainWindowState::tooltip_text_buffer(&mut buffer, &short);
+        assert_eq!(buffer.len(), 41);
+        assert_eq!(String::from_utf16_lossy(&buffer[..40]), short);
     }
 }

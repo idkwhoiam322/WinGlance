@@ -227,6 +227,23 @@ impl TrackInfo {
             self.playback_state = incoming.playback_state;
         }
     }
+
+    /// Consumes a track snapshot and returns the text-only form the session
+    /// history stores. The history renders text only, and the image fields are
+    /// `Arc`-pinned buffers (raw cover, its decode, the app icon) plus the
+    /// cover-derived palette — retaining them across hundreds of rows would pin
+    /// megabytes and keep recolor data no history site reads. Every history
+    /// insert and in-place update funnels through here so no path can store
+    /// image bytes.
+    pub fn into_history_text(self) -> TrackInfo {
+        TrackInfo {
+            artwork: None,
+            decoded_art: None,
+            palette: None,
+            app_icon: None,
+            ..self
+        }
+    }
 }
 
 /// Recovers the owned event from a queue's transport `Arc`: zero-copy when
@@ -486,5 +503,69 @@ mod tests {
             !shorter.same_media(&longer),
             "both known and different -> different media"
         );
+    }
+
+    #[test]
+    fn into_history_text_drops_all_image_fields_and_keeps_text() {
+        // The full-snapshot form (raw cover, decode, palette, app icon plus
+        // every text field) is what a history insert receives.
+        let full = TrackInfo {
+            artwork: art(b"cover"),
+            decoded_art: art(&[0u8; 8 * 8 * 4]),
+            palette: Some(crate::palette::Palette {
+                primary: [0x12, 0x34, 0x56, 0xFF],
+                secondary: [0x65, 0x43, 0x21, 0xFF],
+            }),
+            app_icon: art(&[7u8; 8 * 8 * 4]),
+            title: "Love Me Not".into(),
+            artist: "Ravyn Lenae".into(),
+            album: "Hypnos".into(),
+            album_artist: "Atlantic".into(),
+            subtitle: "bonus".into(),
+            source_app: "spotify".into(),
+            duration_secs: Some(140),
+            track_number: Some(2),
+            track_count: Some(14),
+            genre: Some("R&B".into()),
+            ..TrackInfo::default()
+        };
+        let text_only = full.clone().into_history_text();
+        assert!(text_only.artwork.is_none(), "raw cover bytes must go");
+        assert!(text_only.decoded_art.is_none(), "cover decode must go");
+        assert!(text_only.palette.is_none(), "palette must go");
+        assert!(text_only.app_icon.is_none(), "app icon must go");
+        assert_eq!(text_only.title, "Love Me Not");
+        assert_eq!(text_only.artist, "Ravyn Lenae");
+        assert_eq!(text_only.album, "Hypnos");
+        assert_eq!(text_only.album_artist, "Atlantic");
+        assert_eq!(text_only.subtitle, "bonus");
+        assert_eq!(text_only.source_app, "spotify");
+        assert_eq!(text_only.duration_secs, Some(140));
+        assert_eq!(text_only.track_number, Some(2));
+        assert_eq!(text_only.track_count, Some(14));
+        assert_eq!(text_only.genre.as_deref(), Some("R&B"));
+        // The original snapshot is untouched: into_history_text consumes a
+        // clone at call sites, so the activity's cover stays available.
+        assert!(full.artwork.is_some());
+        assert!(full.decoded_art.is_some());
+        assert!(full.palette.is_some());
+        assert!(full.app_icon.is_some());
+    }
+
+    #[test]
+    fn into_history_text_is_idempotent() {
+        // A refresh that updates a stored row re-runs the same conversion;
+        // there is nothing left to drop the second time.
+        let track = TrackInfo {
+            artwork: art(b"cover"),
+            ..TrackInfo::default()
+        };
+        let once = track.into_history_text();
+        let twice = once.clone().into_history_text();
+        assert_eq!(once.title, twice.title);
+        assert!(twice.artwork.is_none());
+        assert!(twice.decoded_art.is_none());
+        assert!(twice.palette.is_none());
+        assert!(twice.app_icon.is_none());
     }
 }
