@@ -285,6 +285,12 @@ struct ListenerState {
     /// overlay side, so attributing from this worker's emissions would
     /// suppress a re-emit whose pill never actually appeared.
     now_showing: Arc<Mutex<Option<String>>>,
+    /// Last-seen value of `config.behavior.notifications_enabled` on this worker
+    /// thread. A false→true transition (the toggle coming back on) triggers a
+    /// one-shot re-emit of the current session's track, so the pill surfaces the
+    /// live state immediately instead of waiting for the next media event —
+    /// which never diff-emits an unchanged track.
+    last_seen_enabled: bool,
     /// Cached app icons keyed by source_app label (derived from AUMID via
     /// `source_app_label`). Populated on first encounter of a source.
     icon_cache: HashMap<String, Option<Arc<[u8]>>>,
@@ -411,6 +417,15 @@ impl ListenerState {
         shutdown: Arc<AtomicBool>,
         now_showing: Arc<Mutex<Option<String>>>,
     ) -> Self {
+        // Sample the shared notifications flag before it is moved into the
+        // state: the worker polls it on every loop turn to detect a toggle back
+        // on (the worker has no main→worker control channel and must not miss
+        // the transition on a restart).
+        let last_seen_enabled = config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .behavior
+            .notifications_enabled;
         Self {
             manager,
             config,
@@ -432,6 +447,7 @@ impl ListenerState {
             last_track_per_source: HashMap::new(),
             last_known_playback_per_source: HashMap::new(),
             now_showing,
+            last_seen_enabled,
             icon_cache: HashMap::new(),
             cached_allowed: None,
             last_emit_at: HashMap::new(),
@@ -474,6 +490,7 @@ impl ListenerState {
                     }
                 }
             }
+            self.check_notifications_reenable();
             let timeout = self
                 .pending_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
@@ -566,6 +583,146 @@ impl ListenerState {
             }
         }
         Ok(())
+    }
+
+    /// Polls the shared `notifications_enabled` flag once per event-loop turn
+    /// and, on a false→true transition, forces the worker to re-emit the
+    /// current session's track. The overlay flips first (`TOGGLE_MSG` is posted
+    /// before `mutate_config` persists the write), so the re-emit always lands
+    /// on an enabled overlay; the overlay's own `last_track` restore covers the
+    /// narrow case where a queued `MEDIA_EVENT_MSG` is drained and dropped
+    /// before the toggle flips it. Without this, the worker keeps reading
+    /// sessions while notifications are off (it only suppresses at the overlay)
+    /// and has no media event to re-announce an unchanged track, so the pill
+    /// would wait for the next real action.
+    fn check_notifications_reenable(&mut self) {
+        let now_enabled = self
+            .config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .behavior
+            .notifications_enabled;
+        if reenable_reshow_warranted(self.last_seen_enabled, now_enabled)
+            && let Err(error) = self.reshow_current()
+        {
+            warn!("forced re-show on notifications re-enable failed: {error:#}");
+        }
+        self.last_seen_enabled = now_enabled;
+    }
+
+    /// Re-emits the current session's track on a notifications re-enable,
+    /// bypassing the diff gate. `refresh_session` only emits on a content diff,
+    /// so for an unchanged track there is nothing to re-announce and the pill
+    /// would stay hidden until the next media event. This does a fresh,
+    /// authoritative read (`read_artwork=true`) so the surfaced track is never
+    /// a stale cache entry: `store_last_track` can evict artwork from the cache
+    /// past the 64 MB budget, and `retry_artwork` never recovers an evicted
+    /// cover (it gates on the never-cleared `LogicalState.has_artwork`), so a
+    /// cache lookup would render an artless placeholder instead of the cover.
+    fn reshow_current(&mut self) -> Result<()> {
+        if !self.is_current_generation() {
+            return Ok(());
+        }
+        let Some(session) = self.manager.GetCurrentSession().ok() else {
+            // Re-enable with no current SMTC session means the source the pill
+            // is showing stopped or its app quit while notifications were off:
+            // no event reached the disabled overlay to settle a terminal
+            // Stopped, so `last_track` restored by the fast-path is stale.
+            // Emit one for the shown source so it swaps the stale track pill for
+            // a correct Stopped pill and dismisses it, rather than lingering.
+            // The fast-path restores `last_track` first (TOGGLE_MSG lands before
+            // the config write the worker reads), so this corrects it from below.
+            // The emit is gated on the source's disappearance being pending in
+            // this worker, so a transient `GetCurrentSession` failure while the
+            // source is still alive (not pending) never kills a live pill here.
+            self.emit_terminal_stopped_if_shown_unsettled();
+            return Ok(());
+        };
+        if !self.session_source_allowed(&session) || !self.should_follow_session(&session) {
+            let label = read_source_app(&session);
+            debug!("reshow skipped | reason=not-followed | source={label}");
+            return Ok(());
+        }
+        let playback_info = session.GetPlaybackInfo()?;
+        let status = playback_info.PlaybackStatus()?;
+        if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed {
+            return Ok(());
+        }
+        let playback = snapshot_playback_state(status);
+        let playback_type = session_playback_type(&session);
+        if playback_type == PlaybackType::Image {
+            return Ok(());
+        }
+        let mut merged = read_track_info(
+            &session,
+            true,
+            playback,
+            playback_info.PlaybackRate().ok().and_then(|r| r.Value().ok()),
+            playback_type,
+        )?;
+        if is_placeholder_like(&merged) {
+            debug!("reshow skipped | reason=placeholder | source={}", merged.source_app);
+            return Ok(());
+        }
+        // Inject the cached cover if the live thumbnail stream is still empty
+        // (SMTC populates art ~500ms after the title). The identity matches the
+        // last-emitted track, so this is the same cover, not a cross-track leak.
+        if merged.artwork.is_none()
+            && let Some(cached) = self.cached_artwork_for(&merged.source_app, &merged.title, &merged.artist)
+        {
+            merged.artwork = Some(cached);
+        }
+        let mut emitted = with_decoded_art(merged.clone(), crate::events::ARTWORK_DECODE as usize);
+        emitted.palette = self.palette_for_identity(&merged, emitted.decoded_art.as_deref());
+        // `read_track_info` carried the live playback snapshot above onto the
+        // track, so the pill does not infer a state from a lagging cache.
+        let label = track_label(&emitted);
+        info!("notifications re-enabled; track changed | {label}");
+        // Keep the caches current so the next diff-gated read does not re-emit
+        // the same track and so a recovered/evicted artwork is retained for
+        // later session-recreation dedup.
+        store_last_track(
+            &mut self.last_track_per_source,
+            merged.source_app.clone(),
+            merged.clone(),
+            MAX_RETAINED_ARTWORK_BYTES,
+        );
+        self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
+        self.emit(MediaEvent::TrackChanged(emitted));
+        Ok(())
+    }
+
+    /// Emits a terminal `Stopped` for the source the overlay's pill is
+    /// currently displaying, but only when that source's disappearance is
+    /// pending here: a subscribed session vanished and the settle grace has
+    /// not yet decided it is really gone (see `terminal_pending`). Pending
+    /// membership is snapshot-verified absence that survives until the settle
+    /// prunes it — unlike the per-source caches, which the settle already
+    /// evicted by the time the restored `last_track` can be stale — so the
+    /// gate is true exactly when the fast-path pill can no longer be
+    /// corrected from worker state, and false for a source still alive (a
+    /// transient `GetCurrentSession` failure must not kill a live pill).
+    /// A churning source stays silent while on the cool-down. Called from
+    /// `reshow_current` on a notifications re-enable with no current SMTC
+    /// session.
+    fn emit_terminal_stopped_if_shown_unsettled(&mut self) {
+        let Some(source) = self.shown_source() else {
+            return;
+        };
+        if reshow_terminal_stopped_warranted(
+            self.terminal_pending.contains_key(&source),
+            self.source_on_cooldown(&source),
+        ) {
+            // Mark the source Stopped so the next `sync_subscriptions` settle
+            // does not re-emit a terminal Stopped for the same disappearance: its
+            // gate is `terminal_stopped_warranted`, which is false for an
+            // already-announced Stopped. Mirrors `refresh_session`, which
+            // records the last-known state ahead of its emit.
+            self.last_known_playback_per_source
+                .insert(source.clone(), PlaybackState::Stopped);
+            info!("notifications re-enabled; stopped | source={source}");
+            self.emit(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, source));
+        }
     }
 
     /// Resolves everything pending at the deadline: a debounced session burst
@@ -1317,8 +1474,16 @@ impl ListenerState {
                 self.source_on_cooldown(&source),
             ) {
                 info!("playback state changed | state=Stopped | source={source}");
-                self.emit(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, source));
+                self.emit(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, source.clone()));
             }
+            // A settled source is gone for good: emit the overlay hygiene
+            // event unconditionally, even when no terminal Stopped was
+            // warranted (the state was already announced, or the source never
+            // reported one). Either way the overlay's fast-path standby
+            // (`last_track`/`held_content`) still holds this source's last
+            // track — it is stale now and must not resurrect on a later
+            // notifications re-enable.
+            self.emit(MediaEvent::SourceGone { source_app: source });
         }
         // Forget rejected sessions that vanished so a later reappearance is
         // reported again.
@@ -1886,6 +2051,7 @@ fn event_coalesce_key(event: &MediaEvent) -> (&'static str, Option<&str>) {
         MediaEvent::TrackChanged(track) => ("track", Some(track.source_app.as_str())),
         MediaEvent::PlaybackStateChanged(_, source) => ("playback", Some(source.as_str())),
         MediaEvent::SessionRejected { source_app, .. } => ("rejected", Some(source_app.as_str())),
+        MediaEvent::SourceGone { source_app } => ("gone", Some(source_app.as_str())),
         MediaEvent::ProgressChanged { source_app, .. } => ("progress", Some(source_app.as_str())),
         MediaEvent::WorkerFailed { .. } => ("worker-failed", None),
     }
@@ -2410,6 +2576,15 @@ fn session_playback_type(session: &GlobalSystemMediaTransportControlsSession) ->
         .and_then(|ty| ty.Value().ok())
         .map(map_playback_type)
         .unwrap_or(PlaybackType::Unknown)
+}
+
+/// Whether a `notifications_enabled` toggle warrants a forced worker re-emit
+/// of the current track. Only false→true does: the worker keeps reading
+/// sessions (and the overlay keeps dropping while disabled), so there is no
+/// media event to re-announce an unchanged track when notifications come back
+/// on. Pure, so the transition rule is directly testable.
+fn reenable_reshow_warranted(previously_enabled: bool, now_enabled: bool) -> bool {
+    !previously_enabled && now_enabled
 }
 
 /// Whether any displayed content field differs from the stored state.
@@ -2982,6 +3157,24 @@ fn terminal_stopped_warranted(last_known: Option<PlaybackState>, on_cooldown: bo
     !on_cooldown && matches!(last_known, Some(PlaybackState::Playing | PlaybackState::Paused))
 }
 
+/// Whether a notifications re-enable with no current SMTC session should emit a
+/// terminal `Stopped` for the source the overlay's pill is currently showing.
+/// `reshow_current` surfaces the current session's track via a live read, but only
+/// when a current session exists to read from: if the shown source stopped or quit
+/// while notifications were off, there is no session to re-read, so without this
+/// the stale `last_track` the fast-path restored would linger on the pill. The
+/// gate is the source's disappearance being pending (absent from the snapshot,
+/// inside the settle grace): that is verified absence that survives the cache
+/// evictions the settle runs, so it holds exactly when the restored pill can be
+/// stale — and never for a source still alive (a transient `GetCurrentSession`
+/// failure), nor for one already settled (its overlay standby was retired by
+/// `SourceGone`). A churning source stays silent while on the cool-down; the
+/// grace has already kept a mid-recreation source's entry alive, so the same
+/// 4 s tolerance that guards the settle also guards this emit.
+fn reshow_terminal_stopped_warranted(in_terminal_pending: bool, on_cooldown: bool) -> bool {
+    in_terminal_pending && !on_cooldown
+}
+
 /// Whether a pending terminal-Stopped entry survives this sync pass. A source
 /// that still has an open session in the snapshot is not gone at all; a source
 /// missing from the snapshot for less than `grace` may simply be mid-way
@@ -2998,6 +3191,21 @@ mod tests {
     use anyhow::anyhow;
 
     #[test]
+    fn reenable_reshow_warrants_only_the_false_to_true_toggle() {
+        // The worker keeps reading sessions while notifications are off (the
+        // overlay only suppresses the pill), so it has nothing new to emit for
+        // an unchanged track. Only a false→true transition needs a forced
+        // re-emit; toggling on twice, or off, or staying off, is a no-op.
+        assert!(!reenable_reshow_warranted(true, true), "no change while on");
+        assert!(!reenable_reshow_warranted(false, false), "no change while off");
+        assert!(!reenable_reshow_warranted(true, false), "turning off needs no re-emit");
+        assert!(
+            reenable_reshow_warranted(false, true),
+            "turning back on must force a re-show of the current track"
+        );
+    }
+
+    #[test]
     fn terminal_stopped_warranted_only_for_a_real_last_state_off_cooldown() {
         // A source that last played or paused owes the overlay a terminal
         // Stopped when its session vanishes.
@@ -3009,6 +3217,24 @@ mod tests {
         assert!(!terminal_stopped_warranted(None, false));
         // A churning source stays silent while on the cool-down.
         assert!(!terminal_stopped_warranted(Some(PlaybackState::Playing), true));
+    }
+
+    #[test]
+    fn reshow_terminal_stopped_warrants_only_for_a_pending_absence_off_cooldown() {
+        // A source whose subscribed session vanished (absent from the
+        // snapshot, inside the settle grace) is settled on re-enable with no
+        // current session, retiring the stale fast-path pill. Pending
+        // membership is the evidence that survives the settle's cache
+        // eviction, so a re-enable well after the settle still retires an
+        // already-restored stale pill.
+        assert!(reshow_terminal_stopped_warranted(true, false));
+        // A source that is not pending owes nothing: it is alive (a transient
+        // GetCurrentSession failure must not kill a live pill), or it settled
+        // and SourceGone already cleaned the overlay standby.
+        assert!(!reshow_terminal_stopped_warranted(false, false));
+        // A churning source stays silent while on the cool-down.
+        assert!(!reshow_terminal_stopped_warranted(true, true));
+        assert!(!reshow_terminal_stopped_warranted(false, true));
     }
 
     #[test]

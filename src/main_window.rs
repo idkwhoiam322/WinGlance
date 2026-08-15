@@ -1605,6 +1605,10 @@ impl MainWindowState {
                 // A live position refresh is not a notification: it does not add
                 // a history row, only updates the in-memory progress state below.
                 MediaEvent::ProgressChanged { .. } => {}
+                // The settle-time terminal Stopped (if any) already recorded the
+                // history row; the active-source list follows the session
+                // snapshot, not events. Overlay-standby hygiene only.
+                MediaEvent::SourceGone { .. } => {}
             }
         }
         if dirty {

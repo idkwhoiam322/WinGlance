@@ -1139,7 +1139,27 @@ impl OverlayState {
                 self.retire_source(source_app);
                 continue;
             }
+            // A source whose sessions all settled is gone for good. Its
+            // terminal Stopped (if any) was already delivered moments earlier
+            // in the same sync; this event is the cleanup that must land even
+            // while notifications are disabled — otherwise the fast-path
+            // restore on a later re-enable would surface the source's stale
+            // last track (the worker-side caches are pruned at settle, so
+            // nothing corrects it from below).
+            if let MediaEvent::SourceGone { source_app } = &event {
+                self.retire_source_gone(source_app);
+                continue;
+            }
             if !self.enabled {
+                // Notifications off: the ledger above stays live, and so does
+                // the track cache — the re-enable fast path restores the
+                // pinned source's *current* track, not the one cached before
+                // the disable. Same write discipline as the display paths
+                // (`cache_track` dedups by source and enforces the cap); only
+                // the cache is touched, nothing is shown or queued.
+                if let MediaEvent::TrackChanged(track) = &event {
+                    self.cache_track(track);
+                }
                 continue;
             }
             match event {
@@ -1360,9 +1380,11 @@ impl OverlayState {
                     self.enqueue(MediaEvent::PlaybackStateChanged(state, source_app));
                 }
                 MediaEvent::TrackChanged(_) | MediaEvent::PlaybackStateChanged(_, _) => {}
-                // Rejected sessions and worker failures are history-only:
-                // never shown as a pill.
-                MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } => {}
+                // Rejected sessions, settled sources and worker failures are
+                // history-only: never shown as a pill.
+                MediaEvent::SessionRejected { .. }
+                | MediaEvent::SourceGone { .. }
+                | MediaEvent::WorkerFailed { .. } => {}
             }
         }
         if !self.pending.is_empty() {
@@ -1387,11 +1409,14 @@ impl OverlayState {
         crate::repost_if_pending(&self.queue, &self.wake, self.hwnd, "overlay");
     }
 
-    /// Caches the last shown track for a source, moving the source to the
-    /// back of the recency order and evicting the oldest entry when the cap
-    /// is exceeded. A state pill for an evicted source falls back to the
-    /// source-name layout — the accepted degradation for a source that has
-    /// not played in a long time.
+    /// Caches the current track for a source, moving the source to the back
+    /// of the recency order and evicting the oldest entry when the cap is
+    /// exceeded. Written by the display paths for the track they show, and —
+    /// while notifications are disabled — by `receive_events` for every
+    /// incoming `TrackChanged`, so the re-enable restore serves the current
+    /// track rather than the pre-disable one. A state pill for an evicted
+    /// source falls back to the source-name layout — the accepted degradation
+    /// for a source that has not played in a long time.
     fn cache_track(&mut self, track: &TrackInfo) {
         let source = track.source_app.clone();
         // Move the source to the back of the recency order. The keys are
@@ -1478,6 +1503,7 @@ impl OverlayState {
             // Never queued (receive_events skips it); defensive for
             // exhaustiveness.
             MediaEvent::SessionRejected { .. }
+            | MediaEvent::SourceGone { .. }
             | MediaEvent::WorkerFailed { .. }
             | MediaEvent::ProgressChanged { .. } => {}
         }
@@ -1511,6 +1537,9 @@ impl OverlayState {
             }
             MediaEvent::WorkerFailed { .. } | MediaEvent::ProgressChanged { .. } => {
                 debug!("worker-failed event reached the pill queue; ignoring");
+            }
+            MediaEvent::SourceGone { .. } => {
+                debug!("source-gone event reached the pill queue; ignoring");
             }
         }
     }
@@ -1610,6 +1639,63 @@ impl OverlayState {
             .as_ref()
             .is_some_and(|track| track.source_app == retired)
         {
+            self.last_track = successor.clone();
+        }
+    }
+
+    /// A source's sessions all settled (absent from the snapshot past the
+    /// worker's terminal-Stop grace): the source stopped or its app quit for
+    /// real, so everything the fast-path could restore from it is stale.
+    /// Unlike `retire_source` (allow-list removal / churn cool-down), the
+    /// source may legitimately return, so its `track_cache` entry and the
+    /// now-showing cell are left to their normal lifetimes — only the
+    /// restoreable standby dies: queued notifications, the resume hold and
+    /// `last_track` swap to the most recent valid source or are cleared, and
+    /// a pill that is showing the gone source's **track** is retired so it
+    /// cannot linger as a stale "now playing".
+    /// A `PlaybackStateChanged` pill for the gone source is deliberately left
+    /// alone: the settle's terminal Stopped was emitted immediately before
+    /// this event in the same sync, so a state pill on screen is the
+    /// tombstone itself — hiding it early would cut the deliberate dismissal
+    /// UX. Runs regardless of the notifications toggle — a disabled overlay
+    /// must not restore the gone source's content at the next show.
+    fn retire_source_gone(&mut self, gone: &str) {
+        // Queued notifications from the gone source can never show now; drop
+        // them before hide() -> show_next() could re-show one.
+        self.pending.retain(|event| Self::event_source(event) != Some(gone));
+        let content_is_gone_track = matches!(
+            self.content.as_ref(),
+            Some(MediaEvent::TrackChanged(track)) if track.source_app == gone
+        );
+        let held_is_gone_track = matches!(
+            self.held_content.as_ref(),
+            Some(MediaEvent::TrackChanged(track)) if track.source_app == gone
+        );
+        let last_is_gone = self.last_track.as_ref().is_some_and(|track| track.source_app == gone);
+        if !content_is_gone_track && !held_is_gone_track && !last_is_gone {
+            return;
+        }
+        let successor = self.latest_valid_track(gone);
+        if content_is_gone_track {
+            if let Some(track) = &successor {
+                debug!("settled source {gone}: swapping the pill to the most recent valid source");
+                let full = Duration::from_millis(self.config.overlay.duration_ms.max(500));
+                self.current_source = Some(track.source_app.clone());
+                self.last_track = Some(track.clone());
+                self.cache_track(track);
+                self.update_content(MediaEvent::TrackChanged(track.clone()), full);
+            } else {
+                debug!("settled source {gone}: hiding the pill (no valid content remains)");
+                self.held_content = None;
+                self.last_track = None;
+                self.hide();
+                return;
+            }
+        }
+        if held_is_gone_track {
+            self.held_content = successor.as_ref().map(|track| MediaEvent::TrackChanged(track.clone()));
+        }
+        if last_is_gone {
             self.last_track = successor.clone();
         }
     }
@@ -2974,6 +3060,37 @@ impl OverlayState {
         if !self.enabled {
             self.pending.clear();
             self.hide();
+        } else {
+            // Re-enabling: surface the last shown track immediately. The worker
+            // re-reads the current session within ~2s (its poll detects the
+            // config write) and re-emits the live track, which then refreshes
+            // this pill in place via the same_media / same_source_shown dedup.
+            // This fast-path closes the ordering edge case in which a queued
+            // MEDIA_EVENT_MSG is drained and dropped by `!self.enabled` before
+            // the toggle flips it; the worker's re-emit then lands on the
+            // now-enabled overlay and corrects or refreshes the pill.
+            // Otherwise restore the most recent cached track that is
+            // *actually playing* instead of the pre-disable last-shown track:
+            // the cache is kept fresh while notifications are disabled, so a
+            // song change on any playing source is surfaced on re-enable (the
+            // same "swap only to sources still playing" discipline; the
+            // worker's ~2s re-emit then refreshes artwork in place). This
+            // applies both with no pin and when the pin exists but cannot be
+            // restored (paused/stopped/unknown): `best_successor("")`
+            // excludes no source, and the playing filter can never return the
+            // pin's own track in the paused case — a playing pin would have
+            // been served by `pinned_track` above.
+            if let Some(track) = self.best_successor("") {
+                self.show(MediaEvent::TrackChanged(track), true);
+            } else if let Some(held) = self.held_content.take() {
+                self.show(MediaEvent::TrackChanged(track), true);
+            } else if let Some(held) = self.held_content.take() {
+                self.show(held, true);
+            } else if let Some(track) = self.last_track.clone() {
+                self.show(MediaEvent::TrackChanged(track), true);
+            }
+            // If neither is available, the worker's re-show read surfaces the
+            // current track through the normal receive_events path.
         }
     }
 
@@ -3461,6 +3578,9 @@ mod tests {
     use windows::Win32::Graphics::Gdi::{
         BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DT_NOPREFIX, DT_SINGLELINE,
         DT_VCENTER, DrawTextW, HMONITOR, SetBkMode, SetTextColor, TRANSPARENT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DestroyWindow, DispatchMessageW, GetMessageW, TranslateMessage, WINDOW_EX_STYLE, WM_NULL,
     };
 
     #[test]
@@ -5071,6 +5191,545 @@ mod tests {
             "the pill must be flagged to collapse (not fade to idle) on dismiss"
         );
         assert!(state.held_content.is_some(), "the content must be saved for resume");
+    }
+
+    #[test]
+    fn re_enable_restores_the_last_track_as_a_fast_path() {
+        // Disabling hides the pill (clearing `content` but not `last_track`);
+        // re-enabling must surface the last shown track immediately, so a
+        // MEDIA_EVENT_MSG drained ahead of TOGGLE_MSG cannot strand the pill
+        // hidden. The worker's forced re-show (within ~2s) then refreshes it
+        // in place via the same_media / same_source_shown dedup.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        let track = track_for("spotify", "Song", "Artist");
+        state.last_track = Some(track);
+
+        // Simulate toggle-off (notifications disabled, pill hidden).
+        state.enabled = false;
+        state.phase = Phase::Hidden;
+        assert!(state.content.is_none());
+
+        // Re-enable -> the else-branch restores last_track at once.
+        state.toggle_enabled();
+
+        assert!(state.enabled, "notifications must be re-enabled");
+        assert!(
+            !matches!(state.phase, Phase::Hidden),
+            "the pill must show immediately on re-enable, not wait for the worker"
+        );
+        assert!(
+            matches!(&state.content, Some(MediaEvent::TrackChanged(t)) if t.source_app == "spotify" && t.title == "Song"),
+            "last_track must be restored as the shown content"
+        );
+        assert!(
+            state.last_track.is_some(),
+            "last_track is cloned (not consumed) so the worker can refresh it in place"
+        );
+    }
+
+    /// Serializes the wndproc tests that create a real window: the overlay
+    /// class registration is guarded by a process-wide OnceLock whose guard
+    /// check and RegisterClassExW are not atomic, so two parallel tests would
+    /// race the registration (the loser fails with "Class already exists").
+    /// The lock restores the single-registration semantics production relies
+    /// on; production itself never races because the window is created once,
+    /// on the UI thread, at startup.
+    static WNDPROC_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Creates a hidden overlay window wired to the production wndproc and
+    /// class: the state box lives in the window's GWLP_USERDATA slot (exactly
+    /// what WM_NCCREATE sets in production), so dispatching posted messages
+    /// through it exercises the real message path. The baseline state is a
+    /// persistent-compact overlay with `last_track` set, notifications
+    /// disabled, and a test foreground verdict. Returns `(hwnd, state_ptr,
+    /// queue)`; the caller pushes events into `queue`, pumps messages, and
+    /// finishes with `destroy_wndproc_overlay`.
+    fn spawn_wndproc_overlay() -> (HWND, *mut OverlayState, EventQueue) {
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.expect("process module").into();
+        register_window_class(instance, &wide("WinGlanceOverlayWindow")).expect("the overlay class registers");
+
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut state = Box::new(OverlayState::new(config, queue.clone()));
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.last_track = Some(track_for("spotify", "Song", "Artist"));
+        state.enabled = false;
+        state.phase = Phase::Hidden;
+        let state_ptr = Box::into_raw(state);
+
+        let hwnd = unsafe {
+            crate::winapi::create_window(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(wide("WinGlanceOverlayWindow").as_ptr()),
+                PCWSTR(wide("WinGlance test").as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                instance,
+                None,
+            )
+        }
+        .expect("the test overlay window must be created");
+        set_window_state(hwnd, state_ptr);
+        (hwnd, state_ptr, queue)
+    }
+
+    /// Posts `messages` to `hwnd` in order, followed by a WM_NULL sentinel,
+    /// and pumps them through a GetMessageW loop (the same FIFO drain
+    /// production's message_loop performs). The sentinel is retrieved only
+    /// after everything posted ahead of it was dispatched, so its arrival
+    /// marks the drain complete without ever blocking.
+    fn pump_posted_messages(hwnd: HWND, messages: &[u32]) {
+        for &message in messages {
+            unsafe { crate::winapi::post_message(hwnd, message, WPARAM(0), LPARAM(0)) }.expect("the message must post");
+        }
+        unsafe { crate::winapi::post_message(hwnd, WM_NULL, WPARAM(0), LPARAM(0)) }.expect("the sentinel must post");
+        let mut msg = MSG::default();
+        loop {
+            let result = unsafe { GetMessageW(&mut msg, Some(hwnd), 0, 0) };
+            assert!(result.0 > 0, "GetMessageW must retrieve the posted messages");
+            if msg.message == WM_NULL {
+                break;
+            }
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    /// Frees the state box and destroys the window. Clears the routing slot
+    /// first so WM_NCDESTROY sees a null state and does not free the box
+    /// twice.
+    fn destroy_wndproc_overlay(hwnd: HWND, state_ptr: *mut OverlayState) {
+        clear_window_state(hwnd);
+        drop(unsafe { Box::from_raw(state_ptr) });
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn toggle_via_the_wndproc_survives_a_medial_event_drained_while_disabled() {
+        // End-to-end through the real message path, not the method call: a
+        // MEDIA_EVENT_MSG queued while notifications are disabled drains
+        // first (the event is only cached, nothing is shown), then TOGGLE_MSG
+        // re-enables and the fast-path restore must still surface the pill.
+        let _serialize = WNDPROC_TEST_LOCK.lock().unwrap();
+        let (hwnd, state_ptr, queue) = spawn_wndproc_overlay();
+        queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "spotify",
+                "New Song",
+                "New Artist",
+            ))));
+        pump_posted_messages(hwnd, &[MEDIA_EVENT_MSG, TOGGLE_MSG]);
+
+        let state = unsafe { &mut *state_ptr };
+        assert!(state.enabled, "notifications must be re-enabled");
+        assert!(
+            state.track_cache.get("spotify").is_some_and(|t| t.title == "New Song"),
+            "the disabled drain must still cache the track for the restore"
+        );
+        assert!(
+            !matches!(state.phase, Phase::Hidden),
+            "the pill must show immediately, not wait for the worker's re-emit"
+        );
+        assert!(
+            matches!(&state.content, Some(MediaEvent::TrackChanged(t)) if t.source_app == "spotify" && t.title == "Song"),
+            "the drained MEDIA_EVENT_MSG must not strand the pill: the fast-path restore surfaces the last shown track"
+        );
+        destroy_wndproc_overlay(hwnd, state_ptr);
+    }
+
+    #[test]
+    fn toggle_via_the_wndproc_reaches_the_newer_track_when_the_toggle_lands_first() {
+        // The opposite FIFO outcome, pinned through the same real queue: with
+        // TOGGLE_MSG posted first, the fast-path restore surfaces the last
+        // track, and the MEDIA_EVENT_MSG that follows lands on the now-
+        // enabled pill, swapping it in place to the newer track (same-source
+        // update). Together the two tests pin both arrival orders the
+        // production comments rely on.
+        let _serialize = WNDPROC_TEST_LOCK.lock().unwrap();
+        let (hwnd, state_ptr, queue) = spawn_wndproc_overlay();
+        queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "spotify",
+                "New Song",
+                "New Artist",
+            ))));
+        pump_posted_messages(hwnd, &[TOGGLE_MSG, MEDIA_EVENT_MSG]);
+
+        let state = unsafe { &mut *state_ptr };
+        assert!(state.enabled, "notifications must be re-enabled");
+        assert!(
+            !matches!(state.phase, Phase::Hidden),
+            "the pill must be showing after the toggle and the media event"
+        );
+        assert!(
+            matches!(&state.content, Some(MediaEvent::TrackChanged(t)) if t.source_app == "spotify" && t.title == "New Song"),
+            "the media event must update the enabled pill in place to the newer track"
+        );
+        assert!(
+            state.track_cache.get("spotify").is_some_and(|t| t.title == "New Song"),
+            "the enabled drain must cache the newer track too"
+        );
+        destroy_wndproc_overlay(hwnd, state_ptr);
+    }
+
+    #[test]
+    fn track_cache_stays_fresh_while_notifications_are_disabled() {
+        // Disabling must not freeze the track cache: a song change on the
+        // pinned source while notifications are off is still cached, so the
+        // re-enable fast path restores the exact current track rather than
+        // the pre-disable one (the worker's ~2s re-emit would eventually
+        // correct it, but the fast path should not need to wait on it).
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("spotify".into());
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut state = OverlayState::new(config, queue.clone());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        // Cache the pre-disable track; the pin is still playing.
+        state.cache_track(&track_for("spotify", "Old Song", "Old Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Playing);
+        state.enabled = false;
+        state.phase = Phase::Hidden;
+        assert!(state.content.is_none());
+
+        // The pinned source changes songs while notifications are disabled.
+        queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "spotify",
+                "New Song",
+                "New Artist",
+            ))));
+        state.receive_events();
+
+        assert_eq!(
+            state.pending.len(),
+            0,
+            "no pill may be queued while notifications are disabled"
+        );
+        assert!(
+            state.content.is_none(),
+            "no pill may be shown while notifications are disabled"
+        );
+        assert!(
+            matches!(state.track_cache.get("spotify"), Some(t) if t.title == "New Song"),
+            "the track cache must be refreshed while notifications are disabled"
+        );
+
+        state.toggle_enabled();
+
+        assert!(
+            matches!(
+                &state.content,
+                Some(MediaEvent::TrackChanged(t)) if t.title == "New Song"
+            ),
+            "re-enable must restore the exact current pinned track, not the pre-disable one"
+        );
+    }
+
+    #[test]
+    fn re_enable_without_a_pin_restores_the_most_recent_playing_cached_track() {
+        // No pin: the re-enable fast path must surface the most recent cached
+        // track that is *actually playing* — the cache is kept fresh while
+        // notifications are disabled — instead of the pre-disable last-shown
+        // track. The most recent playing source wins over an older playing
+        // one and over the stale last-shown track.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        // Older playing source first, then the newer one (recency order).
+        state.cache_track(&track_for("brave", "Brave Song", "Brave Artist"));
+        state.source_state.insert("brave".into(), PlaybackState::Playing);
+        state.cache_track(&track_for("spotify", "New Song", "New Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Playing);
+        // The pre-disable last-shown track is a third, unrelated source.
+        state.last_track = Some(track_for("vlc", "VLC Song", "VLC Artist"));
+
+        state.enabled = false;
+        state.phase = Phase::Hidden;
+        state.toggle_enabled();
+
+        assert!(
+            matches!(
+                &state.content,
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "spotify" && t.title == "New Song"
+            ),
+            "the most recent playing cached track must win over the older one and the last-shown track"
+        );
+    }
+
+    #[test]
+    fn re_enable_without_a_pin_falls_back_to_the_last_track_when_nothing_cached_is_playing() {
+        // The "swap only to sources still playing" gate applies to the
+        // no-pin search too: a cached source that is paused or stopped is not
+        // restored, so the pre-disable last-shown track remains the fallback.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&track_for("spotify", "Paused Song", "Paused Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Paused);
+        state.last_track = Some(track_for("brave", "Brave Song", "Brave Artist"));
+
+        state.enabled = false;
+        state.phase = Phase::Hidden;
+        state.toggle_enabled();
+
+        assert!(
+            matches!(
+                &state.content,
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "brave" && t.title == "Brave Song"
+            ),
+            "no playing cached source: the last shown track wins"
+        );
+    }
+
+    #[test]
+    fn re_enable_without_a_pin_prefers_a_playing_cached_track_over_held_content() {
+        // The same preference applies when the fast-path standby is the
+        // resume hold: a playing cached track is live state, the held content
+        // is a pre-disable snapshot, so the live track wins.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&track_for("spotify", "New Song", "New Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Playing);
+        state.held_content = Some(MediaEvent::TrackChanged(track_for(
+            "brave",
+            "Brave Song",
+            "Brave Artist",
+        )));
+
+        state.enabled = false;
+        state.phase = Phase::Hidden;
+        state.toggle_enabled();
+
+        assert!(
+            matches!(
+                &state.content,
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "spotify" && t.title == "New Song"
+            ),
+            "a playing cached track must win over the held pre-disable content"
+        );
+    }
+
+    #[test]
+    fn re_enable_with_a_paused_pin_prefers_a_playing_non_pin_source() {
+        // The pinned source paused while notifications were disabled: the pin
+        // itself is not restored (the "swap only to sources still playing"
+        // gate), but the playing-cache search is not gated on "no pin" — a
+        // live non-pin source with a cached track wins over the stale
+        // last-shown track. The playing filter guarantees the paused pin's
+        // own track cannot be the search result.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        // The paused pin is the older cache entry; a live non-pin source is
+        // the newer one (recency order).
+        state.cache_track(&track_for("spotify", "Pinned Song", "Pinned Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Paused);
+        state.cache_track(&track_for("brave", "Brave Song", "Brave Artist"));
+        state.source_state.insert("brave".into(), PlaybackState::Playing);
+        state.last_track = Some(track_for("vlc", "VLC Song", "VLC Artist"));
+
+        state.enabled = false;
+        state.phase = Phase::Hidden;
+        state.toggle_enabled();
+
+        assert!(
+            matches!(
+                &state.content,
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "brave" && t.title == "Brave Song"
+            ),
+            "a paused pin must not be restored; the most recent live non-pin source wins over the stale last-shown track"
+        );
+    }
+
+    #[test]
+    fn source_gone_clears_the_fast_path_standby_while_disabled() {
+        // Post-settle re-enable regression: a source whose sessions settled
+        // while notifications were off left track/state pills and a playback
+        // tombstone queued or held; SourceGone must clean every restoreable
+        // site even though the overlay is disabled, so the fast-path on a
+        // later re-enable has nothing stale to surface.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.enabled = false;
+        state.phase = Phase::Hidden;
+        let track = track_for("spotify", "Song", "Artist");
+        state.content = Some(MediaEvent::TrackChanged(track.clone()));
+        // The resume hold and the fast-path restore source, plus a queued
+        // notification from the same source.
+        state.held_content = Some(MediaEvent::TrackChanged(track.clone()));
+        state.last_track = Some(track.clone());
+        state.pending.push_back(MediaEvent::TrackChanged(track));
+
+        state.queue.lock().unwrap().push_back(Arc::new(MediaEvent::SourceGone {
+            source_app: "spotify".into(),
+        }));
+        state.receive_events();
+
+        assert!(
+            state.pending.is_empty(),
+            "queued events of the gone source must be dropped"
+        );
+        assert!(state.held_content.is_none(), "the resume hold must be cleared");
+        assert!(
+            state.last_track.is_none(),
+            "the fast-path restore source must be cleared"
+        );
+        assert!(state.content.is_none(), "the stale track pill must be hidden");
+
+        // Re-enable: the fast-path finds nothing to restore, so the pill
+        // stays hidden instead of resurrecting the settled source's track.
+        state.toggle_enabled();
+        assert!(state.enabled);
+        assert!(state.content.is_none(), "no stale track may be restored on re-enable");
+        assert!(matches!(state.phase, Phase::Hidden), "the pill must stay hidden");
+    }
+
+    #[test]
+    fn source_gone_retires_a_shown_stale_track_but_keeps_the_tombstone() {
+        // A TrackChanged pillow for the gone source is stale "now playing"
+        // content: SourceGone must retire it. The Stopped tombstone is the
+        // retirement itself, so it stays on screen to finish its dismissal
+        // UX — only the restoreable standby dies around it.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Shown;
+        let track = track_for("spotify", "Song", "Artist");
+        state.content = Some(MediaEvent::TrackChanged(track.clone()));
+        state.last_track = Some(track);
+        state.queue.lock().unwrap().push_back(Arc::new(MediaEvent::SourceGone {
+            source_app: "spotify".into(),
+        }));
+        state.receive_events();
+        assert!(state.content.is_none(), "the stale track pill must be dismissed");
+        assert!(state.last_track.is_none(), "the standby must die with its source");
+        assert!(matches!(state.phase, Phase::Hidden), "nothing valid remains to show");
+
+        // Same source, but the shown content is the Stopped tombstone: it is
+        // left in place, while the standby is still cleaned.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Shown;
+        state.content = Some(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Stopped,
+            "spotify".into(),
+        ));
+        state.last_track = Some(track_for("spotify", "Song", "Artist"));
+        state.queue.lock().unwrap().push_back(Arc::new(MediaEvent::SourceGone {
+            source_app: "spotify".into(),
+        }));
+        state.receive_events();
+        assert!(
+            matches!(&state.content, Some(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, s)) if s == "spotify"),
+            "the Stopped tombstone must survive SourceGone"
+        );
+        assert!(
+            state.last_track.is_none(),
+            "the standby must die even under a tombstone"
+        );
+    }
+
+    #[test]
+    fn source_gone_swaps_the_standby_to_the_most_recent_valid_source() {
+        // A pill (and its standby sites) showing the gone source swaps to the
+        // newest cached track from a source that still matters — same
+        // succession rule as retire_source.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Shown;
+        let gone = track_for("spotify", "Song", "Artist");
+        let survivor = track_for("brave", "Survivor", "Artist");
+        state.cache_track(&gone);
+        state.cache_track(&survivor);
+        state.content = Some(MediaEvent::TrackChanged(gone.clone()));
+        state.held_content = Some(MediaEvent::TrackChanged(gone.clone()));
+        state.last_track = Some(gone);
+
+        state.queue.lock().unwrap().push_back(Arc::new(MediaEvent::SourceGone {
+            source_app: "spotify".into(),
+        }));
+        state.receive_events();
+
+        assert!(
+            matches!(&state.content, Some(MediaEvent::TrackChanged(t)) if t.source_app == "brave" && t.title == "Survivor"),
+            "the pill must swap to the most recent valid source"
+        );
+        assert!(
+            matches!(&state.last_track, Some(t) if t.source_app == "brave"),
+            "the fast-path restore source must swap to the survivor"
+        );
+        assert!(
+            matches!(&state.held_content, Some(MediaEvent::TrackChanged(t)) if t.source_app == "brave"),
+            "the resume hold must swap to the survivor"
+        );
+    }
+
+    #[test]
+    fn source_gone_of_an_unrelated_source_is_a_noop() {
+        // Hygiene must be scoped: another source settling (its own stopped
+        // tombstone may be next in the batch) must not touch this pill or its
+        // standby.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Shown;
+        let track = track_for("spotify", "Song", "Artist");
+        state.content = Some(MediaEvent::TrackChanged(track.clone()));
+        state.last_track = Some(track);
+
+        state.queue.lock().unwrap().push_back(Arc::new(MediaEvent::SourceGone {
+            source_app: "brave".into(),
+        }));
+        state.receive_events();
+
+        assert!(
+            matches!(&state.content, Some(MediaEvent::TrackChanged(t)) if t.source_app == "spotify"),
+            "an unrelated SourceGone must not retire the shown pill"
+        );
+        assert!(
+            state.last_track.is_some(),
+            "an unrelated SourceGone must not clear the standby"
+        );
     }
 
     #[test]

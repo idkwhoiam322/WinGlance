@@ -317,6 +317,17 @@ pub enum MediaEvent {
         duration_secs: Option<u64>,
         playback_rate: Option<f64>,
     },
+    /// A subscribed source's sessions are all gone and its terminal settle
+    /// already ran (they stayed absent past `TERMINAL_STOP_GRACE`): the
+    /// source stopped or its app quit for real. Overlay hygiene event,
+    /// delivered even while notifications are disabled (pre-gate, like
+    /// `SessionRejected`): it retires the overlay's fast-path standby
+    /// (`last_track`/`held_content`), so a later re-enable can never restore
+    /// a track whose source is gone. Never rendered as a pill and never
+    /// stored as the active content.
+    SourceGone {
+        source_app: String,
+    },
 }
 
 /// Side length the SMTC worker decodes album art to (square), fixed for every

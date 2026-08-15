@@ -153,9 +153,10 @@ pub(super) fn content_size_of(config: &Config, content: &MediaEvent, compact: bo
         }
         // Never shown (receive_events skips it); the .max(1.0) guards keep the
         // size sane if this dead arm is ever reached.
-        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } | MediaEvent::ProgressChanged { .. } => {
-            (0.0, 0.0)
-        }
+        MediaEvent::SessionRejected { .. }
+        | MediaEvent::SourceGone { .. }
+        | MediaEvent::WorkerFailed { .. }
+        | MediaEvent::ProgressChanged { .. } => (0.0, 0.0),
     }
 }
 

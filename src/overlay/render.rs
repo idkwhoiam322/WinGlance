@@ -488,9 +488,10 @@ pub(super) fn draw_pixels(
                     .and_then(|(t, _)| t.decoded_art.clone())
             }
         }
-        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } | MediaEvent::ProgressChanged { .. } => {
-            None
-        }
+        MediaEvent::SessionRejected { .. }
+        | MediaEvent::SourceGone { .. }
+        | MediaEvent::WorkerFailed { .. }
+        | MediaEvent::ProgressChanged { .. } => None,
     };
     state.ensure_art(decoded.as_ref());
     let inset = state.aura_inset as usize;
@@ -634,6 +635,7 @@ pub(super) fn draw_pixels(
             // Never rendered: SessionRejected is filtered out before enqueue.
             (
                 MediaEvent::SessionRejected { .. }
+                | MediaEvent::SourceGone { .. }
                 | MediaEvent::WorkerFailed { .. }
                 | MediaEvent::ProgressChanged { .. },
                 _,
@@ -1892,7 +1894,10 @@ pub(super) fn draw_expanded_pill_text(
             }
         }
         // Never rendered: SessionRejected is filtered out before enqueue.
-        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } | MediaEvent::ProgressChanged { .. } => {}
+        MediaEvent::SessionRejected { .. }
+        | MediaEvent::SourceGone { .. }
+        | MediaEvent::WorkerFailed { .. }
+        | MediaEvent::ProgressChanged { .. } => {}
     }
 }
 
@@ -2007,7 +2012,10 @@ pub(super) fn draw_compact_pill(
             }
         }
         // Never rendered: SessionRejected is filtered out before enqueue.
-        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } | MediaEvent::ProgressChanged { .. } => {
+        MediaEvent::SessionRejected { .. }
+        | MediaEvent::SourceGone { .. }
+        | MediaEvent::WorkerFailed { .. }
+        | MediaEvent::ProgressChanged { .. } => {
             return;
         }
     };
@@ -2128,7 +2136,10 @@ pub(super) fn draw_morph_content(
             }
         }
         // Never rendered: SessionRejected is filtered out before enqueue.
-        MediaEvent::SessionRejected { .. } | MediaEvent::WorkerFailed { .. } | MediaEvent::ProgressChanged { .. } => {
+        MediaEvent::SessionRejected { .. }
+        | MediaEvent::SourceGone { .. }
+        | MediaEvent::WorkerFailed { .. }
+        | MediaEvent::ProgressChanged { .. } => {
             return;
         }
     };
