@@ -32,8 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST, IsWindowVisible, KillTimer, MA_NOACTIVATE, MSG, PM_REMOVE,
     PeekMessageW, PostMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetTimer, SetWindowPos, ShowWindow, WINEVENT_OUTOFCONTEXT, WM_APP,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT,
+    WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -3289,11 +3289,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         }
         WM_DISPLAYCHANGE => {
             // A display was added, removed, or reordered (or its resolution
-            // changed). The per-frame target resolution picks the new layout
-            // up on its own; here, a visible pill is moved onto the re-resolved
-            // target immediately instead of waiting for the next tick, and the
-            // refresh-rate cache is dropped so the animation timer re-samples
-            // the target's rate.
+            // changed). Invalidate the display snapshot FIRST: a monitor that
+            // was just removed or reordered must not resolve against the
+            // up-to-1-second-old cache, or the pill could be placed onto a
+            // stale handle. The per-frame target resolution picks the new
+            // layout up on its own; here, a visible pill is moved onto the
+            // re-resolved target immediately instead of waiting for the next
+            // tick (reposition rerenders when the new target's DPI differs),
+            // and the refresh-rate cache is dropped so the animation timer
+            // re-samples the target's rate.
+            invalidate_display_cache();
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 state.period_cache = None;
@@ -3301,7 +3306,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     state.reposition();
                 }
             }
-            invalidate_display_cache();
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            // The window was moved onto a display with a different DPI. This
+            // window (not the system) owns its placement: ignore the suggested
+            // rect and reposition at the resolved target instead — reposition
+            // rerenders when the target's DPI differs from the fonts' DPI, so
+            // the pill re-sizes and re-places at the new DPI with no stale
+            // size or hitbox. While hidden there is nothing to move (the next
+            // show renders against the then-current target).
+            if !state_ptr.is_null() && !matches!((*state_ptr).phase, Phase::Hidden) {
+                let state = &mut *state_ptr;
+                state.reposition();
+            }
             LRESULT(0)
         }
         FOREGROUND_CHANGE_MSG => {
