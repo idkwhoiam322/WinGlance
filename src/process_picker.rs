@@ -677,7 +677,14 @@ pub(crate) fn open(
             // (picker) HWND is carried in the subclass ref data; PickerState is
             // read from that window's GWLP_USERDATA and the subclass is unhooked
             // on WM_NCDESTROY.
-            let _ = SetWindowSubclass(lb, Some(listbox_proc), LISTBOX_SUBCLASS_ID, hwnd.0 as usize);
+            // Without the subclass the click-to-toggle and keyboard behavior
+            // would be silently missing while `open` reported success, so a
+            // failed install is a hard error: log it and close the picker.
+            if !SetWindowSubclass(lb, Some(listbox_proc), LISTBOX_SUBCLASS_ID, hwnd.0 as usize).as_bool() {
+                warn!("installing the picker listbox subclass failed; closing the picker");
+                let _ = DestroyWindow(hwnd);
+                return false;
+            }
 
             let row_h = (ROW_HEIGHT as f32 * scale).round() as i32;
             let _ = SendMessageW(lb, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(row_h as isize));
