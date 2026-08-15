@@ -35,14 +35,20 @@ use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenC
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::UI::Accessibility::{
+    ToggleState_Off, ToggleState_On, UIA_AutomationFocusChangedEventId, UIA_ButtonControlTypeId,
+    UIA_CheckBoxControlTypeId, UIA_ToggleToggleStatePropertyId, UiaRaiseAutomationEvent,
+    UiaRaiseAutomationPropertyChangedEvent, UiaReturnRawElementProvider, UiaRootObjectId,
+};
 use windows::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, NMHDR, NMTTDISPINFOW, ODS_SELECTED, TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_DELTOOLW,
-    TTM_SETMAXTIPWIDTH, TTM_SETTOOLINFOW, TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX, WM_MOUSELEAVE,
+    DRAWITEMSTRUCT, NMHDR, NMTTDISPINFOW, ODS_SELECTED, SetScrollInfo, ShowScrollBar, TOOLTIPS_CLASSW, TTF_SUBCLASS,
+    TTM_ADDTOOLW, TTM_DELTOOLW, TTM_SETMAXTIPWIDTH, TTM_SETTOOLINFOW, TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX,
+    WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN,
-    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME,
+    VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -53,17 +59,25 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindowVisible, KillTimer, LB_ADDSTRING,
     LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT,
     LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos,
-    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT,
-    WM_RBUTTONUP, WM_SETFONT, WM_SIZE, WM_TIMER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
-    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP,
+    SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLBAR_COMMAND, SCROLLINFO, SIF_PAGE,
+    SIF_POS, SIF_RANGE, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT,
+    WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
 const WM_TRAY: u32 = WM_APP + 2;
+
+/// UIA activation: a Settings control's stable runtime id, posted by the
+/// provider's Invoke/Toggle. The id is re-resolved against the live layout in
+/// the handler, so a scrolled or rebuilt pane can never act on a different
+/// control than the one invoked.
+pub(crate) const WM_SETTINGS_ACTIVATE_MSG: u32 = WM_APP + 13;
 const TRAY_ID: u32 = 1;
 const MENU_OPEN_ID: usize = 1001;
 const MENU_PREVIEW_NOTIFY_ID: usize = 1029;
@@ -197,6 +211,15 @@ enum SettingsItem {
     },
 }
 
+/// The laid-out settings items plus the natural (unscrolled) document bottom in
+/// client pixels. `content_extent` lets the scroll range be derived from a layout
+/// that ignores the live `settings_scroll_y`, so the same geometry powers paint,
+/// hit-test, focus, scroll and the UIA provider.
+struct SettingsLayout {
+    items: Vec<SettingsItem>,
+    content_extent: i32,
+}
+
 /// A keyboard-focusable Settings-pane control. `cx`/`cy` is the window client
 /// coordinate at the control's center — the keyboard handler activates a control
 /// by posting a synthetic `WM_LBUTTONDOWN` there, so it reuses the existing mouse
@@ -290,7 +313,7 @@ fn fingerprint(data: &[u8]) -> u64 {
 
 /// Which sub-control of a settings row is being hovered/clicked.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum SettingSub {
+pub(crate) enum SettingSub {
     None,
     Seg(usize),
     Anchor(usize),
@@ -339,6 +362,24 @@ fn row_split(rect: &RECT, scale: f32) -> RowSplit {
             bottom: rect.bottom,
         },
     }
+}
+
+/// Shifts a rect vertically by `dy` client pixels, applying the shared Settings
+/// scroll offset. Width and horizontal position are unchanged.
+fn offset_rect(rect: RECT, dy: i32) -> RECT {
+    RECT {
+        top: rect.top + dy,
+        bottom: rect.bottom + dy,
+        ..rect
+    }
+}
+
+/// Clamps a Settings-pane scroll offset to the reachable range. The largest
+/// offset keeps the document bottom flush with the viewport bottom; when the
+/// content fits, the only valid offset is zero. Pure and testable.
+fn clamp_settings_scroll(scroll_y: i32, content_extent: i32, client_h: i32) -> i32 {
+    let max = (content_extent - client_h).max(0);
+    scroll_y.clamp(0, max)
 }
 
 /// Splits `rect` down the middle with a small gap, for rows that host two
@@ -751,6 +792,10 @@ struct MainWindowState {
     active_pane: Pane,
     /// Hovered settings row (row index, sub-control) for highlight.
     settings_hover: Option<(usize, SettingSub)>,
+    /// Vertical scroll offset (client pixels) for the Settings pane. Every
+    /// settings layout rect is shifted up by this amount, so all controls stay
+    /// reachable on a small viewport. Zero when the content fits.
+    settings_scroll_y: i32,
     /// Native TOOLTIPS_CLASS control showing full history details on hover.
     tooltip_ctrl: HWND,
     /// UTF-16 buffer backing the native tooltip's `lpszText` pointer. The
@@ -981,6 +1026,7 @@ impl MainWindowState {
             accent_art_source: None,
             active_pane: Pane::Activity,
             settings_hover: None,
+            settings_scroll_y: 0,
             tooltip_ctrl: HWND::default(),
             tooltip_text: Vec::new(),
             tooltip_range: None,
@@ -1167,6 +1213,10 @@ impl MainWindowState {
             );
             if self.active_pane != Pane::Activity {
                 let _ = ShowWindow(self.tooltip_ctrl, SW_HIDE);
+                // The dynamic settings scrollbar belongs to the Settings pane
+                // alone; leaving the pane hides it even when the document
+                // still overflows.
+                let _ = ShowScrollBar(self.hwnd, SB_VERT, false);
             }
         }
     }
@@ -2024,16 +2074,21 @@ impl MainWindowState {
 
     /// Builds the settings pane items (section headers + interactive rows).
     /// Both painting and hit-testing use this single source of layout truth.
-    fn settings_items(&self, content_left: i32, client_w: i32, pad: i32, scale: f32) -> Vec<SettingsItem> {
+    /// Lays out the Settings pane items. `scroll_y` shifts every rect up by that
+    /// many client pixels; `content_extent` reports the natural document bottom
+    /// (ignoring `scroll_y`) so the scroll range can be derived without a second
+    /// layout. Paint, hit-test, hover, focus and the UIA provider all read the
+    /// same offset rects, so scrolling stays consistent across every path.
+    fn settings_items(&self, content_left: i32, client_w: i32, pad: i32, scale: f32, scroll_y: i32) -> SettingsLayout {
         let row_h = (34.0 * scale) as i32;
         let gap = (8.0 * scale) as i32;
         let header_h = (18.0 * scale) as i32;
         let left = content_left + pad;
         let right = client_w - pad;
         let mut y = pad + (36.0 * scale) as i32;
-        let mut items = Vec::new();
+        let mut natural = Vec::new();
 
-        items.push(SettingsItem::Header {
+        natural.push(SettingsItem::Header {
             text: "Behavior",
             rect: RECT {
                 left,
@@ -2050,7 +2105,7 @@ impl MainWindowState {
             SettingId::CloseToTray,
             SettingId::AllowedApps,
         ] {
-            items.push(SettingsItem::Row {
+            natural.push(SettingsItem::Row {
                 id,
                 rect: RECT {
                     left,
@@ -2062,7 +2117,7 @@ impl MainWindowState {
             y += row_h + gap;
         }
         y += (14.0 * scale) as i32;
-        items.push(SettingsItem::Header {
+        natural.push(SettingsItem::Header {
             text: "Overlay",
             rect: RECT {
                 left,
@@ -2072,7 +2127,7 @@ impl MainWindowState {
             },
         });
         y += (22.0 * scale) as i32;
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::Layout,
             rect: RECT {
                 left,
@@ -2082,7 +2137,7 @@ impl MainWindowState {
             },
         });
         y += row_h + gap;
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::Position,
             rect: RECT {
                 left,
@@ -2093,7 +2148,7 @@ impl MainWindowState {
             },
         });
         y += (70.0 * scale) as i32 + gap;
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::SeparateCompact,
             rect: RECT {
                 left,
@@ -2103,7 +2158,7 @@ impl MainWindowState {
             },
         });
         y += row_h + gap;
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::CompactPosition,
             rect: RECT {
                 left,
@@ -2114,7 +2169,7 @@ impl MainWindowState {
             },
         });
         y += (70.0 * scale) as i32 + gap;
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::DismissOnHover,
             rect: RECT {
                 left,
@@ -2124,7 +2179,7 @@ impl MainWindowState {
             },
         });
         y += row_h + gap;
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::ExpandCompactOnHover,
             rect: RECT {
                 left,
@@ -2134,7 +2189,7 @@ impl MainWindowState {
             },
         });
         y += row_h + gap;
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::AutoCompactApps,
             rect: RECT {
                 left,
@@ -2144,7 +2199,7 @@ impl MainWindowState {
             },
         });
         y += row_h + gap;
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::HideForAutoCompactSources,
             rect: RECT {
                 left,
@@ -2154,7 +2209,7 @@ impl MainWindowState {
             },
         });
         y += row_h + gap;
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::FadePersistentPill,
             rect: RECT {
                 left,
@@ -2164,7 +2219,7 @@ impl MainWindowState {
             },
         });
         y += row_h + gap;
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::Monitor,
             rect: RECT {
                 left,
@@ -2174,7 +2229,7 @@ impl MainWindowState {
             },
         });
         y += row_h + gap;
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::ShowSample,
             rect: RECT {
                 left,
@@ -2185,7 +2240,7 @@ impl MainWindowState {
         });
         y += row_h + gap;
         y += (14.0 * scale) as i32;
-        items.push(SettingsItem::Header {
+        natural.push(SettingsItem::Header {
             text: "Diagnostics",
             rect: RECT {
                 left,
@@ -2195,7 +2250,7 @@ impl MainWindowState {
             },
         });
         y += (22.0 * scale) as i32;
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::CopyLogs,
             rect: RECT {
                 left,
@@ -2206,7 +2261,7 @@ impl MainWindowState {
         });
         y += row_h + gap;
         if let Some(status) = self.config_status {
-            items.push(SettingsItem::Banner {
+            natural.push(SettingsItem::Banner {
                 text: banner_text(status),
                 rect: RECT {
                     left,
@@ -2218,7 +2273,7 @@ impl MainWindowState {
             y += row_h + gap;
             y += (8.0 * scale) as i32;
         }
-        items.push(SettingsItem::Row {
+        natural.push(SettingsItem::Row {
             id: SettingId::OpenConfig,
             rect: RECT {
                 left,
@@ -2227,7 +2282,45 @@ impl MainWindowState {
                 bottom: y + row_h,
             },
         });
-        items
+        // The document bottom is the lowest item bottom (not the running `y`,
+        // which is not advanced past a final row) plus a pad of breathing room
+        // so the final control is not flush against the edge.
+        let content_extent = natural
+            .iter()
+            .map(|item| match item {
+                SettingsItem::Header { rect, .. }
+                | SettingsItem::Row { rect, .. }
+                | SettingsItem::Banner { rect, .. } => rect.bottom,
+            })
+            .max()
+            .unwrap_or(0)
+            + pad;
+        let dy = -scroll_y;
+        let items = natural
+            .into_iter()
+            .map(|item| match item {
+                SettingsItem::Header { text, rect } => SettingsItem::Header {
+                    text,
+                    rect: offset_rect(rect, dy),
+                },
+                SettingsItem::Row { id, rect } => SettingsItem::Row {
+                    id,
+                    rect: offset_rect(rect, dy),
+                },
+                SettingsItem::Banner { text, rect } => SettingsItem::Banner {
+                    text,
+                    rect: offset_rect(rect, dy),
+                },
+            })
+            .collect();
+        SettingsLayout { items, content_extent }
+    }
+
+    /// Natural document height of the Settings pane, independent of the live
+    /// scroll offset. Used to size the scroll range and clamp the thumb.
+    fn settings_content_extent(&self, content_left: i32, client_w: i32, pad: i32, scale: f32) -> i32 {
+        self.settings_items(content_left, client_w, pad, scale, 0)
+            .content_extent
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2283,7 +2376,9 @@ impl MainWindowState {
             );
         }
 
-        let items = self.settings_items(content_left, client_w, pad, scale);
+        let items = self
+            .settings_items(content_left, client_w, pad, scale, self.settings_scroll_y)
+            .items;
         let brushes = SettingsBrushes {
             border: self.settings_border_brush,
             surface: self.settings_surface_brush,
@@ -2940,7 +3035,9 @@ impl MainWindowState {
         pad: i32,
         scale: f32,
     ) -> Option<(usize, SettingSub)> {
-        let items = self.settings_items(content_left, client_w, pad, scale);
+        let items = self
+            .settings_items(content_left, client_w, pad, scale, self.settings_scroll_y)
+            .items;
         let mut row_index = 0usize;
         for item in &items {
             if let SettingsItem::Row { id, rect } = item
@@ -3029,7 +3126,9 @@ impl MainWindowState {
     /// at `(cx, cy)`, so this enumeration must stay in lockstep with the hover
     /// geometry in `settings_hover_at`.
     fn settings_focus_targets(&self, content_left: i32, client_w: i32, pad: i32, scale: f32) -> Vec<SettingsFocus> {
-        let items = self.settings_items(content_left, client_w, pad, scale);
+        let items = self
+            .settings_items(content_left, client_w, pad, scale, self.settings_scroll_y)
+            .items;
         let mut out = Vec::new();
         let gap = (4.0 * scale) as i32;
         let mut row_index = 0usize;
@@ -3140,6 +3239,57 @@ impl MainWindowState {
             self.settings_hover = new_hover;
             self.invalidate_hover_rows(client_w, old, new_hover);
         }
+        // Keep the focused control on screen: when it would fall outside the
+        // visible band, recenter it in the viewport. The scroll change repaints
+        // and keeps the native scrollbar in sync.
+        let (_, client_h) = client_size(self.hwnd);
+        let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
+        let row_h = (34.0 * scale) as i32;
+        if t.cy < self.settings_scroll_y + row_h / 2 || t.cy > self.settings_scroll_y + client_h - row_h / 2 {
+            self.settings_scroll_y = t.cy - client_h / 2;
+            self.sync_settings_scroll(client_w, client_h);
+        }
+        raise_settings_focus_event(self.hwnd, new_hover);
+    }
+
+    /// Clamps the live Settings scroll offset to the reachable range, repaints
+    /// when it moves, and keeps the native vertical scrollbar synced. The main
+    /// window is created without WS_VSCROLL: the scrollbar is shown dynamically
+    /// (only while Settings is active and the content overflows), so the
+    /// Activity pane never shows it. Call after any scroll change (wheel,
+    /// keyboard, thumb, focus auto-scroll, pane switch, resize).
+    fn sync_settings_scroll(&mut self, client_w: i32, client_h: i32) {
+        let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
+        let pad = (PAD * scale) as i32;
+        let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+        let extent = self.settings_content_extent(sidebar_w, client_w, pad, scale);
+        let new_y = clamp_settings_scroll(self.settings_scroll_y, extent, client_h);
+        if new_y != self.settings_scroll_y {
+            self.settings_scroll_y = new_y;
+            self.invalidate();
+        }
+        if self.active_pane == Pane::Settings && !self.hwnd.0.is_null() {
+            let scrollable = extent > client_h;
+            unsafe {
+                let si = SCROLLINFO {
+                    cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                    fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+                    nMin: 0,
+                    nMax: extent,
+                    nPage: client_h as u32,
+                    nPos: self.settings_scroll_y,
+                    ..Default::default()
+                };
+                let _ = SetScrollInfo(self.hwnd, SB_VERT, &si, true);
+                let _ = ShowScrollBar(self.hwnd, SB_VERT, scrollable);
+            }
+        }
+    }
+
+    /// Applies a scroll delta (client pixels) then syncs the range.
+    fn scroll_settings_by(&mut self, delta: i32, client_w: i32, client_h: i32) {
+        self.settings_scroll_y = self.settings_scroll_y.saturating_add(delta);
+        self.sync_settings_scroll(client_w, client_h);
     }
 
     fn layout(&self) {
@@ -3350,7 +3500,9 @@ impl MainWindowState {
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let sidebar_w = (SIDEBAR_W * scale).round() as i32;
         let pad = (PAD * scale) as i32;
-        let items = self.settings_items(sidebar_w, client_w, pad, scale);
+        let items = self
+            .settings_items(sidebar_w, client_w, pad, scale, self.settings_scroll_y)
+            .items;
         for (row, _) in [old, new].into_iter().flatten() {
             // Row indices count rows only (headers are skipped), so walk the
             // row items to find the rect at that ordinal.
@@ -4203,7 +4355,296 @@ fn show_tray_menu(state: &mut MainWindowState) {
     }
 }
 
+/// The number of equal segments a settings row's control is split into for its
+/// segmented controls. Must stay in lockstep with `settings_focus_targets` and
+/// the row's click handler.
+fn setting_segment_count(id: SettingId) -> usize {
+    match id {
+        SettingId::Duration => 5,
+        SettingId::Layout => 4,
+        _ => 1,
+    }
+}
+
 #[allow(unsafe_op_in_unsafe_fn)]
+/// The point inside a settings row's `rect` that activates `sub` — the same
+/// geometry the provider enumerates. `None` when the layout has no such
+/// sub-control (a stale or foreign encoded tag).
+fn setting_sub_click_point(id: SettingId, sub: SettingSub, rect: &RECT, scale: f32) -> Option<(i32, i32)> {
+    let control = row_split(rect, scale).control;
+    let center = |r: &RECT| ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+    match sub {
+        SettingSub::None => Some(center(&control)),
+        SettingSub::Seg(i) => {
+            let count = setting_segment_count(id);
+            segment_rects(&control, count, (4.0 * scale) as i32).get(i).map(center)
+        }
+        SettingSub::Anchor(i) => position_parts(rect, scale).anchors.get(i).map(center),
+        SettingSub::Reset => Some(center(&position_parts(rect, scale).reset)),
+        SettingSub::Adjust => Some(center(&position_parts(rect, scale).adjust)),
+        SettingSub::Open | SettingSub::OpenConfig => {
+            let (open, _) = halve(&control, (4.0 * scale) as i32);
+            Some(center(&open))
+        }
+        SettingSub::Copy | SettingSub::ReloadConfig => {
+            let (_, copy) = halve(&control, (4.0 * scale) as i32);
+            Some(center(&copy))
+        }
+    }
+}
+
+/// Applies one settings row's action exactly as the mouse path does: `id` is
+/// activated for a click at client `(x, y)` within its `rect`. Shared by the
+/// real `WM_LBUTTONDOWN` hit-test and the UIA activation message, so both
+/// stay on a single dispatch.
+fn apply_settings_row_click(
+    state: &mut MainWindowState,
+    hwnd: HWND,
+    id: &SettingId,
+    row_index: usize,
+    rect: &RECT,
+    x: i32,
+    y: i32,
+    scale: f32,
+) {
+    let control_rect = row_split(rect, scale).control;
+    let toggle_before = setting_toggle_on(*id, &state.cfg());
+    match id {
+        SettingId::Notifications => {
+            let new_value = !state.cfg().behavior.notifications_enabled;
+            // Flip the overlay first; persist only when
+            // the toggle reaches it, so the config and
+            // the pill can never desync.
+            if unsafe { PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0)) }.is_err() {
+                error!("posting the notifications toggle to the overlay failed");
+            } else {
+                state.mutate_config(|cfg| cfg.behavior.notifications_enabled = new_value);
+            }
+            state.invalidate();
+        }
+        SettingId::StartOnLogin => {
+            let new_value = !state.cfg().behavior.start_on_login;
+            // Write the registry entry before committing
+            // the config value: a failed write must not
+            // persist a state the registry does not
+            // reflect.
+            if let Err(error) = autostart::apply(new_value) {
+                error!("start-on-login update failed: {error:#}");
+            } else {
+                state.mutate_config(|cfg| cfg.behavior.start_on_login = new_value);
+            }
+            state.invalidate();
+        }
+        SettingId::CloseToTray => {
+            let new_value = !state.cfg().behavior.close_to_tray;
+            state.mutate_config(|cfg| cfg.behavior.close_to_tray = new_value);
+            info!("close to tray {}", if new_value { "enabled" } else { "disabled" });
+            state.invalidate();
+        }
+        SettingId::Duration => {
+            let segments = segment_rects(&control_rect, 5, (4.0 * scale) as i32);
+            let values = [2000u64, 3000, 5000, 10000];
+            if let Some((i, _)) = segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right) {
+                // The Custom tile asks for a value; the
+                // chosen one is applied like a preset.
+                if i == 4 {
+                    let current_ms = state.cfg().overlay.duration_ms;
+                    if let Some(duration) = crate::duration_dialog::show_duration_dialog(hwnd, current_ms) {
+                        state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
+                        set_duration(state.overlay_hwnd, duration);
+                        info!("custom overlay duration set to {duration} ms");
+                    }
+                } else {
+                    let duration = values[i];
+                    state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
+                    set_duration(state.overlay_hwnd, duration);
+                }
+                state.invalidate();
+            }
+        }
+        SettingId::Layout => {
+            let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
+            let values = [
+                LayoutMode::Expanded,
+                LayoutMode::Compact,
+                LayoutMode::Auto,
+                LayoutMode::PersistentCompact,
+            ];
+            if let Some((i, _)) = segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right) {
+                let mode = values[i];
+                state.mutate_config(|cfg| cfg.overlay.layout = mode);
+                set_layout(state.overlay_hwnd, mode);
+                info!("layout mode set: {mode:?}");
+                state.invalidate();
+            }
+        }
+        SettingId::DismissOnHover => {
+            let new_value = !state.cfg().overlay.dismiss_on_hover;
+            state.mutate_config(|cfg| cfg.overlay.dismiss_on_hover = new_value);
+            set_dismiss_on_hover(state.overlay_hwnd, new_value);
+            info!("dismiss on hover set: {new_value}");
+            state.invalidate();
+        }
+        SettingId::ExpandCompactOnHover => {
+            let new_value = !state.cfg().overlay.expand_compact_on_hover;
+            state.mutate_config(|cfg| cfg.overlay.expand_compact_on_hover = new_value);
+            set_expand_compact_on_hover(state.overlay_hwnd, new_value);
+            info!("expand compact on hover set: {new_value}");
+            state.invalidate();
+        }
+        SettingId::HideForAutoCompactSources => {
+            let new_value = !state.cfg().behavior.hide_for_auto_compact_sources;
+            state.mutate_config(|cfg| cfg.behavior.hide_for_auto_compact_sources = new_value);
+            set_hide_for_auto_compact_sources(state.overlay_hwnd, new_value);
+            info!("hide for auto compact sources set: {new_value}");
+            state.invalidate();
+        }
+        SettingId::FadePersistentPill => {
+            let new_value = !state.cfg().overlay.fade_persistent_pill;
+            state.mutate_config(|cfg| cfg.overlay.fade_persistent_pill = new_value);
+            set_fade_persistent_pill(state.overlay_hwnd, new_value);
+            info!("fade persistent pill set: {new_value}");
+            state.invalidate();
+        }
+        SettingId::SeparateCompact => {
+            let new_value = !state.cfg().overlay.compact_position_separate;
+            state.set_compact_separate(new_value);
+            state.invalidate();
+        }
+        SettingId::CompactPosition => {
+            // Always editable: clicks land in the raw
+            // compact_* fields. While "follows
+            // Expanded" is ON the row mirrors the
+            // Expanded position and these edits are
+            // stored, taking visible effect once the
+            // follow toggle is OFF or the pill is
+            // actually compact.
+            let parts = position_parts(rect, scale);
+            if let Some((i, _)) = parts
+                .anchors
+                .iter()
+                .enumerate()
+                .find(|(_, a)| x >= a.left && x < a.right && y >= a.top && y < a.bottom)
+            {
+                let (v, h) = match i {
+                    0 => (VerticalPosition::Top, HorizontalPosition::Left),
+                    1 => (VerticalPosition::Top, HorizontalPosition::Center),
+                    2 => (VerticalPosition::Top, HorizontalPosition::Right),
+                    3 => (VerticalPosition::Bottom, HorizontalPosition::Left),
+                    4 => (VerticalPosition::Bottom, HorizontalPosition::Center),
+                    _ => (VerticalPosition::Bottom, HorizontalPosition::Right),
+                };
+                state.apply_compact_anchor(v, h);
+            } else if x >= parts.reset.left && x < parts.reset.right && y >= parts.reset.top && y < parts.reset.bottom {
+                state.reset_compact_position();
+            } else if x >= parts.adjust.left
+                && x < parts.adjust.right
+                && y >= parts.adjust.top
+                && y < parts.adjust.bottom
+            {
+                let _ = crate::positioner::open_compact(hwnd, state.overlay_hwnd);
+            }
+            state.invalidate();
+        }
+        SettingId::AutoCompactApps => {
+            if !process_picker::open(
+                hwnd,
+                &control_rect,
+                &state.cfg().behavior.auto_compact_sources,
+                state.auto_sources_result.clone(),
+                AUTO_SOURCES_RESULT_MSG,
+            ) {
+                debug!("auto-compact sources picker failed to open");
+            }
+        }
+        SettingId::Position => {
+            let parts = position_parts(rect, scale);
+            if let Some((i, _)) = parts
+                .anchors
+                .iter()
+                .enumerate()
+                .find(|(_, a)| x >= a.left && x < a.right && y >= a.top && y < a.bottom)
+            {
+                let (v, h) = match i {
+                    0 => (VerticalPosition::Top, HorizontalPosition::Left),
+                    1 => (VerticalPosition::Top, HorizontalPosition::Center),
+                    2 => (VerticalPosition::Top, HorizontalPosition::Right),
+                    3 => (VerticalPosition::Bottom, HorizontalPosition::Left),
+                    4 => (VerticalPosition::Bottom, HorizontalPosition::Center),
+                    _ => (VerticalPosition::Bottom, HorizontalPosition::Right),
+                };
+                state.apply_anchor(v, h);
+            } else if x >= parts.reset.left && x < parts.reset.right && y >= parts.reset.top && y < parts.reset.bottom {
+                state.reset_position();
+            } else if x >= parts.adjust.left
+                && x < parts.adjust.right
+                && y >= parts.adjust.top
+                && y < parts.adjust.bottom
+            {
+                let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
+            }
+            // Repaint in the same frame the anchor was
+            // clicked: the row's highlighted anchor and
+            // value changed, and — while the compact
+            // pill follows — the compact row's mirror
+            // must update without waiting for the next
+            // mouse move.
+            state.invalidate();
+        }
+        SettingId::ShowSample => {
+            show_sample(state.overlay_hwnd);
+        }
+        SettingId::Monitor => {
+            // One click steps to the next choice
+            // (Active window → Primary → Display 1 →
+            // … → back); the tray menu offers direct
+            // selection.
+            let displays = enumerate_displays_cached();
+            let next = next_monitor_mode(state.cfg().overlay.monitor, displays.len());
+            state.apply_monitor(next);
+            state.invalidate();
+        }
+        SettingId::CopyLogs => {
+            let gap = (4.0 * scale) as i32;
+            let (open_rect, _copy_rect) = halve(&control_rect, gap);
+            if x >= open_rect.left && x < open_rect.right {
+                state.open_logs();
+                state.logs_opened_at = Some(Instant::now());
+                unsafe { SetTimer(hwnd, TIMER_OPENED_ID, 2000, None) };
+                state.invalidate();
+            } else {
+                state.copy_logs();
+            }
+        }
+        SettingId::OpenConfig => {
+            let gap = (4.0 * scale) as i32;
+            let (open_rect, _reload_rect) = halve(&control_rect, gap);
+            if x >= open_rect.left && x < open_rect.right {
+                state.open_config();
+                state.config_opened_at = Some(Instant::now());
+                unsafe { SetTimer(hwnd, TIMER_OPENED_ID, 2000, None) };
+                state.invalidate();
+            } else {
+                state.reload_config();
+            }
+        }
+        SettingId::AllowedApps => {
+            if !process_picker::open(
+                hwnd,
+                &control_rect,
+                &state.cfg().behavior.media_sources,
+                state.picker_result.clone(),
+                PICKER_RESULT_MSG,
+            ) {
+                debug!("process picker failed to open");
+            }
+        }
+    }
+    if setting_is_toggle(*id) {
+        raise_settings_toggle_event(hwnd, row_index, toggle_before, setting_toggle_on(*id, &state.cfg()));
+    }
+}
+
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Explorer (re)started and rebuilt the notification area: re-add the
     // tray icon, which Explorer's restart wiped.
@@ -4264,6 +4705,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_SIZE => {
             if !state_ptr.is_null() {
                 (*state_ptr).layout();
+                // A new client height re-clamps the Settings scroll range and
+                // may show/hide the dynamic scrollbar.
+                let (client_w, client_h) = client_size(hwnd);
+                (*state_ptr).sync_settings_scroll(client_w, client_h);
             }
             LRESULT(0)
         }
@@ -4340,6 +4785,84 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             }
             LRESULT(0)
         }
+        WM_VSCROLL => {
+            // The dynamic vertical scrollbar drives Settings-pane scrolling;
+            // outside the Settings pane the message belongs to the default
+            // handler (the Activity listbox has its own scrollbar).
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                if state.active_pane == Pane::Settings {
+                    let (client_w, client_h) = client_size(state.hwnd);
+                    let scale = unsafe { GetDpiForWindow(state.hwnd).max(96) } as f32 / 96.0;
+                    let row_h = (34.0 * scale) as i32;
+                    let page = (client_h - row_h).max(row_h);
+                    let code = (wparam.0 & 0xFFFF) as i32;
+                    let delta = match SCROLLBAR_COMMAND(code) {
+                        SB_LINEUP => -row_h,
+                        SB_LINEDOWN => row_h,
+                        SB_PAGEUP => -page,
+                        SB_PAGEDOWN => page,
+                        // Absolute jumps: a delta that the clamp turns into
+                        // the real top/bottom without risking overflow.
+                        SB_TOP => -state.settings_scroll_y,
+                        SB_BOTTOM => i32::MAX,
+                        SB_THUMBPOSITION | SB_THUMBTRACK => {
+                            let requested = (wparam.0 >> 16) as i32;
+                            requested - state.settings_scroll_y
+                        }
+                        _ => 0,
+                    };
+                    state.scroll_settings_by(delta, client_w, client_h);
+                    return LRESULT(0);
+                }
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        WM_MOUSEWHEEL => {
+            // In the Settings pane the wheel scrolls the settings document;
+            // everywhere else it falls through so children (the history
+            // listbox) and the default handler keep their wheel behavior.
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                if state.active_pane == Pane::Settings {
+                    let (client_w, client_h) = client_size(state.hwnd);
+                    let scale = unsafe { GetDpiForWindow(state.hwnd).max(96) } as f32 / 96.0;
+                    let row_h = (34.0 * scale) as i32;
+                    // Three rows per wheel notch; wheel-up (positive) scrolls the
+                    // content up (toward smaller offsets).
+                    let notches = (((wparam.0 >> 16) as i16 as i32) / 120).clamp(-128, 128);
+                    state.scroll_settings_by(-notches * 3 * row_h, client_w, client_h);
+                    return LRESULT(0);
+                }
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        WM_GETOBJECT => {
+            // UI Automation asks for a provider with lParam == UiaRootObjectId;
+            // MSAA OBJID_* queries keep the DefWindowProcW answer. Only the
+            // Settings pane is exposed, and only once the window state exists
+            // (installed at WM_NCCREATE, before any UIA query can arrive on a
+            // created window). Provider construction is panic-contained so an
+            // internal error can never unwind across the OS callback boundary.
+            if lparam.0 == UiaRootObjectId as isize
+                && !state_ptr.is_null()
+                && unsafe { (*state_ptr).active_pane == Pane::Settings }
+            {
+                let provider = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::accessibility::settings_provider(hwnd)
+                }));
+                match provider {
+                    Ok(Some(provider)) => {
+                        return UiaReturnRawElementProvider(hwnd, wparam, lparam, &provider);
+                    }
+                    Ok(None) => {}
+                    Err(panic) => {
+                        error!("the settings UIA provider panicked: {panic:?}");
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
         WM_KEYDOWN => {
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
@@ -4360,7 +4883,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                             let old = state.settings_hover;
                             state.settings_hover = new_hover;
                             state.invalidate_hover_rows(client_w, old, new_hover);
+                            raise_settings_focus_event(hwnd, new_hover);
                         }
+                        let (client_w, client_h) = client_size(hwnd);
+                        state.sync_settings_scroll(client_w, client_h);
                         state.invalidate();
                     }
                     return LRESULT(0);
@@ -4410,6 +4936,30 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                         state.invalidate_hover_rows(client_w, old, None);
                         state.invalidate();
                     }
+                    VK_PRIOR => {
+                        // PageUp: scroll one viewport up without moving focus.
+                        let (_, client_h) = client_size(hwnd);
+                        let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+                        let row_h = (34.0 * scale) as i32;
+                        state.scroll_settings_by(-(client_h - row_h).max(row_h), client_w, client_h);
+                    }
+                    VK_NEXT => {
+                        // PageDown: scroll one viewport down.
+                        let (_, client_h) = client_size(hwnd);
+                        let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+                        let row_h = (34.0 * scale) as i32;
+                        state.scroll_settings_by((client_h - row_h).max(row_h), client_w, client_h);
+                    }
+                    VK_HOME => {
+                        let (_, client_h) = client_size(hwnd);
+                        state.settings_scroll_y = 0;
+                        state.sync_settings_scroll(client_w, client_h);
+                    }
+                    VK_END => {
+                        let (_, client_h) = client_size(hwnd);
+                        state.settings_scroll_y = i32::MAX;
+                        state.sync_settings_scroll(client_w, client_h);
+                    }
                     _ => {}
                 }
                 return LRESULT(0);
@@ -4449,6 +4999,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                                 let old = state.settings_hover;
                                 state.settings_hover = new_hover;
                                 state.invalidate_hover_rows(client_w, old, new_hover);
+                                raise_settings_focus_event(hwnd, new_hover);
                             }
                         }
                         // Clear the Settings focus highlight when leaving, so
@@ -4460,6 +5011,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                         }
                     }
                     state.apply_pane();
+                    if state.active_pane == Pane::Settings {
+                        // Entering Settings re-evaluates whether the document
+                        // overflows and shows the dynamic scrollbar if so.
+                        let (client_w, client_h) = client_size(hwnd);
+                        state.sync_settings_scroll(client_w, client_h);
+                    }
                     state.invalidate();
                 } else if state.active_pane == Pane::Activity {
                     // Check position area click in Activity pane
@@ -4471,261 +5028,65 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
                     }
                 } else if state.active_pane == Pane::Settings {
                     // Hit-test against the same layout used by paint_settings.
-                    let items = state.settings_items(sidebar_w, client_w, pad, scale);
+                    // Row index counts rows only, like `settings_hover_at`.
+                    let items = state
+                        .settings_items(sidebar_w, client_w, pad, scale, state.settings_scroll_y)
+                        .items;
+                    let mut row_index = 0usize;
                     for item in &items {
                         if let SettingsItem::Row { id, rect } = item
                             && y >= rect.top
                             && y < rect.bottom
                         {
-                            let control_rect = row_split(rect, scale).control;
-                            match id {
-                                SettingId::Notifications => {
-                                    let new_value = !state.cfg().behavior.notifications_enabled;
-                                    // Flip the overlay first; persist only when
-                                    // the toggle reaches it, so the config and
-                                    // the pill can never desync.
-                                    if unsafe { PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0)) }
-                                        .is_err()
-                                    {
-                                        error!("posting the notifications toggle to the overlay failed");
-                                    } else {
-                                        state.mutate_config(|cfg| cfg.behavior.notifications_enabled = new_value);
-                                    }
-                                    state.invalidate();
-                                }
-                                SettingId::StartOnLogin => {
-                                    let new_value = !state.cfg().behavior.start_on_login;
-                                    // Write the registry entry before committing
-                                    // the config value: a failed write must not
-                                    // persist a state the registry does not
-                                    // reflect.
-                                    if let Err(error) = autostart::apply(new_value) {
-                                        error!("start-on-login update failed: {error:#}");
-                                    } else {
-                                        state.mutate_config(|cfg| cfg.behavior.start_on_login = new_value);
-                                    }
-                                    state.invalidate();
-                                }
-                                SettingId::CloseToTray => {
-                                    let new_value = !state.cfg().behavior.close_to_tray;
-                                    state.mutate_config(|cfg| cfg.behavior.close_to_tray = new_value);
-                                    info!("close to tray {}", if new_value { "enabled" } else { "disabled" });
-                                    state.invalidate();
-                                }
-                                SettingId::Duration => {
-                                    let segments = segment_rects(&control_rect, 5, (4.0 * scale) as i32);
-                                    let values = [2000u64, 3000, 5000, 10000];
-                                    if let Some((i, _)) =
-                                        segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right)
-                                    {
-                                        // The Custom tile asks for a value; the
-                                        // chosen one is applied like a preset.
-                                        if i == 4 {
-                                            let current_ms = state.cfg().overlay.duration_ms;
-                                            if let Some(duration) =
-                                                crate::duration_dialog::show_duration_dialog(hwnd, current_ms)
-                                            {
-                                                state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
-                                                set_duration(state.overlay_hwnd, duration);
-                                                info!("custom overlay duration set to {duration} ms");
-                                            }
-                                        } else {
-                                            let duration = values[i];
-                                            state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
-                                            set_duration(state.overlay_hwnd, duration);
-                                        }
-                                        state.invalidate();
-                                    }
-                                }
-                                SettingId::Layout => {
-                                    let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
-                                    let values = [
-                                        LayoutMode::Expanded,
-                                        LayoutMode::Compact,
-                                        LayoutMode::Auto,
-                                        LayoutMode::PersistentCompact,
-                                    ];
-                                    if let Some((i, _)) =
-                                        segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right)
-                                    {
-                                        let mode = values[i];
-                                        state.mutate_config(|cfg| cfg.overlay.layout = mode);
-                                        set_layout(state.overlay_hwnd, mode);
-                                        info!("layout mode set: {mode:?}");
-                                        state.invalidate();
-                                    }
-                                }
-                                SettingId::DismissOnHover => {
-                                    let new_value = !state.cfg().overlay.dismiss_on_hover;
-                                    state.mutate_config(|cfg| cfg.overlay.dismiss_on_hover = new_value);
-                                    set_dismiss_on_hover(state.overlay_hwnd, new_value);
-                                    info!("dismiss on hover set: {new_value}");
-                                    state.invalidate();
-                                }
-                                SettingId::ExpandCompactOnHover => {
-                                    let new_value = !state.cfg().overlay.expand_compact_on_hover;
-                                    state.mutate_config(|cfg| cfg.overlay.expand_compact_on_hover = new_value);
-                                    set_expand_compact_on_hover(state.overlay_hwnd, new_value);
-                                    info!("expand compact on hover set: {new_value}");
-                                    state.invalidate();
-                                }
-                                SettingId::HideForAutoCompactSources => {
-                                    let new_value = !state.cfg().behavior.hide_for_auto_compact_sources;
-                                    state.mutate_config(|cfg| cfg.behavior.hide_for_auto_compact_sources = new_value);
-                                    set_hide_for_auto_compact_sources(state.overlay_hwnd, new_value);
-                                    info!("hide for auto compact sources set: {new_value}");
-                                    state.invalidate();
-                                }
-                                SettingId::FadePersistentPill => {
-                                    let new_value = !state.cfg().overlay.fade_persistent_pill;
-                                    state.mutate_config(|cfg| cfg.overlay.fade_persistent_pill = new_value);
-                                    set_fade_persistent_pill(state.overlay_hwnd, new_value);
-                                    info!("fade persistent pill set: {new_value}");
-                                    state.invalidate();
-                                }
-                                SettingId::SeparateCompact => {
-                                    let new_value = !state.cfg().overlay.compact_position_separate;
-                                    state.set_compact_separate(new_value);
-                                    state.invalidate();
-                                }
-                                SettingId::CompactPosition => {
-                                    // Always editable: clicks land in the raw
-                                    // compact_* fields. While "follows
-                                    // Expanded" is ON the row mirrors the
-                                    // Expanded position and these edits are
-                                    // stored, taking visible effect once the
-                                    // follow toggle is OFF or the pill is
-                                    // actually compact.
-                                    let parts = position_parts(rect, scale);
-                                    if let Some((i, _)) = parts
-                                        .anchors
-                                        .iter()
-                                        .enumerate()
-                                        .find(|(_, a)| x >= a.left && x < a.right && y >= a.top && y < a.bottom)
-                                    {
-                                        let (v, h) = match i {
-                                            0 => (VerticalPosition::Top, HorizontalPosition::Left),
-                                            1 => (VerticalPosition::Top, HorizontalPosition::Center),
-                                            2 => (VerticalPosition::Top, HorizontalPosition::Right),
-                                            3 => (VerticalPosition::Bottom, HorizontalPosition::Left),
-                                            4 => (VerticalPosition::Bottom, HorizontalPosition::Center),
-                                            _ => (VerticalPosition::Bottom, HorizontalPosition::Right),
-                                        };
-                                        state.apply_compact_anchor(v, h);
-                                    } else if x >= parts.reset.left
-                                        && x < parts.reset.right
-                                        && y >= parts.reset.top
-                                        && y < parts.reset.bottom
-                                    {
-                                        state.reset_compact_position();
-                                    } else if x >= parts.adjust.left
-                                        && x < parts.adjust.right
-                                        && y >= parts.adjust.top
-                                        && y < parts.adjust.bottom
-                                    {
-                                        let _ = crate::positioner::open_compact(hwnd, state.overlay_hwnd);
-                                    }
-                                    state.invalidate();
-                                }
-                                SettingId::AutoCompactApps => {
-                                    if !process_picker::open(
-                                        hwnd,
-                                        &control_rect,
-                                        &state.cfg().behavior.auto_compact_sources,
-                                        state.auto_sources_result.clone(),
-                                        AUTO_SOURCES_RESULT_MSG,
-                                    ) {
-                                        debug!("auto-compact sources picker failed to open");
-                                    }
-                                }
-                                SettingId::Position => {
-                                    let parts = position_parts(rect, scale);
-                                    if let Some((i, _)) = parts
-                                        .anchors
-                                        .iter()
-                                        .enumerate()
-                                        .find(|(_, a)| x >= a.left && x < a.right && y >= a.top && y < a.bottom)
-                                    {
-                                        let (v, h) = match i {
-                                            0 => (VerticalPosition::Top, HorizontalPosition::Left),
-                                            1 => (VerticalPosition::Top, HorizontalPosition::Center),
-                                            2 => (VerticalPosition::Top, HorizontalPosition::Right),
-                                            3 => (VerticalPosition::Bottom, HorizontalPosition::Left),
-                                            4 => (VerticalPosition::Bottom, HorizontalPosition::Center),
-                                            _ => (VerticalPosition::Bottom, HorizontalPosition::Right),
-                                        };
-                                        state.apply_anchor(v, h);
-                                    } else if x >= parts.reset.left
-                                        && x < parts.reset.right
-                                        && y >= parts.reset.top
-                                        && y < parts.reset.bottom
-                                    {
-                                        state.reset_position();
-                                    } else if x >= parts.adjust.left
-                                        && x < parts.adjust.right
-                                        && y >= parts.adjust.top
-                                        && y < parts.adjust.bottom
-                                    {
-                                        let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
-                                    }
-                                    // Repaint in the same frame the anchor was
-                                    // clicked: the row's highlighted anchor and
-                                    // value changed, and — while the compact
-                                    // pill follows — the compact row's mirror
-                                    // must update without waiting for the next
-                                    // mouse move.
-                                    state.invalidate();
-                                }
-                                SettingId::ShowSample => {
-                                    show_sample(state.overlay_hwnd);
-                                }
-                                SettingId::Monitor => {
-                                    // One click steps to the next choice
-                                    // (Active window → Primary → Display 1 →
-                                    // … → back); the tray menu offers direct
-                                    // selection.
-                                    let displays = enumerate_displays_cached();
-                                    let next = next_monitor_mode(state.cfg().overlay.monitor, displays.len());
-                                    state.apply_monitor(next);
-                                    state.invalidate();
-                                }
-                                SettingId::CopyLogs => {
-                                    let gap = (4.0 * scale) as i32;
-                                    let (open_rect, _copy_rect) = halve(&control_rect, gap);
-                                    if x >= open_rect.left && x < open_rect.right {
-                                        state.open_logs();
-                                        state.logs_opened_at = Some(Instant::now());
-                                        unsafe { SetTimer(hwnd, TIMER_OPENED_ID, 2000, None) };
-                                        state.invalidate();
-                                    } else {
-                                        state.copy_logs();
-                                    }
-                                }
-                                SettingId::OpenConfig => {
-                                    let gap = (4.0 * scale) as i32;
-                                    let (open_rect, _reload_rect) = halve(&control_rect, gap);
-                                    if x >= open_rect.left && x < open_rect.right {
-                                        state.open_config();
-                                        state.config_opened_at = Some(Instant::now());
-                                        unsafe { SetTimer(hwnd, TIMER_OPENED_ID, 2000, None) };
-                                        state.invalidate();
-                                    } else {
-                                        state.reload_config();
-                                    }
-                                }
-                                SettingId::AllowedApps => {
-                                    if !process_picker::open(
-                                        hwnd,
-                                        &control_rect,
-                                        &state.cfg().behavior.media_sources,
-                                        state.picker_result.clone(),
-                                        PICKER_RESULT_MSG,
-                                    ) {
-                                        debug!("process picker failed to open");
-                                    }
-                                }
-                            }
+                            apply_settings_row_click(state, hwnd, id, row_index, rect, x, y, scale);
                             return LRESULT(0);
+                        }
+                        if matches!(item, SettingsItem::Row { .. }) {
+                            row_index += 1;
+                        }
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_SETTINGS_ACTIVATE_MSG => {
+            // A Settings control's stable runtime id, posted by the UIA
+            // provider's Invoke/Toggle. Re-resolved against the LIVE layout:
+            // a stale provider (scrolled, rebuilt, torn down) finds no row
+            // and the activation is dropped instead of acting on whatever
+            // control now occupies the old position.
+            if !state_ptr.is_null() {
+                let state = unsafe { &mut *state_ptr };
+                let encoded = wparam.0 as i32;
+                if encoded & 0x80 != 0 {
+                    let row_index = (encoded >> 8) as usize;
+                    if let Some(sub) = setting_sub_from_tag(encoded & 0x7F) {
+                        let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+                        let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+                        let pad = (PAD * scale) as i32;
+                        let (client_w, client_h) = client_size(hwnd);
+                        // A Settings control was explicitly activated: bring
+                        // the Settings pane up first, exactly like a sidebar
+                        // click on it would.
+                        if state.active_pane != Pane::Settings {
+                            state.active_pane = Pane::Settings;
+                            state.apply_pane();
+                            state.sync_settings_scroll(client_w, client_h);
+                        }
+                        let items = state
+                            .settings_items(sidebar_w, client_w, pad, scale, state.settings_scroll_y)
+                            .items;
+                        let mut row = 0usize;
+                        for item in &items {
+                            if let SettingsItem::Row { id, rect } = item {
+                                if row == row_index {
+                                    if let Some((x, y)) = setting_sub_click_point(*id, sub, rect, scale) {
+                                        apply_settings_row_click(state, hwnd, id, row_index, rect, x, y, scale);
+                                    }
+                                    break;
+                                }
+                                row += 1;
+                            }
                         }
                     }
                 }
@@ -4935,6 +5296,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             LRESULT(0)
         }
         WM_DESTROY => {
+            // Disconnect the UIA provider while the window and its state still
+            // exist, so UIA core releases its references instead of calling
+            // into a torn-down window later.
+            let _ = UiaReturnRawElementProvider(hwnd, WPARAM(0), LPARAM(0), None);
             if !state_ptr.is_null() {
                 (*state_ptr).on_destroy();
             }
@@ -4961,6 +5326,316 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Accessibility: the Settings pane is owner-drawn, so UI Automation
+// needs an explicit fragment provider. These free functions read the window
+// state by `HWND` (the provider runs on UIA's thread, not the wndproc borrow)
+// and hand the live layout/focus to `accessibility::settings_provider`.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Human-readable label for a settings row, matching the painted text.
+fn setting_label(id: SettingId) -> &'static str {
+    match id {
+        SettingId::Notifications => "Notifications",
+        SettingId::Duration => "Duration",
+        SettingId::StartOnLogin => "Start on login",
+        SettingId::CloseToTray => "Close to tray",
+        SettingId::AllowedApps => "Allowed apps",
+        SettingId::Layout => "Layout",
+        SettingId::Position => "Expanded Position",
+        SettingId::SeparateCompact => "Compact Position follows Expanded Position",
+        SettingId::CompactPosition => "Compact Position",
+        SettingId::DismissOnHover => "Dismiss persistent pill on hover",
+        SettingId::ExpandCompactOnHover => "Expand compact pill on hover",
+        SettingId::HideForAutoCompactSources => "Hide for auto-compact sources",
+        SettingId::FadePersistentPill => "Fade persistent pill",
+        SettingId::Monitor => "Monitor",
+        SettingId::ShowSample => "Show sample",
+        SettingId::CopyLogs => "Diagnostics",
+        SettingId::OpenConfig => "Config",
+        SettingId::AutoCompactApps => "Auto-compact apps",
+    }
+}
+
+/// Whether the row is an ON/OFF toggle (versus a button or segmented control).
+fn setting_is_toggle(id: SettingId) -> bool {
+    matches!(
+        id,
+        SettingId::Notifications
+            | SettingId::StartOnLogin
+            | SettingId::CloseToTray
+            | SettingId::SeparateCompact
+            | SettingId::DismissOnHover
+            | SettingId::ExpandCompactOnHover
+            | SettingId::HideForAutoCompactSources
+            | SettingId::FadePersistentPill
+    )
+}
+
+/// The current displayed value text for a row (used to build the UIA name).
+fn setting_value(id: SettingId, cfg: &Config) -> String {
+    match id {
+        SettingId::Notifications => on_off(cfg.behavior.notifications_enabled),
+        SettingId::StartOnLogin => on_off(cfg.behavior.start_on_login),
+        SettingId::CloseToTray => on_off(cfg.behavior.close_to_tray),
+        // Polarity is inverted from the persisted field: "ON" means the Compact
+        // pill follows the Expanded position (field `false`).
+        SettingId::SeparateCompact => on_off(!cfg.overlay.compact_position_separate),
+        SettingId::DismissOnHover => on_off(cfg.overlay.dismiss_on_hover),
+        SettingId::ExpandCompactOnHover => on_off(cfg.overlay.expand_compact_on_hover),
+        SettingId::HideForAutoCompactSources => on_off(cfg.behavior.hide_for_auto_compact_sources),
+        SettingId::FadePersistentPill => on_off(cfg.overlay.fade_persistent_pill),
+        SettingId::ShowSample => "Show a sample notification".into(),
+        SettingId::Duration => format!("{}s", cfg.overlay.duration_ms / 1000),
+        SettingId::Layout => format!("{:?}", cfg.overlay.layout),
+        SettingId::Monitor => format!("{:?}", cfg.overlay.monitor),
+        SettingId::Position => position_label(cfg),
+        SettingId::CompactPosition => compact_position_label(cfg),
+        // An empty allow-list means every source is allowed; an empty
+        // auto-compact list means none. Spell that out instead of an empty
+        // UIA value.
+        SettingId::AllowedApps => {
+            if cfg.behavior.media_sources.is_empty() {
+                "All apps".into()
+            } else {
+                cfg.behavior.media_sources.join(", ")
+            }
+        }
+        SettingId::AutoCompactApps => {
+            if cfg.behavior.auto_compact_sources.is_empty() {
+                "None".into()
+            } else {
+                cfg.behavior.auto_compact_sources.join(", ")
+            }
+        }
+        SettingId::CopyLogs => "Copy logs / Open logs".into(),
+        SettingId::OpenConfig => "Open config / Restart app".into(),
+    }
+}
+
+/// The current toggle state for a row, when it is a toggle.
+fn setting_toggle_on(id: SettingId, cfg: &Config) -> bool {
+    match id {
+        SettingId::Notifications => cfg.behavior.notifications_enabled,
+        SettingId::StartOnLogin => cfg.behavior.start_on_login,
+        SettingId::CloseToTray => cfg.behavior.close_to_tray,
+        SettingId::SeparateCompact => !cfg.overlay.compact_position_separate,
+        SettingId::DismissOnHover => cfg.overlay.dismiss_on_hover,
+        SettingId::ExpandCompactOnHover => cfg.overlay.expand_compact_on_hover,
+        SettingId::HideForAutoCompactSources => cfg.behavior.hide_for_auto_compact_sources,
+        SettingId::FadePersistentPill => cfg.overlay.fade_persistent_pill,
+        _ => false,
+    }
+}
+
+fn on_off(value: bool) -> String {
+    if value { "On" } else { "Off" }.into()
+}
+
+/// The Settings content rectangle (client coordinates) for the provider's root
+/// bounding box. Null-safe for a state-less window.
+pub(crate) fn settings_content_rect(hwnd: HWND) -> RECT {
+    let (client_w, client_h) = client_size(hwnd);
+    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+    RECT {
+        left: sidebar_w,
+        top: 0,
+        right: client_w,
+        bottom: client_h,
+    }
+}
+
+/// The current keyboard focus, as the provider uses it for `HasKeyboardFocus`.
+/// Null-safe: no window state means no focus.
+pub(crate) fn settings_focus(hwnd: HWND) -> Option<(usize, SettingSub)> {
+    let state = crate::winutil::window_state::<MainWindowState>(hwnd);
+    if state.is_null() {
+        return None;
+    }
+    unsafe { (*state).settings_hover }
+}
+
+/// A stable small tag per `SettingSub` variant, used to derive UIA runtime ids
+/// that survive provider rebuilds. Distinct variants get distinct tags; the
+/// `Seg`/`Anchor` indices fold into the same tag space via their payload.
+pub(crate) fn setting_sub_tag(sub: SettingSub) -> i32 {
+    match sub {
+        SettingSub::None => 0x00,
+        SettingSub::Reset => 0x10,
+        SettingSub::Adjust => 0x11,
+        SettingSub::Open => 0x20,
+        SettingSub::Copy => 0x21,
+        SettingSub::OpenConfig => 0x22,
+        SettingSub::ReloadConfig => 0x23,
+        SettingSub::Seg(i) => 0x40 + (i as i32).min(0x0F),
+        SettingSub::Anchor(i) => 0x50 + (i as i32).min(0x0F),
+    }
+}
+
+/// The stable UIA runtime id for one focusable Settings control. Same
+/// (row, sub) always maps to the same non-zero id.
+pub(crate) fn setting_runtime_id(row_index: usize, sub: SettingSub) -> i32 {
+    ((row_index as i32) << 8) | 0x80 | setting_sub_tag(sub)
+}
+
+/// Inverse of `setting_sub_tag` for the tags this app encodes. Unknown tags
+/// (a corrupt or foreign activation message) map to `None`, so a message can
+/// never be decoded into a control that does not exist.
+pub(crate) fn setting_sub_from_tag(tag: i32) -> Option<SettingSub> {
+    match tag {
+        0x00 => Some(SettingSub::None),
+        0x10 => Some(SettingSub::Reset),
+        0x11 => Some(SettingSub::Adjust),
+        0x20 => Some(SettingSub::Open),
+        0x21 => Some(SettingSub::Copy),
+        0x22 => Some(SettingSub::OpenConfig),
+        0x23 => Some(SettingSub::ReloadConfig),
+        0x40..=0x4F => Some(SettingSub::Seg((tag - 0x40) as usize)),
+        0x50..=0x5F => Some(SettingSub::Anchor((tag - 0x50) as usize)),
+        _ => None,
+    }
+}
+
+/// Snapshot of the focusable Settings controls for the UIA provider. Null-safe:
+/// an empty list means "nothing to expose".
+pub(crate) fn settings_accessibility_children(hwnd: HWND) -> Vec<crate::accessibility::SettingChild> {
+    let state = crate::winutil::window_state::<MainWindowState>(hwnd);
+    if state.is_null() {
+        return Vec::new();
+    }
+    let state = unsafe { &*state };
+    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+    let (client_w, _) = client_size(hwnd);
+    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+    let pad = (PAD * scale) as i32;
+    let cfg = state.cfg();
+    // Row index -> SettingId (headers are not rows).
+    let row_ids: Vec<SettingId> = state
+        .settings_items(sidebar_w, client_w, pad, scale, 0)
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            SettingsItem::Row { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    state
+        .settings_focus_targets(sidebar_w, client_w, pad, scale)
+        .into_iter()
+        .map(|t| {
+            let (name, control_type, toggle) = match row_ids.get(t.row_index).copied() {
+                Some(id) => {
+                    let value = setting_value(id, &cfg);
+                    let name = if value.is_empty() {
+                        setting_label(id).to_string()
+                    } else {
+                        format!("{}: {}", setting_label(id), value)
+                    };
+                    let control_type = if setting_is_toggle(id) {
+                        UIA_CheckBoxControlTypeId
+                    } else {
+                        UIA_ButtonControlTypeId
+                    };
+                    let toggle = if setting_is_toggle(id) {
+                        Some(setting_toggle_on(id, &cfg))
+                    } else {
+                        None
+                    };
+                    (name, control_type, toggle)
+                }
+                None => ("Setting".to_string(), UIA_ButtonControlTypeId, None),
+            };
+            let rect = RECT {
+                left: t.cx - 40,
+                top: t.cy - 14,
+                right: t.cx + 40,
+                bottom: t.cy + 14,
+            };
+            crate::accessibility::SettingChild {
+                row_index: t.row_index,
+                sub: t.sub,
+                rect,
+                name,
+                control_type,
+                toggle,
+                runtime_id: setting_runtime_id(t.row_index, t.sub),
+            }
+        })
+        .collect()
+}
+
+/// Raises the UIA focus-changed event for the Settings control the keyboard
+/// cursor moved onto, so assistive tech follows the same focus the window
+/// paints. No UIA client listening is normal, so failures log at debug level.
+fn raise_settings_focus_event(hwnd: HWND, focus: Option<(usize, SettingSub)>) {
+    let Some((row, sub)) = focus else {
+        return;
+    };
+    if hwnd.0.is_null() {
+        return;
+    }
+    if let Some(provider) = crate::accessibility::settings_child_provider(hwnd, row, sub)
+        && let Err(error) = unsafe { UiaRaiseAutomationEvent(&provider, UIA_AutomationFocusChangedEventId) }
+    {
+        debug!("raising the settings focus-changed UIA event failed: {error}");
+    }
+}
+
+/// Raises the UIA toggle property-changed event for a Settings row whose ON/OFF
+/// value just flipped. `before`/`after` are the displayed toggle states.
+fn raise_settings_toggle_event(hwnd: HWND, row_index: usize, before: bool, after: bool) {
+    if hwnd.0.is_null() || before == after {
+        return;
+    }
+    let Some(provider) = crate::accessibility::settings_child_provider(hwnd, row_index, SettingSub::None) else {
+        return;
+    };
+    let old = windows::core::VARIANT::from(if before { ToggleState_On.0 } else { ToggleState_Off.0 });
+    let new = windows::core::VARIANT::from(if after { ToggleState_On.0 } else { ToggleState_Off.0 });
+    if let Err(error) =
+        unsafe { UiaRaiseAutomationPropertyChangedEvent(&provider, UIA_ToggleToggleStatePropertyId, &old, &new) }
+    {
+        debug!("raising the settings toggle UIA event failed: {error}");
+    }
+}
+
+/// Moves the keyboard focus to a control (used by the provider's SetFocus and
+/// Invoke/Toggle). Reuses the focus path including auto-scroll, so the control
+/// stays on screen.
+pub(crate) fn focus_setting_at(hwnd: HWND, row_index: usize, sub: SettingSub) {
+    let state = crate::winutil::window_state::<MainWindowState>(hwnd);
+    if state.is_null() {
+        return;
+    }
+    let state = unsafe { &mut *state };
+    let new_hover = Some((row_index, sub));
+    if new_hover == state.settings_hover {
+        return;
+    }
+    let old = state.settings_hover;
+    state.settings_hover = new_hover;
+    let (client_w, client_h) = client_size(hwnd);
+    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+    let pad = (PAD * scale) as i32;
+    // Recenter the focused control if it would fall outside the visible band
+    // (mirrors `focus_settings_target`).
+    let row_h = (34.0 * scale) as i32;
+    if let Some(t) = state
+        .settings_focus_targets(sidebar_w, client_w, pad, scale)
+        .iter()
+        .find(|t| t.row_index == row_index && t.sub == sub)
+        && (t.cy < state.settings_scroll_y + row_h / 2 || t.cy > state.settings_scroll_y + client_h - row_h / 2)
+    {
+        state.settings_scroll_y = t.cy - client_h / 2;
+        state.sync_settings_scroll(client_w, client_h);
+    }
+    state.invalidate_hover_rows(client_w, old, new_hover);
+    state.invalidate();
+    raise_settings_focus_event(hwnd, new_hover);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4981,6 +5656,165 @@ mod tests {
             track_count: None,
             genre: None,
             ..TrackInfo::default()
+        }
+    }
+
+    #[test]
+    fn setting_runtime_ids_are_unique_stable_and_nonzero() {
+        // Every (row, sub) pair a focus target can have maps to the same
+        // non-zero id on every call, and distinct pairs never collide — UIA
+        // clients key elements by runtime id across provider rebuilds.
+        let subs = [
+            SettingSub::None,
+            SettingSub::Reset,
+            SettingSub::Adjust,
+            SettingSub::Open,
+            SettingSub::Copy,
+            SettingSub::OpenConfig,
+            SettingSub::ReloadConfig,
+            SettingSub::Seg(0),
+            SettingSub::Seg(1),
+            SettingSub::Seg(4),
+            SettingSub::Anchor(0),
+            SettingSub::Anchor(5),
+            SettingSub::Anchor(8),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for row in 0usize..32 {
+            for sub in &subs {
+                let id = setting_runtime_id(row, *sub);
+                assert_ne!(id, 0, "runtime id must never be zero");
+                assert_eq!(id, setting_runtime_id(row, *sub), "runtime id must be stable");
+                assert!(seen.insert(id), "duplicate runtime id {id} for row {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn clamp_settings_scroll_stays_within_the_reachable_range() {
+        // Content shorter than the viewport: no scrolling is possible.
+        assert_eq!(clamp_settings_scroll(0, 400, 900), 0);
+        assert_eq!(clamp_settings_scroll(500, 400, 900), 0);
+        assert_eq!(clamp_settings_scroll(-200, 400, 900), 0);
+        // Content taller than the viewport: offset is clamped to the bottom
+        // (document bottom flush with viewport bottom) and never negative.
+        assert_eq!(clamp_settings_scroll(0, 1200, 900), 0);
+        assert_eq!(clamp_settings_scroll(100, 1200, 900), 100);
+        assert_eq!(clamp_settings_scroll(5000, 1200, 900), 300);
+        assert_eq!(clamp_settings_scroll(-50, 1200, 900), 0);
+    }
+
+    #[test]
+    fn settings_layout_offsets_every_rect_by_the_scroll_and_reports_extent() {
+        let state = MainWindowState::new(
+            Arc::new(RwLock::new(Config::default())),
+            EventQueue::default(),
+            HWND::default(),
+            HINSTANCE::default(),
+        );
+        let scale = 1.0;
+        let client_w = 1000;
+        let pad = (PAD * scale) as i32;
+        let sidebar_w = (SIDEBAR_W * scale) as i32;
+        let none = state.settings_items(sidebar_w, client_w, pad, scale, 0);
+        let scrolled = state.settings_items(sidebar_w, client_w, pad, scale, 120);
+        assert!(none.content_extent > 0);
+        // Every row shifts up by exactly the scroll offset; geometry otherwise
+        // is identical.
+        let rows_none: Vec<_> = none
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                SettingsItem::Row { rect, .. } => Some(rect.top),
+                _ => None,
+            })
+            .collect();
+        let rows_scrolled: Vec<_> = scrolled
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                SettingsItem::Row { rect, .. } => Some(rect.top),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows_none.len(), rows_scrolled.len());
+        for (a, b) in rows_none.iter().zip(&rows_scrolled) {
+            assert_eq!(*b, *a - 120);
+        }
+    }
+
+    #[test]
+    fn every_settings_focus_target_can_scroll_into_view() {
+        // At every accepted DPI scale and the small/large client heights from
+        // the acceptance matrix (768/900/1080), recentering on a focus target
+        // and clamping keeps that target inside the visible band — so keyboard
+        // navigation can always bring a control on screen.
+        let state = MainWindowState::new(
+            Arc::new(RwLock::new(Config::default())),
+            EventQueue::default(),
+            HWND::default(),
+            HINSTANCE::default(),
+        );
+        let client_w = 1000;
+        for scale in [1.0f32, 1.5, 2.0] {
+            let pad = (PAD * scale) as i32;
+            let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+            let extent = state.settings_content_extent(sidebar_w, client_w, pad, scale);
+            let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
+            assert!(!targets.is_empty(), "focus targets must exist at scale {scale}");
+            for client_h in [768i32, 900, 1080] {
+                for t in &targets {
+                    let scroll = clamp_settings_scroll(t.cy - client_h / 2, extent, client_h);
+                    let on_screen = t.cy - scroll;
+                    assert!(
+                        on_screen >= 0 && on_screen < client_h,
+                        "target at cy={} not reachable at scale {scale}, client_h {client_h} (extent {extent})",
+                        t.cy
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn setting_labels_are_unique_and_values_non_empty() {
+        // The UIA provider derives element names from label + value; a
+        // duplicate or empty name would make controls indistinguishable to
+        // Narrator.
+        let cfg = Config::default();
+        let ids = [
+            SettingId::Notifications,
+            SettingId::Duration,
+            SettingId::StartOnLogin,
+            SettingId::CloseToTray,
+            SettingId::AllowedApps,
+            SettingId::Layout,
+            SettingId::Position,
+            SettingId::SeparateCompact,
+            SettingId::CompactPosition,
+            SettingId::DismissOnHover,
+            SettingId::ExpandCompactOnHover,
+            SettingId::HideForAutoCompactSources,
+            SettingId::FadePersistentPill,
+            SettingId::Monitor,
+            SettingId::ShowSample,
+            SettingId::CopyLogs,
+            SettingId::OpenConfig,
+            SettingId::AutoCompactApps,
+        ];
+        let mut labels = std::collections::HashSet::new();
+        for id in ids {
+            assert!(!setting_label(id).is_empty());
+            assert!(
+                labels.insert(setting_label(id)),
+                "duplicate label {}",
+                setting_label(id)
+            );
+            assert!(
+                !setting_value(id, &cfg).is_empty(),
+                "empty value for {}",
+                setting_label(id)
+            );
         }
     }
 

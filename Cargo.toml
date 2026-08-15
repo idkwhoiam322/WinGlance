@@ -5,7 +5,13 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# Direct dependency so the `windows::core::implement!` macro's generated code
+# (which references `::windows_core`) resolves. `windows` already pulls in this
+# exact crate transitively; promoting it to a direct dependency only makes the
+# codegen support crate nameable. No new behavioral dependency.
+windows-core = "0.58"
 windows = { version = "0.58", features = [
+    "implement",
     "Foundation",
     "Foundation_Collections",
     "Media_Control",
@@ -23,6 +29,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_Registry",
+    "Win32_System_Variant",
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_System_Threading",
