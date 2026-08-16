@@ -83,11 +83,30 @@ WinGlance/
   posts the chosen `position_x`/`position_y` to the main window via
   `POSITION_MSG` (the main window owns the config, applies, and persists), and
   the overlay is nudged via `overlay::set_positions`.
-- **process_picker.rs** — the owner-drawn "Allowed apps" popup opened from the
-  Settings pane: lists running processes and open SMTC session sources,
-  pre-checks the allow-list, and posts the confirmed patterns back to the main
-  window via `PICKER_RESULT_MSG` (which applies them to
-  `behavior.media_sources`).
+- **process_picker.rs** — the owner-drawn picker popups opened from the
+  Settings pane: the "Allowed apps" picker (lists running processes and open
+  SMTC session sources, pre-checks the allow-list, posts via
+  `PICKER_RESULT_MSG` to `behavior.media_sources`), the Auto-compact apps
+  picker (`AUTO_SOURCES_RESULT_MSG`), and the single-select pinned-source
+  picker (`PINNED_SOURCE_RESULT_MSG`), which only offers apps on the
+  allow-list — a pin outside it could never fire.
+- **accessibility.rs** — the UI Automation providers: a read-only name
+  provider for the passive pill (current track as the accessible name, no
+  patterns, never focusable) and the Settings-pane fragment provider with
+  keyboard-focus/toggle-state events. Providers read shared snapshots or
+  cells, never window state off the UI thread, and are detached in
+  `WM_DESTROY`/`WM_NCDESTROY`.
+- **winapi.rs / winutil.rs** — `winapi.rs` is a thin version-stable facade
+  over the raw Win32/WinRT calls (signatures identical on the pinned
+  `windows` line, so a future bump is a diff of wrapper bodies only);
+  `winutil.rs` holds the shared helpers — the `StateClaim` window-state-box
+  handshake, `register_class_once`, `copy_wide_terminated` (the required
+  path for every hand-written fixed-size wide-string copy — a raw
+  `copy_from_slice` into a `[u16; N]` is a review must-fix, see
+  `docs/architecture.md`), verified-file writes, system preference
+  sampling.
+- **gdi.rs** — the shared GDI text drawing (`draw_string`); **duration_dialog.rs**
+  — the custom pill-duration prompt.
 
 ## Build and verify
 

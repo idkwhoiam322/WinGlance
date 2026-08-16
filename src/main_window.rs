@@ -3966,9 +3966,8 @@ impl MainWindowState {
                 return;
             }
         };
-        let mut wide: Vec<u16> = text.encode_utf16().collect();
-        wide.push(0);
-        let bytes = wide.len() * 2;
+        let clipboard = wide(&text);
+        let bytes = clipboard.len() * 2;
 
         unsafe {
             if OpenClipboard(None).is_err() {
@@ -3985,7 +3984,7 @@ impl MainWindowState {
                     let _ = global_free(hmem);
                     return false;
                 }
-                std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr.cast(), wide.len());
+                std::ptr::copy_nonoverlapping(clipboard.as_ptr(), ptr.cast(), clipboard.len());
                 let _ = GlobalUnlock(hmem);
                 if set_clipboard_data(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0)).is_ok() {
                     true
@@ -4436,9 +4435,7 @@ fn tray_data(hwnd: HWND) -> Result<NOTIFYICONDATAW> {
         hIcon: tray_icon()?,
         ..Default::default()
     };
-    let tip = wide("WinGlance media overlay");
-    let count = tip.len().min(data.szTip.len());
-    data.szTip[..count].copy_from_slice(&tip[..count]);
+    crate::winutil::copy_wide_terminated(&mut data.szTip, "WinGlance media overlay");
     Ok(data)
 }
 
@@ -4453,12 +4450,12 @@ fn show_tray_note(hwnd: HWND, title: &str, text: &str, flags: NOTIFY_ICON_INFOTI
     };
     data.uFlags |= NIF_INFO;
     data.dwInfoFlags = flags;
-    let title_wide = wide(title);
-    let count = title_wide.len().min(data.szInfoTitle.len());
-    data.szInfoTitle[..count].copy_from_slice(&title_wide[..count]);
-    let text_wide = wide(text);
-    let count = text_wide.len().min(data.szInfo.len());
-    data.szInfo[..count].copy_from_slice(&text_wide[..count]);
+    // NUL-terminate explicitly via the shared helper (`copy_wide_terminated`
+    // caps at len-1 and writes the terminator), so a truncated title/text
+    // never leaves the fixed-size array unterminated — `Shell_NotifyIconW`
+    // must never read past the buffer.
+    crate::winutil::copy_wide_terminated(&mut data.szInfoTitle, title);
+    crate::winutil::copy_wide_terminated(&mut data.szInfo, text);
     unsafe {
         if Shell_NotifyIconW(NIM_MODIFY, &data).0 == 0 {
             // The balloon is best-effort (the tray icon may be gone or the

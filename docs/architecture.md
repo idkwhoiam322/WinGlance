@@ -519,6 +519,58 @@ to the main window via `PICKER_RESULT_MSG`, which applies them to
 `behavior.media_sources` — so allow-list changes apply to the live worker
 without a restart.
 
+## Fixed-size wide-string copies
+
+Win32 accepts wide strings through fixed-size `[u16; N]` buffers (the tray
+`NOTIFYICONDATAW` fields, `GetClassNameW`, `WM_GETTEXT`, …). Every copy the
+**app writes by hand** into such an array must go through
+`winutil::copy_wide_terminated`, the single sanctioned path: it copies at
+most `len - 1` code units and writes the NUL terminator explicitly, so a
+truncated value is terminated exactly like a shorter one — never relying on
+the buffer's prior contents (e.g. the zero-fill of a `..Default::default()`
+struct) for termination.
+
+Hand-rolling the copy (`copy_from_slice` with `len().min(N)`) is a review
+**must-fix**: the zero-fill-reliant form leaves the array *unterminated*
+exactly at the truncation boundary (`count == N`), and the Win32 reader
+(`Shell_NotifyIconW`, …) reads past the end of the buffer. All three tray
+sites (`szTip`, `szInfoTitle`, `szInfo`) route through the helper.
+
+Two classes of fixed-size buffers are deliberately exempt because they are
+never hand-written: **API-managed buffers** (the API itself NUL-terminates —
+`GetClassNameW`, `GetWindowTextW`, `WM_GETTEXT`), and **grow-until-fits
+idioms** with an explicit length check before reading. Pointer-based strings
+(`wide()` Vecs, `LB_ADDSTRING`, class names) have no fixed buffer to
+truncate. Only new hand-written fixed-array copies must use the helper. The
+exemption is for the *fill*: the API-managed **read** side has its own rule —
+read the buffer back with an explicit length (the API's return value or a
+NUL scan), never the whole buffer, whose termination would rest on the
+zero-fill of `[0u16; N]` and embed the terminator and padding in the string.
+
+**Enforcement — the source-audit guard.** The must-fix is mechanical, not
+just a review rule: `wide_copies_stay_in_winutil` in winutil.rs's test
+module walks every `.rs` file under `src/` (excluding winutil.rs, the
+helper's sanctioned home) and fails on any `copy_from_slice` whose ±3-line
+window carries a wide-string marker (`u16`, `encode_utf16`, `wide(`,
+`as_utf16`). The window is calibrated to the historical banned shape, whose
+`wide(...)` source sits a line or two above the copy line; the guard's
+self-test (`wide_copy_window_flags_the_banned_pattern_and_passes_u8_copies`)
+pins both sides — the exact tray pattern is flagged, the u8 crash-log and
+pixel copies pass — and the scan asserts it actually covered the tree.
+Documented limitation: a source slice stored far from its copy (a struct
+field) without a nearby marker can evade a lexical scan, so reviewers still
+verify such buffers; but a reintroduction of the shape that actually bit the
+tray path fails the suite. The read side has its own guard:
+`wide_fixed_buffer_reads_use_explicit_lengths` flags any non-sliced
+`from_utf16`/`from_utf16_lossy` read within ±3 lines of a wide-API fill
+(`GetClassNameW`, `GetWindowTextW`, `WM_GETTEXT`, …) — a whole-buffer read
+that leans on the zero-fill. Capacity-idiom APIs that report size in/out
+(`QueryFullProcessImageNameW`) and struct fills (Toolhelp's `szExeFile`)
+are out of scope: the former's truncate-to-size is the fix, the latter is
+the same struct-field limitation as the copy side. Every current read site
+is compliant (sliced or explicitly NUL-trimmed), so the guard passes today
+and catches a reintroduction.
+
 ## UI Automation event surface
 
 Both windows expose UI Automation (UIA) providers; a screen reader only

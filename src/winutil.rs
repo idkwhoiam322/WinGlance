@@ -499,6 +499,36 @@ pub(crate) fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Copies `value` into a fixed-size wide-string buffer, always leaving the
+/// array NUL-terminated: at most `buffer.len() - 1` code units are copied
+/// and the terminator is written explicitly, never relying on the buffer's
+/// prior contents (e.g. a zero-filled struct) for termination — so the
+/// truncation boundary is terminated exactly like every shorter copy.
+///
+/// **Required pattern:** every hand-written copy into a fixed-size `[u16; N]`
+/// buffer must use this helper. Hand-rolling it — `copy_from_slice` with
+/// `len().min(N)`, leaning on the struct's zero-fill for the terminator —
+/// leaves the array *unterminated* exactly at the truncation boundary
+/// (`count == N`), and the Win32 reader (`Shell_NotifyIconW`, …) reads past
+/// the end of the buffer. (API-managed buffers such as `GetClassNameW` /
+/// `WM_GETTEXT`, and grow-until-fits idioms with explicit length checks, are
+/// exempt — see `docs/architecture.md`.) Truncating a long value is the
+/// caller's display concern, never an unterminated-buffer hazard.
+pub(crate) fn copy_wide_terminated(buffer: &mut [u16], value: &str) {
+    if buffer.is_empty() {
+        return;
+    }
+    let mut count = 0;
+    for unit in value.encode_utf16() {
+        if count + 1 >= buffer.len() {
+            break;
+        }
+        buffer[count] = unit;
+        count += 1;
+    }
+    buffer[count] = 0;
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Verified app-data writes (reparse-safe: the data root and temp file are identity-checked)
 //
@@ -1005,6 +1035,267 @@ mod tests {
             panic!("injected")
         });
         assert_eq!(result.0, 0);
+    }
+
+    #[test]
+    fn copy_wide_terminated_fills_fits_and_terminates() {
+        let mut buf = [0u16; 16];
+        copy_wide_terminated(&mut buf, "Song");
+        assert_eq!(&buf[..5], &[b'S' as u16, b'o' as u16, b'n' as u16, b'g' as u16, 0]);
+        assert_eq!(buf[5], 0, "the untouched tail of the zero-filled buffer stays zero");
+        // A value that exactly fills len-1 slots gets its terminator in the
+        // last slot, not one past it.
+        let mut exact = [0u16; 4];
+        copy_wide_terminated(&mut exact, "abc");
+        assert_eq!(&exact, &[b'a' as u16, b'b' as u16, b'c' as u16, 0]);
+    }
+
+    /// Recursively collects the `.rs` files under `dir`.
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("src must be readable") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Whether a `copy_from_slice` at 0-based line `copy_idx` looks like a
+    /// hand-rolled wide-string copy: a wide marker within `±WINDOW` lines.
+    /// The pre-helper tray pattern — `dest[..n].copy_from_slice(&src[..n])`
+    /// with the `wide(...)` source created a line or two above — always
+    /// carries the marker inside the window; a plain u8/binary copy (crash
+    /// writer, DIB blits, palette fills, row blits) carries none.
+    fn is_wide_copy_window(lines: &[&str], copy_idx: usize) -> bool {
+        const WINDOW: usize = 3;
+        const MARKERS: [&str; 4] = ["u16", "encode_utf16", "wide(", "as_utf16"];
+        let lo = copy_idx.saturating_sub(WINDOW);
+        let hi = (copy_idx + WINDOW + 1).min(lines.len());
+        lines[lo..hi]
+            .iter()
+            .any(|line| MARKERS.iter().any(|marker| line.contains(marker)))
+    }
+
+    fn is_zero_fill_reliant_read_window(lines: &[&str], read_idx: usize) -> bool {
+        // The read side of the fixed-array wide contract: an API-managed fill
+        // (GetClassNameW, GetWindowTextW, WM_GETTEXT, …) writes a
+        // NUL-terminated string into a fixed [u16; N] buffer, and the code
+        // must read it back with an explicit length (the API's return value
+        // or a NUL scan) — never the whole buffer, whose termination would
+        // then rest on the zero-fill of `[0u16; N]` (and which embeds the
+        // terminator and padding in the string when read whole). Flag a
+        // non-sliced `from_utf16`/`from_utf16_lossy` read within ±3 lines of
+        // such a fill. Capacity-idiom APIs that report size in/out
+        // (QueryFullProcessImageNameW) and struct fills (Toolhelp's
+        // szExeFile) are deliberately out of scope — the former's
+        // truncate-to-size is the fix, the latter is the documented
+        // struct-field limitation.
+        const WINDOW: usize = 3;
+        const FILL_MARKERS: [&str; 7] = [
+            "GetClassNameW",
+            "GetWindowTextW",
+            "GetFinalPathNameByHandleW",
+            "GetModuleBaseNameW",
+            "GetModuleFileNameW",
+            "GetModuleFileNameExW",
+            "WM_GETTEXT",
+        ];
+        let line = lines[read_idx];
+        if !line.contains("from_utf16") || line.contains("[..") {
+            return false;
+        }
+        let lo = read_idx.saturating_sub(WINDOW);
+        let hi = (read_idx + WINDOW + 1).min(lines.len());
+        lines[lo..hi]
+            .iter()
+            .any(|candidate| FILL_MARKERS.iter().any(|marker| candidate.contains(marker)))
+    }
+
+    #[test]
+    fn wide_copies_stay_in_winutil() {
+        // Enforces the copy_wide_terminated contract mechanically: a
+        // hand-written copy_from_slice into a fixed-size wide buffer must not
+        // appear outside winutil.rs (the sanctioned home of the helper). Any
+        // `copy_from_slice` whose ±3-line window carries a wide marker is
+        // flagged; the plain u8/binary copies (crash-log writer in main.rs,
+        // palette fills, overlay row blits, test pixel writes) carry no
+        // marker and stay unflagged — the self-test below proves both sides.
+        // Known limit (documented): a source slice stored far from the copy
+        // (e.g. a struct field) without a nearby `u16`/`wide(` marker can
+        // evade the lexical scan; the window catches the historical tray
+        // shape and every idiomatic form.
+        let mut files = Vec::new();
+        collect_rs_files(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for path in files {
+            if path.file_name().is_some_and(|name| name == "winutil.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source files must be readable");
+            let lines: Vec<&str> = text.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                if line.contains("copy_from_slice") && is_wide_copy_window(&lines, idx) {
+                    offenders.push(format!("{}:{}", path.display(), idx + 1));
+                }
+            }
+            scanned += 1;
+        }
+        assert!(
+            scanned >= 15,
+            "the scan must cover the source tree, scanned {scanned} files"
+        );
+        assert!(
+            offenders.is_empty(),
+            "hand-rolled wide-string copies outside winutil.rs — route fixed-size [u16; N] \
+            copies through winutil::copy_wide_terminated:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn wide_fixed_buffer_reads_use_explicit_lengths() {
+        // The read side of the fixed-array wide contract, enforced
+        // mechanically: an API-managed fill into a fixed [u16; N] buffer must
+        // be read back with an explicit length (the API's return value or a
+        // NUL scan), never the whole buffer — a whole-buffer read leans on
+        // the `[0u16; N]` zero-fill for termination and embeds the terminator
+        // and padding in the string. Any non-sliced `from_utf16`/
+        // `from_utf16_lossy` read within ±3 lines of a wide-API fill
+        // (GetClassNameW, GetWindowTextW, WM_GETTEXT, …) is flagged. Every
+        // current site is compliant — each read is sliced to the returned
+        // length or explicitly NUL-trimmed — so the guard passes today and
+        // catches a reintroduction.
+        let mut files = Vec::new();
+        collect_rs_files(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for path in files {
+            if path.file_name().is_some_and(|name| name == "winutil.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source files must be readable");
+            let lines: Vec<&str> = text.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                if line.contains("from_utf16") && is_zero_fill_reliant_read_window(&lines, idx) {
+                    offenders.push(format!("{}:{}", path.display(), idx + 1));
+                }
+            }
+            scanned += 1;
+        }
+        assert!(
+            scanned >= 15,
+            "the scan must cover the source tree, scanned {scanned} files"
+        );
+        assert!(
+            offenders.is_empty(),
+            "whole-buffer from_utf16 reads of wide-API fills — slice to the returned length \
+            (or NUL-scan) instead of relying on the zero-fill:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn wide_copy_window_flags_the_banned_pattern_and_passes_u8_copies() {
+        // The pre-helper tray shape: the wide(...) source sits a line or two
+        // above the copy — inside the window, so it must be flagged.
+        let banned = vec![
+            "    let tip = wide(\"Song — Artist\");",
+            "    let count = tip.len().min(data.szTip.len() - 1);",
+            "    data.szTip[..count].copy_from_slice(&tip[..count]);",
+            "    data.szTip[count] = 0;",
+        ];
+        assert!(
+            is_wide_copy_window(&banned, 2),
+            "the pre-helper tray pattern must be flagged"
+        );
+        // A plain byte copy — no wide marker in the window — must pass.
+        let legit = vec![
+            "fn crash_write_str(buf: &mut [u8], pos: usize, s: &[u8]) -> usize {",
+            "    let end = (pos + s.len()).min(buf.len());",
+            "    buf[pos..end].copy_from_slice(&s[..end - pos]);",
+            "    end",
+            "}",
+        ];
+        assert!(!is_wide_copy_window(&legit, 2), "a u8 copy must not be flagged");
+    }
+
+    #[test]
+    fn wide_read_window_flags_the_zero_fill_reliant_shape_and_passes_sliced_reads() {
+        // The banned read shape: GetClassNameW fills a fixed [0u16; N] buffer
+        // and the code reads the whole buffer back — termination would rest
+        // on the zero-fill, and the terminator + padding land inside the
+        // string. Must be flagged.
+        let banned = vec![
+            "        let mut class = [0u16; 256];",
+            "        let len = GetClassNameW(hwnd, &mut class);",
+            "        let name = String::from_utf16_lossy(&class);",
+        ];
+        assert!(
+            is_zero_fill_reliant_read_window(&banned, 2),
+            "a whole-buffer read of a wide-API fill must be flagged"
+        );
+        // The compliant shape: the same fill, read with the returned length.
+        let legit = vec![
+            "        let mut class = [0u16; 256];",
+            "        let len = GetClassNameW(hwnd, &mut class);",
+            "        let name = String::from_utf16_lossy(&class[..len as usize]);",
+        ];
+        assert!(
+            !is_zero_fill_reliant_read_window(&legit, 2),
+            "a sliced read must not be flagged"
+        );
+        // A whole-buffer read with no wide-API fill in the window (a Vec
+        // truncated to the API's size, or a struct field) is out of the
+        // guard's scope and must pass.
+        let no_fill = vec![
+            "        buffer.truncate(size as usize);",
+            "        let path = String::from_utf16_lossy(&buffer);",
+        ];
+        assert!(
+            !is_zero_fill_reliant_read_window(&no_fill, 1),
+            "reads without a wide-API fill marker must not be flagged"
+        );
+    }
+
+    #[test]
+    fn copy_wide_terminated_truncates_with_an_explicit_terminator() {
+        // The truncation boundary is the case that must never be left
+        // unterminated. The buffer is poisoned (no zero-fill to lean on): a
+        // longer value fills up to len-1 and the explicit terminator lands in
+        // the last slot, so the array is always terminated.
+        let mut buf = [0xFFFFu16; 8];
+        copy_wide_terminated(&mut buf, "abcdefghijklmnop");
+        assert_eq!(
+            &buf,
+            &[
+                b'a' as u16,
+                b'b' as u16,
+                b'c' as u16,
+                b'd' as u16,
+                b'e' as u16,
+                b'f' as u16,
+                b'g' as u16,
+                0
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_wide_terminated_handles_empty_input_and_empty_buffer() {
+        let mut buf = [0u16; 4];
+        copy_wide_terminated(&mut buf, "");
+        assert_eq!(buf[0], 0, "an empty value leaves a lone terminator");
+        let mut empty: [u16; 0] = [];
+        copy_wide_terminated(&mut empty, "x"); // must not panic
     }
 
     #[test]

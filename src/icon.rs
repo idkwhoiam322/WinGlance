@@ -1,4 +1,5 @@
 use crate::winapi::delete_object;
+use crate::winutil::wide;
 use log::{debug, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, mpsc};
@@ -117,8 +118,8 @@ fn try_shell_item(item: &IShellItem, size: usize) -> Option<Vec<u8>> {
 }
 
 fn try_parsing_name(path: &str, size: usize) -> Option<Vec<u8>> {
-    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-    let pcwstr = PCWSTR(wide.as_ptr());
+    let wide_path = wide(path);
+    let pcwstr = PCWSTR(wide_path.as_ptr());
     let item: IShellItem = unsafe { SHCreateItemFromParsingName(pcwstr, Option::<&IBindCtx>::None).ok() }?;
     let result = try_shell_item(&item, size);
     // The generated `IShellItem` wraps an `IUnknown` field that releases the
