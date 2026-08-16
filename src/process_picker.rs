@@ -1,3 +1,4 @@
+use crate::overlay::source_matches_pin;
 use crate::winutil::{StateClaim, clear_window_state, set_window_state, wide, window_state};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
@@ -53,6 +54,12 @@ pub(crate) const PICKER_RESULT_MSG: u32 = WM_APP + 7;
 /// Result message for the Auto-compact sources picker (same contract as
 /// `PICKER_RESULT_MSG`, same picker window, different config field).
 pub(crate) const AUTO_SOURCES_RESULT_MSG: u32 = WM_APP + 11;
+/// Result message for the pinned-source picker (same contract as
+/// `PICKER_RESULT_MSG`, same picker window). This picker runs in single-select
+/// mode: checking a row unchecks every other, so the result holds at most one
+/// pattern — the config field it feeds (`behavior.pinned_source`) is a single
+/// app, not a list.
+pub(crate) const PINNED_SOURCE_RESULT_MSG: u32 = WM_APP + 12;
 
 /// Identifier for the listbox's Comctl32 subclass registration.
 const LISTBOX_SUBCLASS_ID: usize = 1;
@@ -90,9 +97,14 @@ struct PickerState {
     result: Arc<Mutex<Option<Vec<String>>>>,
     /// The result message posted on confirm: `PICKER_RESULT_MSG` for the
     /// media-sources picker, `AUTO_SOURCES_RESULT_MSG` for the Auto-compact
-    /// sources picker. The main window distinguishes the two by this message
-    /// and writes the matching config field.
+    /// sources picker, `PINNED_SOURCE_RESULT_MSG` for the pinned-source
+    /// picker. The main window distinguishes them by this message and writes
+    /// the matching config field.
     result_msg: u32,
+    /// Single-select mode (pinned-source picker): checking a row unchecks
+    /// every other row, so `read_checked` returns at most one pattern. The
+    /// media-sources and Auto-compact pickers are multi-select.
+    single: bool,
 }
 
 static OPEN_PICKER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
@@ -317,6 +329,45 @@ fn build_picker_list(current: &[String], mut entries: Vec<ProcessEntry>) -> Vec<
     not_running
 }
 
+/// The pinned-source picker's row list: the live app/session set filtered to
+/// the user's allowed sources (`media_sources`; an empty allow-list means all
+/// apps are allowed, so nothing is filtered), plus the stored pin — kept
+/// visible even when it no longer matches the allow-list so it can be cleared,
+/// labeled "(not allowed)" instead of the misleading "(not running)". The same
+/// identity rule the pin uses at runtime (`source_matches_pin`) drives the
+/// filter, so every row offered here, if chosen, actually matches the pin.
+fn build_pinned_source_list(current: &[String], allowed: &[String], entries: Vec<ProcessEntry>) -> Vec<ProcessEntry> {
+    let allowed_entries = if allowed.is_empty() {
+        entries
+    } else {
+        entries
+            .into_iter()
+            .filter(|e| allowed.iter().any(|a| source_matches_pin(&e.pattern, a)))
+            .collect()
+    };
+    let current_allowed: Vec<String> = current
+        .iter()
+        .filter(|p| allowed.is_empty() || allowed.iter().any(|a| source_matches_pin(p, a)))
+        .cloned()
+        .collect();
+    let list = build_picker_list(&current_allowed, allowed_entries);
+    // A stored pin that no longer matches the allow-list (media_sources was
+    // narrowed after pinning) stays visible and pre-checked so the user can
+    // clear it; the label says why it would not work. Pinned above the
+    // "(not running)" rows so it is not missed.
+    let mut not_allowed: Vec<ProcessEntry> = current
+        .iter()
+        .filter(|p| !current_allowed.iter().any(|c| c == *p))
+        .map(|p| ProcessEntry {
+            display_name: format!("{} (not allowed)", pretty_source_label(p)),
+            pattern: p.clone(),
+        })
+        .collect();
+    not_allowed.sort_by_key(|e| e.display_name.to_lowercase());
+    not_allowed.extend(list);
+    not_allowed
+}
+
 /// The Auto-compact picker's row list: the pinned "Full screen apps" status
 /// row is always the first entry — fullscreen apps compact regardless of the
 /// app list (see `decide_layout`), so the coverage stays visible even after
@@ -443,6 +494,7 @@ pub(crate) fn open(
     owner: HWND,
     trigger_rect: &RECT,
     current: &[String],
+    allowed: &[String],
     result: Arc<Mutex<Option<Vec<String>>>>,
     result_msg: u32,
 ) -> bool {
@@ -452,7 +504,15 @@ pub(crate) fn open(
         return false;
     }
     let auto_picker = result_msg == AUTO_SOURCES_RESULT_MSG;
-    let list = if auto_picker {
+    // The pinned-source picker is single-select: the config field it feeds is
+    // one app, never a list. It is also restricted to the user's allowed
+    // sources: the SMTC worker excludes any session not matching
+    // `media_sources` (when non-empty), so a pin outside the allow-list could
+    // never fire — offering such rows would let the user pin something dead.
+    let single = result_msg == PINNED_SOURCE_RESULT_MSG;
+    let list = if single {
+        build_pinned_source_list(current, allowed, entries)
+    } else if auto_picker {
         build_auto_compact_list(current, entries)
     } else {
         build_picker_list(current, entries)
@@ -546,6 +606,7 @@ pub(crate) fn open(
             row_selected_brush: HBRUSH::default(),
             result,
             result_msg,
+            single,
         });
         let state_ptr = Box::into_raw(state);
         PICKER_STATE_CLAIMED.reset();
@@ -889,17 +950,40 @@ unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPAR
                         return LRESULT(0);
                     }
                     let _ = unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
-                    let mut item_rect = RECT::default();
-                    let _ = unsafe {
-                        SendMessageW(
-                            lb,
-                            LB_GETITEMRECT,
-                            WPARAM(i),
-                            LPARAM(&mut item_rect as *mut RECT as isize),
-                        )
-                    };
-                    unsafe {
-                        let _ = InvalidateRect(lb, Some(&item_rect), false);
+                    if state.single {
+                        // Single-select (pinned-source picker): checking one
+                        // row clears every other, so at most one pattern is
+                        // ever confirmed — clicking the checked row unchecks
+                        // it (clearing the pin), clicking any other row moves
+                        // the selection. The whole list repaints because any
+                        // other checked row just flipped too.
+                        let count = unsafe { SendMessageW(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as usize;
+                        for j in 0..count {
+                            if j != i
+                                && unsafe { SendMessageW(lb, LB_GETITEMDATA, WPARAM(j), LPARAM(0)) }.0 as usize
+                                    == BST_CHECKED
+                            {
+                                let _ = unsafe {
+                                    SendMessageW(lb, LB_SETITEMDATA, WPARAM(j), LPARAM(BST_UNCHECKED as isize))
+                                };
+                            }
+                        }
+                        unsafe {
+                            let _ = InvalidateRect(lb, None, false);
+                        }
+                    } else {
+                        let mut item_rect = RECT::default();
+                        let _ = unsafe {
+                            SendMessageW(
+                                lb,
+                                LB_GETITEMRECT,
+                                WPARAM(i),
+                                LPARAM(&mut item_rect as *mut RECT as isize),
+                            )
+                        };
+                        unsafe {
+                            let _ = InvalidateRect(lb, Some(&item_rect), false);
+                        }
                     }
                     return LRESULT(0);
                 }
@@ -1419,6 +1503,67 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].pattern, "alpha");
         assert_eq!(list[1].pattern, "zeta");
+    }
+
+    #[test]
+    fn pinned_source_list_is_restricted_to_allowed_sources() {
+        // The pinned-source picker may only offer apps matching the user's
+        // Allowed Sources: the worker excludes anything outside `media_sources`
+        // (non-empty), so a pin outside it could never fire.
+        let entries = vec![entry("spotify"), entry("spotifyhelper"), entry("chrome")];
+        let allowed = vec!["Spotify".to_string()];
+        let list = build_pinned_source_list(&[], &allowed, entries);
+        let patterns: Vec<&str> = list.iter().map(|e| e.pattern.as_str()).collect();
+        assert_eq!(
+            patterns,
+            ["spotify", "spotifyhelper"],
+            "only sources matching the allow-list may be pinned"
+        );
+    }
+
+    #[test]
+    fn pinned_source_list_with_empty_allow_list_shows_everything() {
+        // Empty `media_sources` = all apps allowed (documented semantics), so
+        // the pinned picker is unfiltered in that case.
+        let entries = vec![entry("spotify"), entry("chrome")];
+        let list = build_pinned_source_list(&[], &[], entries);
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn pinned_source_list_matches_allow_patterns_bidirectionally() {
+        // The same identity rule as the pin at runtime: an allow pattern
+        // stored as "youtube music" matches the session-derived
+        // "youtube-music" entry, so the row set agrees with the worker.
+        let entries = vec![entry("youtube-music"), entry("brave")];
+        let allowed = vec!["youtube music".to_string()];
+        let list = build_pinned_source_list(&[], &allowed, entries);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].pattern, "youtube-music");
+    }
+
+    #[test]
+    fn disallowed_stored_pin_stays_visible_and_clearable() {
+        // A pin that no longer matches the allow-list (media_sources was
+        // narrowed after pinning) must not vanish: it stays as a
+        // "(not allowed)" row — an accurate label even when the app is
+        // running — with the pattern verbatim so the pre-check marks it and
+        // the user can clear it.
+        let entries = vec![entry("foobar"), entry("spotify")];
+        let allowed = vec!["spotify".to_string()];
+        let list = build_pinned_source_list(&["foobar".to_string()], &allowed, entries);
+        assert_eq!(list.len(), 2, "the disallowed pin row plus the allowed live app");
+        assert!(
+            list[0].display_name.contains("not allowed"),
+            "label must read '(not allowed)', got '{}'",
+            list[0].display_name
+        );
+        assert_eq!(list[0].pattern, "foobar");
+        assert_eq!(list[1].pattern, "spotify");
+        // The stored-pin row's pattern is verbatim, so the pre-check (which
+        // matches normalized current patterns) marks it checked and it
+        // survives the single-select replace-on-save.
+        assert_eq!(normalize_pattern(&list[0].pattern), normalize_pattern("foobar"));
     }
 
     #[test]

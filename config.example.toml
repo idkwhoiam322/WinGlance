@@ -76,6 +76,12 @@ close_to_tray = true
 # Source apps to allow (case-insensitive substrings against the
 # AUMID and its label). When empty, all apps generate notifications.
 # media_sources = ["spotify"]
+# Preferred source for the persistent pill (same matching rules as
+# media_sources, but a single app). The pill keeps showing every source's
+# events; when a pill would dismiss (the idle fade) it returns to this
+# source's last track instead, while the source is still playing. Unset =
+# no pin. Only meaningful with layout = "persistent-compact".
+# pinned_source = "spotify"
 # Apps that force the Compact layout while layout = "auto" and one of them
 # is the foreground app (same matching rules as media_sources). When empty,
 # only fullscreen foregrounds compact.

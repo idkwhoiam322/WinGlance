@@ -141,6 +141,48 @@ Expanded rules, in the compact layout the Compact rules):
 | `media_sources`                 | `[]`    | list   | Media source apps (case-insensitive substrings) to allow; empty = all apps |
 | `auto_compact_sources`          | `[]`    | list   | Apps (case-insensitive substrings) that force the Compact layout while `layout` is `"auto"`; empty = only fullscreen compacts |
 | `hide_for_auto_compact_sources` | `true`  | bool   | When `layout` is `"persistent-compact"`, hide the pill while a fullscreen window or a listed `auto_compact_sources` app is the foreground window; resumes when the foreground clears |
+| `pinned_source`                 | —      | string | Preferred source for the persistent pill (same matching rules as `media_sources`, single app). The pill still shows every source's events; when a pill would dismiss (idle fade) it returns to this source's last track while it is still playing. Unset = no pin. The settings picker only offers apps on the Allowed Sources list (when that list is non-empty) — a pin outside it could never fire. What the pill shows when the pinned source stops playing is described below |
+
+**How the persistent pill behaves when the pinned source stops playing**
+(mid-track, with another source active):
+
+- **The pin pauses** (its session is still open): the pill keeps the pinned
+  source's track, flips the symbol to ⏸ and freezes the progress bar, and
+  rests on that paused state at idle opacity — the pin is the pill's resting
+  identity, so the pill stays truthful about the pin rather than jumping to
+  whatever else happens to be playing. Resuming playback flips the symbol
+  back to the music note in place.
+- **The pin stops for real** (its session closes): the pill shows the ⏹
+  tombstone for the normal duration, then settles on the most recent source
+  that is *actually still playing* — the pill keeps its persistent promise
+  instead of going dark while other media is audible. Only when nothing else
+  is playing does the pill collapse into the usual full hide.
+- **The pin stops while the pill is showing another source**: nothing
+  changes — the pin's terminal stop never disturbs the content on screen;
+  the pill only ever *returns* to the pin when it is playing.
+
+Re-enabling notifications (the tray toggle) restores the pill through a
+fixed priority, most desirable first:
+
+1. **The pinned source, while it is actually playing** — its most recent
+   cached track, shown immediately instead of whatever was last shown when
+   notifications were disabled. The track cache stays live while
+   notifications are off — a song change on the pinned source during the
+   disabled gap is still recorded — so the restore shows the *current*
+   track, not the one from before the disable.
+2. **The most recent cached track that is actually playing** (any source) —
+   a paused/stopped/unknown pin is never restored; the pill falls through to
+   the newest live source instead, so re-enabling surfaces a song change
+   that happened during the disabled gap rather than stale pre-disable
+   content. This step applies with no pin configured too.
+3. **The pre-disable hold** — the pill content that was held when
+   notifications were turned off (e.g. the persistent-compact auto-hide
+   snapshot).
+4. **The pre-disable last-shown track** — the final fallback when nothing
+   above is available.
+
+If every step is empty, the worker's ~2 s re-emit surfaces the current
+playing track through the normal event path.
 
 ## [appearance]
 

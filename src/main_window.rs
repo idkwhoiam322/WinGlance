@@ -8,10 +8,10 @@ use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
     EventQueue, OverlayPos, enumerate_displays_cached, invalidate_display_cache, set_dismiss_on_hover, set_duration,
     set_expand_compact_on_hover, set_fade_persistent_pill, set_hide_for_auto_compact_sources, set_layout,
-    set_positions, show_sample,
+    set_pinned_source, set_positions, show_sample,
 };
 use crate::process_picker;
-use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG};
+use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG, PINNED_SOURCE_RESULT_MSG};
 use crate::winutil::{StateClaim, clear_window_state, set_window_state, wide, window_state};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
@@ -186,6 +186,7 @@ enum SettingId {
     ExpandCompactOnHover,
     HideForAutoCompactSources,
     FadePersistentPill,
+    PinnedSource,
     CompactPosition,
     AutoCompactApps,
     Monitor,
@@ -898,6 +899,10 @@ struct MainWindowState {
     /// Shared slot for the Auto-compact apps picker, which posts
     /// `AUTO_SOURCES_RESULT_MSG` (same contract as `picker_result`).
     auto_sources_result: Arc<Mutex<Option<Vec<String>>>>,
+    /// Shared slot for the pinned-source picker's confirmed pattern(s). The
+    /// picker runs single-select, so the slot holds at most one entry, posted
+    /// via `PINNED_SOURCE_RESULT_MSG` (same contract as `picker_result`).
+    pinned_source_result: Arc<Mutex<Option<Vec<String>>>>,
     /// Last playback state each source app reported, so a new track from a
     /// source starts with its own state instead of inheriting the previous
     /// activity's (which may belong to another app).
@@ -1109,6 +1114,7 @@ impl MainWindowState {
             config_status: None,
             picker_result: Arc::new(Mutex::new(None)),
             auto_sources_result: Arc::new(Mutex::new(None)),
+            pinned_source_result: Arc::new(Mutex::new(None)),
             source_states: HashMap::new(),
             source_order: VecDeque::new(),
             wake: Arc::new(AtomicBool::new(false)),
@@ -2337,6 +2343,16 @@ impl MainWindowState {
         });
         y += row_h + gap;
         natural.push(SettingsItem::Row {
+            id: SettingId::PinnedSource,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        natural.push(SettingsItem::Row {
             id: SettingId::Monitor,
             rect: RECT {
                 left,
@@ -2658,6 +2674,14 @@ impl MainWindowState {
                             },
                             if fade_persistent_pill { accent } else { colors.faint },
                         ),
+                        SettingId::PinnedSource => (
+                            "Pinned source",
+                            match &cfg.behavior.pinned_source {
+                                Some(pin) => pin.clone(),
+                                None => "None".to_string(),
+                            },
+                            colors.muted,
+                        ),
                         SettingId::Monitor => ("Monitor", monitor_label(&cfg, display_count), colors.muted),
                         SettingId::AllowedApps => (
                             "Allowed apps",
@@ -2694,6 +2718,7 @@ impl MainWindowState {
                         | SettingId::ExpandCompactOnHover
                         | SettingId::HideForAutoCompactSources
                         | SettingId::FadePersistentPill
+                        | SettingId::PinnedSource
                         | SettingId::AutoCompactApps
                         | SettingId::Monitor => {
                             let mut val_rect = control_rect;
@@ -4703,10 +4728,32 @@ fn apply_settings_row_click(
                 hwnd,
                 &control_rect,
                 &state.cfg().behavior.auto_compact_sources,
+                &[],
                 state.auto_sources_result.clone(),
                 AUTO_SOURCES_RESULT_MSG,
             ) {
                 debug!("auto-compact sources picker failed to open");
+            }
+        }
+        SettingId::PinnedSource => {
+            // Single-select picker: the confirmed
+            // result holds at most one pattern. The
+            // stored pin (a single string) is passed
+            // as the current selection slice, and the
+            // row set is restricted to the user's
+            // Allowed Sources — a pin outside
+            // `media_sources` could never fire (the
+            // worker excludes non-allowed sessions).
+            let current: Vec<String> = state.cfg().behavior.pinned_source.clone().into_iter().collect();
+            if !process_picker::open(
+                hwnd,
+                &control_rect,
+                &current,
+                &state.cfg().behavior.media_sources,
+                state.pinned_source_result.clone(),
+                PINNED_SOURCE_RESULT_MSG,
+            ) {
+                debug!("pinned-source picker failed to open");
             }
         }
         SettingId::Position => {
@@ -4785,6 +4832,7 @@ fn apply_settings_row_click(
                 hwnd,
                 &control_rect,
                 &state.cfg().behavior.media_sources,
+                &[],
                 state.picker_result.clone(),
                 PICKER_RESULT_MSG,
             ) {
@@ -5447,6 +5495,29 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             LRESULT(0)
         }
+        PINNED_SOURCE_RESULT_MSG => {
+            // Same contract as PICKER_RESULT_MSG, but for the single-select
+            // pinned-source picker: at most one pattern lands in the shared
+            // slot and is taken here into `behavior.pinned_source` (an empty
+            // result clears the pin). The live overlay keeps its own config
+            // snapshot, so the change is pushed there too — the pin only
+            // decides what the persistent pill returns to after a dismiss.
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                let patterns = state
+                    .pinned_source_result
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if let Some(patterns) = patterns {
+                    let pin = patterns.into_iter().next();
+                    state.mutate_config(|cfg| cfg.behavior.pinned_source = pin);
+                    set_pinned_source(state.overlay_hwnd, state.cfg().behavior.pinned_source.clone());
+                    state.invalidate();
+                }
+            }
+            LRESULT(0)
+        }
         WM_DISPLAYCHANGE => {
             // A display was added, removed, or reordered (or its resolution
             // changed). Invalidate the shared display cache so the next tray
@@ -5531,6 +5602,7 @@ fn setting_label(id: SettingId) -> &'static str {
         SettingId::ExpandCompactOnHover => "Expand compact pill on hover",
         SettingId::HideForAutoCompactSources => "Hide for auto-compact sources",
         SettingId::FadePersistentPill => "Fade persistent pill",
+        SettingId::PinnedSource => "Pinned source",
         SettingId::Monitor => "Monitor",
         SettingId::ShowSample => "Show sample",
         SettingId::CopyLogs => "Diagnostics",
@@ -5567,6 +5639,9 @@ fn setting_value(id: SettingId, cfg: &Config) -> String {
         SettingId::ExpandCompactOnHover => on_off(cfg.overlay.expand_compact_on_hover),
         SettingId::HideForAutoCompactSources => on_off(cfg.behavior.hide_for_auto_compact_sources),
         SettingId::FadePersistentPill => on_off(cfg.overlay.fade_persistent_pill),
+        // No pin is spelled out (like the empty Auto-compact list) so the UIA
+        // name never reads a bare "Pinned source:".
+        SettingId::PinnedSource => cfg.behavior.pinned_source.clone().unwrap_or_else(|| "None".into()),
         SettingId::ShowSample => "Show a sample notification".into(),
         SettingId::Duration => format!("{}s", cfg.overlay.duration_ms / 1000),
         SettingId::Layout => format!("{:?}", cfg.overlay.layout),
@@ -6035,6 +6110,7 @@ mod tests {
             SettingId::ExpandCompactOnHover,
             SettingId::HideForAutoCompactSources,
             SettingId::FadePersistentPill,
+            SettingId::PinnedSource,
             SettingId::Monitor,
             SettingId::ShowSample,
             SettingId::CopyLogs,

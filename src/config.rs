@@ -287,6 +287,18 @@ pub struct BehaviorConfig {
     /// window or a listed `auto_compact_sources` app is the foreground window,
     /// and resume the held content when the foreground clears. Default: `true`.
     pub hide_for_auto_compact_sources: bool,
+    /// Preferred source for the persistent pill (same form, identity and
+    /// matching rules as `media_sources`, but a single app). While
+    /// `layout = "persistent-compact"`, the pill keeps showing every source's
+    /// events — nothing is filtered — but when a pill would dismiss (the idle
+    /// fade) it returns to this source's last track instead, provided the
+    /// source is still playing (the "swap only to sources still playing"
+    /// discipline, `best_successor`). Empty/None: the persistent pill behaves
+    /// as before and no return happens. Implemented UI-side only: the SMTC
+    /// worker keeps emitting every source, and the overlay decides what the
+    /// persistent pill displays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_source: Option<String>,
     /// Unknown keys under `[behavior]`, preserved across saves.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -419,6 +431,7 @@ impl Default for BehaviorConfig {
             media_sources: Vec::new(),
             auto_compact_sources: Vec::new(),
             hide_for_auto_compact_sources: true,
+            pinned_source: None,
             unknown: toml::Table::new(),
         }
     }
@@ -698,6 +711,14 @@ impl Config {
         self.overlay.margin = self.overlay.margin.clamp(0, 500);
         self.overlay.compact_margin = self.overlay.compact_margin.clamp(0, 500);
         self.behavior.debounce_ms = self.behavior.debounce_ms.clamp(150, 250);
+        // `pinned_source` is a single source pattern: trim it (a hand-edited
+        // value with stray whitespace must match the same way the picker's
+        // patterns do) and treat an empty string as "no pin" — the same
+        // normalization the settings UI applies when it clears the pin.
+        if let Some(pinned) = &self.behavior.pinned_source {
+            let trimmed = pinned.trim().to_string();
+            self.behavior.pinned_source = (!trimmed.is_empty()).then_some(trimmed);
+        }
         // f32 appearance fields go through `finite_clamp`: a non-finite value
         // declared in config.toml (TOML accepts nan/inf spellings) must fall
         // back to the documented default instead of passing through f32::clamp
@@ -1237,6 +1258,45 @@ nested_appearance = [1, 2, 3]
         let config: Config = toml::from_str("[overlay]\nduration_ms = 4000\n").unwrap();
         assert_eq!(config.overlay.monitor, MonitorMode::ActiveWindow);
         assert_eq!(config.overlay.duration_ms, 4000);
+    }
+
+    #[test]
+    fn pinned_source_defaults_to_none_and_round_trips() {
+        // The default config has no pin.
+        assert_eq!(Config::default().behavior.pinned_source, None);
+        // A config that never mentions the key deserializes to None.
+        let config: Config = toml::from_str("[behavior]\n").unwrap();
+        assert_eq!(config.behavior.pinned_source, None);
+        // An explicit value loads and survives a save round trip.
+        let mut config: Config = toml::from_str("[behavior]\npinned_source = \"spotify\"\n").unwrap();
+        assert_eq!(config.behavior.pinned_source.as_deref(), Some("spotify"));
+        let saved = toml::to_string_pretty(&config).unwrap();
+        let reloaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded.behavior.pinned_source.as_deref(), Some("spotify"));
+        // Clearing the pin (None) serializes to an omitted key, so an unset
+        // pin never leaves a stale empty string in config.toml.
+        config.behavior.pinned_source = None;
+        let cleared = toml::to_string_pretty(&config).unwrap();
+        assert!(!cleared.contains("pinned_source"), "{cleared}");
+    }
+
+    #[test]
+    fn pinned_source_normalizes_trim_and_empty_to_none() {
+        // normalize() trims stray whitespace around a hand-edited pattern.
+        let mut padded = Config::default();
+        padded.behavior.pinned_source = Some("  spotify  ".to_string());
+        padded.normalize();
+        assert_eq!(padded.behavior.pinned_source.as_deref(), Some("spotify"));
+        // An empty (or whitespace-only) value means no pin — the same rule
+        // the settings UI relies on when it clears the selection.
+        let mut empty = Config::default();
+        empty.behavior.pinned_source = Some(String::new());
+        empty.normalize();
+        assert_eq!(empty.behavior.pinned_source, None);
+        let mut blank = Config::default();
+        blank.behavior.pinned_source = Some("   ".to_string());
+        blank.normalize();
+        assert_eq!(blank.behavior.pinned_source, None);
     }
 
     #[test]

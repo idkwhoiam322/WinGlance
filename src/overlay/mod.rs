@@ -807,6 +807,29 @@ pub(crate) fn set_fade_persistent_pill(hwnd: HWND, enabled: bool) {
     }
 }
 
+/// Pushes the pinned-source pattern to the live overlay (which keeps its own
+/// config snapshot). Trims the pattern and treats an empty value as no pin —
+/// the same normalization `Config::normalize` applies to hand-edited configs,
+/// so a pin cleared in the settings UI and a cleared hand-edited config agree.
+/// Nothing changes visually until the next dismiss deadline: the pin only
+/// decides what the persistent pill returns to after a dismiss
+/// (`try_return_to_pinned`), so no re-render or preview is needed here.
+pub(crate) fn set_pinned_source(hwnd: HWND, pin: Option<String>) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = window_state::<OverlayState>(hwnd);
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        let pin = pin.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+        state.config.behavior.pinned_source = pin;
+        info!("overlay pinned_source set to {:?}", state.config.behavior.pinned_source);
+    }
+}
+
 /// Pushes the hide-for-auto-compact-sources setting to the live overlay.
 /// The next foreground change evaluates the new value.
 pub(crate) fn set_hide_for_auto_compact_sources(hwnd: HWND, enabled: bool) {
@@ -822,6 +845,22 @@ pub(crate) fn set_hide_for_auto_compact_sources(hwnd: HWND, enabled: bool) {
         state.config.behavior.hide_for_auto_compact_sources = enabled;
         info!("overlay hide_for_auto_compact_sources set to {enabled}");
     }
+}
+
+/// Whether a source app matches the pinned-source pattern, using the same
+/// identity rules as the media-sources allow-list (`normalize_for_match`):
+/// the pattern or the source contains the other, so a stored "Spotify.exe"
+/// matches a session label "spotify" and vice versa (the same bidirectional
+/// rule the picker's pre-check uses, so a row the picker shows as checked
+/// always matches at runtime). An empty pattern never matches. Shared with
+/// the process picker, which uses it to restrict the pinned-source row set
+/// to the user's allowed sources.
+pub(crate) fn source_matches_pin(source: &str, pin: &str) -> bool {
+    let nsource = crate::smtc::normalize_for_match(source);
+    let npin = crate::smtc::normalize_for_match(pin);
+    // Both sides must be non-empty: the bidirectional contains rule would
+    // otherwise let an empty source or pin match everything.
+    !nsource.is_empty() && !npin.is_empty() && (nsource.contains(&npin) || npin.contains(&nsource))
 }
 
 /// Whether the pill's fonts must be rebuilt because the resolved target
@@ -1578,6 +1617,64 @@ impl OverlayState {
             let (track, last_used) = self.track_cache.get(source)?;
             (now.duration_since(*last_used) <= TRACK_CACHE_TTL).then(|| track.clone())
         })
+    }
+
+    /// The pinned source's most recently cached track, but only while the pin
+    /// is *actually playing* — the "swap only to sources still playing"
+    /// discipline (`best_successor`). Recency order keeps the choice
+    /// deterministic when several cached sources match a broad pin, and a
+    /// paused/stopped match never blocks a playing one — iterating the cache
+    /// map directly would let the arbitrary HashMap order decide, and could
+    /// skip the pin even though its app is playing. Returns None when no pin
+    /// is configured, or the pinned source is paused/stopped/unknown or has
+    /// no cached track.
+    fn pinned_track(&self) -> Option<TrackInfo> {
+        let pin = self.config.behavior.pinned_source.as_deref()?;
+        self.track_cache_order.iter().rev().find_map(|source| {
+            if !source_matches_pin(source, pin) {
+                return None;
+            }
+            self.track_cache
+                .get(source)
+                .filter(|_| self.source_state.get(source.as_str()) == Some(&PlaybackState::Playing))
+                .cloned()
+        })
+    }
+
+    /// Preferred-source pinning: when the persistent pill's dismiss deadline
+    /// fires while a non-pinned source is showing, swap the pill to the pinned
+    /// source's cached track instead of settling into the idle fade — the
+    /// pill's resting state is its pinned source. Other sources' events still
+    /// show (nothing is filtered; the worker keeps emitting every source); the
+    /// return only decides what the pill *rests* on after a dismiss.
+    /// The pinned source must be *actually playing* — the "swap only to
+    /// sources still playing" discipline, `best_successor` — and must have a
+    /// cached track: a paused/stopped pin never resurrects stale content, and
+    /// when the pin's session closes (`retire_source_gone` marks it Stopped)
+    /// the return stops on its own. Returns true when the pill was swapped;
+    /// the caller then skips the fade/collapse decisions and the fresh
+    /// deadline (set by `update_content`) runs a full duration before the
+    /// next idle fade.
+    fn try_return_to_pinned(&mut self) -> bool {
+        let Some(pin) = self.config.behavior.pinned_source.as_deref() else {
+            return false;
+        };
+        // The pill already rests on the pinned source (its track, or a state
+        // pill for it): nothing to return to.
+        let shown_source = self.content.as_ref().and_then(Self::event_source);
+        if shown_source.is_some_and(|source| source_matches_pin(source, pin)) {
+            return false;
+        }
+        let Some(track) = self.pinned_track() else {
+            return false;
+        };
+        debug!("persistent pill returning to pinned source {}", track.source_app);
+        self.current_source = Some(track.source_app.clone());
+        self.last_track = Some(track.clone());
+        self.cache_track(&track);
+        let full = Duration::from_millis(self.config.overlay.duration_ms.max(500));
+        self.update_content(MediaEvent::TrackChanged(track), full);
+        true
     }
 
     /// A source is no longer allowed (removed from `media_sources`, or its
@@ -2376,16 +2473,71 @@ impl OverlayState {
         // full opacity whether playing or paused — only a Stopped-state pill
         // (tombstone: source is done) collapses into a full hide below.
         if self.config.overlay.layout == LayoutMode::PersistentCompact && !self.persistent_collapse_on_dismiss {
-            // A Stopped-state pill must not linger at idle opacity: its source is
-            // done, so the deadline collapses it into a full hide.
-            if stopped_shown {
+            // Preferred-source pinning: when the dismiss deadline fires while a
+            // non-pinned source is showing, return to the pinned source's
+            // cached track instead of settling into the idle fade (or
+            // collapsing a Stopped tombstone) — the pill's resting state is
+            // its pinned source. The swap runs `update_content`, which
+            // restores full opacity and restarts the dismiss timer, so the
+            // pill shows the pinned track for a full duration before the next
+            // idle fade. Skipped whenever the pill must collapse into a hide
+            // instead (collapse-on-dismiss is handled by the outer guard), is
+            // being read (cursor over), or the pinned source is not playing.
+            if !cursor_over
+                && self.dismiss_at.is_some_and(|deadline| deadline <= now)
+                && matches!(self.phase, Phase::Shown)
+                && self.try_return_to_pinned()
+            {
+                debug!("persistent pill returned to the pinned source");
+            } else if stopped_shown {
+                // A Stopped-state pill must not linger at idle opacity: its
+                // source is done, so the deadline collapses it into a full
+                // hide. One exception: when the tombstone belongs to the
+                // pinned source and another source is still playing, the pill
+                // settles onto that source's most recent track instead of
+                // going dark — the pin's session closing must not leave the
+                // persistent pill hiding while other media is audible. The
+                // tombstone has already held its full duration by this
+                // deadline, so the deliberate "source stopped" announcement
+                // is preserved; this is the "swap only to sources still
+                // playing" discipline (`best_successor`) applied to the pin's
+                // own retirement. With no playing successor the tombstone
+                // still collapses into the full hide.
                 if !cursor_over
                     && self.dismiss_at.is_some_and(|deadline| deadline <= now)
                     && matches!(self.phase, Phase::Shown)
                 {
-                    self.phase = Phase::Collapsing(now);
-                    self.hover_expand = None;
-                    debug!("persistent pill hidden (stopped)");
+                    let tombstone_source = match &self.content {
+                        Some(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, source)) => Some(source.as_str()),
+                        _ => None,
+                    };
+                    let pinned_tombstone = tombstone_source.is_some_and(|source| {
+                        self.config
+                            .behavior
+                            .pinned_source
+                            .as_deref()
+                            .is_some_and(|pin| source_matches_pin(source, pin))
+                    });
+                    let successor = if pinned_tombstone {
+                        tombstone_source.and_then(|gone| self.best_successor(gone))
+                    } else {
+                        None
+                    };
+                    if let Some(track) = successor {
+                        debug!(
+                            "persistent pill settling on {} after the pinned source stopped",
+                            track.source_app
+                        );
+                        let full = Duration::from_millis(self.config.overlay.duration_ms.max(500));
+                        self.current_source = Some(track.source_app.clone());
+                        self.last_track = Some(track.clone());
+                        self.cache_track(&track);
+                        self.update_content(MediaEvent::TrackChanged(track), full);
+                    } else {
+                        self.phase = Phase::Collapsing(now);
+                        self.hover_expand = None;
+                        debug!("persistent pill hidden (stopped)");
+                    }
                 }
             } else if self.config.overlay.fade_persistent_pill
                 && !self.persistent_faded
@@ -3069,6 +3221,14 @@ impl OverlayState {
             // MEDIA_EVENT_MSG is drained and dropped by `!self.enabled` before
             // the toggle flips it; the worker's re-emit then lands on the
             // now-enabled overlay and corrects or refreshes the pill.
+            // Preferred-source pinning: while the pin is actually playing, the
+            // pill's resting state is its pinned source, so the restore
+            // prefers the pinned track over whatever happened to be showing
+            // when notifications were disabled (the same "swap only to
+            // sources still playing" gate as the dismiss-deadline return, so
+            // a paused/stopped pin never gets restored). The worker's re-emit
+            // then corrects the cached track if the pin changed songs while
+            // disabled.
             // Otherwise restore the most recent cached track that is
             // *actually playing* instead of the pre-disable last-shown track:
             // the cache is kept fresh while notifications are disabled, so a
@@ -3080,16 +3240,16 @@ impl OverlayState {
             // excludes no source, and the playing filter can never return the
             // pin's own track in the paused case — a playing pin would have
             // been served by `pinned_track` above.
-            if let Some(track) = self.best_successor("") {
+            if let Some(track) = self.pinned_track() {
                 self.show(MediaEvent::TrackChanged(track), true);
-            } else if let Some(held) = self.held_content.take() {
+            } else if let Some(track) = self.best_successor("") {
                 self.show(MediaEvent::TrackChanged(track), true);
             } else if let Some(held) = self.held_content.take() {
                 self.show(held, true);
             } else if let Some(track) = self.last_track.clone() {
                 self.show(MediaEvent::TrackChanged(track), true);
             }
-            // If neither is available, the worker's re-show read surfaces the
+            // If none is available, the worker's re-show read surfaces the
             // current track through the normal receive_events path.
         }
     }
@@ -5396,6 +5556,102 @@ mod tests {
     }
 
     #[test]
+    fn re_enable_restores_the_pinned_source_when_playing() {
+        // Notifications were disabled while an arbitrary source (Brave) was
+        // the last shown track; the pinned source (Spotify) is still playing.
+        // Re-enabling must restore the pinned track — the pill's resting
+        // identity — instead of the last arbitrary one.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&track_for("spotify", "Pinned Song", "Pinned Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Playing);
+        state.last_track = Some(brave_track("Brave Song"));
+
+        state.enabled = false;
+        state.phase = Phase::Hidden;
+        assert!(state.content.is_none());
+
+        state.toggle_enabled();
+
+        assert!(state.enabled, "notifications must be re-enabled");
+        assert!(
+            matches!(
+                &state.content,
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "spotify" && t.title == "Pinned Song"
+            ),
+            "re-enable must restore the pinned source's track, not the last arbitrary one"
+        );
+    }
+
+    #[test]
+    fn re_enable_prefers_the_pinned_track_over_held_content() {
+        // The same preference holds when the fast-path standby is the resume
+        // hold rather than `last_track`: a playing pin wins over the held
+        // content saved before the pill hid.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&track_for("spotify", "Pinned Song", "Pinned Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Playing);
+        state.held_content = Some(MediaEvent::TrackChanged(brave_track("Brave Song")));
+
+        state.enabled = false;
+        state.phase = Phase::Hidden;
+
+        state.toggle_enabled();
+
+        assert!(
+            matches!(
+                &state.content,
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "spotify" && t.title == "Pinned Song"
+            ),
+            "a playing pin must win over the held content on re-enable"
+        );
+    }
+
+    #[test]
+    fn re_enable_does_not_restore_a_paused_pinned_source() {
+        // The pinned source paused while notifications were disabled: the
+        // "swap only to sources still playing" gate must keep the restore on
+        // the last shown track instead of resurrecting the paused pin.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&track_for("spotify", "Pinned Song", "Pinned Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Paused);
+        state.last_track = Some(brave_track("Brave Song"));
+
+        state.enabled = false;
+        state.phase = Phase::Hidden;
+
+        state.toggle_enabled();
+
+        assert!(
+            matches!(
+                &state.content,
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "Brave" && t.title == "Brave Song"
+            ),
+            "a paused pin must not be restored; the last shown track wins"
+        );
+    }
+
+    #[test]
     fn track_cache_stays_fresh_while_notifications_are_disabled() {
         // Disabling must not freeze the track cache: a song change on the
         // pinned source while notifications are off is still cached, so the
@@ -5877,6 +6133,363 @@ mod tests {
         assert!(
             matches!(state.phase, Phase::Hidden),
             "the completed collapse must hide the stopped pill"
+        );
+    }
+
+    #[test]
+    fn source_matches_pin_uses_the_media_sources_identity_rules() {
+        // The pin matches with the same normalization as the media-sources
+        // allow-list, bidirectionally: a picker-stored "Spotify.exe" matches
+        // the session label "spotify" and vice versa. Empty sides never match.
+        assert!(source_matches_pin("spotify", "Spotify"));
+        assert!(source_matches_pin("Spotify.exe", "spotify"));
+        assert!(source_matches_pin("spotify", "Spotify.exe"));
+        assert!(source_matches_pin("youtube-music", "youtube music"));
+        assert!(!source_matches_pin("brave", "Spotify"));
+        assert!(!source_matches_pin("spotify", ""));
+        assert!(!source_matches_pin("", "spotify"));
+        assert!(!source_matches_pin("", ""));
+    }
+
+    #[test]
+    fn persistent_pill_returns_to_the_pinned_source_at_the_dismiss_deadline() {
+        // Preferred-source pinning: the pill shows Brave's track; at the
+        // dismiss deadline it returns to the pinned source's (Spotify, still
+        // playing) cached track instead of fading to idle on the non-pinned
+        // content — the pill's resting state is its pinned source.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("Spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&track_for("spotify", "Pinned Song", "Pinned Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Playing);
+        state.content = Some(MediaEvent::TrackChanged(track_for(
+            "brave",
+            "Other Song",
+            "Other Artist",
+        )));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "spotify" && t.title == "Pinned Song"
+            ),
+            "the pill must return to the pinned source's track at the deadline"
+        );
+        assert!(!state.persistent_faded, "the return must restart full opacity");
+        assert!(
+            state.dismiss_at.is_some_and(|d| d > Instant::now()),
+            "the returned pill must run a fresh dismiss timer"
+        );
+    }
+
+    #[test]
+    fn pinned_return_prefers_the_newest_playing_match() {
+        // A broad pin ("spotify") matches two cached sources — the app and a
+        // helper — and only the app is playing. The return must pick the
+        // most recently cached *playing* match deterministically (recency
+        // order), not an arbitrary cache entry that would skip the return.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&track_for("spotifyhelper", "Helper Song", "Artist"));
+        state.cache_track(&track_for("spotify", "Pinned Song", "Artist"));
+        state.source_state.insert("spotifyhelper".into(), PlaybackState::Paused);
+        state.source_state.insert("spotify".into(), PlaybackState::Playing);
+        state.content = Some(MediaEvent::TrackChanged(track_for("brave", "Other", "Other")));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "spotify" && t.title == "Pinned Song"
+            ),
+            "the return must pick the newest cached source that is actually playing"
+        );
+    }
+
+    #[test]
+    fn persistent_pill_does_not_return_to_a_paused_pinned_source() {
+        // The pinned source paused: the "swap only to sources still playing"
+        // discipline must keep the pill on what is actually audible — the
+        // normal idle fade applies instead of resurrecting the paused pin.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&track_for("spotify", "Pinned Song", "Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Paused);
+        state.content = Some(MediaEvent::TrackChanged(track_for("brave", "Other", "Other")));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+
+        assert!(
+            state.persistent_faded,
+            "the deadline must fade normally when the pinned source is paused"
+        );
+        assert!(
+            matches!(state.content.as_ref(), Some(MediaEvent::TrackChanged(t)) if t.source_app == "brave"),
+            "the non-playing pin must not displace the pill"
+        );
+    }
+
+    #[test]
+    fn persistent_pill_does_not_return_when_the_pinned_source_has_no_cached_track() {
+        // The pin is configured but its source never emitted a track this
+        // session: there is nothing to return to, so the normal fade applies.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.content = Some(MediaEvent::TrackChanged(track_for("brave", "Other", "Other")));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+
+        assert!(state.persistent_faded, "no cached track: fade normally");
+    }
+
+    #[test]
+    fn persistent_pill_fades_normally_without_a_pin() {
+        // No pinned_source configured: the deadline behaves exactly as before
+        // — fade to idle, no content swap.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&track_for("spotify", "Pinned Song", "Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Playing);
+        state.content = Some(MediaEvent::TrackChanged(track_for("brave", "Other", "Other")));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+
+        assert!(
+            state.persistent_faded,
+            "without a pin the deadline must fade, not swap content"
+        );
+        assert!(matches!(state.content.as_ref(), Some(MediaEvent::TrackChanged(t)) if t.source_app == "brave"));
+    }
+
+    #[test]
+    fn pinned_return_yields_to_the_collapse_on_dismiss_path() {
+        // hide_for_auto_compact_sources over a fullscreen/listed foreground
+        // flags the pill for collapse-on-dismiss: the deliberate hide takes
+        // precedence over returning to the pinned source.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("Spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&track_for("spotify", "Pinned Song", "Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Playing);
+        state.content = Some(MediaEvent::TrackChanged(track_for("brave", "Other", "Other")));
+        state.phase = Phase::Shown;
+        state.persistent_collapse_on_dismiss = true;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+
+        assert!(
+            matches!(state.phase, Phase::Collapsing(_)),
+            "collapse-on-dismiss must hide the pill, not return to the pin"
+        );
+        assert!(
+            matches!(state.content.as_ref(), Some(MediaEvent::TrackChanged(t)) if t.source_app == "brave"),
+            "the collapse path must not swap content"
+        );
+    }
+
+    #[test]
+    fn stopped_tombstone_from_another_source_returns_to_the_pinned_source() {
+        // A Stopped-state pill (tombstone) from a non-pinned source: with the
+        // pinned source still playing, the deadline returns to the pin instead
+        // of collapsing into a full hide — the playing pin's track is what
+        // should rest on screen.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&track_for("spotify", "Pinned Song", "Artist"));
+        state.source_state.insert("spotify".into(), PlaybackState::Playing);
+        state.content = Some(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "brave".into()));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "spotify"
+            ),
+            "the tombstone must yield to the pinned source's playing track"
+        );
+        assert!(
+            matches!(state.phase, Phase::Shown),
+            "the returned pill stays shown at full opacity"
+        );
+    }
+
+    #[test]
+    fn pinned_source_tombstone_settles_on_the_playing_successor() {
+        // The pinned source's session closes while its tombstone is showing
+        // and another source (Brave) is still playing: after the tombstone's
+        // full duration the pill settles onto Brave's track instead of
+        // hiding — the pin's retirement must not leave the persistent pill
+        // dark while other media is audible (the "swap only to sources still
+        // playing" discipline, `best_successor`).
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&brave_track("Brave Song"));
+        state.source_state.insert("Brave".into(), PlaybackState::Playing);
+        state.source_state.insert("spotify".into(), PlaybackState::Stopped);
+        state.content = Some(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Stopped,
+            "spotify".into(),
+        ));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::TrackChanged(t)) if t.source_app == "Brave"
+            ),
+            "the pin's tombstone must settle onto the most recent playing source"
+        );
+        assert!(matches!(state.phase, Phase::Shown), "the successor track stays shown");
+        assert!(!state.persistent_faded, "the swap must restart full opacity");
+        assert!(
+            state.dismiss_at.is_some_and(|d| d > Instant::now()),
+            "the settled pill must run a fresh dismiss timer"
+        );
+    }
+
+    #[test]
+    fn pinned_source_tombstone_hides_when_nothing_else_is_playing() {
+        // The pinned source stops and no other source is playing: there is
+        // no truthful content to settle onto, so the tombstone collapses
+        // into the full hide exactly as before.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.source_state.insert("spotify".into(), PlaybackState::Stopped);
+        state.content = Some(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Stopped,
+            "spotify".into(),
+        ));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+
+        assert!(
+            matches!(state.phase, Phase::Collapsing(_)),
+            "no playing successor: the pin's tombstone still collapses"
+        );
+    }
+
+    #[test]
+    fn non_pinned_tombstone_still_hides_with_a_playing_source_present() {
+        // Scoped to the pinned source: a tombstone for a *non-pinned*
+        // source (here Brave stops while its track shows, with YouTube Music
+        // still playing) keeps the deliberate hide — the successor fallback
+        // is the pin's retirement rule, not a change to general tombstone
+        // semantics.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.pinned_source = Some("spotify".into());
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.cache_track(&ytm_track("YTM Song"));
+        state
+            .source_state
+            .insert("youtube-music".into(), PlaybackState::Playing);
+        state.source_state.insert("brave".into(), PlaybackState::Stopped);
+        state.content = Some(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "brave".into()));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+
+        state.tick();
+
+        assert!(
+            matches!(state.phase, Phase::Collapsing(_)),
+            "a non-pinned tombstone still hides at its deadline"
         );
     }
 
