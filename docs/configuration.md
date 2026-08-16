@@ -95,6 +95,15 @@ cap only limits repaint frequency. Values at or below 60 keep the default 60 Hz
 cap, and values above 1000 are clamped to 1000. It is configurable only via
 `config.toml`, not the Settings UI.
 
+> **Windows animation/transparency preferences.** The "animation effects"
+> preference and the "minimize translucent overlapped content" preference
+> (System Parameters `SPI_GETCLIENTAREAANIMATION` /
+> `SPI_GETDISABLEOVERLAPPEDCONTENT`) both disable the pill's *motion*: all
+> animations complete instantly and the pill behaves statically. They do not
+> touch the pill's translucency itself — the pill's identity is a translucent
+> overlay, so the alpha fill, the aura halo, and the layered-window
+> composition stay as configured even when either preference is on.
+
 Hovering behavior follows the pill's *effective* layout (for `"auto"`, the
 layout currently in effect — an Auto pill in the expanded layout follows the
 Expanded rules, in the compact layout the Compact rules):
