@@ -3119,24 +3119,44 @@ fn cap_meta(value: String) -> String {
         );
     }
     let safe: String = trimmed.chars().filter(|c| !display_unsafe(*c)).collect();
+    // Filtering can expose boundary whitespace that an unsafe character had
+    // shielded from the first trim (`"Song\u{0} "` -> filter -> `"Song "`);
+    // trim again so the returned value is always boundary-clean. Without
+    // this, a shielded space would defeat the whitespace normalization that
+    // keeps one track from splitting into two duplicate pills.
+    let safe = safe.trim();
     if safe.chars().count() > MAX_META_CHARS {
         safe.chars().take(MAX_META_CHARS).collect()
     } else {
-        safe
+        safe.to_string()
     }
 }
 
 /// Whether a character must never reach displayed metadata: the C0 control
-/// range, DEL plus the C1 range, and the Unicode directional
+/// range, DEL plus the C1 range, the Unicode directional
 /// formatting/override/isolate command characters (bidi embeddings,
-/// overrides, isolates). Ordinary RTL letters, combining marks, emoji and ZWJ
+/// overrides, isolates), and the Zl/Zp line/paragraph separators
+/// (U+2028/U+2029). Ordinary RTL letters, combining marks, emoji and ZWJ
 /// sequences are all preserved — only the directionality *commands* are
 /// stripped, so a legitimate RTL title still orders right-to-left by its
 /// letters.
+///
+/// Zl/Zp are stripped on the same basis as the bidi commands: they are
+/// display commands, not content — a renderer that honors them forces a
+/// visible line break, which a single-line pill, history row or tooltip
+/// cannot represent (and some log viewers render as a forged record split).
+/// Boundary occurrences would be removed by `trim()` anyway (Zl/Zp are
+/// Unicode White_Space), but an interior separator survives trimming and
+/// forces a mid-row break, so the strip set is the only gate for it. A
+/// legitimate title containing a real line separator is vanishingly rare and
+/// the pill would mangle it anyway, so the display-command rationale
+/// outweighs preservation here — the choice is pinned by
+/// `cap_meta_strips_zl_zp_separators`.
 fn display_unsafe(c: char) -> bool {
     let code = c as u32;
     (0x0000..=0x001F).contains(&code)
         || (0x007F..=0x009F).contains(&code)
+        || (0x2028..=0x2029).contains(&code)
         || (0x202A..=0x202E).contains(&code)
         || (0x2066..=0x2069).contains(&code)
 }
@@ -3742,6 +3762,37 @@ mod tests {
     }
 
     #[test]
+    fn cap_meta_strips_zl_zp_separators() {
+        // The Zl/Zp decision (threat-model gap G2): U+2028/U+2029 are display
+        // commands — a renderer that honors them forces a visible line break,
+        // visually splitting a single-line pill row, history line, tooltip,
+        // or log line — so they are stripped like the bidi commands, not
+        // preserved like ordinary letters. Boundary occurrences would be
+        // trimmed away anyway (Zl/Zp are Unicode White_Space), but an
+        // *interior* separator survives `trim()` and forces a mid-row break;
+        // the strip set is the only gate for it. Interior separators are
+        // removed...
+        assert_eq!(cap_meta("Song\u{2028}Artist".into()), "SongArtist");
+        assert_eq!(cap_meta("Song\u{2029}Artist".into()), "SongArtist");
+        // ...and boundary ones too (the strip set covers them regardless of
+        // the trim path).
+        assert_eq!(cap_meta("\u{2028}Song\u{2029}".into()), "Song");
+        assert_eq!(cap_meta("Song\u{2028}\u{2029} ".into()), "Song");
+        assert_eq!(cap_meta("Song".into()), "Song");
+        // Pin the boundary semantics so the strip-set rationale stays honest:
+        // trim() does remove Zl/Zp at the edges (they are White_Space), but
+        // never an interior one — which is exactly what the strip set adds.
+        assert_eq!("\u{2028}Song\u{2029}".trim(), "Song");
+        assert_eq!("Song\u{2028}Artist".trim(), "Song\u{2028}Artist");
+        // The strip-set decision itself: these characters are display-unsafe.
+        assert!(display_unsafe('\u{2028}'));
+        assert!(display_unsafe('\u{2029}'));
+        // Ordinary whitespace remains preserved (trimmed only at boundaries).
+        assert!(!display_unsafe(' '));
+        assert!(!display_unsafe('\u{2009}'));
+    }
+
+    #[test]
     fn source_app_label_is_capped_and_sanitized() {
         // A hostile AUMID with none of the shrinking separators falls back to
         // the same cap as every other metadata field.
@@ -3945,6 +3996,99 @@ mod tests {
         // The length cap still applies after trimming.
         let long = format!("{}{}", "x".repeat(300), "   ");
         assert_eq!(cap_meta(long).chars().count(), MAX_META_CHARS);
+    }
+
+    /// Deterministic xorshift64 for the fuzz sweeps below: the same seed
+    /// always yields the same sequence, so a failure reproduces exactly and
+    /// the tests never depend on ambient randomness.
+    struct FuzzRng(u64);
+
+    impl FuzzRng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn pick(&mut self, alphabet: &[char]) -> char {
+            alphabet[(self.next() as usize) % alphabet.len()]
+        }
+    }
+
+    #[test]
+    fn cap_meta_never_emits_hostile_characters_or_grows_the_input() {
+        // Fuzz-style sweep: whatever mix of hostile and benign characters the
+        // generated input carries — controls, C1, DEL, bidi commands, Zl/Zp
+        // separators, whitespace, path punctuation, RTL letters, emoji — the
+        // output must always (a) contain no display-unsafe character (the
+        // log/display injection invariant: no newline, NUL, bidi override, or
+        // line separator can ride into a rendered field or a log line), (b)
+        // be trimmed, (c) respect the character cap, (d) never be longer than
+        // the input, (e) be a subsequence of it (sanitization never reorders
+        // or invents text), and (f) be stable under reprocessing.
+        fn is_subsequence(needle: &str, haystack: &str) -> bool {
+            let mut it = haystack.chars();
+            needle.chars().all(|c| it.any(|h| h == c))
+        }
+        const HOSTILE: &[char] = &[
+            // display-unsafe: C0, DEL, C1, bidi commands, Zl/Zp separators.
+            '\u{0}', '\u{1}', '\u{7}', '\u{1F}', '\u{7F}', '\u{80}', '\u{85}', '\u{9F}', '\u{202A}', '\u{202E}',
+            '\u{2028}', '\u{2029}', '\u{2066}', '\u{2069}', // whitespace (trim boundaries and interior).
+            ' ', '\t', '\n', '\r', '\u{2009}',
+            // benign ASCII: letters, digits, punctuation including path chars.
+            'a', 'z', 'A', 'Z', '0', '9', '.', '-', '_', '!', '/', '\\', ':', '?', '*', '"', '<', '>',
+            // benign Unicode: accented, CJK, emoji, ZWJ, RTL letter, combining.
+            'é', '你', '🎵', '\u{200D}', 'א', '\u{301}',
+        ];
+        let mut rng = FuzzRng(0xC0FF_EE00_C0FF_EE00);
+        for _ in 0..2000 {
+            // Straddle the 256-char cap, the empty string, and the trim path.
+            let len = (rng.next() % 320) as usize;
+            let input: String = (0..len).map(|_| rng.pick(HOSTILE)).collect();
+            let out = cap_meta(input.clone());
+            assert!(
+                out.chars().all(|c| !display_unsafe(c)),
+                "a display-unsafe character survived {out:?} from {input:?}"
+            );
+            assert_eq!(out.trim(), out, "output must be trimmed: {out:?} from {input:?}");
+            assert!(
+                out.chars().count() <= MAX_META_CHARS,
+                "output exceeds the cap: {out:?} from {input:?}"
+            );
+            assert!(
+                out.chars().count() <= input.chars().count(),
+                "output grew the input: {out:?} from {input:?}"
+            );
+            assert!(
+                is_subsequence(&out, &input),
+                "output must be a subsequence of the input: {out:?} from {input:?}"
+            );
+            assert_eq!(cap_meta(out.clone()), out, "cap_meta must be idempotent: {out:?}");
+        }
+    }
+
+    #[test]
+    fn cap_meta_is_identity_for_benign_short_inputs() {
+        // A clean, short, already-normalized string passes through unchanged
+        // apart from trimming: the sanitizer must never mangle legitimate
+        // metadata (titles with apostrophes, CJK, RTL letters, emoji).
+        const SAFE: &[char] = &[
+            'a', 'z', 'A', 'Z', '0', '9', ' ', '.', ',', '-', '_', '!', '?', 'é', '你', 'א', '🎵', '\u{200D}',
+            '\u{301}',
+        ];
+        let mut rng = FuzzRng(0xBEEF_CAFE_BEEF_CAFE);
+        for _ in 0..1000 {
+            let len = 1 + (rng.next() % 200) as usize;
+            let input: String = (0..len).map(|_| rng.pick(SAFE)).collect();
+            assert_eq!(
+                cap_meta(input.clone()),
+                input.trim(),
+                "benign input was mangled: {input:?}"
+            );
+        }
     }
 
     #[test]
@@ -5418,5 +5562,418 @@ mod tests {
         release_pending_bytes(&mut queue, &counter);
         assert!(queue.is_empty(), "the mailbox must be fully drained");
         assert_eq!(counter.load(Ordering::Relaxed), 60, "the two payloads' bytes are freed");
+    }
+}
+
+/// Deterministic hostile-Unicode fuzz sweeps over the dedup/identity
+/// comparisons and the log path — the layer below the `cap_meta` sweep in
+/// `mod tests`. Everything SMTC reads from other processes (title, artist,
+/// album, genre, the AUMID-derived source label) is sanitized by `cap_meta`
+/// at the worker boundary; these sweeps push that sanitized output — plus the
+/// raw hostile strings themselves — through every comparison that decides
+/// "same track / recreated session / emit vs. suppress / cache identity", and
+/// through the log-line composition, asserting the downstream invariants:
+///
+/// - no panic on any input (a panic fails the test outright);
+/// - no growth: every output below `cap_meta` stays bounded by a constant
+///   independent of the raw input length (the 256-char cap is the choke
+///   point), so an arbitrarily long hostile title cannot bloat history rows,
+///   tooltips, pill text, marquee strips, or log lines;
+/// - no log injection: no ASCII newline or carriage return can reach a log
+///   line — neither through `track_label`'s `{:?}` escaping nor through
+///   `log_preview`'s `escape_debug` — so hostile metadata cannot forge or
+///   split log records.
+///
+/// Same deterministic xorshift64 convention as `mod tests::FuzzRng` and the
+/// `icon.rs` grammar sweeps: fixed seeds reproduce any failure exactly and
+/// the tests never depend on ambient randomness.
+#[cfg(test)]
+mod hostile_identity_fuzz {
+    use super::*;
+    use crate::events::artwork_same;
+
+    /// Deterministic xorshift64 (the shared fuzz-sweep convention).
+    struct FuzzRng(u64);
+
+    impl FuzzRng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn pick(&mut self, alphabet: &[char]) -> char {
+            alphabet[(self.next() as usize) % alphabet.len()]
+        }
+
+        /// A uniform random Unicode scalar, excluding surrogate halves (which
+        /// cannot appear in a Rust `&str` anyway). Covers rare scripts,
+        /// control planes and formatting chars the curated alphabet misses.
+        fn scalar(&mut self) -> char {
+            loop {
+                let value = (self.next() % 0x11_0000) as u32;
+                if !(0xD800..=0xDFFF).contains(&value) {
+                    return char::from_u32(value).unwrap_or('\u{FFFD}');
+                }
+            }
+        }
+    }
+
+    /// Characters every generated string draws from: display-unsafe
+    /// controls, bidi commands, whitespace, line/paragraph separators,
+    /// benign ASCII (including path punctuation), and benign Unicode
+    /// (accented, CJK, emoji, ZWJ, RTL letters, combining marks).
+    const HOSTILE: &[char] = &[
+        // display-unsafe: C0, DEL, C1, bidi commands.
+        '\u{0}', '\u{1}', '\u{7}', '\u{1F}', '\u{7F}', '\u{80}', '\u{85}', '\u{9F}', '\u{202A}', '\u{202E}', '\u{2066}',
+        '\u{2069}', // whitespace and Zl/Zp separators (trim boundaries, interior).
+        ' ', '\t', '\n', '\r', '\u{2009}', '\u{2028}', '\u{2029}', // benign ASCII.
+        'a', 'z', 'A', 'Z', '0', '9', '.', '-', '_', '!', '/', '\\', ':', '?', '*', '"', '<', '>',
+        // benign Unicode.
+        'é', '你', '🎵', '\u{200D}', 'א', '\u{301}',
+    ];
+
+    /// A random string of 0..320 chars from the curated hostile alphabet, so
+    /// the corpus straddles the 256-char cap, the empty string, and the trim
+    /// path.
+    fn hostile_string(rng: &mut FuzzRng) -> String {
+        let len = (rng.next() % 320) as usize;
+        (0..len).map(|_| rng.pick(HOSTILE)).collect()
+    }
+
+    /// A random string of 0..320 uniform Unicode scalars — the broad plane
+    /// sweep that complements the curated alphabet.
+    fn hostile_scalars(rng: &mut FuzzRng) -> String {
+        let len = (rng.next() % 320) as usize;
+        (0..len).map(|_| rng.scalar()).collect()
+    }
+
+    /// Builds a `TrackInfo` whose every metadata field is the capped
+    /// sanitization of an independent hostile string, with random artwork
+    /// presence — the shape a hostile source's read produces after the
+    /// worker boundary.
+    fn hostile_track(rng: &mut FuzzRng, source_label: &str) -> TrackInfo {
+        let artwork = if rng.next() & 1 == 0 {
+            None
+        } else {
+            // Arbitrary bytes: hostile "cover" data is opaque input too.
+            let len = (rng.next() % 64) as usize;
+            Some(Arc::from((0..len).map(|_| rng.next() as u8).collect::<Vec<u8>>()))
+        };
+        TrackInfo {
+            title: cap_meta(hostile_string(rng)),
+            artist: cap_meta(hostile_string(rng)),
+            album: cap_meta(hostile_string(rng)),
+            album_artist: cap_meta(hostile_string(rng)),
+            subtitle: cap_meta(hostile_string(rng)),
+            genre: Some(cap_meta(hostile_string(rng))),
+            source_app: source_label.to_string(),
+            duration_secs: Some(rng.next() % 1_000_000),
+            track_number: Some((rng.next() % 100_000) as u32),
+            track_count: Some((rng.next() % 100_000) as u32),
+            artwork,
+            ..TrackInfo::default()
+        }
+    }
+
+    /// The `LogicalState` counterpart of a track, mirroring the fields
+    /// `content_differ`/`emit_track` compare so those comparisons run against
+    /// real values rather than defaults.
+    fn state_from(track: &TrackInfo) -> LogicalState {
+        LogicalState {
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            album_artist: track.album_artist.clone(),
+            subtitle: track.subtitle.clone(),
+            source_app: track.source_app.clone(),
+            duration_secs: track.duration_secs,
+            track_number: track.track_number,
+            track_count: track.track_count,
+            genre: track.genre.clone(),
+            has_artwork: track.artwork.is_some(),
+            ..LogicalState::default()
+        }
+    }
+
+    /// Asserts the cap_meta contract on every string field of a track: no
+    /// display-unsafe character (the log/display injection invariant) and no
+    /// value past the character cap (the no-growth invariant).
+    fn assert_sane_fields(track: &TrackInfo, context: &str) {
+        for (name, value) in [
+            ("title", &track.title),
+            ("artist", &track.artist),
+            ("album", &track.album),
+            ("album_artist", &track.album_artist),
+            ("subtitle", &track.subtitle),
+            ("source_app", &track.source_app),
+        ] {
+            assert!(
+                value.chars().all(|c| !display_unsafe(c)),
+                "{context}: {name} carries a display-unsafe char: {value:?}"
+            );
+            assert!(
+                value.chars().count() <= MAX_META_CHARS,
+                "{context}: {name} exceeds the {MAX_META_CHARS}-char cap ({})",
+                value.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn identity_comparisons_are_total_and_deterministic_on_hostile_metadata() {
+        // Every dedup/identity comparison must answer for any hostile
+        // metadata (no panic), agree with itself on a second call
+        // (deterministic), and never let a display-unsafe or over-cap value
+        // into stored/merged state.
+        let mut rng = FuzzRng(0x0DEA_DBEE_0DEA_DBEE);
+        for iteration in 0..2000 {
+            let source_a = source_app_label(&hostile_string(&mut rng));
+            let source_b = source_app_label(&hostile_string(&mut rng));
+            let a = hostile_track(&mut rng, &source_a);
+            let b = hostile_track(&mut rng, &source_b);
+            let context = format!("iteration {iteration}");
+
+            assert_sane_fields(&a, &context);
+            assert_sane_fields(&b, &context);
+            assert!(
+                source_a.chars().all(|c| !display_unsafe(c)),
+                "{context}: source label is dirty: {source_a:?}"
+            );
+            assert!(
+                source_b.chars().all(|c| !display_unsafe(c)),
+                "{context}: source label is dirty: {source_b:?}"
+            );
+
+            // Content-diff and session-recreation dedup: total, deterministic.
+            let diff = content_differ(&state_from(&a), &b);
+            assert_eq!(
+                content_differ(&state_from(&a), &b),
+                diff,
+                "{context}: content_differ is nondeterministic"
+            );
+            let recreation = is_session_recreation(&a, &b, true);
+            assert_eq!(
+                is_session_recreation(&a, &b, true),
+                recreation,
+                "{context}: is_session_recreation is nondeterministic"
+            );
+            assert_eq!(
+                is_session_recreation(&a, &b, false),
+                is_session_recreation(&a, &b, false),
+                "{context}: is_session_recreation(false) is nondeterministic"
+            );
+
+            // Emit/suppress decisions, stale-thumbnail pairing, placeholder
+            // and churn gates: total over hostile metadata (no panic).
+            let _ = should_suppress_recreation(Some(&a), &b, true, Some(&source_b));
+            let _ = emit_track(&state_from(&a), &b, true);
+            let _ = stale_thumbnail(&b, Some(&a));
+            let _ = is_placeholder_like(&b);
+            let _ = first_read_counts_toward_churn(true, &b);
+            let _ = merge_track(&state_from(&a), &b, true);
+
+            // The overlay's same-media dedup decision: reflexive and
+            // symmetric for any hostile pair.
+            assert!(a.same_media(&a), "{context}: same_media is not reflexive");
+            assert_eq!(
+                a.same_media(&b),
+                b.same_media(&a),
+                "{context}: same_media is asymmetric"
+            );
+            let _ = artwork_same(a.artwork.as_deref(), b.artwork.as_deref());
+
+            // A late-metadata merge must stay within the cap and keep every
+            // field clean (no growth, no re-introduced hostile char).
+            let mut merged = a.clone();
+            merged.merge_late_metadata(&b);
+            assert_sane_fields(&merged, &context);
+
+            // Allow-list normalization: total, deterministic, and bounded
+            // (to_lowercase can expand by at most a small factor; the strip
+            // only shrinks), so a huge hostile title cannot blow it up.
+            let norm = normalize_for_match(&b.title);
+            assert_eq!(
+                normalize_for_match(&b.title),
+                norm,
+                "{context}: normalize_for_match is nondeterministic"
+            );
+            assert!(
+                norm.len() <= b.title.len() * 4,
+                "{context}: normalize_for_match grew the input ({} -> {})",
+                b.title.len(),
+                norm.len()
+            );
+            assert!(
+                norm.chars().all(|c| !display_unsafe(c)),
+                "{context}: normalize_for_match produced a display-unsafe char: {norm:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_comparisons_are_total_on_uniform_unicode_scalars() {
+        // The broad-plane complement to the curated-alphabet sweep above:
+        // arbitrary Unicode scalars (rare scripts, exotic controls, unpaired
+        // combining marks) through the same pipeline with the same
+        // invariants.
+        let mut rng = FuzzRng(0x5EED_CAFE_5EED_CAFE);
+        for iteration in 0..1000 {
+            let source = source_app_label(&hostile_scalars(&mut rng));
+            let a = hostile_track(&mut rng, &source);
+            let b = hostile_track(&mut rng, &source);
+            let context = format!("iteration {iteration}");
+
+            assert_sane_fields(&a, &context);
+            assert_sane_fields(&b, &context);
+            let _ = content_differ(&state_from(&a), &b);
+            let _ = is_session_recreation(&a, &b, true);
+            let _ = emit_track(&state_from(&a), &b, true);
+            let _ = stale_thumbnail(&b, Some(&a));
+            let _ = merge_track(&state_from(&a), &b, true);
+            let _ = a.same_media(&b);
+            let mut merged = a.clone();
+            merged.merge_late_metadata(&b);
+            assert_sane_fields(&merged, &context);
+        }
+    }
+
+    #[test]
+    fn log_lines_cannot_be_injected_through_hostile_metadata() {
+        // A log record is a `\n`-terminated line; injection means hostile
+        // metadata forging a new record or altering a boundary. The layers
+        // that carry metadata into the log are `track_label` (the worker's
+        // `track changed | ...` line, Debug-escaped) and `log_preview`
+        // (bounded escaped previews for raw values). Neither may ever emit a
+        // raw newline or carriage return, and both must stay bounded
+        // regardless of the raw input length. Debug-format escaping of the
+        // raw string is the belt-and-braces layer for any direct
+        // `format!("{value:?}")` log site.
+        let mut rng = FuzzRng(0xFEED_FACE_FEED_FACE);
+        for iteration in 0..2000 {
+            let raw = hostile_string(&mut rng);
+            let source = source_app_label(&raw.clone());
+            let track = hostile_track(&mut rng, &source);
+            let context = format!("iteration {iteration}");
+
+            // `track changed | title=.. | artist=.. | ...` line: Debug
+            // escapes everything, so no raw line break can ride in.
+            let label = track_label(&track);
+            assert!(
+                !label.contains('\n') && !label.contains('\r'),
+                "{context}: track_label carries a raw newline: {label:?}"
+            );
+            assert!(
+                label.len() <= 20_000,
+                "{context}: track_label grew unbounded ({} bytes)",
+                label.len()
+            );
+
+            // The pill/history meta line is composed from the same capped
+            // fields: bounded and line-break-free.
+            let line = track.meta_line(true);
+            assert!(
+                !line.contains('\n') && !line.contains('\r'),
+                "{context}: meta_line carries a raw newline: {line:?}"
+            );
+            assert!(
+                line.len() <= 4_096,
+                "{context}: meta_line grew unbounded ({} bytes)",
+                line.len()
+            );
+
+            // Raw values only ever enter the log through log_preview, which
+            // escapes and caps them: the preview represents at most `cap`
+            // input scalar values, each escaped to at most 10 characters
+            // (`\u{10ffff}`), so the preview string — and thus the log line
+            // — is bounded by `cap * 10` chars no matter how long the raw
+            // input is. It must also carry no line breaks, and its omitted
+            // count must account for every scalar beyond the cap.
+            let (preview, omitted) = crate::winutil::log_preview(&raw, 128);
+            assert!(
+                preview.chars().count() <= 128 * 10,
+                "{context}: log_preview exceeded its {} * 10 char bound ({} chars)",
+                128,
+                preview.chars().count()
+            );
+            assert!(
+                !preview.contains('\n') && !preview.contains('\r'),
+                "{context}: log_preview carries a raw newline: {preview:?}"
+            );
+            let count = raw.chars().count();
+            assert_eq!(
+                omitted,
+                count.saturating_sub(128),
+                "{context}: log_preview's omitted count is inconsistent ({count} chars in)"
+            );
+
+            // Debug formatting of the raw string itself (any future direct
+            // log site) never emits a raw line break.
+            let debug = format!("{raw:?}");
+            assert!(
+                !debug.contains('\n') && !debug.contains('\r'),
+                "{context}: Debug formatting leaked a raw newline"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_artwork_identity_is_sound_under_hostile_metadata() {
+        // The artwork cache is keyed by exact (source, title, artist)
+        // identity; a hostile metadata pair must never cross-return another
+        // identity's cover, and the byte comparison must be total.
+        let mut rng = FuzzRng(0xABCD_EF01_ABCD_EF01);
+        for iteration in 0..2000 {
+            let source = source_app_label(&hostile_string(&mut rng));
+            let title = cap_meta(hostile_string(&mut rng));
+            let artist = cap_meta(hostile_string(&mut rng));
+            let cover: Arc<[u8]> = Arc::from(vec![(rng.next() % 256) as u8; (rng.next() % 32) as usize]);
+            let mut map = HashMap::new();
+            map.insert(
+                source.clone(),
+                TrackInfo {
+                    title: title.clone(),
+                    artist: artist.clone(),
+                    artwork: Some(cover.clone()),
+                    ..TrackInfo::default()
+                },
+            );
+            let context = format!("iteration {iteration}");
+
+            // Exact identity (source + title + artist) returns the cover.
+            assert_eq!(
+                cached_artwork_for(&map, &source, &title, &artist),
+                Some(cover.clone()),
+                "{context}: the exact identity missed the cache"
+            );
+
+            // A different title or artist must never return it — the
+            // cross-identity leak that would attach the previous song's
+            // cover to a new one.
+            let other_title = cap_meta(hostile_string(&mut rng));
+            let other_artist = cap_meta(hostile_string(&mut rng));
+            if other_title != title {
+                assert_eq!(
+                    cached_artwork_for(&map, &source, &other_title, &artist),
+                    None,
+                    "{context}: a different title returned the cached cover"
+                );
+            }
+            if other_artist != artist {
+                assert_eq!(
+                    cached_artwork_for(&map, &source, &title, &other_artist),
+                    None,
+                    "{context}: a different artist returned the cached cover"
+                );
+            }
+
+            // Artwork byte comparison is total over presence combinations.
+            let _ = artwork_same(Some(cover.as_ref()), None);
+            let _ = artwork_same(None, Some(cover.as_ref()));
+            let _ = artwork_same(Some(cover.as_ref()), Some(cover.as_ref()));
+        }
     }
 }

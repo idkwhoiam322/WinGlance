@@ -42,9 +42,13 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
 };
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, ReleaseMutex, SetEvent, WaitForSingleObject,
+    CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, GetCurrentProcessId, OpenEventW, ReleaseMutex, SetEvent,
+    WaitForSingleObject,
 };
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -310,6 +314,81 @@ impl Drop for SingletonGuard {
 /// failure, so `main` keeps exactly one live guard at all times.
 static SINGLETON_GUARD: Mutex<Option<SingletonGuard>> = Mutex::new(None);
 
+/// Whether a snapshot entry is a running instance of this app: the
+/// executable name matches `WinGlance.exe` case-insensitively (NUL-padded as
+/// Toolhelp reports it) and the pid is not this process's own. Pure, so the
+/// duplicate-vs-squat classification is unit-testable without a process
+/// snapshot.
+fn is_our_instance(units: &[u16], pid: u32, our_pid: u32) -> bool {
+    pid != our_pid
+        && String::from_utf16_lossy(units)
+            .trim_end_matches('\0')
+            .eq_ignore_ascii_case("WinGlance.exe")
+}
+
+/// Whether another `WinGlance.exe` process is currently running in this
+/// session, sampled from one Toolhelp snapshot and excluding this process.
+/// Used only to classify a live-held single-instance mutex (see
+/// `acquire_singleton`): a running instance means the duplicate launch is a
+/// legitimate double-launch and may exit silently, while no running instance
+/// means the mutex name is likely squatted by a foreign process, which is
+/// worth reporting instead of failing without a trace. Diagnostic only — the
+/// probe is not a security boundary, and a same-session adversary can evade
+/// or spoof it (they can already stop or interfere with the app).
+fn winglance_instance_running() -> bool {
+    let our_pid = unsafe { GetCurrentProcessId() };
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return false;
+        };
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut running = false;
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                if is_our_instance(&entry.szExeFile, entry.th32ProcessID, our_pid) {
+                    running = true;
+                    break;
+                }
+                if !Process32NextW(snapshot, &mut entry).is_ok() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+        running
+    }
+}
+
+/// Re-samples `winglance_instance_running` a few times so a just-started
+/// legitimate instance — already past mutex creation but not yet visible in a
+/// snapshot — is not mistaken for a squatter. Returns the last sample.
+fn winglance_instance_running_retried() -> bool {
+    for _ in 0..3 {
+        if winglance_instance_running() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(75));
+    }
+    false
+}
+
+/// Records a suspected single-instance squat to `crash.log` — the only log
+/// available before `logging::init_logging` runs. The mutex is live-held by a
+/// process that is not a running WinGlance instance, so this launch exits
+/// with no feedback anywhere; without this line the app would silently refuse
+/// to start. Bounded like the panic hook so a launch loop cannot grow the
+/// file without limit.
+fn report_suspected_squat() {
+    if let Some(dir) = config::Config::data_dir().ok().map(|d| d.join("logs")) {
+        let _ = crate::winutil::append_verified_bounded(
+            &dir.join("crash.log"),
+            b"suspected single-instance mutex squat: 'WinGlanceSingleInstance' is held by a live process that is not a running WinGlance instance; this launch exits without starting\n",
+            CRASH_LOG_CAP,
+        );
+    }
+}
+
 /// Acquires the single-instance mutex for the process lifetime. Returns the
 /// guard while the caller holds it, or `None` when another instance already
 /// owns the mutex. On the restart-handoff path (`restart_nonce` is `Some`),
@@ -318,7 +397,15 @@ static SINGLETON_GUARD: Mutex<Option<SingletonGuard>> = Mutex::new(None);
 fn acquire_singleton(restart_nonce: Option<&str>) -> anyhow::Result<Option<SingletonGuard>> {
     unsafe {
         let name = wide("WinGlanceSingleInstance");
-        let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr()))?;
+        // CreateMutexW both creates (fresh) and opens (existing) the named
+        // mutex. Opening can fail with ACCESS_DENIED when the name is held by
+        // a process whose DACL denies us (a higher-integrity squatter):
+        // annotate that instead of surfacing a bare OS error.
+        let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr())).map_err(|error| {
+            anyhow::anyhow!(
+                "creating/opening the single-instance mutex failed: {error} (another process may already hold the name with restrictive permissions)"
+            )
+        })?;
         if GetLastError() != ERROR_ALREADY_EXISTS {
             return Ok(Some(SingletonGuard::new(handle)));
         }
@@ -373,11 +460,22 @@ fn acquire_singleton(restart_nonce: Option<&str>) -> anyhow::Result<Option<Singl
             WAIT_ABANDONED | WAIT_OBJECT_0 => Ok(Some(SingletonGuard::new(handle))),
             WAIT_TIMEOUT => {
                 let _ = CloseHandle(handle);
+                // A live (non-abandoned) owner: either a legitimate running
+                // instance (a double-launch, which exits silently) or a
+                // foreign process squatting the name (a same-session denial
+                // of service). The probe tells the two apart well enough to
+                // report the second — without it, a squatted name makes the
+                // app fail to start with no diagnostic anywhere.
+                if !winglance_instance_running_retried() {
+                    report_suspected_squat();
+                }
                 Ok(None)
             }
             WAIT_FAILED => {
                 let _ = CloseHandle(handle);
-                anyhow::bail!("WaitForSingleObject failed on the single-instance mutex");
+                anyhow::bail!(
+                    "WaitForSingleObject failed on the single-instance mutex (the name may be held by a higher-integrity process)"
+                );
             }
             _ => {
                 let _ = CloseHandle(handle);
@@ -1407,5 +1505,31 @@ mod tests {
         );
         let changed = MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "Brave".into());
         assert!(overlay_bound(&changed), "playback events must reach the overlay");
+    }
+
+    #[test]
+    fn is_our_instance_matches_only_another_win_glance_exe() {
+        // Toolhelp reports the executable name as a fixed 260-unit NUL-padded
+        // buffer; the classification must match the product name
+        // case-insensitively, ignore padding, and never count this process
+        // itself as "another instance".
+        let padded = |s: &str| {
+            let mut units: Vec<u16> = s.encode_utf16().collect();
+            units.resize(260, 0);
+            units
+        };
+        // Another pid running WinGlance.exe (any casing, padded) is an
+        // instance.
+        assert!(is_our_instance(&padded("WinGlance.EXE"), 42, 1));
+        assert!(is_our_instance(&padded("winglance.exe"), 42, 1));
+        // Our own pid never counts, even with the right name: the probe runs
+        // in the duplicate process, which is itself a WinGlance.exe.
+        assert!(!is_our_instance(&padded("WinGlance.exe"), 42, 42));
+        // Foreign names, a missing extension, a trailing space, and empty
+        // buffers are rejected.
+        assert!(!is_our_instance(&padded("winthing.exe"), 42, 1));
+        assert!(!is_our_instance(&padded("WinGlance"), 42, 1));
+        assert!(!is_our_instance(&padded("WinGlance.exe "), 42, 1));
+        assert!(!is_our_instance(&padded(""), 42, 1));
     }
 }

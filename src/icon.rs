@@ -317,4 +317,100 @@ mod tests {
             assert!(!valid_aumid(id), "{id:?} must be rejected");
         }
     }
+
+    /// Deterministic xorshift64 for the fuzz sweeps below: the same seed
+    /// always yields the same sequence, so a failure reproduces exactly and
+    /// the tests never depend on ambient randomness.
+    struct FuzzRng(u64);
+
+    impl FuzzRng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn pick(&mut self, alphabet: &[char]) -> char {
+            alphabet[(self.next() as usize) % alphabet.len()]
+        }
+    }
+
+    #[test]
+    fn valid_aumid_matches_the_grammar_oracle_on_fuzzed_inputs() {
+        // Fuzz-style sweep against an independently written reference for the
+        // same grammar (1-128 ASCII shell-identifier characters). Every
+        // generated string — path delimiters, controls, whitespace,
+        // non-ASCII, traversal shapes, and boundary lengths — must agree
+        // with the oracle, so a boundary slip in either formulation cannot
+        // hide. This is the security-critical property: the gate is exactly
+        // the identifier grammar, and nothing else ever reaches a Shell
+        // parsing-name.
+        fn oracle(id: &str) -> bool {
+            let len = id.chars().count();
+            (1..=128).contains(&len)
+                && id.is_ascii()
+                && id
+                    .bytes()
+                    .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-' | b'!'))
+        }
+        const HOSTILE: &[char] = &[
+            // Allowed shell-identifier characters.
+            'a', 'z', 'A', 'Z', '0', '9', '.', '_', '-', '!',
+            // Every non-identifier ASCII shape an AUMID might smuggle.
+            '/', '\\', ':', '?', '*', '"', '<', '>', '|', '#', '%', '~', '(', ')', ' ', '\t', '\n',
+            // Controls and bidi commands.
+            '\u{0}', '\u{1F}', '\u{7F}', '\u{85}', '\u{202E}', '\u{2066}',
+            // Non-ASCII that looks identifier-like.
+            'é', '你', '🎵', 'א', '\u{200D}', '\u{301}',
+        ];
+        let mut rng = FuzzRng(0xA1D5_0B17_0B17_0B17);
+        for _ in 0..2000 {
+            // Spans empty, in-range, and over-the-128-cap lengths.
+            let len = (rng.next() % 200) as usize;
+            let id: String = (0..len).map(|_| rng.pick(HOSTILE)).collect();
+            assert_eq!(valid_aumid(&id), oracle(&id), "grammar oracle mismatch for {id:?}");
+        }
+    }
+
+    #[test]
+    fn valid_aumid_rejects_every_non_identifier_ascii_character() {
+        // Exhaustive over the whole ASCII range, one character at a time:
+        // exactly the alphanumerics plus . _ - ! may pass. Everything else —
+        // punctuation, delimiters, whitespace, controls — must be rejected,
+        // so no single-character escape hatch exists.
+        let allowed = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'!');
+        for b in 0u8..=127 {
+            let s = (b as char).to_string();
+            assert_eq!(
+                valid_aumid(&s),
+                allowed(b),
+                "byte {b:#04x} ({:?}) misclassified",
+                b as char
+            );
+        }
+        // Non-ASCII characters are outside the grammar however identifier-like
+        // they look: letters, bidi commands, emoji, ZWJ, combining marks.
+        for c in ['é', 'א', '你', '🎵', '\u{202E}', '\u{2066}', '\u{200D}', '\u{301}'] {
+            assert!(!valid_aumid(&c.to_string()), "{c:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn valid_aumid_enforces_the_length_bounds_under_fuzz() {
+        // The 1..=128 bound holds under random lengths built purely from
+        // allowed characters: shorter and in-range strings pass, empty and
+        // anything past 128 fail, regardless of how the length was reached
+        // (single char, packed suffix, exact cap).
+        let mut rng = FuzzRng(0x5EED_0000_0000_5EED);
+        const ALLOWED: &[char] = &['a', 'Z', '0', '.', '_', '-', '!', 'b', 'Y', '1', '9'];
+        for _ in 0..2000 {
+            let len = (rng.next() % 200) as usize;
+            let id: String = (0..len).map(|_| rng.pick(ALLOWED)).collect();
+            let expected = (1..=128).contains(&len);
+            assert_eq!(valid_aumid(&id), expected, "length bound mismatch at {len} for {id:?}");
+        }
+    }
 }
