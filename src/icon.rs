@@ -133,7 +133,7 @@ fn extract_from_aumid(aumid: &str, size: usize) -> Option<Vec<u8>> {
     try_parsing_name(&apps_path, size)
 }
 
-/// Bounded escaped preview for untrusted strings in log output (R-04).
+/// Bounded escaped preview for untrusted strings in log output.
 /// Mirrors the `metadata_preview` pattern in `smtc.rs` so the log line is
 /// independent of the raw input length.
 const ICON_LOG_PREVIEW: usize = 128;

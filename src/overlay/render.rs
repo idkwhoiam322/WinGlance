@@ -3334,7 +3334,7 @@ mod tests {
         // deletes its font. A frame that skipped its restore would leave the
         // generation's font current in the long-lived DC, so the next frame's
         // `SelectObject` would read it as `old_font` — a stale handle once the
-        // provider drops it (scenario 6).
+        // provider drops it.
         unsafe {
             let hdc = CreateCompatibleDC(None);
             assert!(!hdc.0.is_null());

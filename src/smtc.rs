@@ -4518,8 +4518,8 @@ mod tests {
     fn full_output_channel_replays_latest_state_after_drain() {
         // Capacity-1 channel: fill it, commit two playback states (the newer
         // supersedes the older in the mailbox), drain the channel, then flush.
-        // Acceptance: the latest authoritative state arrives; nothing is
-        // permanently invisible just because the channel was briefly full.
+        // The latest authoritative state arrives; nothing is permanently
+        // invisible just because the channel was briefly full.
         let (tx, rx) = mpsc::sync_channel(1);
         tx.try_send(Arc::new(MediaEvent::PlaybackStateChanged(
             PlaybackState::Stopped,

@@ -5923,10 +5923,11 @@ mod tests {
 
     #[test]
     fn every_settings_focus_target_can_scroll_into_view() {
-        // At every accepted DPI scale and the small/large client heights from
-        // the acceptance matrix (768/900/1080), recentering on a focus target
-        // and clamping keeps that target inside the visible band — so keyboard
-        // navigation can always bring a control on screen.
+        // At every accepted DPI scale and the small/large client heights in the
+        // tested viewport grid (768/900/1080 tall at 100/150/200% scale),
+        // recentering on a focus target and clamping keeps that target inside
+        // the visible band — so keyboard navigation can always bring a control
+        // on screen.
         let state = MainWindowState::new(
             Arc::new(RwLock::new(Config::default())),
             EventQueue::default(),

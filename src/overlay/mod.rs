@@ -7534,7 +7534,7 @@ mod tests {
 
     #[test]
     fn ensure_contrast_brightens_the_reviewed_worst_case_colors() {
-        // The audit's concrete measured failure: a strict-guard-accepted
+        // The concrete measured failure: a strict-guard-accepted
         // palette primary (60, 45, 84) tints the fill to ~(25, 24, 37) and
         // gives an artist-row text of ~(128, 118, 144) — 4.10:1 — while the
         // raw primary as meta-row text lands at 1.40:1 against the same
