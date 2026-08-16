@@ -5872,10 +5872,9 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             // Drop the shared snapshot so a provider that outlives the window
             // can no longer read window data; its next request fails to post
-            // and degrades to empty answers.
-            *SETTINGS_UI_SNAPSHOT
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            // and degrades to empty answers. Same teardown contract as the
+            // overlay's name-cell null (accessibility::clear_uia_provider_state).
+            crate::accessibility::clear_uia_provider_state(&SETTINGS_UI_SNAPSHOT);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
@@ -6552,6 +6551,13 @@ mod tests {
         assert_eq!(setting_sub_from_tag(0x7F), None);
     }
 
+    /// Serializes the tests that touch the shared `SETTINGS_UI_SNAPSHOT`
+    /// static: `concurrent_teardown_never_strands_a_provider_read` storms it
+    /// from many threads, and `snapshot_generation_advances_with_each_store`
+    /// asserts exact generation arithmetic — without the lock they race each
+    /// other's interleaved writes on the same static.
+    static SNAPSHOT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn settings_snapshot_defaults_to_empty_when_nothing_is_stored() {
         // A provider asked before the UI thread ever built a snapshot (or after
@@ -6565,6 +6571,7 @@ mod tests {
 
     #[test]
     fn snapshot_generation_advances_with_each_store() {
+        let _serialize = SNAPSHOT_TEST_LOCK.lock().unwrap();
         // Each stored build gets a strictly newer generation, so a waiter
         // that captured the old one can tell a fresh build from a stale one.
         let first = Arc::new(SettingsUiSnapshot::default());

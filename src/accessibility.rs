@@ -536,6 +536,18 @@ pub fn settings_child_provider(
     )
 }
 
+/// Teardown contract for shared UIA provider state, called from every
+/// window's WM_NCDESTROY. A provider handed to UIA core may outlive the
+/// window (core holds a reference across the last release), so the window
+/// clears the shared state it answered from: a client-held provider then
+/// reads empty instead of window data. Both the main window's settings
+/// snapshot and the overlay's pill name cell follow this; the lock is
+/// recovered even when poisoned, so a panic while holding it can never keep
+/// stale window data readable after teardown.
+pub(crate) fn clear_uia_provider_state<T>(slot: &Mutex<Option<T>>) {
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,5 +574,29 @@ mod tests {
             assert_eq!(second, 0x0503);
             SafeArrayDestroy(array).ok().unwrap();
         }
+    }
+
+    #[test]
+    fn clear_uia_provider_state_empties_the_slot_and_recovers_poison() {
+        // Plain clear: a slot that still holds data reads empty after the call.
+        let slot: Mutex<Option<String>> = Mutex::new(Some("last track".into()));
+        clear_uia_provider_state(&slot);
+        assert!(slot.lock().unwrap().is_none());
+
+        // Poisoned lock: a panic while holding the lock must not keep stale
+        // window data readable after teardown — the recovery the overlay's
+        // teardown previously lacked (it skipped the clear on poison).
+        let slot: Mutex<Option<String>> = Mutex::new(Some("stale".into()));
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = slot.lock().unwrap();
+            panic!("simulated panic while holding the teardown lock");
+        });
+        assert!(slot.is_poisoned());
+        clear_uia_provider_state(&slot);
+        // The poison flag persists after recovery — every production reader
+        // uses the same `unwrap_or_else(into_inner)` the helper does, so the
+        // assertion mirrors that read pattern.
+        let read = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(read.is_none());
     }
 }

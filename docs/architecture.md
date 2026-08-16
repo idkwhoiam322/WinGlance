@@ -570,10 +570,28 @@ instance):
 
 Teardown mirrors the surface on the way out: `detach_hwnd_provider` (both
 WM_DESTROY handlers) disconnects the provider while the window and its state
-still exist, and `clear_uia_provider_state` (both WM_NCDESTROY handlers,
-poison-recovered) empties the shared snapshot slot and the pill's name cell
-— a client-held provider degrades to empty answers instead of reading
-window data after the window is gone.
+still exist, and the shared state the providers answer from is cleared at
+WM_NCDESTROY — a client-held provider degrades to empty answers instead of
+reading window data after the window is gone.
+
+**Shared UIA state teardown contract.** Any window that answers UIA queries
+from shared state (a slot, cell, or snapshot its providers read) must clear
+that state at WM_NCDESTROY through `accessibility::clear_uia_provider_state`
+— the single sanctioned pattern. UIA core holds references to a provider
+across the last release, so a provider can outlive its window; clearing the
+shared state it answers from makes that provider read empty rather than
+stale window data. The helper locks the slot and writes `None`, recovering
+a poisoned lock (`unwrap_or_else(into_inner)`) — a panic while holding it
+can never keep stale data readable after teardown. The two current users are
+the main window's `SETTINGS_UI_SNAPSHOT` slot and the overlay's pill name
+cell, both at WM_NCDESTROY.
+
+Hand-rolling the clear — e.g. an `if let Ok` lock that *skips* on poison,
+which the overlay's teardown originally did — is a review **must-fix**: the
+contract is that teardown always empties the slot, and the helper exists so
+no window can drift back to a partial clear. A new window serving UIA from a
+shared slot must route its teardown through the helper, and (for a
+window-owned cell, like the pill's) drop its own reference alongside it.
 
 ## Configuration
 

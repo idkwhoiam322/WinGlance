@@ -3865,7 +3865,14 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             LRESULT(0)
         }
-        WM_DESTROY => LRESULT(0),
+        WM_DESTROY => {
+            // Disconnect the UIA provider while the window and its state still
+            // exist, so UIA core releases its references instead of calling
+            // into a torn-down window later — the same defensive teardown the
+            // main window applies in its WM_DESTROY.
+            let _ = UiaReturnRawElementProvider(hwnd, WPARAM(0), LPARAM(0), None);
+            LRESULT(0)
+        }
         WM_NCDESTROY => {
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
@@ -3881,6 +3888,12 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 }
                 OVERLAY_FG_HWND.store(0, Ordering::SeqCst);
                 state.delete_anim_timer();
+                // Null the shared accessible-name cell last: a provider that
+                // outlives the window must read an empty name, not the last
+                // track (see `null_pill_name_cell`). Placed after the hook
+                // and timer teardown so no racing callback can repopulate it
+                // before the box is released.
+                state.null_pill_name_cell();
                 // Dropping the scratch buffers unselects the bitmaps and
                 // frees the DIBs and DCs via the `Drop` impls; the state box
                 // is released right after.
@@ -4224,6 +4237,36 @@ mod tests {
             "a play/pause transition never announces, even when it changes the name"
         );
         assert!(!OverlayState::announces_pill_name_change(&None));
+    }
+
+    #[test]
+    fn nulling_the_name_cell_makes_a_client_held_clone_read_empty() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        // The "client" is a provider handed to UIA core: it holds its own
+        // clone of the cell and outlives the window.
+        let client = Arc::new(Mutex::new(None));
+        state.pill_name = Some(client.clone());
+        state.content = Some(MediaEvent::TrackChanged(track_for(
+            "spotify",
+            "Love Me Not",
+            "Ravyn Lenae",
+        )));
+        state.resolve_pill_text();
+        assert_eq!(
+            *client.lock().unwrap(),
+            Some("Love Me Not — Ravyn Lenae (spotify)".to_string())
+        );
+
+        // Teardown (WM_NCDESTROY): the overlay drops its reference and
+        // clears the contents — the client's clone stays alive but must now
+        // read empty, not the last track name.
+        state.null_pill_name_cell();
+        assert!(state.pill_name.is_none(), "the overlay no longer holds the cell");
+        assert_eq!(
+            *client.lock().unwrap(),
+            None,
+            "a client-held provider must read empty after teardown"
+        );
     }
 
     #[test]
@@ -5813,6 +5856,49 @@ mod tests {
             "the enabled drain must cache the newer track too"
         );
         destroy_wndproc_overlay(hwnd, state_ptr);
+    }
+
+    #[test]
+    fn teardown_via_the_wndproc_leaves_a_client_held_name_cell_empty() {
+        // End-to-end through the real message path: a MEDIA_EVENT_MSG is
+        // pumped into the enabled pill (the production wndproc writes the
+        // shared name cell via resolve_pill_text), then DestroyWindow drives
+        // WM_DESTROY/WM_NCDESTROY synchronously through the production
+        // handler — the provider detach, the name-cell null, and the box
+        // release. The client-held clone (a provider handed to UIA core)
+        // must read empty after the real teardown, not the last track name.
+        let _serialize = WNDPROC_TEST_LOCK.lock().unwrap();
+        let (hwnd, state_ptr, queue) = spawn_wndproc_overlay();
+        let client = Arc::new(Mutex::new(None));
+        unsafe {
+            (*state_ptr).pill_name = Some(client.clone());
+            (*state_ptr).enabled = true;
+        }
+        queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track_for(
+                "spotify",
+                "Love Me Not",
+                "Ravyn Lenae",
+            ))));
+        pump_posted_messages(hwnd, &[MEDIA_EVENT_MSG]);
+
+        // The real path wrote the cell: the client's clone mirrors the pill.
+        assert_eq!(
+            *client.lock().unwrap(),
+            Some("Love Me Not — Ravyn Lenae (spotify)".to_string())
+        );
+
+        // DestroyWindow sends WM_DESTROY then WM_NCDESTROY through the
+        // production wndproc; the handler frees the state box, so state_ptr
+        // must not be touched after this point.
+        destroy_wndproc_overlay(hwnd, state_ptr);
+        assert_eq!(
+            *client.lock().unwrap(),
+            None,
+            "a client-held provider must read empty after the real teardown"
+        );
     }
 
     #[test]
