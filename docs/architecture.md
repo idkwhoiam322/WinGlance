@@ -87,8 +87,9 @@ after one hung shell call)
   SMTC worker performs the metadata + artwork reads and the fixed-size
   artwork *decode* (into a fixed `ARTWORK_DECODE`² = 256² premultiplied
   BGRA buffer, once per unique cover). App-icon extraction runs on the
-  separate icon worker (see above), so a hung shell extension cannot stall
-  the SMTC worker. The UI thread only converts that buffer to RGBA in
+  separate icon worker (see above). A hung shell extension cannot stall it
+  indefinitely: the worker waits at most `ICON_EXTRACT_TIMEOUT` (1.5 s) per
+  new source's extraction before giving up and continuing without the icon. The UI thread only converts that buffer to RGBA in
   `ensure_art` (~0.1 ms, cached for the animation frames); the palette is
   derived from that same converted buffer, so no separate full-resolution
   decode is ever needed.
@@ -337,11 +338,13 @@ anti-aliased.
 The target display comes from `monitor`: `active-window` (the monitor of the
 foreground window — see "Foreground tracking" below), `primary` (the display
 flagged `MONITORINFOF_PRIMARY`), or `index-N` (the (N+1)-th display in
-`EnumDisplayMonitors` order). `overlay::enumerate_displays()` takes a fresh
-snapshot on every placement — handles are never cached — and
-`resolve_target()` maps the mode onto it; an out-of-range index falls back to
-the primary (with a throttled warning) without touching the config, so the
-setting reapplies when the display returns. `position_x`/`position_y` retain
+`EnumDisplayMonitors` order). `overlay::enumerate_displays_cached()` returns
+the display snapshot from a 1-second cache (an `Arc<[DisplayInfo]>` shared
+by every per-frame lookup) and `resolve_target()` maps the mode onto it;
+the cache is invalidated on `WM_DISPLAYCHANGE`, so a removed or reordered
+display is picked up on the next resolution. An out-of-range index falls
+back to the primary (with a throttled warning) without touching the config,
+so the setting reapplies when the display returns. `position_x`/`position_y` retain
 their existing semantics — absolute virtual-screen coordinates in 96-DPI
 logical pixels — and the resulting position is clamped into the target
 display's work area.

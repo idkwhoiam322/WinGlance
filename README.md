@@ -48,13 +48,14 @@ start-on-login, close-to-tray, allowed apps, position, logs).
 ### Tray menu
 
 - **Open WinGlance** — the tracking window (current activity + history list)
+- **Preview Notification** — show a sample pill
 - **Toggle notifications** — enable/disable pills
 - **Start with Windows** — launch at logon
 - **Close window to tray** — hide instead of quit when the window is closed
 - **Monitor** — place the pill on the active window's display, the primary
   display, or a numbered display
-- **Duration** — 2 / 3 / 5 / 10 seconds
-- **Layout** — Expanded / Compact / Auto
+- **Duration** — 2 / 3 / 5 / 10 seconds, or a custom value via **Custom…**
+- **Layout** — Expanded / Compact / Auto / Persistent Compact
 - **Quit**
 
   Placement (edge anchor, custom coordinates) is not in the tray; it is edited in

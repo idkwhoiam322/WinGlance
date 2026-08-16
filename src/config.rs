@@ -1570,6 +1570,24 @@ nested_appearance = [1, 2, 3]
     }
 
     #[test]
+    fn tray_menu_lists_in_readme_and_docs_cover_every_entry() {
+        // The tray menu offers more than the preset durations and the three
+        // classic layouts: a custom duration entry (Custom…), the Persistent
+        // Compact layout, and a Preview Notification command. Both user-facing
+        // documents must mention all three so the tray list cannot silently
+        // drift from the menu again.
+        let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("README.md must exist at the crate root");
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/configuration.md"))
+            .expect("docs/configuration.md must exist at the crate root");
+        for (file, text) in [("README.md", &readme), ("docs/configuration.md", &doc)] {
+            for needle in ["Custom…", "Persistent Compact", "Preview Notification"] {
+                assert!(text.contains(needle), "{file} must mention the tray {needle:?} entry");
+            }
+        }
+    }
+
+    #[test]
     fn finite_clamp_falls_back_to_default_for_non_finite_values() {
         // NaN and ±inf must not pass through f32::clamp (which leaves NaN
         // untouched and has no opinion on inf): they fall back to the

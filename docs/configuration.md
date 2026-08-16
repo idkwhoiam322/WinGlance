@@ -111,7 +111,10 @@ Expanded rules, in the compact layout the Compact rules):
 - **Expanded layout, `dismiss_on_hover = true`** — hovering arms the
   dismissal: the remaining time is capped at 500 ms, one-way (leaving before
   that does not cancel it). The countdown is never deferred for the cursor.
-  With `dismiss_on_hover = false`, hovering does nothing.
+  This is the inverse of the Compact hover-to-expand interaction: parking
+  the cursor on an Expanded pill to *read* it starts the dismissal, so
+  hovering means "I've seen it" — it never holds the pill open. With
+  `dismiss_on_hover = false`, hovering does nothing.
 - **Compact layout, `expand_compact_on_hover = true`** — the first hover of
   a showing expands the pill in place and resets the countdown to the full
   duration. The expanded state is an interaction: while the cursor stays on
@@ -220,15 +223,19 @@ It is never shown as a pop-up on launch.
 The tray menu mirrors the `[behavior]` toggles in real time:
 
 - **Open WinGlance** — restore the tracking window.
+- **Preview Notification** — show a sample pill.
 - **Toggle notifications** — enable/disable SMTC track-change + state-change events.
 - **Start with Windows** — write/remove the `%APPDATA%\...\Run` registry entry.
 - **Close window to tray** — on-off (mirrors `close_to_tray`).
 - **Monitor** — which display the pill is placed on (Active window, Primary, or
   a numbered Display).
-- **Duration** — 2 s / 3 s / 5 s / 10 s. When the system "show notifications
-  for" preference exceeds the selection, a grayed `Currently applied: 5s
-  (system)` line shows the effective value.
-- **Layout** — Expanded / Compact / Auto (mirrors `overlay.layout`).
+- **Duration** — 2 s / 3 s / 5 s / 10 s, or **Custom…** for an arbitrary
+  value (the chosen duration applies immediately). When the system "show
+  notifications for" preference exceeds the selection, a grayed
+  `Currently applied: 5s (system)` line shows the effective value.
+- **Layout** — Expanded / Compact / Auto / **Persistent Compact** (mirrors
+  `overlay.layout`; Persistent Compact keeps the pill on screen in the
+  Compact layout, fading to idle instead of collapsing).
   Pill placement — the edge anchor, the custom coordinates, and the per-layout
   Compact position — is edited in the **Settings** pane, not the tray: the
   **Position** row offers edge anchors and **Adjust position…** opens the drag
