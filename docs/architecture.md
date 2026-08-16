@@ -130,6 +130,26 @@ A fresh read is merged into the stored `LogicalState` and diffed against it:
 Two sources with identical content both notify independently; no cross-source
 matching or suppression happens.
 
+The subscribed set is bounded: the worker never tracks more than
+`MAX_TRACKED_SESSIONS` sessions across `MAX_TRACKED_SOURCES` sources. Each
+re-sync builds a priority-ordered candidate list — the current session first,
+then the surviving subscriptions in snapshot order, then genuinely new
+sessions truncated at the session cap — via the pure `prioritize_sessions`
+function, so overflow candidates are never enumerated past the cap and never
+subscribed (the same ordering contract the admission tests pin). A source
+that keeps recreating content-free sessions (the churn signature) is charged
+per content-free first read and, past the threshold, excluded from emitting
+and evicted for a cool-down window.
+
+Artwork is a stream that lags the text fields: a transition read can pair a
+NEW track identity with the PREVIOUS track's thumbnail bytes (SMTC updates
+the thumbnail stream after the text). The byte-equal cross-identity cover is
+dropped and the emit deferred (`track emit deferred | reason=stale-art-drop`);
+a budget-bounded retry (~2 s) re-reads the thumbnail, and an artwork-timeout
+force shows the pill with a placeholder if the stream never recovers — the
+pill always eventually shows something, but never a wrong cover on a new
+track.
+
 ## Event pipeline and debounce
 
 `MediaPropertiesChanged` / `PlaybackInfoChanged` fire frequently, sometimes
@@ -142,8 +162,9 @@ multiple times per second for a single visual change. The worker:
 3. A `SessionsChanged`/`CurrentSessionChanged` burst is debounced the same
    way: one subscription re-sync per burst.
 4. A 2-second periodic safety net re-syncs subscriptions and re-reads every
-   subscribed session (metadata only, no artwork) so a missed event still
-   surfaces; the same read reports what is already playing at startup.
+   subscribed session (metadata only — except a bounded thumbnail re-read
+   for sessions still missing artwork) so a missed event still surfaces; the
+   same read reports what is already playing at startup.
 
 The overlay holds a small pending queue (cap 4): while a pill is on screen the
 next notification waits for the current one to collapse, so simultaneous
@@ -153,6 +174,24 @@ of the incoming one; the pill on screen is never pulled.
 
 A Stopped session keeps its stored content, so a state pill after a stop still
 shows the last track.
+
+**Source retirement and succession.** When a source settles — its last session
+disappears from the list (the worker emits `SourceGone`) or it is removed from
+the allow-list / evicted as churning — the overlay retires it: its content is
+removed from the pill, the persistent-compact resume hold, the settings sample
+pill, and any queued notification (a queued event from a source that settled
+before its turn is dropped by the queue's SourceGone pre-gate, never shown).
+If the retiring source's content was on the pill, the overlay may swap it: the
+successor is the most recent cached track of a source whose last known
+playback state is **Playing**, chosen from a per-source playback-state ledger
+(fed by `TrackChanged` snapshots and `PlaybackStateChanged` events — updated
+even while notifications are disabled, capped at 64 entries, evicting Stopped
+entries first). Paused, stopped, or unknown sources never qualify: a settle
+with nothing actually playing hides the pill instead of announcing stale
+"now playing" content, and a live source re-shows the pill on its own next
+event. The track cache itself is cap-bounded (3 entries, text plus one
+decoded cover each) with indefinite retention — a playing source's track is
+never evicted by time, only by newer inserts.
 
 ## Rendering pipeline
 
@@ -371,9 +410,10 @@ switching between two panes:
   intended). A native `TOOLTIPS_CLASSW` control shows full row details on hover,
   synced to the visible row band on a 1 Hz timer while the window is visible.
 - **Settings** — cards mirroring the tray menu and `[behavior]`/`[overlay]`
-  config: notifications toggle, duration presets, start-on-login, close-to-
-  tray, allowed apps, position anchors + Reset/Adjust, target display
-  selection, "Preview Notification", and the "Copy logs" button. The main window is the
+  config: notifications toggle, duration presets and the respect-system-
+  duration toggle, start-on-login, close-to-tray, allowed apps, position
+  anchors + Reset/Adjust, target display selection, "Preview Notification",
+  and the "Copy logs" button. The main window is the
   single writer of the in-memory config (see the guardrail in `AGENTS.md`);
   every change goes through `mutate_config` and is persisted.
 

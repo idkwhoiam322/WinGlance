@@ -51,7 +51,9 @@ WinGlance/
   own COM thread. Subscribes to every session's `PlaybackInfoChanged` /
   `MediaPropertiesChanged`, reads metadata and artwork bytes, extracts app
   icons, deduplicates (content diff, session-recreation, artwork-change
-  time-gate, per-source churn cool-down), and sends events down the channel.
+  time-gate, per-source churn cool-down), drops stale cross-identity
+  thumbnails with a budget-bounded artwork retry, bounds the subscribed set
+  by session/source admission caps, and sends events down the channel.
 - **overlay/** — the passive pill, split into `mod` (state, tick, events,
   hover handling, window/timer glue), `morph` (springs, hover decisions,
   pill geometry), `render` (frame composition, text rasterization, vector
@@ -122,11 +124,14 @@ the always-visible pill — no window, no console, no dialogs.
 |---------------|--------------------------------------------------|
 | Config        | `%APPDATA%\WinGlance\WinGlance\data\config.toml`         |
 | Logs          | `%APPDATA%\WinGlance\WinGlance\data\logs\log-Live.log`  |
-| Artwork cache | In memory only: one decoded buffer per unique cover (overlay), plus per-source track/icon caches evicted when a session closes |
+| Artwork cache | In memory only: one decoded buffer per unique cover; the overlay's cap-3 track cache (indefinite retention) plus its 64-entry playback-state ledger; per-source icon caches evicted when a session closes |
 
 ## Testing notes
 
-Unit tests cover pure logic only (config clamping, debounce bounds, event
-types). OS-level behavior — click-through, focus avoidance, tray menu, real
+Unit tests cover the pure logic: config clamping and normalization, debounce
+and queue bounds, event dedup and the stale-art guard, session admission
+ordering, the overlay's retirement/succession ledger, settings-layout purity,
+autostart safety, and verified-file writes (reparse-point rejection).
+OS-level behavior — click-through, focus avoidance, tray menu, real SMTC
 provider timing — needs a live Windows desktop with media playing and cannot
 be exercised in CI or a headless shell.

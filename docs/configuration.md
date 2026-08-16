@@ -15,7 +15,7 @@ corrected silently but the file is not rewritten (see `docs/architecture.md`).
 | Key            | Default | Range   | Effect                                            |
 |----------------|---------|---------|---------------------------------------------------|
 | `duration_ms`  | `5000`  | 500–60000 | How long the pill stays visible before collapsing |
-| `respect_system_message_duration` | `true` | bool | While on, the pill stays up at least as long as Windows' "show notifications for" preference (the larger of it and `duration_ms` wins). `false` makes `duration_ms` the exact duration |
+| `respect_system_message_duration` | `true` | bool | While on, the pill stays up at least as long as Windows' "show notifications for" preference (the larger of it and `duration_ms` wins). `false` makes `duration_ms` the exact duration. The Settings pane's Duration row shows the effective value (e.g. `2s (system 5s)`) when the preference wins, and a **Respect system message duration** toggle edits this key |
 
 > **Progress bar.** When the playing app reports timeline position via SMTC
 > (Spotify, Groove, MusicBee, and a few others — not browsers), the pill draws
@@ -225,7 +225,9 @@ The tray menu mirrors the `[behavior]` toggles in real time:
 - **Close window to tray** — on-off (mirrors `close_to_tray`).
 - **Monitor** — which display the pill is placed on (Active window, Primary, or
   a numbered Display).
-- **Duration** — 2 s / 3 s / 5 s / 10 s.
+- **Duration** — 2 s / 3 s / 5 s / 10 s. When the system "show notifications
+  for" preference exceeds the selection, a grayed `Currently applied: 5s
+  (system)` line shows the effective value.
 - **Layout** — Expanded / Compact / Auto (mirrors `overlay.layout`).
   Pill placement — the edge anchor, the custom coordinates, and the per-layout
   Compact position — is edited in the **Settings** pane, not the tray: the
