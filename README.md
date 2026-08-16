@@ -32,9 +32,22 @@ interrupts and never needs interaction.
   the visible band, then stop when shown.
 - **Placement** — anchor to any of six screen edges with a configurable
   margin, or drag to a custom spot with the built-in positioner.
+- **Persistent Compact layout** — the pill never fully disappears while
+  media is playing: after its duration it rests at idle opacity instead of
+  collapsing, so the now-playing info stays on screen.
+- **Preferred source (pin)** — with a pin set, the persistent pill returns
+  to that app's current track whenever it would fade out, while that source
+  is actually playing; a paused/stopped pin is never resurrected, and with
+  no pin the pill settles on the most recent source that is still playing.
+- **Bounded progress bar** — when the playing app reports timeline position
+  via SMTC, a thin accent bar along the pill's bottom edge advances with
+  playback, freezes while paused, and re-bases on a seek.
+- **Accessible** — the pill exposes the current track as an accessible name
+  (UI Automation), and the tracking window's Settings pane is
+  keyboard-navigable and exposes a full UIA provider.
 - **Small footprint** — raw Win32 + GDI, no UI framework, no webview, no GPU
-  runtime. One worker thread for SMTC; the pill repaints only while animating
-  or scrolling.
+  runtime. One SMTC worker thread (plus a supervisor watchdog and an icon
+  worker); the pill repaints only while animating or scrolling.
 
 ## Getting started
 
@@ -43,7 +56,8 @@ it sits in the tray. It starts silently (no window); the pill appears when
 media plays. Double-click the tray icon for the tracking window: it shows the
 current activity and a per-source history on the **Now Playing** pane, plus a
 **Settings** pane mirroring the tray menu (notifications, duration,
-start-on-login, close-to-tray, allowed apps, position, logs).
+start-on-login, close-to-tray, allowed apps, layout, position, monitor,
+preferred source, logs).
 
 ### Tray menu
 
@@ -94,15 +108,27 @@ loop), `-NoThrottle` / `-Jobs N` (parallelism). Direct checks:
 - `src/smtc.rs` — the SMTC worker thread: subscribes to every session,
   reads metadata/artwork, extracts app icons, and deduplicates (content
   diff, session-recreation, churn cool-down, artwork-change time-gate).
+  Async reads are time-bounded, and a source whose session hangs a read is
+  excluded from tracking for a cool-down window instead of stalling the
+  worker.
 - `src/overlay/` — the raw Win32 layered pill, split into `mod` (state,
   tick, window glue), `morph` (springs, hover decisions, geometry),
   `render` (frame composition, text, vector primitives) and `fullscreen`
   (display enumeration and fullscreen detection): expand/light/collapse
   animation, palette + aura rendering, vector glyphs, marquee rows,
-  hover expand/dismiss.
+  hover expand/dismiss, the persistent-compact idle rest, the progress bar.
+- `src/accessibility.rs` — the UI Automation providers: the pill's read-only
+  name provider and the Settings-pane fragment provider.
 - `src/palette.rs` / `src/icon.rs` — the color quantizer and the shell icon
   extraction.
-- `src/main_window.rs` — tracking window, tray icon/menu, history.
+- `src/main_window.rs` — tracking window, tray icon/menu, history, the
+  Settings pane (keyboard-navigable, UIA-provided).
+- `src/process_picker.rs` — the owner-drawn popups (allowed apps,
+  auto-compact apps, and the single-select pinned-source picker).
+- `src/winapi.rs` / `src/winutil.rs` — a version-stable facade over the raw
+  Win32 calls plus shared helpers (window-state boxes, NUL-terminated wide
+  copies).
+- `src/positioner.rs` — the drag-to-place sample window.
 
 The overlay is a click-through layered window rendered with GDI and
 `UpdateLayeredWindow`; the `image` crate only decodes the SMTC artwork.

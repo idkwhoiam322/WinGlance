@@ -183,7 +183,15 @@ function, so overflow candidates are never enumerated past the cap and never
 subscribed (the same ordering contract the admission tests pin). A source
 that keeps recreating content-free sessions (the churn signature) is charged
 per content-free first read and, past the threshold, excluded from emitting
-and evicted for a cool-down window.
+and evicted for a cool-down window. The same exclusion map also serves the
+wedged-read path: every app-controlled async read
+(`TryGetMediaPropertiesAsync`, `OpenReadAsync`, `ReadAsync`) is
+**time-bounded** (`READ_ASYNC_TIMEOUT`, 10 s — under the 30 s stall
+threshold), and a session that does not answer within the bound excludes its
+source from tracking and emitting for the cool-down window. One hostile app
+can therefore cost at most a single 10 s hiccup plus its own exclusion —
+it can never hang the worker into a supervisor stall that burns the global
+restart budget for every source.
 
 Artwork is a stream that lags the text fields: a transition read can pair a
 NEW track identity with the PREVIOUS track's thumbnail bytes (SMTC updates
@@ -268,6 +276,13 @@ receives sanitized, bounded payloads:
 - **Session churn** — admission caps (`MAX_TRACKED_SESSIONS` = 64,
   `MAX_TRACKED_SOURCES` = 32) with priority ordering; a source recreating
   content-free sessions is excluded and evicted for a cool-down window.
+  **Wedged async reads** — the same exclusion map covers a source whose
+  session hangs an async read past `READ_ASYNC_TIMEOUT` (10 s): the read is
+  abandoned with a distinct timeout marker (never retried against the wedged
+  stream) and the source is excluded, so a hostile app cannot stall the
+  worker into the global restart budget. The residual is the synchronous COM
+  calls (`GetPlaybackInfo`, `GetTimelineProperties`, `GetSessions`), which
+  cannot be timed out and still route through the supervisor restart + cap.
 - **Hangs** — the supervisor watchdog restarts a worker stalled 30 s with
   backoff (5 s → 60 s), capped at `MAX_WORKER_RESTARTS` = 5, then surfaces a
   one-shot `WorkerFailed`; a hung thread is leaked but bounded by the cap.

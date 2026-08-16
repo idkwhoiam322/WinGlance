@@ -74,8 +74,12 @@ changes (track change, play/pause/stop).
    `IShellItemImageFactory` / package manager. Uncertain results for browsers
    (matrix says incomplete) but should work for Store/UWP apps (Spotify, Groove).
    Fallback: draw a colored letter avatar (first letter of source-app name).
+   *Status: shipped — icons render next to the source name, with the readable
+   source-app label as the browsers fallback.*
 2. **Monitor pinning** — setting to lock the pill to a specific monitor instead of
    the foreground one.
+   *Status: shipped — the Monitor setting (active window / primary / numbered
+   display) covers the common cases; the pill still auto-follows by default.*
 3. **Content stacking direction + alignment** — horizontal (art left, text right)
    vs vertical layout, mirroring ModernFlyouts.
 4. **Light/dark appearance presets** — one-key `[appearance]` presets.
@@ -97,3 +101,8 @@ the revision note.)
   no duplicate notifications) — implemented after observing ModernFlyouts-era
   complaints about double flyouts.
 - Full session history with status, sidebar panes, tray-driven settings.
+- **Preferred-source pinning** (not in the reference set): the persistent
+  pill rests on a user-pinned source's current track while it plays, falling
+  back to the most recent source that is actually still playing — the
+  closest thing Windows has to a configurable now-playing home, with none of
+  ModernFlyouts' interaction.

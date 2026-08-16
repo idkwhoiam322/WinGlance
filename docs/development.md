@@ -4,7 +4,7 @@
 
 ```
 WinGlance/
-├── Cargo.toml              Crate manifest; pinned windows 0.58, image, serde/toml
+├── Cargo.toml              Crate manifest; pinned windows 0.62, image, serde/toml
 ├── Cargo.lock              Locked dependency set (build with --locked)
 ├── deny.toml               cargo-deny policy (license allowlist, duplicate skips)
 ├── .rustfmt.toml           Formatting options (imports = "granular")
@@ -19,6 +19,8 @@ WinGlance/
 │   ├── architecture.md     Design, threading, SMTC selection, rendering, placement
 │   ├── development.md      This file
 │   ├── configuration.md    Every config option, its range, and its effect
+│   ├── research.md         Competitive research + improvement roadmap
+│   ├── windows-0.62-migration.md  Staged 0.58 → 0.62 bump plan (executed; kept as history)
 │   └── reviews/            External audit prompt + code-packaging script
 │       ├── FULL_CODE_REVIEW_PROMPT.md
 │       └── PACKAGE_FOR_REVIEW.ps1
@@ -29,12 +31,17 @@ WinGlance/
     ├── logging.rs          Single-file logger (log-Live.log, current run)
     ├── smtc.rs             Isolated SMTC listener on its own COM thread
     ├── overlay/            Pill overlay: mod/morph/render/fullscreen (see below)
+    ├── accessibility.rs    UI Automation providers (pill name, Settings pane)
     ├── icon.rs             Source-app icon extraction (shell COM, worker thread)
     ├── palette.rs          Vibrant-color quantizer for the accent/aura
     ├── main_window.rs      Maximized tracking window + tray icon/menu
     ├── autostart.rs        HKCU Run-key start-on-login sync
     ├── positioner.rs       Draggable sample window for custom placement
-    └── process_picker.rs   Owner-drawn app-picker popup for the allow-list
+    ├── process_picker.rs   Owner-drawn app-picker popups (allow-list, auto-compact, pin)
+    ├── gdi.rs              Shared GDI drawing helpers (text rasterization)
+    ├── duration_dialog.rs  Custom pill-duration prompt
+    ├── winapi.rs           Version-stable facade over raw Win32/WinRT calls
+    └── winutil.rs          Shared Win32 helpers (window-state boxes, wide strings)
 ```
 
 ## Module responsibilities
@@ -54,6 +61,11 @@ WinGlance/
   time-gate, per-source churn cool-down), drops stale cross-identity
   thumbnails with a budget-bounded artwork retry, bounds the subscribed set
   by session/source admission caps, and sends events down the channel.
+  All app-controlled async reads are time-bounded (`READ_ASYNC_TIMEOUT`,
+  10 s): a session that hangs one is excluded from tracking for the same
+  cool-down window the churn path uses, so a hostile source can cost a
+  single bounded hiccup plus its own exclusion — never a worker stall that
+  burns the supervisor's global restart budget.
 - **overlay/** — the passive pill, split into `mod` (state, tick, events,
   hover handling, window/timer glue), `morph` (springs, hover decisions,
   pill geometry), `render` (frame composition, text rasterization, vector
@@ -77,7 +89,11 @@ WinGlance/
   luminance guard, ≥ 30° hue separation) that feeds the accents and the aura.
 - **main_window.rs** — the tracking window (current activity + history) and the
   full tray menu: Open, Toggle notifications, Start with Windows, Close to tray,
-  and the Monitor, Duration, and Layout submenus, and Quit.
+  and the Monitor, Duration, and Layout submenus, and Quit. Also owns the
+  in-memory config (settings changes are pushed to the overlay, never reloaded
+  from disk), the Settings pane (keyboard-navigable, exposed to screen readers
+  through a UIA fragment provider), and the one-shot tray notes (worker
+  failure, budget-drop warning).
 - **autostart.rs** — reads/writes the `HKCU ...\Run` entry for start-on-login.
 - **positioner.rs** — the in-app floating sample used to drag-place the pill; it
   posts the chosen `position_x`/`position_y` to the main window via
@@ -149,8 +165,14 @@ the always-visible pill — no window, no console, no dialogs.
 
 Unit tests cover the pure logic: config clamping and normalization, debounce
 and queue bounds, event dedup and the stale-art guard, session admission
-ordering, the overlay's retirement/succession ledger, settings-layout purity,
-autostart safety, and verified-file writes (reparse-point rejection).
+ordering, the churn/wedged-source exclusion map and the bounded-wait timeout
+marker, the budget-warning latch resets (mailbox clear, over-cap pop,
+supervisor stall), the re-enable restore priority, the overlay's
+retirement/succession ledger, the UIA name-cell teardown, the
+`copy_wide_terminated` truncation boundary, settings-layout purity,
+autostart safety, and verified-file writes (reparse-point rejection). Two
+end-to-end tests drive the overlay through the real `GetMessageW`/wndproc
+path, including the production `WM_NCDESTROY` teardown ordering.
 OS-level behavior — click-through, focus avoidance, tray menu, real SMTC
 provider timing — needs a live Windows desktop with media playing and cannot
 be exercised in CI or a headless shell.
