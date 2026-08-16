@@ -626,6 +626,10 @@ pub fn relaunch_self() {
 }
 
 fn main() -> Result<()> {
+    // Record the thread that owns the windows before anything can create one:
+    // the UIA provider helpers use this to tell whether a call already runs on
+    // the UI thread (direct state access) or must be handed off by message.
+    main_window::mark_ui_thread();
     // The single-instance guard must come before any side effects: logging
     // truncates the live log and config recovery touches the user's file, so a
     // duplicate launch must not get that far. A restart-handoff child carries

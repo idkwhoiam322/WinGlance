@@ -37,6 +37,7 @@ use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenC
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentThreadId, SetEvent, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::{
     ToggleState_Off, ToggleState_On, UIA_AutomationFocusChangedEventId, UIA_ButtonControlTypeId,
     UIA_CheckBoxControlTypeId, UIA_ToggleToggleStatePropertyId, UiaRaiseAutomationEvent,
@@ -58,11 +59,11 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GetClientRect, GetCursorPos, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindowVisible, KillTimer, LB_ADDSTRING,
-    LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT,
-    LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED, MF_DISABLED,
-    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SB_BOTTOM,
-    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT,
+    GetClientRect, GetCursorPos, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindow, IsWindowVisible, KillTimer,
+    LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING,
+    LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED,
+    MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterWindowMessageW,
+    SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT,
     SCROLLBAR_COMMAND, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE,
@@ -80,6 +81,13 @@ const WM_TRAY: u32 = WM_APP + 2;
 /// the handler, so a scrolled or rebuilt pane can never act on a different
 /// control than the one invoked.
 pub(crate) const WM_SETTINGS_ACTIVATE_MSG: u32 = WM_APP + 13;
+/// UIA provider threads post this to ask the UI thread (the only thread that
+/// may touch the window-state box) to rebuild the Settings snapshot. The
+/// requesting thread waits on `SETTINGS_SNAPSHOT_EVENT` for the answer.
+const WM_SETTINGS_SNAPSHOT_MSG: u32 = WM_APP + 3;
+/// A UIA `SetFocus` handoff: the focus state lives in the window-state box,
+/// so provider threads post this instead of mutating it themselves.
+const WM_SETTINGS_FOCUS_MSG: u32 = WM_APP + 4;
 const TRAY_ID: u32 = 1;
 const MENU_OPEN_ID: usize = 1001;
 const MENU_PREVIEW_NOTIFY_ID: usize = 1029;
@@ -5821,11 +5829,39 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             LRESULT(0)
         }
+        WM_SETTINGS_SNAPSHOT_MSG => {
+            // A UIA provider thread asked for a fresh Settings snapshot. The
+            // UI thread is the only one allowed to read the window-state box,
+            // so it builds the snapshot here; the requesting thread waits on
+            // the event this build signals.
+            if !state_ptr.is_null() {
+                build_settings_ui_snapshot(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_SETTINGS_FOCUS_MSG => {
+            // A provider SetFocus arrived from a UIA thread; move the focus
+            // here, on the owner thread.
+            if !state_ptr.is_null() {
+                focus_setting_at_body(
+                    hwnd,
+                    wparam.0,
+                    setting_sub_from_tag(lparam.0 as i32).unwrap_or(SettingSub::None),
+                );
+            }
+            LRESULT(0)
+        }
         WM_NCDESTROY => {
             clear_window_state(hwnd);
             if !state_ptr.is_null() {
                 drop(Box::from_raw(state_ptr));
             }
+            // Drop the shared snapshot so a provider that outlives the window
+            // can no longer read window data; its next request fails to post
+            // and degrades to empty answers.
+            *SETTINGS_UI_SNAPSHOT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
@@ -5852,7 +5888,7 @@ fn setting_label(id: SettingId) -> &'static str {
         SettingId::Position => "Expanded Position",
         SettingId::SeparateCompact => "Compact Position follows Expanded Position",
         SettingId::CompactPosition => "Compact Position",
-        SettingId::DismissOnHover => "Dismiss persistent pill on hover",
+        SettingId::DismissOnHover => "Dismiss on hover",
         SettingId::ExpandCompactOnHover => "Expand compact pill on hover",
         SettingId::HideForAutoCompactSources => "Hide for auto-compact sources",
         SettingId::FadePersistentPill => "Fade persistent pill",
@@ -5960,14 +5996,175 @@ pub(crate) fn settings_content_rect(hwnd: HWND) -> RECT {
     }
 }
 
+/// An immutable picture of the Settings pane for UI Automation. Built on the
+/// UI thread (the only thread that may read the window-state box) and shared
+/// by `Arc`; provider threads read this snapshot instead of the live state,
+/// so their reads can never race the UI thread's writes or deref a box that
+/// teardown already freed. Every field is owned, so the snapshot stays valid
+/// even after the window is gone.
+#[derive(Clone, Default)]
+pub(crate) struct SettingsUiSnapshot {
+    /// Every focusable control with the fields the provider answers from.
+    pub children: Vec<crate::accessibility::SettingChild>,
+    /// The currently focused (hovered) control, if any.
+    pub focus: Option<(usize, SettingSub)>,
+}
+
+/// The id of the thread that owns the window state. Set once at startup;
+/// provider helpers use it to detect calls that already run on the UI thread
+/// (those read the state directly — a posted request would never be
+/// processed by the very thread making it).
+static UI_THREAD_ID: OnceLock<u32> = OnceLock::new();
+
+/// The last Settings snapshot the UI thread built, tagged with a strictly
+/// increasing build generation. Provider threads wait — bounded — for a
+/// generation newer than the one they saw before posting their request, so a
+/// read is never answered with a build that predates its own request. The UI
+/// thread replaces the slot wholesale under the lock, so a reader always
+/// sees one complete snapshot.
+static SETTINGS_UI_SNAPSHOT: Mutex<Option<(u64, Arc<SettingsUiSnapshot>)>> = Mutex::new(None);
+
+/// How long a provider thread waits for the UI thread to rebuild the
+/// snapshot. The rebuild normally lands within the same scheduler quantum as
+/// the posted message (~1 ms); the bound only bites when the UI thread is
+/// wedged or the window is tearing down, and assistive tech must never be
+/// stalled indefinitely by either.
+const SETTINGS_SNAPSHOT_WAIT_MS: u64 = 250;
+
+/// Signals a requesting provider thread that a fresh snapshot is stored.
+/// Auto-reset: one waiter wakes per build; later waiters time out and read
+/// the slot, which still holds a complete snapshot.
+fn settings_snapshot_event() -> HANDLE {
+    // The handle value is inert data — the object it names is kernel-owned and
+    // safely shared — so the Send+Sync wrapper is sound for the static.
+    struct SnapshotEvent(HANDLE);
+    unsafe impl Send for SnapshotEvent {}
+    unsafe impl Sync for SnapshotEvent {}
+    static EVENT: OnceLock<SnapshotEvent> = OnceLock::new();
+    EVENT
+        .get_or_init(|| SnapshotEvent(unsafe { CreateEventW(None, false, false, None).unwrap_or_default() }))
+        .0
+}
+
+/// Records the thread that owns the windows, so provider helpers can tell
+/// whether they already run on it. Called from `main` before any window is
+/// created.
+pub(crate) fn mark_ui_thread() {
+    let _ = UI_THREAD_ID.set(unsafe { GetCurrentThreadId() });
+}
+
+fn on_ui_thread() -> bool {
+    UI_THREAD_ID
+        .get()
+        .is_some_and(|id| *id == unsafe { GetCurrentThreadId() })
+}
+
+/// Stores a snapshot under the next generation and wakes any thread waiting
+/// for a build.
+fn store_settings_ui_snapshot(snapshot: Arc<SettingsUiSnapshot>) {
+    let mut slot = SETTINGS_UI_SNAPSHOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = slot.as_ref().map(|(generation, _)| *generation + 1).unwrap_or(1);
+    *slot = Some((generation, snapshot));
+    // Best-effort: a failed signal only costs a waiting thread its next poll
+    // slice before it reads the slot anyway.
+    unsafe {
+        let _ = SetEvent(settings_snapshot_event());
+    }
+}
+
+/// The generation of the newest stored build, or 0 when none was ever built.
+/// A waiter captures it before posting its request and then waits for a
+/// strictly newer generation, so a stale signal can never satisfy it.
+fn snapshot_generation() -> u64 {
+    SETTINGS_UI_SNAPSHOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|(generation, _)| *generation)
+        .unwrap_or(0)
+}
+
+/// The newest stored build, or None when nothing was ever built (no window,
+/// or teardown cleared it). Clones the Arc so the caller never holds the
+/// lock.
+fn snapshot_slot() -> Option<(u64, Arc<SettingsUiSnapshot>)> {
+    SETTINGS_UI_SNAPSHOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// The last complete snapshot, or an empty default when none was ever built.
+/// A provider must degrade to empty answers, never crash.
+fn current_settings_ui_snapshot() -> Arc<SettingsUiSnapshot> {
+    snapshot_slot().map(|(_, snapshot)| snapshot).unwrap_or_default()
+}
+
+/// Builds the snapshot from the live window state. Only ever called on the
+/// UI thread, which owns the box; returns an empty snapshot when the window
+/// state is gone.
+fn build_settings_ui_snapshot(hwnd: HWND) -> Arc<SettingsUiSnapshot> {
+    let state = crate::winutil::window_state::<MainWindowState>(hwnd);
+    let snapshot = if state.is_null() {
+        SettingsUiSnapshot::default()
+    } else {
+        let state = unsafe { &*state };
+        SettingsUiSnapshot {
+            children: settings_children_from(state, hwnd),
+            focus: state.settings_hover,
+        }
+    };
+    let snapshot = Arc::new(snapshot);
+    store_settings_ui_snapshot(snapshot.clone());
+    snapshot
+}
+
+/// The snapshot to answer a provider call with. On the UI thread the live
+/// state is read directly; anywhere else the UI thread is asked (by message)
+/// to rebuild it. The answer is returned once a build strictly newer than
+/// the request lands — the posted message is what triggers it — or, after a
+/// bounded wait, a failed post, or a window that is gone, from the last
+/// complete build. The window-state box is never dereferenced off the UI
+/// thread, and assistive tech is never stalled beyond the bound.
+fn settings_ui_snapshot(hwnd: HWND) -> Arc<SettingsUiSnapshot> {
+    if on_ui_thread() {
+        return build_settings_ui_snapshot(hwnd);
+    }
+    let wanted = snapshot_generation();
+    let event = settings_snapshot_event();
+    let posted = unsafe { PostMessageW(hwnd, WM_SETTINGS_SNAPSHOT_MSG, WPARAM(0), LPARAM(0)) };
+    let deadline = Instant::now() + Duration::from_millis(SETTINGS_SNAPSHOT_WAIT_MS);
+    while posted.is_ok() && !event.0.is_null() {
+        // The UI thread's answer may already be stored (or a concurrent
+        // request's answer — any build newer than ours is equally valid).
+        if let Some((generation, snapshot)) = snapshot_slot().as_ref()
+            && *generation > wanted
+        {
+            return Arc::clone(snapshot);
+        }
+        // The window is gone; the posted message was discarded and no build
+        // will ever land.
+        if !unsafe { IsWindow(hwnd) }.as_bool() {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        // Short slices so a destroyed window is noticed promptly; a signal
+        // wakes the wait immediately.
+        let slice = deadline.saturating_duration_since(now).as_millis().min(50) as u32;
+        unsafe { WaitForSingleObject(event, slice) };
+    }
+    current_settings_ui_snapshot()
+}
+
 /// The current keyboard focus, as the provider uses it for `HasKeyboardFocus`.
 /// Null-safe: no window state means no focus.
 pub(crate) fn settings_focus(hwnd: HWND) -> Option<(usize, SettingSub)> {
-    let state = crate::winutil::window_state::<MainWindowState>(hwnd);
-    if state.is_null() {
-        return None;
-    }
-    unsafe { (*state).settings_hover }
+    settings_ui_snapshot(hwnd).focus
 }
 
 /// A stable small tag per `SettingSub` variant, used to derive UIA runtime ids
@@ -6012,13 +6209,16 @@ pub(crate) fn setting_sub_from_tag(tag: i32) -> Option<SettingSub> {
 }
 
 /// Snapshot of the focusable Settings controls for the UIA provider. Null-safe:
-/// an empty list means "nothing to expose".
+/// an empty list means "nothing to expose". Answered from the UI-thread
+/// snapshot; the caller never dereferences the window-state box itself.
 pub(crate) fn settings_accessibility_children(hwnd: HWND) -> Vec<crate::accessibility::SettingChild> {
-    let state = crate::winutil::window_state::<MainWindowState>(hwnd);
-    if state.is_null() {
-        return Vec::new();
-    }
-    let state = unsafe { &*state };
+    settings_ui_snapshot(hwnd).children.clone()
+}
+
+/// Materializes the focusable Settings controls from a live window state.
+/// UI-thread only — `build_settings_ui_snapshot` calls it while holding the
+/// state the UI thread owns.
+fn settings_children_from(state: &MainWindowState, hwnd: HWND) -> Vec<crate::accessibility::SettingChild> {
     let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
     let (client_w, _) = client_size(hwnd);
     let sidebar_w = (SIDEBAR_W * scale).round() as i32;
@@ -6116,8 +6316,21 @@ fn raise_settings_toggle_event(hwnd: HWND, row_index: usize, before: bool, after
 
 /// Moves the keyboard focus to a control (used by the provider's SetFocus and
 /// Invoke/Toggle). Reuses the focus path including auto-scroll, so the control
-/// stays on screen.
+/// stays on screen. The focus state lives in the window-state box, which only
+/// the UI thread may touch: on the UI thread the move happens in place,
+/// anywhere else it is handed off by message.
 pub(crate) fn focus_setting_at(hwnd: HWND, row_index: usize, sub: SettingSub) {
+    if on_ui_thread() {
+        focus_setting_at_body(hwnd, row_index, sub);
+        return;
+    }
+    let tag = setting_sub_tag(sub);
+    let _ = unsafe { PostMessageW(hwnd, WM_SETTINGS_FOCUS_MSG, WPARAM(row_index), LPARAM(tag as isize)) };
+}
+
+/// The UI-thread half of `focus_setting_at`; runs on the thread that owns the
+/// window state (either directly, or via `WM_SETTINGS_FOCUS_MSG`).
+fn focus_setting_at_body(hwnd: HWND, row_index: usize, sub: SettingSub) {
     let state = crate::winutil::window_state::<MainWindowState>(hwnd);
     if state.is_null() {
         return;
@@ -6153,6 +6366,64 @@ pub(crate) fn focus_setting_at(hwnd: HWND, row_index: usize, sub: SettingSub) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setting_sub_tag_round_trips_through_from_tag() {
+        // The UIA focus handoff encodes a control into the message payload via
+        // setting_sub_tag and decodes it with setting_sub_from_tag; every
+        // variant (including the payload-carrying segments and anchors) must
+        // survive the round trip.
+        let variants = [
+            SettingSub::None,
+            SettingSub::Reset,
+            SettingSub::Adjust,
+            SettingSub::Open,
+            SettingSub::Copy,
+            SettingSub::OpenConfig,
+            SettingSub::ReloadConfig,
+            SettingSub::Seg(0),
+            SettingSub::Seg(3),
+            SettingSub::Anchor(0),
+            SettingSub::Anchor(5),
+        ];
+        for variant in variants {
+            assert_eq!(
+                setting_sub_from_tag(setting_sub_tag(variant)),
+                Some(variant),
+                "tag round trip must preserve the control"
+            );
+        }
+        // An unknown tag (a message from a newer build) is rejected as `None`
+        // so a foreign message can never name a control that does not exist.
+        assert_eq!(setting_sub_from_tag(0x7F), None);
+    }
+
+    #[test]
+    fn settings_snapshot_defaults_to_empty_when_nothing_is_stored() {
+        // A provider asked before the UI thread ever built a snapshot (or after
+        // teardown cleared it) must degrade to empty answers, never crash.
+        // (The snapshot built by `snapshot_generation_advances_with_each_store`
+        // is also empty, so the assertion holds regardless of test order.)
+        let snapshot = current_settings_ui_snapshot();
+        assert!(snapshot.children.is_empty());
+        assert!(snapshot.focus.is_none());
+    }
+
+    #[test]
+    fn snapshot_generation_advances_with_each_store() {
+        // Each stored build gets a strictly newer generation, so a waiter
+        // that captured the old one can tell a fresh build from a stale one.
+        let first = Arc::new(SettingsUiSnapshot::default());
+        store_settings_ui_snapshot(first);
+        let before = snapshot_generation();
+        assert!(before > 0, "the first store must land on a non-zero generation");
+        store_settings_ui_snapshot(Arc::new(SettingsUiSnapshot::default()));
+        assert!(snapshot_generation() > before, "each build must advance the generation");
+        // The slot always holds the newest build, tagged with that generation.
+        let (generation, stored) = snapshot_slot().expect("a snapshot is stored");
+        assert_eq!(generation, snapshot_generation());
+        assert!(stored.children.is_empty());
+    }
 
     fn track(title: &str) -> TrackInfo {
         TrackInfo {
