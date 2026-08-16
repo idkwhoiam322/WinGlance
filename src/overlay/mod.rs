@@ -5547,12 +5547,14 @@ mod tests {
         }
     }
 
-    /// Frees the state box and destroys the window. Clears the routing slot
-    /// first so WM_NCDESTROY sees a null state and does not free the box
-    /// twice.
-    fn destroy_wndproc_overlay(hwnd: HWND, state_ptr: *mut OverlayState) {
-        clear_window_state(hwnd);
-        drop(unsafe { Box::from_raw(state_ptr) });
+    /// Destroys the window through the production teardown: WM_NCDESTROY
+    /// clears the routing slot *before* releasing the state box (the same
+    /// order the main window applies), so the e2e tests exercise the real
+    /// ordered teardown instead of bypassing it. The box must therefore not
+    /// be freed here — the handler owns it once it resolves it from the
+    /// slot the test installed. A double-free (slot cleared after the box was
+    /// freed, or freed twice) would crash this helper, which is the point.
+    fn destroy_wndproc_overlay(hwnd: HWND, _state_ptr: *mut OverlayState) {
         unsafe {
             let _ = DestroyWindow(hwnd);
         }

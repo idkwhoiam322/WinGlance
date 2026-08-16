@@ -867,6 +867,24 @@ fn main() -> Result<()> {
                     WorkerExit::Stalled => {
                         // Do not join: the worker may be blocked inside COM forever.
                         consecutive_restarts += 1;
+                        // A hard-stalled worker is leaked mid-call, so its `Drop`
+                        // never runs and the mailbox-clear latch reset (see
+                        // `clear_pending_output`) cannot fire: an undelivered
+                        // budget warning sitting in the leaked mailbox would keep
+                        // `budget_warned` set and lose the note for the rest of
+                        // the app run — exactly the wedged-UI overload it exists
+                        // to report. Reset the latch here. A budget strip is
+                        // almost always caused by a full event channel (the
+                        // in-flight byte counter only trips while the forwarder
+                        // cannot drain), which is also the precondition for the
+                        // warning to sit in the mailbox rather than the channel;
+                        // the accepted residual is the rare delivered-then-stall
+                        // ordering, where a later, separate wedged episode may
+                        // re-warn once more — a duplicate tray note beats a
+                        // permanently silent one.
+                        if reset_budget_warning_on_stall(&supervisor_budget_warned) {
+                            warn!("budget-warning latch reset | reason=stalled-worker-leak");
+                        }
                         let delay = worker_restart_delay(consecutive_restarts);
                         error!("SMTC worker stalled; restarting it in {}s", delay.as_secs());
                         sleep_interruptible(delay, &supervisor_shutdown);
@@ -1003,6 +1021,18 @@ fn worker_restart_delay(consecutive: u32) -> Duration {
 /// and stops restarting.
 fn worker_budget_exhausted(consecutive_restarts: u32) -> bool {
     consecutive_restarts >= MAX_WORKER_RESTARTS
+}
+
+/// The supervisor's stall-branch latch reset: a hard-stalled worker is
+/// leaked mid-call, so its `Drop` (and the mailbox-clear latch reset in
+/// `clear_pending_output`) never runs — an undelivered budget warning in the
+/// leaked mailbox would keep `budget_warned` set and lose the note for the
+/// rest of the app run. Returns whether the latch was set (a stall with no
+/// outstanding warning stays silent) and clears it, so the next budget strip
+/// can warn again. Extracted as a pure helper so the swap is testable
+/// without a genuinely stalled COM worker.
+fn reset_budget_warning_on_stall(latch: &AtomicBool) -> bool {
+    latch.swap(false, Ordering::Relaxed)
 }
 
 /// Stall threshold for the SMTC worker: both the time since spawn and the
@@ -1232,6 +1262,28 @@ mod tests {
         // delay up to the slow 60 s plateau.
         assert!(worker_restart_delay(1) < worker_restart_delay(3));
         assert_eq!(worker_restart_delay(3), worker_restart_delay(4));
+    }
+
+    #[test]
+    fn stall_reset_reports_and_clears_a_set_budget_warning_latch() {
+        // A hard-stalled worker may leave an undelivered budget warning in
+        // its leaked mailbox; the supervisor's stall reset must report it
+        // (so the WARN logs) and clear it (so the next strip can warn again).
+        // A stall with no outstanding warning stays silent.
+        let latch = AtomicBool::new(true);
+        assert!(
+            reset_budget_warning_on_stall(&latch),
+            "a set latch is reported so the stall logs the reset"
+        );
+        assert!(
+            !latch.load(Ordering::Relaxed),
+            "and cleared, so the note can fire again after the stall"
+        );
+        assert!(
+            !reset_budget_warning_on_stall(&latch),
+            "a clear latch is silent — no warning was stranded"
+        );
+        assert!(!latch.load(Ordering::Relaxed));
     }
 
     #[test]

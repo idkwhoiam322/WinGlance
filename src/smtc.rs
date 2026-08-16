@@ -95,6 +95,24 @@ struct LogicalState {
 const CHURN_WINDOW_MS: u64 = 2000;
 const CHURN_THRESHOLD: usize = 5;
 const CHURN_COOLDOWN_MS: u64 = 30_000;
+/// Bound on a single SMTC async read before the worker abandons it and
+/// excludes the source (threat-model gap G4): the supervisor's restart
+/// budget (`MAX_WORKER_RESTARTS`) is global — the SMTC manager is one
+/// process-wide listener, a stall is a hang of that whole thread, and a hung
+/// worker cannot report which source it was reading — so a hostile app that
+/// supplies a never-completing media-properties operation or thumbnail
+/// stream could otherwise hang the worker, get it restarted, and burn the
+/// whole budget for every source. Bounding the async waits the *app controls*
+/// (its session data and artwork streams) converts that vector into a 10 s
+/// hiccup plus a per-source exclusion instead of a global stall. Chosen
+/// comfortably below the 30 s `WORKER_STALL_THRESHOLD`: a timed-out read
+/// must never push the heartbeat age toward a supervisor stall, and every
+/// legitimate SMTC read (a few MiB of local thumbnail at most, system-
+/// mediated metadata) completes in a fraction of this. Synchronous WinRT
+/// calls (`GetPlaybackInfo`, `GetTimelineProperties`, `GetSessions`) are
+/// COM calls that no timeout can bound; a hang there remains covered by the
+/// supervisor restart and the global cap (documented residual).
+const READ_ASYNC_TIMEOUT: Duration = Duration::from_secs(10);
 /// A position jump larger than this (seconds) between reads is treated as a
 /// user seek, not ordinary playback advance, and re-emits the track so the
 /// overlay re-bases its progress estimate. Well above the ~1 s/event cadence
@@ -273,9 +291,13 @@ struct ListenerState {
     /// Session-creation counts per source app within a rolling window, for the
     /// churn cool-down.
     churn: HashMap<String, VecDeque<Instant>>,
-    /// Source apps currently on cool-down (their sessions are not tracked)
-    /// until the stored time.
-    churn_cooldown: HashMap<String, Instant>,
+    /// Source apps currently excluded from tracking until the stored time:
+    /// either the churn cool-down (a session-recreation storm) or the
+    /// wedged-read exclusion (an async read that timed out — see
+    /// `READ_ASYNC_TIMEOUT`). Both entries mean the same thing downstream:
+    /// `session_source_allowed` returns false, so the source's sessions are
+    /// never read, subscribed, or emitted.
+    excluded_sources: HashMap<String, Instant>,
     /// Keys of rejected sessions already reported to the history, so a
     /// rejected session is logged once per appearance instead of on every
     /// re-sync (the 2-second poll re-lists all sessions). Bounded by
@@ -431,8 +453,10 @@ impl SmtcListener {
     }
 
     fn run_initialized(self) -> Result<()> {
-        let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?
-            .get()
+        // Manager creation is process-local and cannot be blamed on any
+        // source's sessions, so it keeps the unbounded wait (a hang here is
+        // a startup failure the supervisor's restart budget covers).
+        let manager = wait_async(&GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?, None)
             .context("requesting the SMTC session manager")?;
         let (signal_tx, signal_rx) = mpsc::sync_channel(SIGNAL_QUEUE_CAP);
         let sessions_token = register_sessions_handler(&manager, signal_tx.clone())?;
@@ -505,7 +529,7 @@ impl ListenerState {
             last_heap_compact: Instant::now(),
             last_session_check: Instant::now(),
             churn: HashMap::new(),
-            churn_cooldown: HashMap::new(),
+            excluded_sources: HashMap::new(),
             rejected_seen: HashSet::new(),
             ignored_seen: HashSet::new(),
             terminal_pending: HashMap::new(),
@@ -718,7 +742,7 @@ impl ListenerState {
         if playback_type == PlaybackType::Image {
             return Ok(());
         }
-        let mut merged = read_track_info(
+        let mut merged = self.read_track_or_exclude_wedged(
             &session,
             true,
             playback,
@@ -897,7 +921,7 @@ impl ListenerState {
         // Content is only diffed while the session is not stopped; a stopped
         // session keeps its stored content (the pill shows the last track).
         if status != GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped {
-            match read_track_info(
+            match self.read_track_or_exclude_wedged(
                 session,
                 read_artwork,
                 playback,
@@ -1572,7 +1596,7 @@ impl ListenerState {
         // reappearance is reported again.
         self.rejected_seen.retain(|key| alive.contains(key));
         self.ignored_seen.retain(|key| alive.contains(key));
-        self.churn_cooldown.retain(|_, until| *until > Instant::now());
+        self.excluded_sources.retain(|_, until| *until > Instant::now());
         // Keep the picker's candidate list in sync with what is actually
         // open, including apps whose sessions were rejected: checking them
         // is how the user adds them to the allow-list. Dedup and cap it
@@ -1710,17 +1734,18 @@ impl ListenerState {
                 return Err(error.into());
             }
         };
-        let read = match read_track_info(session, true, playback, rate, session_playback_type(session)) {
-            Ok(read) => read,
-            Err(error) => {
-                // Count a failed read against the budget too: a session whose
-                // reads keep failing must not be retried forever.
-                if let Some(state) = self.states.get_mut(&key) {
-                    state.artwork_attempts += 1;
+        let read =
+            match self.read_track_or_exclude_wedged(session, true, playback, rate, session_playback_type(session)) {
+                Ok(read) => read,
+                Err(error) => {
+                    // Count a failed read against the budget too: a session whose
+                    // reads keep failing must not be retried forever.
+                    if let Some(state) = self.states.get_mut(&key) {
+                        state.artwork_attempts += 1;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         let prev = self.states.get(&key).cloned().unwrap_or_default();
         let mut merged = merge_track(&prev, &read, true);
         // The stale-thumbnail guard from the refresh path applies here too:
@@ -1815,6 +1840,51 @@ impl ListenerState {
         }
     }
 
+    /// Reads a session's track state, applying the wedged-source exclusion
+    /// when the read timed out (see `is_wait_timeout`): a source whose own
+    /// async operation never completes must be excluded from tracking — not
+    /// retried, and certainly not allowed to hang the worker into a
+    /// supervisor stall that burns the global restart budget (G4). All three
+    /// read paths (event-driven refresh, poll retry, re-enable reshow) route
+    /// through this so the exclusion is applied exactly once per timeout.
+    fn read_track_or_exclude_wedged(
+        &mut self,
+        session: &GlobalSystemMediaTransportControlsSession,
+        read_artwork: bool,
+        playback_state: Option<PlaybackState>,
+        playback_rate: Option<f64>,
+        playback_type: PlaybackType,
+    ) -> Result<TrackInfo> {
+        match read_track_info(session, read_artwork, playback_state, playback_rate, playback_type) {
+            Ok(info) => Ok(info),
+            Err(error) => {
+                if is_wait_timeout(&error) {
+                    self.exclude_wedged_source(session);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Excludes a source whose session hung an async read past
+    /// `READ_ASYNC_TIMEOUT` (threat-model gap G4): the source is put on the
+    /// same tracking exclusion the churn cool-down uses, so its sessions are
+    /// not read, subscribed, or emitted for the cool-down period, and the
+    /// next `sync_subscriptions` evicts them. One hostile app can therefore
+    /// cost at most a single 10 s hiccup plus its own exclusion — never a
+    /// worker stall, so it can never burn the global restart budget for
+    /// every source.
+    fn exclude_wedged_source(&mut self, session: &GlobalSystemMediaTransportControlsSession) {
+        let source = read_source_app(session);
+        self.excluded_sources.insert(
+            source.clone(),
+            Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
+        );
+        warn!(
+            "source {source} did not answer an SMTC read within {READ_ASYNC_TIMEOUT:?}; excluding it from tracking for {CHURN_COOLDOWN_MS}ms"
+        );
+    }
+
     /// The source the overlay's pill is currently displaying, if any. Read
     /// for every session-recreation candidate so the gate compares against
     /// what the user actually sees, not against what this worker emitted.
@@ -1868,9 +1938,10 @@ impl ListenerState {
         normalized.iter().any(|np| naumid.contains(np) || nlabel.contains(np))
     }
 
-    /// True while a source app is on the churn cool-down.
+    /// True while a source app is excluded from tracking (churn cool-down or
+    /// wedged-read exclusion).
     fn source_on_cooldown(&self, source: &str) -> bool {
-        self.churn_cooldown
+        self.excluded_sources
             .get(source)
             .is_some_and(|until| *until > Instant::now())
     }
@@ -1894,7 +1965,7 @@ impl ListenerState {
             events.pop_front();
         }
         if events.len() >= CHURN_THRESHOLD && !self.source_on_cooldown(source) {
-            self.churn_cooldown
+            self.excluded_sources
                 .insert(source.to_string(), now + Duration::from_millis(CHURN_COOLDOWN_MS));
             warn!(
                 "source {source} is churning sessions ({CHURN_THRESHOLD}+ new sessions in {CHURN_WINDOW_MS}ms); excluding it from tracking for {CHURN_COOLDOWN_MS}ms"
@@ -2177,6 +2248,7 @@ impl ListenerState {
                     returned,
                     OUTPUT_RETRY_CAP,
                     &self.in_flight_art,
+                    &self.budget_warned,
                 );
                 if dropped > 0 && self.may_warn_overflow() {
                     warn!(
@@ -2208,7 +2280,23 @@ impl ListenerState {
     /// forwarder is gone, so nothing queued can ever be delivered) and from
     /// `Drop`, so a worker ending with a non-empty mailbox returns its bytes
     /// to the shared counter instead of starving the next worker's budget.
+    ///
+    /// If the discarded mailbox holds the one-shot budget warning, the
+    /// `budget_warned` latch is reset: the warning was emitted but never
+    /// delivered, and the latch is shared across worker restarts — leaving
+    /// it set would permanently lose the "the UI is not keeping up" tray
+    /// note for the rest of the app run even though the condition is real.
+    /// The note is one per *delivery*, not one per worker: resetting here
+    /// lets the replacement worker re-warn on the next budget strip. (A hard
+    /// stall — where the worker thread is leaked mid-call and `drop` never
+    /// runs — cannot run this at all; the supervisor covers that case by
+    /// resetting the latch on every stall, see the `WorkerExit::Stalled`
+    /// branch in main.rs.)
     fn clear_pending_output(&mut self) {
+        if mailbox_holds_budget_warning(&self.pending_output) {
+            self.budget_warned.store(false, Ordering::Relaxed);
+            debug!("budget-warning latch reset | reason=undelivered-warning-discarded");
+        }
         release_pending_bytes(&mut self.pending_output, &self.in_flight_art);
     }
 
@@ -2231,6 +2319,10 @@ impl Drop for ListenerState {
         // where the worker thread is leaked mid-call and `drop` never runs:
         // those bytes stay counted (and their memory stays live), bounded by
         // the mailbox cap and documented as a residual in the threat model.
+        // The *warning* half of that leak is covered from the other side:
+        // the supervisor resets `budget_warned` on every stall (see the
+        // `WorkerExit::Stalled` branch in main.rs), so a warning stranded in
+        // the leaked mailbox cannot lose the note for the rest of the run.
         self.clear_pending_output();
     }
 }
@@ -2281,11 +2373,20 @@ fn budget_artwork(event: &mut MediaEvent, in_flight: u64, budget: u64) -> u64 {
 /// that leaves the mailbox (superseded or over-cap) had its artwork bytes
 /// counted when it was queued, so those bytes are freed from `in_flight`
 /// here — the counter tracks distinct live allocations, not queue slots.
+///
+/// The one-shot budget warning cannot leave the mailbox by supersession (a
+/// queued warning implies its latch is set, so no newer same-key warning can
+/// ever arrive), so its only discard path is the over-cap pop: when that pop
+/// drops it undelivered, `budget_warned` is reset so the next strip can
+/// re-warn — the same rule `clear_pending_output` applies to a mailbox
+/// cleared at worker teardown, so the warning is one per *delivery*, never
+/// silently lost for the rest of the app run.
 fn coalesce_pending_event(
     queue: &mut VecDeque<Arc<MediaEvent>>,
     event: Arc<MediaEvent>,
     cap: usize,
     in_flight: &AtomicU64,
+    budget_warned: &AtomicBool,
 ) -> usize {
     let key = event_coalesce_key(&event);
     if let Some(index) = queue.iter().position(|queued| event_coalesce_key(queued) == key)
@@ -2298,10 +2399,27 @@ fn coalesce_pending_event(
     while queue.len() > cap {
         if let Some(oldest) = queue.pop_front() {
             in_flight.fetch_sub(artwork_bytes(&oldest), Ordering::Relaxed);
+            if matches!(oldest.as_ref(), MediaEvent::ArtworkBudgetExceeded) {
+                // The queued one-shot budget warning was discarded undelivered
+                // by the over-cap pop: reset its latch so a later strip
+                // re-warns, instead of the note being lost for the rest of
+                // the app run (mirrors the mailbox-clear reset).
+                budget_warned.store(false, Ordering::Relaxed);
+                debug!("budget-warning latch reset | reason=over-cap-pop-discarded-warning");
+            }
             dropped += 1;
         }
     }
     dropped
+}
+
+/// Whether the retry mailbox holds the one-shot budget warning, which is
+/// about to be discarded undelivered (see `clear_pending_output`). Pure, so
+/// the reset decision is unit-testable without a live session manager.
+fn mailbox_holds_budget_warning(queue: &VecDeque<Arc<MediaEvent>>) -> bool {
+    queue
+        .iter()
+        .any(|event| matches!(event.as_ref(), MediaEvent::ArtworkBudgetExceeded))
 }
 
 /// Drops every event in a mailbox and frees its in-flight artwork accounting
@@ -3170,7 +3288,14 @@ const MAX_PREVIEW_CHARS: usize = 128;
 /// return empty for freshly-created sessions; the title falls back to the
 /// source label so the row always names the app.
 fn read_session_text(session: &GlobalSystemMediaTransportControlsSession, source_app: &str) -> (String, String) {
-    let Ok(properties) = session.TryGetMediaPropertiesAsync().and_then(|op| op.get()) else {
+    // Bounded: this runs for *rejected* sessions (the history row), and a
+    // rejected session's own operation must not be able to hang the worker
+    // forever — the supervisor would stall and burn the global restart
+    // budget. A timeout degrades the row to the source label, nothing more.
+    let Ok(operation) = session.TryGetMediaPropertiesAsync() else {
+        return (source_app.to_string(), String::new());
+    };
+    let Ok(properties) = wait_async(&operation, Some(READ_ASYNC_TIMEOUT)) else {
         return (source_app.to_string(), String::new());
     };
     let title = cap_meta(non_empty(
@@ -3222,7 +3347,7 @@ fn read_track_info(
     playback_type: PlaybackType,
 ) -> Result<TrackInfo> {
     let source_app = read_source_app(session);
-    let properties = session.TryGetMediaPropertiesAsync()?.get()?;
+    let properties = wait_async(&session.TryGetMediaPropertiesAsync()?, Some(READ_ASYNC_TIMEOUT))?;
     let title = cap_meta(non_empty(properties.Title()?.to_string(), &source_app));
     // Keep artist empty when the app has not provided it yet; the pill and
     // the Activity pane show "Unknown Artist" as a placeholder so the row
@@ -3249,11 +3374,20 @@ fn read_track_info(
                 debug!("album-art read failed (attempt 1): {first:#}");
                 if is_session_gone(&first) {
                     None
+                } else if is_wait_timeout(&first) {
+                    // A wedged thumbnail stream (the source's own async
+                    // operation never completes) is definitive, not a
+                    // transient failure: surface it so the caller excludes
+                    // the source instead of retrying a hung read.
+                    return Err(first);
                 } else {
                     match read_thumbnail(&properties) {
                         Ok(artwork) => artwork,
                         Err(second) => {
                             debug!("album-art read failed (attempt 2): {second:#}");
+                            if is_wait_timeout(&second) {
+                                return Err(second);
+                            }
                             None
                         }
                     }
@@ -3391,17 +3525,45 @@ fn is_session_gone(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Marker error for an SMTC async read that did not complete within
+/// `READ_ASYNC_TIMEOUT`. Deliberately distinct from the ordinary read
+/// failures (which are transient and retried): a timeout means the source's
+/// own operation is wedged, so the caller excludes the source instead of
+/// retrying a hung read. Carries the wait bound so the WARN explains itself.
+#[derive(Debug)]
+struct AsyncReadTimeout {
+    secs: u64,
+}
+
+impl std::fmt::Display for AsyncReadTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SMTC async read did not complete within {}s", self.secs)
+    }
+}
+
+impl std::error::Error for AsyncReadTimeout {}
+
+/// Whether an error marks a wedged async read (an `AsyncReadTimeout`)
+/// rather than a transient failure. Drives the per-source exclusion: only
+/// timeouts exclude; an RPC-unavailable session, a failed `Thumbnail()` or
+/// a `Size()` rejection all stay retryable.
+fn is_wait_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<AsyncReadTimeout>().is_some()
+}
+
 fn read_thumbnail(
     properties: &windows::Media::Control::GlobalSystemMediaTransportControlsSessionMediaProperties,
 ) -> Result<Option<Vec<u8>>> {
     let reference = properties
         .Thumbnail()
         .map_err(|e| anyhow::Error::new(e).context("Thumbnail failed"))?;
-    let stream = reference
-        .OpenReadAsync()
-        .map_err(|e| anyhow::Error::new(e).context("OpenReadAsync failed"))?
-        .get()
-        .map_err(|e| anyhow::Error::new(e).context("OpenReadAsync get failed"))?;
+    let stream = wait_async(
+        &reference
+            .OpenReadAsync()
+            .map_err(|e| anyhow::Error::new(e).context("OpenReadAsync failed"))?,
+        Some(READ_ASYNC_TIMEOUT),
+    )
+    .map_err(|e| e.context("OpenReadAsync get failed"))?;
     let size = stream
         .Size()
         .map_err(|e| anyhow::Error::new(e).context("Size failed"))?;
@@ -3413,11 +3575,13 @@ fn read_thumbnail(
     }
     let size = size as u32;
     let buffer = Buffer::Create(size).map_err(|e| anyhow::Error::new(e).context("Buffer::Create failed"))?;
-    stream
-        .ReadAsync(&buffer, size, InputStreamOptions::None)
-        .map_err(|e| anyhow::Error::new(e).context("ReadAsync failed"))?
-        .get()
-        .map_err(|e| anyhow::Error::new(e).context("ReadAsync get failed"))?;
+    wait_async_progress(
+        &stream
+            .ReadAsync(&buffer, size, InputStreamOptions::None)
+            .map_err(|e| anyhow::Error::new(e).context("ReadAsync failed"))?,
+        Some(READ_ASYNC_TIMEOUT),
+    )
+    .map_err(|e| e.context("ReadAsync get failed"))?;
     let reader =
         DataReader::FromBuffer(&buffer).map_err(|e| anyhow::Error::new(e).context("DataReader::FromBuffer failed"))?;
     let mut data = vec![0u8; size as usize];
@@ -4243,6 +4407,97 @@ mod tests {
         let wrapped =
             anyhow::Error::new(windows::core::Error::from(HRESULT(0x8007_06BAu32 as i32))).context("Thumbnail failed");
         assert!(is_session_gone(&wrapped));
+    }
+
+    #[test]
+    fn wait_timeout_marker_is_recognized_only_for_async_read_timeouts() {
+        use windows::core::HRESULT;
+        // G4: the marker drives the wedged-source exclusion, so recognition
+        // must be precise — a timed-out async read excludes the source,
+        // while every transient failure (RPC-unavailable session, failed
+        // Thumbnail, Size rejection) stays retryable and must not exclude.
+        let timeout = anyhow::Error::new(AsyncReadTimeout { secs: 10 });
+        assert!(is_wait_timeout(&timeout), "the marker itself must be recognized");
+        // The artwork path wraps the raw error with context; the marker must
+        // still be found through the chain (anyhow downcast_ref walks it).
+        let wrapped = timeout.context("OpenReadAsync get failed");
+        assert!(is_wait_timeout(&wrapped));
+        let rpc = anyhow::Error::new(windows::core::Error::from(HRESULT(0x8007_06BAu32 as i32)));
+        assert!(
+            !is_wait_timeout(&rpc),
+            "an RPC-unavailable session is transient, not wedged"
+        );
+        let other = anyhow!("GetPlaybackInfo failed: hr=0x80004005");
+        assert!(!is_wait_timeout(&other));
+    }
+
+    /// A ListenerState for tests that only touch the exclusion map: the
+    /// manager is a null handle (never dereferenced by these paths), the
+    /// channels are drained nowhere, and every read-only field gets a default.
+    /// Callers MUST NOT drop the returned state (and should `mem::forget` it):
+    /// the null manager's `IUnknown` Drop calls `Release` on a null pointer,
+    /// which crashes — the test process exit reclaims everything instead.
+    fn listener_state_for_exclusion_tests() -> ListenerState {
+        let (output, _rx) = mpsc::sync_channel(1);
+        let (signal_tx, _signal_rx) = mpsc::sync_channel(1);
+        ListenerState::new(
+            unsafe { GlobalSystemMediaTransportControlsSessionManager::from_raw(std::ptr::null_mut()) },
+            Arc::new(RwLock::new(Config::default())),
+            output,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            signal_tx,
+            Arc::new(Mutex::new(Instant::now())),
+            Arc::new(AtomicU64::new(0)),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+        )
+    }
+
+    #[test]
+    fn churn_trips_the_exclusion_and_gates_the_source() {
+        // A source that recreates its session CHURN_THRESHOLD times inside
+        // the window lands on the shared exclusion map, and the map gates it:
+        // `source_on_cooldown` is what the churn path and the G4 wedged-read
+        // path share, so the trip must be visible through it.
+        let mut state = listener_state_for_exclusion_tests();
+        assert!(!state.source_on_cooldown("spotify"), "a fresh source is not excluded");
+        for _ in 0..CHURN_THRESHOLD {
+            state.record_churn("spotify");
+        }
+        assert!(
+            state.source_on_cooldown("spotify"),
+            "the churn cool-down must gate the source"
+        );
+        // Churn while already excluded is absorbed: the source stays gated
+        // and the exclusion is not extended (the guard prevents re-insert).
+        state.record_churn("spotify");
+        assert!(state.source_on_cooldown("spotify"));
+        assert_eq!(state.excluded_sources.len(), 1, "one exclusion per source");
+        std::mem::forget(state);
+    }
+
+    #[test]
+    fn cooldown_expiry_releases_the_source() {
+        // Both exclusion writers — the churn cool-down and the G4 wedged-read
+        // path — insert into the same `excluded_sources` map, so the expiry
+        // semantics are shared: a source whose deadline has passed is
+        // re-admitted and re-tested.
+        let mut state = listener_state_for_exclusion_tests();
+        state.excluded_sources.insert(
+            "spotify".to_string(),
+            Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
+        );
+        assert!(state.source_on_cooldown("spotify"), "a live exclusion gates the source");
+        state
+            .excluded_sources
+            .insert("spotify".to_string(), Instant::now() - Duration::from_millis(1));
+        assert!(
+            !state.source_on_cooldown("spotify"),
+            "an expired exclusion releases the source"
+        );
+        std::mem::forget(state);
     }
 
     #[test]
@@ -5233,8 +5488,20 @@ mod tests {
         let mut queue = VecDeque::new();
         let first = Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "src".into()));
         let second = Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "src".into()));
-        coalesce_pending_event(&mut queue, first, OUTPUT_RETRY_CAP, &AtomicU64::new(0));
-        coalesce_pending_event(&mut queue, second.clone(), OUTPUT_RETRY_CAP, &AtomicU64::new(0));
+        coalesce_pending_event(
+            &mut queue,
+            first,
+            OUTPUT_RETRY_CAP,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+        );
+        coalesce_pending_event(
+            &mut queue,
+            second.clone(),
+            OUTPUT_RETRY_CAP,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+        );
         assert_eq!(queue.len(), 1, "the superseded event must be removed");
         assert!(Arc::ptr_eq(&queue[0], &second), "the newest event must be the survivor");
         // Progress updates for one source coalesce the same way (latest position wins).
@@ -5249,6 +5516,7 @@ mod tests {
             }),
             OUTPUT_RETRY_CAP,
             &AtomicU64::new(0),
+            &AtomicBool::new(false),
         );
         coalesce_pending_event(
             &mut queue,
@@ -5260,6 +5528,7 @@ mod tests {
             }),
             OUTPUT_RETRY_CAP,
             &AtomicU64::new(0),
+            &AtomicBool::new(false),
         );
         assert_eq!(queue.len(), 1, "progress coalesces per source");
         match queue[0].as_ref() {
@@ -5279,8 +5548,20 @@ mod tests {
         tb.source_app = "src-b".into();
         let track_a = Arc::new(MediaEvent::TrackChanged(ta));
         let track_b = Arc::new(MediaEvent::TrackChanged(tb));
-        coalesce_pending_event(&mut queue, track_a.clone(), OUTPUT_RETRY_CAP, &AtomicU64::new(0));
-        coalesce_pending_event(&mut queue, track_b.clone(), OUTPUT_RETRY_CAP, &AtomicU64::new(0));
+        coalesce_pending_event(
+            &mut queue,
+            track_a.clone(),
+            OUTPUT_RETRY_CAP,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+        );
+        coalesce_pending_event(
+            &mut queue,
+            track_b.clone(),
+            OUTPUT_RETRY_CAP,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+        );
         assert_eq!(queue.len(), 2, "cross-source tracks keep arrival order");
         assert!(Arc::ptr_eq(&queue[0], &track_a), "first-arrived track stays first");
 
@@ -5292,18 +5573,21 @@ mod tests {
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "a".into())),
             2,
             &AtomicU64::new(0),
+            &AtomicBool::new(false),
         );
         coalesce_pending_event(
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "b".into())),
             2,
             &AtomicU64::new(0),
+            &AtomicBool::new(false),
         );
         coalesce_pending_event(
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "c".into())),
             2,
             &AtomicU64::new(0),
+            &AtomicBool::new(false),
         );
         assert_eq!(queue.len(), 2, "cap must hold");
         match queue[0].as_ref() {
@@ -5318,6 +5602,63 @@ mod tests {
             }
             other => panic!("expected PlaybackStateChanged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn over_cap_pop_of_the_budget_warning_resets_the_latch() {
+        // The one-shot budget warning queued at the head of a full mailbox is
+        // discarded undelivered by the over-cap pop; its latch must reset so
+        // a later strip re-warns instead of the note being lost for the rest
+        // of the app run — the second warning-loss path (the first, the
+        // mailbox-clear at worker teardown, is covered alongside
+        // `mailbox_holds_budget_warning`).
+        let mut queue = VecDeque::new();
+        let latch = AtomicBool::new(true); // the warning was emitted; latch set
+        queue.push_back(Arc::new(MediaEvent::ArtworkBudgetExceeded));
+        queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Stopped,
+            "a".into(),
+        )));
+        let dropped = coalesce_pending_event(
+            &mut queue,
+            Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "b".into())),
+            2,
+            &AtomicU64::new(0),
+            &latch,
+        );
+        assert_eq!(dropped, 1, "the warning aged to the head and was popped");
+        assert!(
+            !latch.load(Ordering::Relaxed),
+            "the discarded warning must reset the latch"
+        );
+        match queue[0].as_ref() {
+            MediaEvent::PlaybackStateChanged(_, source) => assert_eq!(source, "a"),
+            other => panic!("expected the surviving 'a' event, got {other:?}"),
+        }
+
+        // The reset is event-precise, not count-precise: the same pop that
+        // removes a different oldest event leaves the still-queued warning's
+        // latch set — the note is pending delivery, so no re-warn may fire.
+        let mut queue = VecDeque::new();
+        let latch = AtomicBool::new(true);
+        queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Stopped,
+            "a".into(),
+        )));
+        queue.push_back(Arc::new(MediaEvent::ArtworkBudgetExceeded));
+        let dropped = coalesce_pending_event(
+            &mut queue,
+            Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "b".into())),
+            2,
+            &AtomicU64::new(0),
+            &latch,
+        );
+        assert_eq!(dropped, 1, "the over-cap pop still ran");
+        assert!(latch.load(Ordering::Relaxed), "the surviving warning keeps its latch");
+        assert!(
+            matches!(queue[0].as_ref(), MediaEvent::ArtworkBudgetExceeded),
+            "the warning must still be queued for delivery"
+        );
     }
 
     #[test]
@@ -5338,12 +5679,14 @@ mod tests {
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "src".into())),
             OUTPUT_RETRY_CAP,
             &AtomicU64::new(0),
+            &AtomicBool::new(false),
         );
         coalesce_pending_event(
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "src".into())),
             OUTPUT_RETRY_CAP,
             &AtomicU64::new(0),
+            &AtomicBool::new(false),
         );
         assert_eq!(queue.len(), 1, "the older Paused was superseded in the mailbox");
         let _ = rx.recv().unwrap();
@@ -5372,12 +5715,14 @@ mod tests {
             Arc::new(MediaEvent::TrackChanged(track("A", "1"))),
             OUTPUT_RETRY_CAP,
             &AtomicU64::new(0),
+            &AtomicBool::new(false),
         );
         coalesce_pending_event(
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "a".into())),
             OUTPUT_RETRY_CAP,
             &AtomicU64::new(0),
+            &AtomicBool::new(false),
         );
         assert!(
             !drain_pending_to_channel(&mut queue, &tx),
@@ -5408,6 +5753,7 @@ mod tests {
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "src".into())),
             OUTPUT_RETRY_CAP,
             &AtomicU64::new(0),
+            &AtomicBool::new(false),
         );
         drop(rx);
         assert!(drain_pending_to_channel(&mut queue, &tx), "disconnect must be reported");
@@ -5516,10 +5862,22 @@ mod tests {
         let mut queue = VecDeque::new();
         let counter = AtomicU64::new(0);
         counter.fetch_add(10, Ordering::Relaxed); // emit counted art(10)
-        coalesce_pending_event(&mut queue, art(10, "src"), OUTPUT_RETRY_CAP, &counter);
+        coalesce_pending_event(
+            &mut queue,
+            art(10, "src"),
+            OUTPUT_RETRY_CAP,
+            &counter,
+            &AtomicBool::new(false),
+        );
         assert_eq!(counter.load(Ordering::Relaxed), 10, "queued bytes stay counted");
         counter.fetch_add(20, Ordering::Relaxed); // emit counted art(20)
-        coalesce_pending_event(&mut queue, art(20, "src"), OUTPUT_RETRY_CAP, &counter);
+        coalesce_pending_event(
+            &mut queue,
+            art(20, "src"),
+            OUTPUT_RETRY_CAP,
+            &counter,
+            &AtomicBool::new(false),
+        );
         assert_eq!(
             counter.load(Ordering::Relaxed),
             20,
@@ -5530,7 +5888,13 @@ mod tests {
         let counter = AtomicU64::new(0);
         for (len, source) in [(10u64, "a"), (20, "b"), (30, "c")] {
             counter.fetch_add(len, Ordering::Relaxed); // emit counted each
-            coalesce_pending_event(&mut queue, art(len as usize, source), 2, &counter);
+            coalesce_pending_event(
+                &mut queue,
+                art(len as usize, source),
+                2,
+                &counter,
+                &AtomicBool::new(false),
+            );
         }
         assert_eq!(queue.len(), 2, "the cap must hold");
         assert_eq!(
@@ -5562,6 +5926,31 @@ mod tests {
         release_pending_bytes(&mut queue, &counter);
         assert!(queue.is_empty(), "the mailbox must be fully drained");
         assert_eq!(counter.load(Ordering::Relaxed), 60, "the two payloads' bytes are freed");
+    }
+
+    #[test]
+    fn mailbox_holds_budget_warning_recognizes_the_warning() {
+        // The latch-reset edge: when the worker discards a mailbox that still
+        // holds the undelivered one-shot budget warning, `clear_pending_output`
+        // must reset `budget_warned` so the replacement worker can re-warn.
+        // Recognition must be precise — only the warning itself counts, not
+        // the ordinary events that share the mailbox.
+        let mut queue = VecDeque::new();
+        assert!(
+            !mailbox_holds_budget_warning(&queue),
+            "an empty mailbox holds no warning"
+        );
+        queue.push_back(Arc::new(MediaEvent::TrackChanged(TrackInfo {
+            title: "Song".into(),
+            source_app: "spotify".into(),
+            ..TrackInfo::default()
+        })));
+        assert!(
+            !mailbox_holds_budget_warning(&queue),
+            "an ordinary track event is not the warning"
+        );
+        queue.push_back(Arc::new(MediaEvent::ArtworkBudgetExceeded));
+        assert!(mailbox_holds_budget_warning(&queue), "the warning must be recognized");
     }
 }
 
