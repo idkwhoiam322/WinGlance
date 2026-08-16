@@ -3,7 +3,7 @@
 use super::OverlayPos;
 use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, VerticalPosition};
 use log::{debug, warn};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
@@ -120,15 +120,20 @@ pub(crate) struct DisplayInfo {
 /// per-animation-frame `EnumDisplayMonitors` + `GetMonitorInfoW` calls that
 /// `enumerate_displays()` issues. Invalidated by `invalidate_display_cache()`
 /// when `WM_DISPLAYCHANGE` fires.
-pub(crate) fn enumerate_displays_cached() -> Vec<DisplayInfo> {
+///
+/// The snapshot is returned behind an `Arc` so the overlay's per-frame
+/// lookups (`target()`, `is_cursor_over_pill()`, `position()`) share one
+/// immutable copy instead of cloning the vector — including the device-name
+/// strings — on every animated frame.
+pub(crate) fn enumerate_displays_cached() -> Arc<[DisplayInfo]> {
     let mut guard = DISPLAY_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some((at, displays)) = guard.0.as_ref()
         && at.elapsed() < Duration::from_secs(1)
     {
-        return displays.clone();
+        return Arc::clone(displays);
     }
-    let displays = enumerate_displays();
-    guard.0 = Some((Instant::now(), displays.clone()));
+    let displays: Arc<[DisplayInfo]> = Arc::from(enumerate_displays());
+    guard.0 = Some((Instant::now(), Arc::clone(&displays)));
     displays
 }
 
@@ -142,7 +147,7 @@ pub(crate) fn invalidate_display_cache() {
 
 /// HMONITOR is an opaque OS handle, not a data pointer — safe to send across
 /// threads. The Mutex provides the necessary synchronization.
-struct DisplayCacheEntry(Option<(Instant, Vec<DisplayInfo>)>);
+struct DisplayCacheEntry(Option<(Instant, Arc<[DisplayInfo]>)>);
 unsafe impl Send for DisplayCacheEntry {}
 
 /// The shared display enumeration cache. Poison-tolerant: a panicking holder

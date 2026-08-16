@@ -1070,7 +1070,11 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 };
                 // The listbox re-flows at the new row height and tracks the
                 // new window size; LB_SETITEMHEIGHT makes its scrollbar
-                // recalculate.
+                // recalculate. The old font was deleted by
+                // `rebuild_picker_fonts`, so the listbox must be handed the
+                // new handle too — otherwise its owner-draw rows keep
+                // selecting the dangling font and render in the default
+                // system font, mirroring the open path below.
                 if !state.listbox.0.is_null() {
                     let _ = unsafe {
                         SetWindowPos(
@@ -1084,6 +1088,9 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                         )
                     };
                     let _ = unsafe { SendMessageW(state.listbox, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(row_h as isize)) };
+                    let _ = unsafe {
+                        SendMessageW(state.listbox, WM_SETFONT, WPARAM(state.list_font.0 as usize), LPARAM(1))
+                    };
                 }
                 let _ = unsafe { InvalidateRect(hwnd, None, true) };
             }
