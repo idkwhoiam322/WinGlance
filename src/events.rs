@@ -107,8 +107,15 @@ impl TrackInfo {
         let mut parts: Vec<String> = Vec::new();
         if let Some(d) = self.duration_secs {
             // The stopwatch glyph labels the number as a duration; without it
-            // "3:45" reads ambiguously in a line of text.
-            parts.push(format!("⏱ {}:{:02}", d / 60, d % 60));
+            // "3:45" reads ambiguously in a line of text. At one hour and up
+            // the line switches to h:mm:ss so a 3661 s podcast reads
+            // "1:01:01" instead of the misleading "61:01".
+            let line = if d >= 3600 {
+                format!("⏱ {}:{:02}:{:02}", d / 3600, (d % 3600) / 60, d % 60)
+            } else {
+                format!("⏱ {}:{:02}", d / 60, d % 60)
+            };
+            parts.push(line);
         }
         if include_album {
             let album_line = if !self.album.trim().is_empty() {
@@ -425,6 +432,35 @@ mod tests {
             MediaEvent::PlaybackStateChanged(_, source) => assert_eq!(source, "spotify"),
             _ => panic!("expected PlaybackStateChanged"),
         }
+    }
+
+    #[test]
+    fn meta_line_formats_hour_long_durations_as_h_mm_ss() {
+        // A 3661 s podcast must read 1:01:01, not the misleading 61:01 that
+        // the m:ss form would produce for any duration >= 1 hour.
+        let hour_long = TrackInfo {
+            duration_secs: Some(3661),
+            ..TrackInfo::default()
+        };
+        assert_eq!(hour_long.meta_line(true), "⏱ 1:01:01");
+        // Exactly one hour keeps the hour part and zeroes the rest.
+        let exactly_one_hour = TrackInfo {
+            duration_secs: Some(3600),
+            ..TrackInfo::default()
+        };
+        assert_eq!(exactly_one_hour.meta_line(true), "⏱ 1:00:00");
+        // A long-running album (5 h 1 m 1 s) still formats correctly.
+        let five_hours = TrackInfo {
+            duration_secs: Some(18061),
+            ..TrackInfo::default()
+        };
+        assert_eq!(five_hours.meta_line(true), "⏱ 5:01:01");
+        // Sub-hour durations keep the compact m:ss form.
+        let sub_hour = TrackInfo {
+            duration_secs: Some(225),
+            ..TrackInfo::default()
+        };
+        assert_eq!(sub_hour.meta_line(true), "⏱ 3:45");
     }
 
     #[test]

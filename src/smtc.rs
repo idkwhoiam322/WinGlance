@@ -162,6 +162,11 @@ const MAX_TRACKED_SOURCES: usize = 32;
 /// metadata is retained, so the pill renders a placeholder instead of a stale
 /// cover.
 const MAX_THUMBNAIL_BYTES: u64 = 4 * 1024 * 1024;
+/// Smallest thumbnail stream WinGlance will read. Legitimate covers can be
+/// compact 64-128 px PNGs/JPEGs that compress below 1 KiB; the floor exists
+/// only to skip streams that are certainly not a cover (empty or a few stray
+/// bytes). Anything below it is dropped with a debug log, never silently.
+const THUMBNAIL_MIN_BYTES: u64 = 64;
 const MAX_RETAINED_ARTWORK_BYTES: usize = 64 * 1024 * 1024;
 /// Cap for the recoverable output retry mailbox (`pending_output`). The
 /// mailbox exists so a briefly-full output channel cannot make a committed
@@ -3380,7 +3385,10 @@ fn read_thumbnail(
     let size = stream
         .Size()
         .map_err(|e| anyhow::Error::new(e).context("Size failed"))?;
-    if size == 0 || !(1024..=MAX_THUMBNAIL_BYTES).contains(&size) || size > u32::MAX as u64 {
+    if !thumbnail_stream_size_acceptable(size) {
+        debug!(
+            "thumbnail dropped | reason=stream-size | size={size} | floor={THUMBNAIL_MIN_BYTES} | cap={MAX_THUMBNAIL_BYTES}"
+        );
         return Ok(None);
     }
     let size = size as u32;
@@ -3397,6 +3405,15 @@ fn read_thumbnail(
         .ReadBytes(&mut data)
         .map_err(|e| anyhow::Error::new(e).context("ReadBytes failed"))?;
     Ok(Some(data))
+}
+
+/// Whether a thumbnail stream's declared size is worth reading. Empty and
+/// sub-floor streams are not covers (a compact 64-128 px PNG/JPEG cover can
+/// legitimately compress below 1 KiB, so the floor is low); anything above
+/// the per-stream byte cap is rejected before buffering so a hostile size
+/// cannot drive allocation.
+fn thumbnail_stream_size_acceptable(size: u64) -> bool {
+    (THUMBNAIL_MIN_BYTES..=MAX_THUMBNAIL_BYTES).contains(&size) && size <= u32::MAX as u64
 }
 
 fn non_empty(value: String, fallback: &str) -> String {
@@ -3474,6 +3491,24 @@ fn terminal_pending_keep(alive_in_snapshot: bool, absent_for: Duration, grace: D
 mod tests {
     use super::*;
     use anyhow::anyhow;
+
+    #[test]
+    fn thumbnail_stream_size_accepts_compact_covers_and_rejects_hostile_sizes() {
+        // Compact 64-128 px covers can compress below 1 KiB: the floor is low
+        // enough to admit them.
+        assert!(thumbnail_stream_size_acceptable(64));
+        assert!(thumbnail_stream_size_acceptable(512));
+        assert!(thumbnail_stream_size_acceptable(1024));
+        assert!(thumbnail_stream_size_acceptable(MAX_THUMBNAIL_BYTES));
+        // Empty and sub-floor streams are never covers.
+        assert!(!thumbnail_stream_size_acceptable(0));
+        assert!(!thumbnail_stream_size_acceptable(63));
+        // Above the per-stream cap a hostile declared size cannot drive a
+        // Buffer::Create allocation.
+        assert!(!thumbnail_stream_size_acceptable(MAX_THUMBNAIL_BYTES + 1));
+        // The WinRT buffer is u32-sized; larger streams are rejected too.
+        assert!(!thumbnail_stream_size_acceptable(u64::from(u32::MAX) + 1));
+    }
 
     #[test]
     fn reenable_reshow_warrants_only_the_false_to_true_toggle() {

@@ -16,6 +16,7 @@ use crate::winutil::{StateClaim, clear_window_state, set_window_state, wide, win
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use log::{debug, error, info, warn};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,10 +26,11 @@ use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HINSTANCE, HWND, 
 use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BeginPaint, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_WINDOWFRAME, COLOR_WINDOWTEXT, CreateCompatibleDC,
-    CreateDIBSection, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC,
-    DeleteObject, EndPaint, FF_DONTCARE, FillRect, FrameRect, GetStockObject, GetSysColor, HBITMAP, HBRUSH, HDC, HFONT,
-    HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SYS_COLOR_INDEX, SelectObject, SetBkColor, SetTextColor,
+    CLIP_DEFAULT_PRECIS, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOWFRAME, COLOR_WINDOWTEXT,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FillRect, FrameRect, GetStockObject, GetSysColor,
+    HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SYS_COLOR_INDEX,
+    SelectObject, SetBkColor, SetTextColor,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
@@ -58,16 +60,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GetClientRect, GetCursorPos, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindowVisible, KillTimer, LB_ADDSTRING,
     LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT,
-    LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP,
-    SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLBAR_COMMAND, SCROLLINFO, SIF_PAGE,
-    SIF_POS, SIF_RANGE, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT,
-    WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
-    WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED, MF_DISABLED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterWindowMessageW, SB_BOTTOM,
+    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT,
+    SCROLLBAR_COMMAND, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE,
+    WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_GETOBJECT, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL,
+    WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN,
+    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -176,6 +178,7 @@ enum ConfigStatus {
 enum SettingId {
     Notifications,
     Duration,
+    RespectSystemDuration,
     StartOnLogin,
     CloseToTray,
     AllowedApps,
@@ -195,6 +198,7 @@ enum SettingId {
     OpenConfig,
 }
 
+#[derive(Clone)]
 enum SettingsItem {
     Header {
         text: &'static str,
@@ -216,9 +220,24 @@ enum SettingsItem {
 /// client pixels. `content_extent` lets the scroll range be derived from a layout
 /// that ignores the live `settings_scroll_y`, so the same geometry powers paint,
 /// hit-test, focus, scroll and the UIA provider.
+#[derive(Clone)]
 struct SettingsLayout {
     items: Vec<SettingsItem>,
     content_extent: i32,
+}
+
+/// Memoization key for the laid-out Settings pane: every input
+/// `build_settings_layout` reads that is not a constant — client width, scroll
+/// offset, DPI-derived geometry, and whether the persistence banner is shown.
+/// The key covers all inputs, so the cache can never serve a stale layout.
+#[derive(Clone, Copy, PartialEq)]
+struct SettingsLayoutKey {
+    content_left: i32,
+    client_w: i32,
+    pad: i32,
+    scale: u32,
+    scroll_y: i32,
+    status: Option<ConfigStatus>,
 }
 
 /// A keyboard-focusable Settings-pane control. `cx`/`cy` is the window client
@@ -272,6 +291,25 @@ struct SettingsColors {
     /// The keyboard-focus outline color (checked at 3:1 against both the
     /// surface and the hover fill).
     focus: [u8; 4],
+    /// The accent for emphasized text (ON values, the SETTINGS header, small
+    /// button labels). Art-derived normally; under a high-contrast theme it
+    /// is derived from the system highlight color and lifted to the AA floor
+    /// against the system surface, so emphasized labels stay readable on
+    /// light and dark system surfaces alike.
+    accent: [u8; 4],
+    /// The fill color of active segments/buttons: the art accent normally,
+    /// the raw system highlight under a high-contrast theme (paired with
+    /// `accent_fill_text`, whose contrast Windows itself guarantees against
+    /// it).
+    accent_fill: [u8; 4],
+    /// The label color drawn on an `accent_fill` backdrop: `COLOR_HIGHLIGHTTEXT`
+    /// under a high-contrast theme (the standard HC button pairing), unused by
+    /// the normal theme (which draws active labels in the surface text color).
+    accent_fill_text: [u8; 4],
+    /// Whether this palette is the high-contrast system-derived set (vs. the
+    /// fixed dark theme). The paint path picks the system accent only when
+    /// true — the art-derived accent stays in charge of the normal theme.
+    high_contrast: bool,
 }
 
 fn settings_colors_for(prefs: &crate::winutil::SystemPreferences) -> SettingsColors {
@@ -289,6 +327,17 @@ fn settings_colors_for(prefs: &crate::winutil::SystemPreferences) -> SettingsCol
             muted: crate::overlay::ensure_contrast(text, surface, crate::overlay::TEXT_CONTRAST_AA),
             warn: crate::overlay::ensure_contrast(SETTINGS_WARN, surface, crate::overlay::TEXT_CONTRAST_AA),
             focus: crate::overlay::ensure_contrast(sys_color_rgba(COLOR_HIGHLIGHT), surface, 3.0),
+            accent: crate::overlay::ensure_contrast(
+                sys_color_rgba(COLOR_HIGHLIGHT),
+                surface,
+                crate::overlay::TEXT_CONTRAST_AA,
+            ),
+            // The standard HC button pairing: the raw highlight fill and the
+            // system's own highlight-text color, whose contrast Windows
+            // guarantees against the highlight.
+            accent_fill: sys_color_rgba(COLOR_HIGHLIGHT),
+            accent_fill_text: sys_color_rgba(COLOR_HIGHLIGHTTEXT),
+            high_contrast: true,
             surface,
             text,
         }
@@ -302,6 +351,12 @@ fn settings_colors_for(prefs: &crate::winutil::SystemPreferences) -> SettingsCol
             faint: crate::overlay::ensure_contrast(SETTINGS_FAINT, SETTINGS_SURFACE, crate::overlay::TEXT_CONTRAST_AA),
             warn: SETTINGS_WARN,
             focus: crate::overlay::ensure_contrast(SETTINGS_TEXT, SETTINGS_SURFACE, 3.0),
+            // Unused by the paint path (which keeps the art-derived accent
+            // for the normal theme); sane placeholders.
+            accent: SETTINGS_TEXT,
+            accent_fill: SETTINGS_TEXT,
+            accent_fill_text: SETTINGS_TEXT,
+            high_contrast: false,
         }
     }
 }
@@ -653,6 +708,7 @@ fn draw_segment_button(
     hovered: bool,
     scale: f32,
     brushes: SettingsBrushes,
+    colors: SettingsColors,
 ) {
     unsafe {
         let _ = FillRect(hdc, rect, if active { brushes.accent } else { brushes.border });
@@ -674,7 +730,19 @@ fn draw_segment_button(
         let _ = FillRect(hdc, &inner, fill);
     }
     let mut t = inner;
-    let tc = if active { SETTINGS_TEXT } else { SETTINGS_MUTED };
+    // Active labels sit on the accent fill: the system highlight-text pairing
+    // under high contrast (guaranteed against the highlight), the surface text
+    // otherwise. Inactive labels use the palette's muted color, which is
+    // AA-lifted against the system surface under high contrast.
+    let tc = if active {
+        if colors.high_contrast {
+            colors.accent_fill_text
+        } else {
+            colors.text
+        }
+    } else {
+        colors.muted
+    };
     draw_string(fonts, hdc, label, &mut t, (10.0 * scale) as i32, tc, active, true);
 }
 
@@ -867,6 +935,9 @@ struct MainWindowState {
     /// settings layout rect is shifted up by this amount, so all controls stay
     /// reachable on a small viewport. Zero when the content fits.
     settings_scroll_y: i32,
+    /// Memoized laid-out Settings pane (see `settings_items`); keyed by
+    /// `SettingsLayoutKey` so it can never serve a stale layout.
+    settings_layout_cache: RefCell<Option<(SettingsLayoutKey, SettingsLayout)>>,
     /// Native TOOLTIPS_CLASS control showing full history details on hover.
     tooltip_ctrl: HWND,
     /// UTF-16 buffer backing the native tooltip's `lpszText` pointer. The
@@ -1104,6 +1175,7 @@ impl MainWindowState {
             active_pane: Pane::Activity,
             settings_hover: None,
             settings_scroll_y: 0,
+            settings_layout_cache: RefCell::new(None),
             tooltip_ctrl: HWND::default(),
             tooltip_text: Vec::new(),
             tooltip_range: None,
@@ -1492,6 +1564,17 @@ impl MainWindowState {
     /// old brushes are deleted first, so every paint site picks up the new
     /// accent without per-paint brush allocation.
     fn rebuild_accent_brushes(&mut self) {
+        // Under a high-contrast theme the accent family derives from the
+        // system highlight (paired with COLOR_HIGHLIGHTTEXT labels), not the
+        // art-derived accent — the configured pink would break the standard
+        // HC control pairing and can fall below the palette's contrast floor.
+        // Blends target the system surface so the soft fills stay in family.
+        let colors = self.settings_colors;
+        let hc = colors.high_contrast;
+        let accent = if hc { colors.accent_fill } else { self.accent_color };
+        let blend_surface = if hc { colors.surface } else { SETTINGS_SURFACE };
+        let highlight_base = if hc { colors.accent_fill } else { self.accent_secondary };
+        let highlight_surface = if hc { colors.surface } else { [0x0A, 0x0A, 0x0A, 0xFF] };
         unsafe {
             for brush in [
                 &mut self.accent_brush,
@@ -1505,21 +1588,47 @@ impl MainWindowState {
                     let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
                 }
             }
-            let accent = self.accent_color;
             self.accent_brush = CreateSolidBrush(colorref(accent[0], accent[1], accent[2]));
             let soft = |weight: f32| -> HBRUSH {
-                let c = mix(accent, SETTINGS_SURFACE, weight);
+                let c = mix(accent, blend_surface, weight);
                 CreateSolidBrush(colorref(c[0], c[1], c[2]))
             };
             self.settings_accent_soft_brush = soft(SETTINGS_ACCENT_SOFT_WEIGHT);
             self.settings_adjust_hover_brush = soft(SETTINGS_ADJUST_HOVER_WEIGHT);
             self.settings_small_hover_brush = soft(0.35);
             let highlight = |weight: f32| -> HBRUSH {
-                let c = mix(self.accent_secondary, [0x0A, 0x0A, 0x0A, 0xFF], weight);
+                let c = mix(highlight_base, highlight_surface, weight);
                 CreateSolidBrush(colorref(c[0], c[1], c[2]))
             };
             self.sidebar_highlight_brush = highlight(0.15);
             self.history_selected_brush = highlight(0.20);
+        }
+    }
+
+    /// Colors the window title bar to match the effective accent — the system
+    /// highlight under a high-contrast theme (`accent_fill`, the same color
+    /// the settings brushes derive from), the art-derived accent otherwise —
+    /// so the frame reads as one theme with the Settings pane. COLORREF is
+    /// 0x00BBGGRR, hence the swapped red/blue channels. Called at creation,
+    /// on accent changes, and after a `WM_SETTINGCHANGE` re-samples the
+    /// high-contrast state.
+    fn apply_title_bar_color(&self) {
+        let accent = if self.settings_colors.high_contrast {
+            self.settings_colors.accent_fill
+        } else {
+            self.accent_color
+        };
+        let color = COLORREF(((accent[2] as u32) << 16) | ((accent[1] as u32) << 8) | accent[0] as u32);
+        let result = unsafe {
+            DwmSetWindowAttribute(
+                self.hwnd,
+                DWMWA_CAPTION_COLOR,
+                &color as *const COLORREF as *const c_void,
+                size_of::<u32>() as u32,
+            )
+        };
+        if let Err(error) = result {
+            debug!("DwmSetWindowAttribute(CAPTION_COLOR) failed: {error}");
         }
     }
 
@@ -1545,17 +1654,7 @@ impl MainWindowState {
             self.accent_color = primary;
             self.accent_secondary = secondary;
             self.rebuild_accent_brushes();
-            // Re-color the window title bar to match (COLORREF is 0x00BBGGRR,
-            // hence the swapped red/blue channels).
-            let color = COLORREF(((primary[2] as u32) << 16) | ((primary[1] as u32) << 8) | primary[0] as u32);
-            let _ = unsafe {
-                DwmSetWindowAttribute(
-                    self.hwnd,
-                    DWMWA_CAPTION_COLOR,
-                    &color as *const COLORREF as *const c_void,
-                    size_of::<u32>() as u32,
-                )
-            };
+            self.apply_title_bar_color();
             debug!(
                 "settings accent: primary=#{:02X}{:02X}{:02X} secondary=#{:02X}{:02X}{:02X}",
                 primary[0], primary[1], primary[2], secondary[0], secondary[1], secondary[2]
@@ -2219,6 +2318,41 @@ impl MainWindowState {
     /// layout. Paint, hit-test, hover, focus and the UIA provider all read the
     /// same offset rects, so scrolling stays consistent across every path.
     fn settings_items(&self, content_left: i32, client_w: i32, pad: i32, scale: f32, scroll_y: i32) -> SettingsLayout {
+        // Memoized: the layout is a pure function of (client geometry, scroll
+        // offset, banner status), so the ~20-item Vec (and its per-call
+        // allocation) is rebuilt only when one of those changes — paint,
+        // hover hit-test, focus walk, scroll sync and UIA queries all share
+        // one layout. The key covers every input, so the cache cannot go
+        // stale.
+        let key = SettingsLayoutKey {
+            content_left,
+            client_w,
+            pad,
+            scale: scale.to_bits(),
+            scroll_y,
+            status: self.config_status,
+        };
+        if let Some((cached_key, cached)) = &*self.settings_layout_cache.borrow()
+            && *cached_key == key
+        {
+            return cached.clone();
+        }
+        let layout = Self::build_settings_layout(content_left, client_w, pad, scale, scroll_y, key.status);
+        *self.settings_layout_cache.borrow_mut() = Some((key, layout.clone()));
+        layout
+    }
+
+    /// Pure layout builder for the Settings pane (see `settings_items` for the
+    /// memoized wrapper). `status` controls whether the persistence banner is
+    /// inserted — the only non-geometric input the layout depends on.
+    fn build_settings_layout(
+        content_left: i32,
+        client_w: i32,
+        pad: i32,
+        scale: f32,
+        scroll_y: i32,
+        status: Option<ConfigStatus>,
+    ) -> SettingsLayout {
         let row_h = (34.0 * scale) as i32;
         let gap = (8.0 * scale) as i32;
         let header_h = (18.0 * scale) as i32;
@@ -2240,6 +2374,7 @@ impl MainWindowState {
         for id in [
             SettingId::Notifications,
             SettingId::Duration,
+            SettingId::RespectSystemDuration,
             SettingId::StartOnLogin,
             SettingId::CloseToTray,
             SettingId::AllowedApps,
@@ -2409,7 +2544,7 @@ impl MainWindowState {
             },
         });
         y += row_h + gap;
-        if let Some(status) = self.config_status {
+        if let Some(status) = status {
             natural.push(SettingsItem::Banner {
                 text: banner_text(status),
                 rect: RECT {
@@ -2486,10 +2621,31 @@ impl MainWindowState {
         // Read the config once per paint instead of ~10 lock acquisitions,
         // and snapshot the hover/flag state so the row loop stays pure.
         let cfg = self.cfg();
-        let accent = self.accent_color;
+        // The effective Settings color set: AA-lifted state text normally,
+        // system colors under a high-contrast theme.
+        let colors = self.settings_colors;
+        // Emphasized text uses the art-derived accent for the normal theme,
+        // and the system-derived accent (COLOR_HIGHLIGHT lifted to the AA
+        // floor) under a high-contrast theme — the configured pink would
+        // otherwise fall below the contrast floor the palette enforces.
+        let accent = if colors.high_contrast {
+            colors.accent
+        } else {
+            self.accent_color
+        };
         let notifications_enabled = cfg.behavior.notifications_enabled;
         let settings_hover = self.settings_hover;
         let duration_ms = cfg.overlay.duration_ms;
+        // The value the pill actually applies: while
+        // `respect_system_message_duration` is on, the effective duration is
+        // the larger of the configured value and the system message-duration
+        // preference. Surfaced in the row below when it differs, so the UI
+        // never shows a value the pill does not honor.
+        let duration_effective_ms = crate::config::effective_display_duration(
+            duration_ms,
+            crate::winutil::system_preferences().message_duration_ms,
+            cfg.overlay.respect_system_message_duration,
+        );
         let start_on_login = cfg.behavior.start_on_login;
         let close_to_tray = cfg.behavior.close_to_tray;
         let media_sources = cfg.behavior.media_sources.join(", ");
@@ -2505,9 +2661,6 @@ impl MainWindowState {
         let hide_for_auto_compact = cfg.behavior.hide_for_auto_compact_sources;
         let fade_persistent_pill = cfg.overlay.fade_persistent_pill;
         let display_count = enumerate_displays_cached().len();
-        // The effective Settings color set: AA-lifted state
-        // text normally, system colors under a high-contrast theme.
-        let colors = self.settings_colors;
 
         let mut hdr = RECT {
             left: content_left + pad,
@@ -2620,7 +2773,27 @@ impl MainWindowState {
                             },
                             if close_to_tray { accent } else { colors.faint },
                         ),
-                        SettingId::Duration => ("Duration", format!("{}s", duration_ms / 1000), colors.muted),
+                        SettingId::Duration => {
+                            let value = if duration_effective_ms > duration_ms {
+                                format!("{}s (system {}s)", duration_ms / 1000, duration_effective_ms / 1000)
+                            } else {
+                                format!("{}s", duration_ms / 1000)
+                            };
+                            ("Duration", value, colors.muted)
+                        }
+                        SettingId::RespectSystemDuration => (
+                            "Respect system message duration",
+                            if cfg.overlay.respect_system_message_duration {
+                                "ON".to_string()
+                            } else {
+                                "OFF".to_string()
+                            },
+                            if cfg.overlay.respect_system_message_duration {
+                                accent
+                            } else {
+                                colors.faint
+                            },
+                        ),
                         SettingId::Layout => ("Layout", String::new(), colors.muted),
                         SettingId::Position => ("Expanded Position", position_label.clone(), colors.muted),
                         SettingId::SeparateCompact => (
@@ -2726,6 +2899,7 @@ impl MainWindowState {
 
                     match id {
                         SettingId::Notifications
+                        | SettingId::RespectSystemDuration
                         | SettingId::StartOnLogin
                         | SettingId::CloseToTray
                         | SettingId::AllowedApps
@@ -2780,7 +2954,16 @@ impl MainWindowState {
                                     let _ = FillRect(hdc, &s_inner, fill);
                                 }
                                 let mut t = s_inner;
-                                let tc = if active { colors.text } else { colors.muted };
+                                // On an active segment the label sits on the
+                                // accent fill: under high contrast it must be
+                                // the system highlight-text pairing.
+                                let tc = if active && colors.high_contrast {
+                                    colors.accent_fill_text
+                                } else if active {
+                                    colors.text
+                                } else {
+                                    colors.muted
+                                };
                                 // The Custom tile shows the actual value while
                                 // active, like the tray menu's "Custom (Xs)".
                                 let label = if is_custom {
@@ -2838,7 +3021,16 @@ impl MainWindowState {
                                     let _ = FillRect(hdc, &s_inner, fill);
                                 }
                                 let mut t = s_inner;
-                                let tc = if active { colors.text } else { colors.muted };
+                                // On an active segment the label sits on the
+                                // accent fill: under high contrast it must be
+                                // the system highlight-text pairing.
+                                let tc = if active && colors.high_contrast {
+                                    colors.accent_fill_text
+                                } else if active {
+                                    colors.text
+                                } else {
+                                    colors.muted
+                                };
                                 draw_string(
                                     &self.fonts,
                                     hdc,
@@ -2903,6 +3095,7 @@ impl MainWindowState {
                                     seg_hovered,
                                     scale,
                                     brushes,
+                                    colors,
                                 );
                             }
                             let adjust_hovered = settings_hover == Some((current_row, SettingSub::Adjust));
@@ -2927,11 +3120,19 @@ impl MainWindowState {
                             } else {
                                 SETTINGS_ACCENT_SOFT_WEIGHT
                             };
-                            let label_color = crate::overlay::ensure_contrast(
-                                accent,
-                                mix(accent, SETTINGS_SURFACE, fill_weight),
-                                crate::overlay::TEXT_CONTRAST_AA,
-                            );
+                            // Under high contrast the Adjust label uses the
+                            // guaranteed highlight-text pairing (the fill is
+                            // the system highlight); otherwise clamp the
+                            // accent against the soft fill as before.
+                            let label_color = if colors.high_contrast {
+                                colors.accent_fill_text
+                            } else {
+                                crate::overlay::ensure_contrast(
+                                    accent,
+                                    mix(accent, SETTINGS_SURFACE, fill_weight),
+                                    crate::overlay::TEXT_CONTRAST_AA,
+                                )
+                            };
                             let mut bt = parts.adjust;
                             draw_string(
                                 &self.fonts,
@@ -3006,6 +3207,7 @@ impl MainWindowState {
                                     seg_hovered,
                                     scale,
                                     brushes,
+                                    colors,
                                 );
                             }
                             let adjust_hovered = settings_hover == Some((current_row, SettingSub::Adjust));
@@ -3030,11 +3232,19 @@ impl MainWindowState {
                             } else {
                                 SETTINGS_ACCENT_SOFT_WEIGHT
                             };
-                            let label_color = crate::overlay::ensure_contrast(
-                                accent,
-                                mix(accent, SETTINGS_SURFACE, fill_weight),
-                                crate::overlay::TEXT_CONTRAST_AA,
-                            );
+                            // Under high contrast the Adjust label uses the
+                            // guaranteed highlight-text pairing (the fill is
+                            // the system highlight); otherwise clamp the
+                            // accent against the soft fill as before.
+                            let label_color = if colors.high_contrast {
+                                colors.accent_fill_text
+                            } else {
+                                crate::overlay::ensure_contrast(
+                                    accent,
+                                    mix(accent, SETTINGS_SURFACE, fill_weight),
+                                    crate::overlay::TEXT_CONTRAST_AA,
+                                )
+                            };
                             let mut bt = parts.adjust;
                             draw_string(
                                 &self.fonts,
@@ -3634,6 +3844,7 @@ impl MainWindowState {
                 &self.settings_border_brush,
                 &self.settings_surface_brush,
                 &self.settings_hover_brush,
+                &self.settings_focus_brush,
                 &self.history_header_brush,
                 &self.history_selected_brush,
                 &self.history_row_even_brush,
@@ -4386,6 +4597,31 @@ fn show_tray_menu(state: &mut MainWindowState) {
             MENU_DURATION_CUSTOM,
             PCWSTR(wide(&custom_label).as_ptr()),
         );
+        // Truth about what the pill actually applies: while
+        // `respect_system_message_duration` is on, the effective duration is
+        // the larger of the chosen value and the system message-duration
+        // preference, so the menu can check "2 seconds" while the pill stays
+        // up for 5. A grayed info line surfaces the effective value when it
+        // differs, so the presets never read as silently broken.
+        {
+            let cfg = state.cfg();
+            if cfg.overlay.respect_system_message_duration {
+                let effective = crate::config::effective_display_duration(
+                    cfg.overlay.duration_ms,
+                    crate::winutil::system_preferences().message_duration_ms,
+                    true,
+                );
+                if effective > cfg.overlay.duration_ms {
+                    let label = format!("Currently applied: {}s (system)", effective / 1000);
+                    let _ = AppendMenuW(
+                        duration_menu,
+                        MF_STRING | MF_DISABLED | MF_GRAYED,
+                        0,
+                        PCWSTR(wide(&label).as_ptr()),
+                    );
+                }
+            }
+        }
         let _ = AppendMenuW(
             menu,
             MF_POPUP,
@@ -4656,6 +4892,17 @@ fn apply_settings_row_click(
                 state.invalidate();
             }
         }
+        SettingId::RespectSystemDuration => {
+            let new_value = !state.cfg().overlay.respect_system_message_duration;
+            state.mutate_config(|cfg| cfg.overlay.respect_system_message_duration = new_value);
+            // The effective pill duration may change with
+            // the flag, so re-push it (and the Duration
+            // row's "(system Ns)" suffix updates on the
+            // repaint below).
+            state.push_effective_duration();
+            info!("respect system message duration set: {new_value}");
+            state.invalidate();
+        }
         SettingId::Layout => {
             let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
             let values = [
@@ -4903,26 +5150,12 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 // system message-duration preference to its copy now.
                 (*state_ptr).push_effective_duration();
             }
-            // Color the window title bar with the effective accent so the
-            // app reads as one theme. Applied here, after the frame is
-            // realized, rather than right after CreateWindowExW. COLORREF is
-            // 0x00BBGGRR, hence the swapped red/blue channels.
-            let accent = if state_ptr.is_null() {
-                [240, 110, 155, 255]
-            } else {
-                (*state_ptr).accent_color
-            };
-            let color = COLORREF(((accent[2] as u32) << 16) | ((accent[1] as u32) << 8) | accent[0] as u32);
-            let result = unsafe {
-                DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_CAPTION_COLOR,
-                    &color as *const COLORREF as *const c_void,
-                    std::mem::size_of::<COLORREF>() as u32,
-                )
-            };
-            if let Err(error) = result {
-                debug!("DwmSetWindowAttribute(CAPTION_COLOR) failed: {error}");
+            // Color the window title bar with the effective accent (system
+            // highlight under high contrast, art accent otherwise) so the
+            // frame reads as one theme. Applied here, after the frame is
+            // realized, rather than right after CreateWindowExW.
+            if !state_ptr.is_null() {
+                (*state_ptr).apply_title_bar_color();
             }
             LRESULT(0)
         }
@@ -5560,6 +5793,9 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 let prefs = crate::winutil::refresh_system_preferences();
                 debug!("re-sampled system preferences after WM_SETTINGCHANGE: {prefs:?}");
                 state.rebuild_settings_appearance();
+                // The effective accent may have flipped (e.g. high contrast
+                // toggled): re-color the title bar from the new state.
+                state.apply_title_bar_color();
                 state.push_effective_duration();
                 state.invalidate();
             }
@@ -5608,6 +5844,7 @@ fn setting_label(id: SettingId) -> &'static str {
     match id {
         SettingId::Notifications => "Notifications",
         SettingId::Duration => "Duration",
+        SettingId::RespectSystemDuration => "Respect system message duration",
         SettingId::StartOnLogin => "Start on login",
         SettingId::CloseToTray => "Close to tray",
         SettingId::AllowedApps => "Allowed apps",
@@ -5633,6 +5870,7 @@ fn setting_is_toggle(id: SettingId) -> bool {
     matches!(
         id,
         SettingId::Notifications
+            | SettingId::RespectSystemDuration
             | SettingId::StartOnLogin
             | SettingId::CloseToTray
             | SettingId::SeparateCompact
@@ -5647,6 +5885,7 @@ fn setting_is_toggle(id: SettingId) -> bool {
 fn setting_value(id: SettingId, cfg: &Config) -> String {
     match id {
         SettingId::Notifications => on_off(cfg.behavior.notifications_enabled),
+        SettingId::RespectSystemDuration => on_off(cfg.overlay.respect_system_message_duration),
         SettingId::StartOnLogin => on_off(cfg.behavior.start_on_login),
         SettingId::CloseToTray => on_off(cfg.behavior.close_to_tray),
         // Polarity is inverted from the persisted field: "ON" means the Compact
@@ -5691,6 +5930,7 @@ fn setting_value(id: SettingId, cfg: &Config) -> String {
 fn setting_toggle_on(id: SettingId, cfg: &Config) -> bool {
     match id {
         SettingId::Notifications => cfg.behavior.notifications_enabled,
+        SettingId::RespectSystemDuration => cfg.overlay.respect_system_message_duration,
         SettingId::StartOnLogin => cfg.behavior.start_on_login,
         SettingId::CloseToTray => cfg.behavior.close_to_tray,
         SettingId::SeparateCompact => !cfg.overlay.compact_position_separate,
@@ -5931,6 +6171,46 @@ mod tests {
             genre: None,
             ..TrackInfo::default()
         }
+    }
+
+    #[test]
+    fn settings_layout_is_a_pure_function_of_geometry_and_banner() {
+        // The memoized `settings_items` wrapper keys on every input, so the
+        // pure builder must depend only on (geometry, scroll, banner status):
+        // identical inputs yield identical layouts, scroll shifts every rect
+        // by exactly the offset without touching the extent, and the banner
+        // is the only config-dependent item.
+        fn first_row_top(layout: &SettingsLayout) -> i32 {
+            layout
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    SettingsItem::Row { rect, .. } => Some(rect.top),
+                    _ => None,
+                })
+                .expect("the layout has rows")
+        }
+        let base = MainWindowState::build_settings_layout(100, 800, 16, 1.0, 0, None);
+        let same = MainWindowState::build_settings_layout(100, 800, 16, 1.0, 0, None);
+        let scrolled = MainWindowState::build_settings_layout(100, 800, 16, 1.0, 30, None);
+        let banner = MainWindowState::build_settings_layout(100, 800, 16, 1.0, 0, Some(ConfigStatus::Conflict));
+        assert_eq!(base.items.len(), same.items.len());
+        assert_eq!(base.content_extent, same.content_extent);
+        assert_eq!(
+            first_row_top(&scrolled),
+            first_row_top(&base) - 30,
+            "scroll must shift every rect up by the offset"
+        );
+        assert_eq!(
+            base.content_extent, scrolled.content_extent,
+            "scroll must not affect the extent"
+        );
+        assert_eq!(
+            banner.items.len(),
+            base.items.len() + 1,
+            "the banner is the only config-dependent item"
+        );
+        assert!(banner.content_extent > base.content_extent);
     }
 
     #[test]
