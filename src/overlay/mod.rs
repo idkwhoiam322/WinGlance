@@ -11,7 +11,8 @@ use crate::events::{
 };
 use crate::gdi::FontProvider;
 use crate::palette::Palette;
-use crate::winutil::{StateClaim, clear_window_state, set_window_state, wide, window_state};
+use crate::winapi::{delete_object, kill_timer, post_message, select_object, set_timer, set_window_pos, validate_rect};
+use crate::winutil::{StateClaim, release_window_state, set_window_state, wide, window_state};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
@@ -3867,10 +3868,8 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         }
         WM_DESTROY => {
             // Disconnect the UIA provider while the window and its state still
-            // exist, so UIA core releases its references instead of calling
-            // into a torn-down window later — the same defensive teardown the
-            // main window applies in its WM_DESTROY.
-            let _ = UiaReturnRawElementProvider(hwnd, WPARAM(0), LPARAM(0), None);
+            // exist — the same defensive detach the main window applies.
+            crate::accessibility::detach_hwnd_provider(hwnd);
             LRESULT(0)
         }
         WM_NCDESTROY => {
@@ -3896,12 +3895,12 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 state.null_pill_name_cell();
                 // Dropping the scratch buffers unselects the bitmaps and
                 // frees the DIBs and DCs via the `Drop` impls; the state box
-                // is released right after.
+                // is released right after — slot clear first, box second, via
+                // the shared helper (the canonical order every window applies).
                 state.text_scratch = None;
                 state.dib = None;
-                drop(Box::from_raw(state_ptr));
+                release_window_state(hwnd, state_ptr);
             }
-            clear_window_state(hwnd);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
@@ -5776,10 +5775,17 @@ mod tests {
     /// Destroys the window through the production teardown: WM_NCDESTROY
     /// clears the routing slot *before* releasing the state box (the same
     /// order the main window applies), so the e2e tests exercise the real
-    /// ordered teardown instead of bypassing it. The box must therefore not
-    /// be freed here — the handler owns it once it resolves it from the
-    /// slot the test installed. A double-free (slot cleared after the box was
-    /// freed, or freed twice) would crash this helper, which is the point.
+    /// teardown instead of bypassing it. The box must therefore not be
+    /// freed here — the handler owns it once it resolves it from the slot
+    /// the test installed; freeing it here too would double-free.
+    ///
+    /// The slot-vs-box *order* is not observable through this e2e path: the
+    /// window is mid-destroy during WM_NCDESTROY, so nothing reads the slot
+    /// between the two operations, and the name-cell null precedes the
+    /// release in either order — a mutation reversing them passes every e2e
+    /// test unchanged. The order is pinned where it is observable, at the
+    /// box's own drop, by `release_window_state_clears_the_slot_before_dropping_the_box`
+    /// in winutil.rs.
     fn destroy_wndproc_overlay(hwnd: HWND, _state_ptr: *mut OverlayState) {
         unsafe {
             let _ = DestroyWindow(hwnd);

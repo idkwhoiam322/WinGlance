@@ -12,7 +12,11 @@ use crate::overlay::{
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG, PINNED_SOURCE_RESULT_MSG};
-use crate::winutil::{StateClaim, clear_window_state, set_window_state, wide, window_state};
+use crate::winapi::{
+    create_dib_section, create_font, delete_object, global_free, invalidate_rect, is_window, kill_timer, post_message,
+    select_object, send_message, set_clipboard_data, set_timer, set_window_pos, shell_execute, track_popup_menu,
+};
+use crate::winutil::{StateClaim, release_window_state, set_window_state, wide, window_state};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use log::{debug, error, info, warn};
@@ -5825,9 +5829,8 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         }
         WM_DESTROY => {
             // Disconnect the UIA provider while the window and its state still
-            // exist, so UIA core releases its references instead of calling
-            // into a torn-down window later.
-            let _ = UiaReturnRawElementProvider(hwnd, WPARAM(0), LPARAM(0), None);
+            // exist — the same defensive detach the overlay applies.
+            crate::accessibility::detach_hwnd_provider(hwnd);
             if !state_ptr.is_null() {
                 (*state_ptr).on_destroy();
             }
@@ -5866,10 +5869,9 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
         WM_NCDESTROY => {
-            clear_window_state(hwnd);
-            if !state_ptr.is_null() {
-                drop(Box::from_raw(state_ptr));
-            }
+            // Slot clear first, box second — the canonical order every window
+            // applies via the shared helper.
+            release_window_state(hwnd, state_ptr);
             // Drop the shared snapshot so a provider that outlives the window
             // can no longer read window data; its next request fails to post
             // and degrades to empty answers. Same teardown contract as the
@@ -6584,6 +6586,86 @@ mod tests {
         let (generation, stored) = snapshot_slot().expect("a snapshot is stored");
         assert_eq!(generation, snapshot_generation());
         assert!(stored.children.is_empty());
+    }
+
+    #[test]
+    fn concurrent_teardown_never_strands_a_provider_read() {
+        let _serialize = SNAPSHOT_TEST_LOCK.lock().unwrap();
+        // Teardown (WM_NCDESTROY) clears the shared snapshot via
+        // clear_uia_provider_state while provider threads read it. The
+        // storm races a fresh build against the clear, and an injector
+        // poisons the lock mid-read. Every reader must finish — recovering
+        // the poison through the production read pattern — so a teardown
+        // can never strand a provider read.
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_millis(400);
+
+        // Readers: the provider threads. Half use the post-teardown read
+        // (current_settings_ui_snapshot); half go through the full
+        // settings_ui_snapshot entry, whose post to a gone window fails and
+        // falls back to the same slot read.
+        let mut readers = Vec::new();
+        for use_full_path in [false, true] {
+            for _ in 0..4 {
+                readers.push(std::thread::spawn(move || {
+                    let mut reads = 0usize;
+                    while Instant::now() < deadline {
+                        if use_full_path {
+                            let _ = settings_ui_snapshot(HWND::default());
+                        } else {
+                            let _ = current_settings_ui_snapshot();
+                        }
+                        reads += 1;
+                    }
+                    reads
+                }));
+            }
+        }
+
+        // Builder: stores a fresh build like build_settings_ui_snapshot.
+        let builder = std::thread::spawn(move || {
+            while Instant::now() < deadline {
+                store_settings_ui_snapshot(Arc::new(SettingsUiSnapshot::default()));
+            }
+        });
+
+        // Teardown: clears the slot like WM_NCDESTROY.
+        let teardown = std::thread::spawn(move || {
+            while Instant::now() < deadline {
+                crate::accessibility::clear_uia_provider_state(&SETTINGS_UI_SNAPSHOT);
+            }
+        });
+
+        // Poison injector: panics while holding the lock mid-read, so every
+        // later lock in the storm must go through the recovery path. Bounded
+        // so the panic hook's stderr output stays small.
+        let injector = std::thread::spawn(move || {
+            let mut injections = 0u32;
+            while injections < 8 && Instant::now() < deadline {
+                let _ = std::panic::catch_unwind(|| {
+                    let _guard = SETTINGS_UI_SNAPSHOT.lock().unwrap();
+                    std::thread::sleep(Duration::from_millis(1));
+                    panic!("injected poison while holding the snapshot lock");
+                });
+                injections += 1;
+            }
+            injections
+        });
+
+        // All threads must terminate: a reader stranded on the poisoned lock
+        // would hang these joins forever.
+        for handle in readers {
+            let _ = handle.join().expect("a provider read must never be stranded");
+        }
+        builder.join().expect("the builder must finish");
+        teardown.join().expect("the teardown must finish");
+        injector.join().expect("the injector must finish");
+
+        // Teardown wins in the end: one final clear empties the slot and the
+        // production read degrades to the empty default.
+        crate::accessibility::clear_uia_provider_state(&SETTINGS_UI_SNAPSHOT);
+        assert!(snapshot_slot().is_none());
+        assert!(current_settings_ui_snapshot().children.is_empty());
     }
 
     fn track(title: &str) -> TrackInfo {

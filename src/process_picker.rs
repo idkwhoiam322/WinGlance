@@ -1,5 +1,11 @@
 use crate::overlay::source_matches_pin;
-use crate::winutil::{StateClaim, clear_window_state, set_window_state, wide, window_state};
+use crate::winapi::{
+    create_font, create_window, delete_object, invalidate_rect, post_message, select_object, send_message, set_cursor,
+    set_window_pos,
+};
+use crate::winutil::{
+    Registered, StateClaim, clear_registered, release_window_state, set_window_state, wide, window_state,
+};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -107,7 +113,7 @@ struct PickerState {
     single: bool,
 }
 
-static OPEN_PICKER: OnceLock<Mutex<Option<isize>>> = OnceLock::new();
+static OPEN_PICKER: Registered<Option<isize>> = Registered::new();
 
 /// Set when this window's WM_NCCREATE claims the state box handed over in
 /// `lpCreateParams`, so a failed CreateWindowExW can tell whether the box was
@@ -118,10 +124,6 @@ static PICKER_STATE_CLAIMED: StateClaim = StateClaim::new();
 
 /// Guards class registration: registering twice would leak the class brush.
 static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
-
-fn get_open_picker() -> &'static Mutex<Option<isize>> {
-    OPEN_PICKER.get_or_init(|| Mutex::new(None))
-}
 
 fn close_btn_rect(client: &RECT, scale: f32) -> RECT {
     let size = (CLOSE_BTN_SIZE as f32 * scale).round() as i32;
@@ -640,9 +642,7 @@ pub(crate) fn open(
             }
         };
 
-        if let Ok(mut guard) = get_open_picker().lock() {
-            *guard = Some(hwnd.0 as isize);
-        }
+        OPEN_PICKER.set(Some(hwnd.0 as isize));
 
         let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
         // Fixed GDI objects for the picker's own chrome, created once per open
@@ -1030,8 +1030,17 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             let create = lparam.0 as *const CREATESTRUCTW;
             if !create.is_null() {
                 let state = (*create).lpCreateParams as *mut PickerState;
-                set_window_state(hwnd, state);
-                PICKER_STATE_CLAIMED.claim();
+                // Same guard as the positioner, main window, and duration
+                // dialog: a null param must not flip PICKER_STATE_CLAIMED
+                // while GWLP_USERDATA stays empty — WM_NCDESTROY would free
+                // nothing and take_unclaimed would refuse to return the box,
+                // leaking it with its chrome GDI objects on a failed create.
+                // With the guard, an unclaimed box returns to the caller's
+                // failure branch.
+                if !state.is_null() {
+                    set_window_state(hwnd, state);
+                    PICKER_STATE_CLAIMED.claim();
+                }
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
@@ -1370,9 +1379,9 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_DESTROY => {
-            if let Ok(mut guard) = get_open_picker().lock() {
-                *guard = None;
-            }
+            // Guarded by hwnd via the shared helper: a stale teardown must
+            // never clear a newer picker's registration.
+            clear_registered(&OPEN_PICKER, |guard| *guard == Some(hwnd.0 as isize));
             LRESULT(0)
         }
         WM_NCDESTROY => {
@@ -1383,16 +1392,17 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             let state_ptr = window_state::<PickerState>(hwnd);
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
-                let _ = unsafe { DeleteObject(state.header_font) };
-                let _ = unsafe { DeleteObject(state.list_font) };
-                let _ = unsafe { DeleteObject(state.header_brush) };
-                let _ = unsafe { DeleteObject(state.close_brush) };
-                let _ = unsafe { DeleteObject(state.close_hover_brush) };
-                let _ = unsafe { DeleteObject(state.row_brush) };
-                let _ = unsafe { DeleteObject(state.row_selected_brush) };
-                drop(Box::from_raw(state_ptr));
+                let _ = unsafe { delete_object(state.header_font) };
+                let _ = unsafe { delete_object(state.list_font) };
+                let _ = unsafe { delete_object(state.header_brush) };
+                let _ = unsafe { delete_object(state.close_brush) };
+                let _ = unsafe { delete_object(state.close_hover_brush) };
+                let _ = unsafe { delete_object(state.row_brush) };
+                let _ = unsafe { delete_object(state.row_selected_brush) };
+                // Slot clear first, box second — the canonical order every
+                // window applies via the shared helper.
+                release_window_state(hwnd, state_ptr);
             }
-            clear_window_state(hwnd);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
@@ -1402,6 +1412,47 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nccreate_with_null_create_params_leaves_the_box_unclaimed() {
+        // A valid CREATESTRUCTW whose lpCreateParams is null (WM_NCCREATE
+        // with lparam naming it) must not flip PICKER_STATE_CLAIMED while
+        // the slot stays empty: on a failed create the caller's
+        // take_unclaimed would then refuse to return the box, leaking it
+        // with its chrome GDI objects. The null-guard keeps an unclaimed
+        // box returnable — the same contract the positioner, main window,
+        // and duration dialog apply. (lparam == 0, the null-CREATESTRUCTW
+        // case, is caught by the outer guard and is not what this pins.)
+        PICKER_STATE_CLAIMED.reset();
+        let state_ptr = Box::into_raw(Box::new(PickerState {
+            listbox: HWND::default(),
+            list: Vec::new(),
+            close_hover: false,
+            last_click_item: None,
+            last_click_time: None,
+            scale: 1.0,
+            header_font: HFONT::default(),
+            list_font: HFONT::default(),
+            header_brush: HBRUSH::default(),
+            close_brush: HBRUSH::default(),
+            close_hover_brush: HBRUSH::default(),
+            row_brush: HBRUSH::default(),
+            row_selected_brush: HBRUSH::default(),
+            result: Arc::new(Mutex::new(None)),
+            result_msg: 0,
+            single: false,
+        }));
+        let create = CREATESTRUCTW {
+            lpCreateParams: std::ptr::null_mut(),
+            ..Default::default()
+        };
+        let lparam = LPARAM((&create as *const CREATESTRUCTW) as isize);
+        let _ = unsafe { picker_proc_body(HWND::default(), WM_NCCREATE, WPARAM(0), lparam) };
+        let boxed = PICKER_STATE_CLAIMED
+            .take_unclaimed(state_ptr)
+            .expect("a null lpCreateParams must leave the box unclaimed and returnable to the caller");
+        drop(boxed);
+    }
 
     #[test]
     fn exe_name_for_pid_resolves_the_current_process() {

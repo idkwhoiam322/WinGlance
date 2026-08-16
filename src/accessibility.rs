@@ -22,7 +22,7 @@
 //! instead of reading freed memory.
 
 use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Com::SAFEARRAY;
 use windows::Win32::System::Ole::{SafeArrayCreateVector, SafeArrayDestroy, SafeArrayPutElement};
@@ -36,7 +36,7 @@ use windows::Win32::UI::Accessibility::{
     UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId, UIA_IsEnabledPropertyId,
     UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId, UIA_PATTERN_ID, UIA_PROPERTY_ID, UIA_PaneControlTypeId,
     UIA_TextControlTypeId, UIA_TogglePatternId, UiaAppendRuntimeId, UiaHostProviderFromHwnd,
-    UiaRaiseAutomationPropertyChangedEvent, UiaRect,
+    UiaRaiseAutomationPropertyChangedEvent, UiaRect, UiaReturnRawElementProvider,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::implement;
@@ -546,6 +546,14 @@ pub fn settings_child_provider(
 /// stale window data readable after teardown.
 pub(crate) fn clear_uia_provider_state<T>(slot: &Mutex<Option<T>>) {
     *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// Disconnects a window's UIA provider at WM_DESTROY, while the window and
+/// its state still exist, so UIA core releases its references instead of
+/// calling into a torn-down window later. Both the main window and the
+/// overlay apply the same defensive detach.
+pub(crate) fn detach_hwnd_provider(hwnd: HWND) {
+    let _ = unsafe { UiaReturnRawElementProvider(hwnd, WPARAM(0), LPARAM(0), None) };
 }
 
 #[cfg(test)]

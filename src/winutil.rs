@@ -72,9 +72,40 @@ pub(crate) fn set_window_state<T>(hwnd: HWND, state: *mut T) {
 
 /// Clears a window's GWLP_USERDATA slot after WM_NCDESTROY freed the state
 /// box, so a stale pointer is never read from a reused window handle.
-pub(crate) fn clear_window_state(hwnd: HWND) {
+///
+/// Deliberately **private**: `release_window_state` is the only path that
+/// clears the slot, so a window cannot inline a teardown that drops the box
+/// before clearing it (box-first) without the helper — the exact reorder
+/// the probe test pins, kept a compile error rather than a review nit. Any
+/// raw `SetWindowLongPtrW` write to `GWLP_USERDATA` in a window file is
+/// therefore a review must-fix by construction. (The install side,
+/// `set_window_state`, stays public — windows must store their box at
+/// WM_NCCREATE.)
+fn clear_window_state(hwnd: HWND) {
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    }
+}
+
+/// Releases a window's per-instance state box at WM_NCDESTROY: frees the
+/// box (unless null) and clears the GWLP_USERDATA slot. Canonical order
+/// shared by every window — slot clear first, box second — so a stale
+/// pointer is never left readable in the slot after the box is freed. The
+/// only pub(crate) way to clear the slot, so the order cannot be bypassed
+/// by an inlined teardown. `state_ptr` must be the pointer captured at the
+/// top of the handler (or, for handlers that read the slot per message,
+/// read before this call), and this must run after any teardown that still
+/// reads the state (GDI object deletion, hook/timer teardown). Call exactly
+/// once per window.
+pub(crate) fn release_window_state<T>(hwnd: HWND, state_ptr: *mut T) {
+    clear_window_state(hwnd);
+    if !state_ptr.is_null() {
+        // SAFETY: the caller created the box with `Box::into_raw` at
+        // WM_NCCREATE and has not freed it; this is the window's one
+        // ownership-release point, called at most once.
+        unsafe {
+            drop(Box::from_raw(state_ptr));
+        }
     }
 }
 
@@ -363,15 +394,61 @@ impl StateClaim {
     }
 }
 
-/// Closes a window whose handle is registered in a `OnceLock<Mutex<T>>`
-/// slot, e.g. the positioner or the process picker. `extract` pulls the
-/// window handle out of the slot's value (returning `None` when no window is
+/// A window-registration slot (used by the positioner and the process
+/// picker), the guarded form of `OnceLock<Mutex<T>>`. The inner mutex is
+/// **private** and never exposed — the only write paths are `set` (install,
+/// at open time) and the guarded `clear_registered`/`close_registered` free
+/// functions — so a window cannot inline a clear that skips the match guard,
+/// mirroring how `clear_window_state` makes `release_window_state` the only
+/// way to clear `GWLP_USERDATA`. Any direct lock of the slot in a window
+/// file is therefore a compile error by construction; `read` returns a copy
+/// and never a guard, so a reader cannot hold the mutex across a call or
+/// write through it.
+pub(crate) struct Registered<T> {
+    slot: OnceLock<Mutex<T>>,
+}
+
+impl<T> Registered<T> {
+    pub(crate) const fn new() -> Self {
+        Self { slot: OnceLock::new() }
+    }
+
+    /// Installs (or replaces) the registration at open time — the only
+    /// write path that puts a *non-empty* value in the slot. The slot is
+    /// initialized lazily with the type's empty value (`T::default()`),
+    /// then overwritten. Window creation is single-threaded on the UI
+    /// thread, so the get-or-init is purely defensive.
+    pub(crate) fn set(&self, value: T)
+    where
+        T: Default,
+    {
+        if let Ok(mut guard) = self.slot.get_or_init(|| Mutex::new(T::default())).lock() {
+            *guard = value;
+        }
+    }
+
+    /// Reads the current registration as a copy; `None` when the slot was
+    /// never opened. Never returns the mutex, so the caller cannot hold the
+    /// guard (e.g. across `DestroyWindow`) or write through it.
+    pub(crate) fn read(&self) -> Option<T>
+    where
+        T: Copy,
+    {
+        let m = self.slot.get()?;
+        let guard = m.lock().ok()?;
+        Some(*guard)
+    }
+}
+
+/// Closes a window whose handle is registered in a `Registered<T>` slot,
+/// e.g. the positioner or the process picker. `extract` pulls the window
+/// handle out of the slot's value (returning `None` when no window is
 /// open). The handle is copied out and the guard released before
 /// `DestroyWindow`: the destruction messages (WM_DESTROY/WM_NCDESTROY) lock
 /// the same slot again, and holding the mutex across `DestroyWindow` would
 /// deadlock the UI thread.
-pub(crate) fn close_registered<T>(slot: &OnceLock<Mutex<T>>, extract: impl FnOnce(&T) -> Option<HWND>) {
-    let Some(m) = slot.get() else {
+pub(crate) fn close_registered<T>(slot: &Registered<T>, extract: impl FnOnce(&T) -> Option<HWND>) {
+    let Some(m) = slot.slot.get() else {
         return;
     };
     let hwnd = {
@@ -384,6 +461,32 @@ pub(crate) fn close_registered<T>(slot: &OnceLock<Mutex<T>>, extract: impl FnOnc
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
+    }
+}
+
+/// Clears a registered window's slot at teardown, but only when it still
+/// names the window being torn down — the guarded form the positioner and
+/// picker use, so a stale teardown can never clear a newer window's
+/// registration. `matches` tests the current slot value (the closure
+/// captures the dying window's handle). The cleared value is always the
+/// slot's empty value (`T::default()`), never an arbitrary caller-supplied
+/// state, so `set` is the only path that can leave a non-empty
+/// registration. This is the only way a window can clear a registration:
+/// the slot's mutex is private, so a direct `*guard = empty` in a window
+/// file is a compile error. Window teardown is single-threaded, so the
+/// guard is defensive — but it is the shared contract, and both windows
+/// must use it.
+pub(crate) fn clear_registered<T>(slot: &Registered<T>, matches: impl Fn(&T) -> bool)
+where
+    T: Default,
+{
+    let Some(m) = slot.slot.get() else {
+        return;
+    };
+    if let Ok(mut guard) = m.lock()
+        && matches(&guard)
+    {
+        *guard = T::default();
     }
 }
 
@@ -1114,5 +1217,133 @@ mod tests {
 
         assert!(append_verified(&link.join("crash.log"), b"x").is_err());
         assert!(!real.join("target").join("crash.log").exists());
+    }
+
+    #[test]
+    fn release_window_state_drops_the_box_and_tolerates_null() {
+        // The box must actually be freed (a Drop probe observes it); a null
+        // pointer is a no-op. The slot-clear half writes to a null window,
+        // which SetWindowLongPtrW safely rejects.
+        struct Probe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state_ptr = Box::into_raw(Box::new(Probe(dropped.clone())));
+        release_window_state(HWND::default(), state_ptr);
+        assert!(dropped.load(Ordering::SeqCst), "the state box must be freed");
+        release_window_state(HWND::default(), std::ptr::null_mut::<Probe>()); // must not panic
+    }
+
+    #[test]
+    fn release_window_state_clears_the_slot_before_dropping_the_box() {
+        // The canonical slot-first order, pinned structurally. A black-box
+        // e2e teardown test cannot observe the slot-vs-box sequence: the
+        // window is mid-destroy, so nothing reads the slot between the two
+        // operations (the mutation — box drop before slot clear — passes
+        // every e2e test unchanged). The box's own Drop can: a probe that
+        // reads the slot at drop time discriminates the order, since
+        // slot-first leaves it null and box-first still holds the pointer.
+        struct Probe {
+            hwnd: HWND,
+            slot_was_cleared: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let slot = window_state::<Probe>(self.hwnd);
+                self.slot_was_cleared.store(slot.is_null(), Ordering::SeqCst);
+            }
+        }
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{WINDOW_EX_STYLE, WS_OVERLAPPED};
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.expect("process module").into();
+        // The predefined "STATIC" class needs no registration or wndproc.
+        let hwnd = unsafe {
+            crate::winapi::create_window(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(wide("STATIC").as_ptr()),
+                PCWSTR(wide("teardown-order probe").as_ptr()),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                instance,
+                None,
+            )
+        }
+        .expect("the probe window must be created");
+        let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state_ptr = Box::into_raw(Box::new(Probe {
+            hwnd,
+            slot_was_cleared: cleared.clone(),
+        }));
+        set_window_state(hwnd, state_ptr);
+        release_window_state(hwnd, state_ptr);
+        assert!(
+            cleared.load(Ordering::SeqCst),
+            "the slot must be cleared before the state box is dropped"
+        );
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        };
+    }
+
+    #[test]
+    fn registered_slot_set_read_and_clear_contract() {
+        // The guarded contract: a stale teardown must never clear a newer
+        // window's registration, and a clear always resets to the empty
+        // value — `set` is the only path that can leave a non-empty value.
+        let slot = Registered::new();
+        assert_eq!(slot.read(), None, "a never-opened slot reads None");
+        slot.set(7);
+        assert_eq!(slot.read(), Some(7), "set installs the registration");
+        slot.set(42); // a second open replaces the registration
+        assert_eq!(slot.read(), Some(42));
+        clear_registered(&slot, |v| *v == 8);
+        assert_eq!(slot.read(), Some(42), "non-matching hwnd must not clear");
+        clear_registered(&slot, |v| *v == 42);
+        assert_eq!(slot.read(), Some(0), "matching hwnd clears to the empty value");
+    }
+
+    #[test]
+    fn close_registered_destroys_the_registered_window() {
+        // The extract-then-destroy contract: the handle is copied out and
+        // the guard released before DestroyWindow (holding it would
+        // deadlock the UI thread when the destruction messages relock the
+        // slot). DestroyWindow is synchronous, so IsWindow reports the
+        // handle gone once it returns.
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, WINDOW_EX_STYLE, WS_OVERLAPPED};
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.expect("process module").into();
+        let hwnd = unsafe {
+            crate::winapi::create_window(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(wide("STATIC").as_ptr()),
+                PCWSTR(wide("close-registered probe").as_ptr()),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                instance,
+                None,
+            )
+        }
+        .expect("the probe window must be created");
+        assert!(unsafe { IsWindow(Some(hwnd)).as_bool() }, "the probe window is alive");
+        let slot = Registered::new();
+        slot.set(hwnd.0 as usize);
+        close_registered(&slot, |v| (*v != 0).then_some(HWND(*v as *mut std::ffi::c_void)));
+        assert!(
+            !unsafe { IsWindow(Some(hwnd)).as_bool() },
+            "close must destroy the registered window"
+        );
     }
 }

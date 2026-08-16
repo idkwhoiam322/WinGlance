@@ -1,7 +1,10 @@
 use crate::events::{COMPACT_POSITION_MSG, POSITION_MSG};
-use crate::winutil::{StateClaim, clear_window_state, set_window_state, wide, window_state};
+use crate::winapi::{create_window, delete_object, invalidate_rect, post_message, select_object, set_window_pos};
+use crate::winutil::{
+    Registered, StateClaim, clear_registered, release_window_state, set_window_state, wide, window_state,
+};
 use log::debug;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreatePen, CreateSolidBrush, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint,
@@ -34,7 +37,7 @@ const PEN_W: f32 = 2.0;
 /// Tracks the currently open positioner window and its overlay, so the settings
 /// Reset action can move the adjustor back to the default spot. Stored as raw
 /// handle values: HWND is not Send, so the static holds usize.
-static OPEN_POSITIONER: OnceLock<Mutex<(usize, usize)>> = OnceLock::new(); // (positioner, overlay)
+static OPEN_POSITIONER: Registered<(usize, usize)> = Registered::new(); // (positioner, overlay)
 
 /// Guards class registration: registering twice would leak the class brush.
 static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -123,9 +126,7 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
         );
         match hwnd {
             Ok(hwnd) => {
-                if let Ok(mut guard) = OPEN_POSITIONER.get_or_init(|| Mutex::new((0, 0))).lock() {
-                    *guard = (hwnd.0 as usize, overlay.0 as usize);
-                }
+                OPEN_POSITIONER.set((hwnd.0 as usize, overlay.0 as usize));
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 // Start the sample where the pill currently lives, so the user
                 // drags from the right spot; fall back to the default top-center
@@ -191,13 +192,9 @@ pub(crate) fn close_existing() {
 /// same place the settings Reset applies to the pill). No-op when the positioner
 /// is not open.
 pub(crate) fn reset_position() {
-    let Some(m) = OPEN_POSITIONER.get() else {
+    let Some((hwnd, overlay)) = OPEN_POSITIONER.read() else {
         return;
     };
-    let Ok(guard) = m.lock() else {
-        return;
-    };
-    let (hwnd, overlay) = *guard;
     if hwnd == 0 || overlay == 0 {
         return;
     }
@@ -346,8 +343,16 @@ unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             let create = lparam.0 as *const CREATESTRUCTW;
             if !create.is_null() {
                 let state = (*create).lpCreateParams as *mut PositionerState;
-                set_window_state(hwnd, state);
-                POSITIONER_STATE_CLAIMED.claim();
+                // Same guard as the overlay and main window: a null param must
+                // not flip POSITIONER_STATE_CLAIMED while GWLP_USERDATA stays
+                // empty — WM_NCDESTROY would free nothing and take_unclaimed
+                // would refuse to return the box, leaking it with its GDI
+                // objects on a failed create. With the guard, an unclaimed
+                // box returns to the caller's failure branch.
+                if !state.is_null() {
+                    set_window_state(hwnd, state);
+                    POSITIONER_STATE_CLAIMED.claim();
+                }
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
@@ -510,15 +515,11 @@ unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                     let _ = DeleteObject(HGDIOBJ(state.x_brush.0));
                     let _ = DeleteObject(HGDIOBJ(state.pen.0));
                 }
-                drop(Box::from_raw(state_ptr));
+                // Slot clear first, box second — the canonical order every
+                // window applies via the shared helper.
+                release_window_state(hwnd, state_ptr);
             }
-            if let Some(m) = OPEN_POSITIONER.get()
-                && let Ok(mut guard) = m.lock()
-                && guard.0 == hwnd.0 as usize
-            {
-                *guard = (0, 0);
-            }
-            clear_window_state(hwnd);
+            clear_registered(&OPEN_POSITIONER, |guard| guard.0 == hwnd.0 as usize);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),

@@ -7,7 +7,8 @@
 //! dialog open with a message box; valid input is clamped to the config
 //! range [0.5, 60] seconds before it is converted to milliseconds.
 
-use crate::winutil::{register_class_once, wide};
+use crate::winapi::{create_window, message_box, send_message, set_focus};
+use crate::winutil::{StateClaim, register_class_once, release_window_state, set_window_state, wide, window_state};
 use log::warn;
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -19,13 +20,12 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect,
-    HMENU, IDCANCEL, IDOK, IsDialogMessageW, MB_ICONWARNING, MB_OK, MSG, MessageBoxW, PostQuitMessage, SW_SHOW,
-    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_GETTEXT, WM_NCCREATE,
-    WM_SETFONT, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
-    WS_VISIBLE,
+    AdjustWindowRectEx, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, ES_AUTOHSCROLL, GetClientRect, GetMessageW, GetWindowRect, HMENU, IDCANCEL, IDOK,
+    IsDialogMessageW, MB_ICONWARNING, MB_OK, MSG, PostQuitMessage, SW_SHOW, SetForegroundWindow, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG,
+    WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_GETTEXT, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WS_BORDER, WS_CAPTION,
+    WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
@@ -35,6 +35,13 @@ const MAX_SECONDS: f64 = 60.0;
 
 const CLASS_NAME: &str = "WinGlanceDurationDialog";
 static CLASS_GUARD: OnceLock<()> = OnceLock::new();
+
+/// Set when this window's WM_NCCREATE claims the state box handed over in
+/// `lpCreateParams`, so a failed CreateWindowExW can tell whether the box was
+/// taken by the system (and freed in WM_NCDESTROY) or still belongs to the
+/// caller. Reset before each open. See `winutil::StateClaim` for the shared
+/// mechanics.
+static DIALOG_STATE_CLAIMED: StateClaim = StateClaim::new();
 
 struct DialogData {
     chosen: Option<u64>,
@@ -94,12 +101,20 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
         let x = parent_rect.left + (parent_rect.right - parent_rect.left - outer_w) / 2;
         let y = parent_rect.top + (parent_rect.bottom - parent_rect.top - outer_h) / 2;
 
-        let mut data = DialogData {
+        // The state box is heap-allocated and handed to the window through
+        // `lpCreateParams`: WM_NCCREATE stores it via `set_window_state`
+        // (claiming it), and WM_NCDESTROY frees it through
+        // `release_window_state` — the same shared guard every window uses.
+        // The caller keeps the raw pointer to read `done`/`chosen` while the
+        // window is alive, and reads the result *before* DestroyWindow frees
+        // the box.
+        let state_ptr = Box::into_raw(Box::new(DialogData {
             chosen: None,
             done: false,
             edit: HWND::default(),
-        };
-        let hwnd = match CreateWindowExW(
+        }));
+        DIALOG_STATE_CLAIMED.reset();
+        let hwnd = match create_window(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             PCWSTR(wide(CLASS_NAME).as_ptr()),
             PCWSTR(wide("Custom duration").as_ptr()),
@@ -111,11 +126,18 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
             parent,
             None,
             instance,
-            Some((&mut data as *mut DialogData).cast()),
+            Some(state_ptr.cast()),
         ) {
             Ok(hwnd) => hwnd,
             Err(error) => {
                 warn!("duration dialog: CreateWindowExW failed: {error}");
+                // The state box is owned by the window from WM_NCCREATE
+                // onward and freed in WM_NCDESTROY. WM_NCCREATE flips
+                // DIALOG_STATE_CLAIMED when it takes the box; if it never
+                // ran, the box still belongs to us and must be freed here.
+                if let Some(state) = DIALOG_STATE_CLAIMED.take_unclaimed(state_ptr) {
+                    drop(state);
+                }
                 return None;
             }
         };
@@ -162,7 +184,7 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
             100,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
         );
-        data.edit = edit;
+        (*state_ptr).edit = edit;
         let _ = child(
             "BUTTON",
             "OK",
@@ -215,15 +237,20 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
                 let _ = TranslateMessage(&msg);
                 let _ = DispatchMessageW(&msg);
             }
-            if data.done {
+            if (*state_ptr).done {
                 break;
             }
         }
 
+        // Read the result while the box is still alive; DestroyWindow below
+        // frees it in WM_NCDESTROY. The parent was disabled before the modal
+        // loop (EnableWindow(parent, false) above); re-enable it before
+        // returning or the settings window stays disabled until restart.
+        let chosen = (*state_ptr).chosen;
         let _ = EnableWindow(parent, true);
         let _ = SetForegroundWindow(parent);
         let _ = DestroyWindow(hwnd);
-        data.chosen
+        chosen
     }
 }
 
@@ -241,12 +268,19 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
     if message == WM_NCCREATE {
         let create = lparam.0 as *const CREATESTRUCTW;
         if !create.is_null() {
-            let data = (*create).lpCreateParams as *mut DialogData;
-            let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, data as isize);
+            let state = (*create).lpCreateParams as *mut DialogData;
+            // Null-guard like the other windows: a null param must not flip
+            // DIALOG_STATE_CLAIMED while the slot stays empty — WM_NCDESTROY
+            // would free nothing and take_unclaimed would refuse to return
+            // the box, leaking it on a failed create.
+            if !state.is_null() {
+                set_window_state(hwnd, state);
+                DIALOG_STATE_CLAIMED.claim();
+            }
         }
         return LRESULT(1);
     }
-    let data_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DialogData;
+    let data_ptr = window_state::<DialogData>(hwnd);
     match message {
         WM_COMMAND => {
             if data_ptr.is_null() {
@@ -289,6 +323,16 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             LRESULT(0)
         }
+        WM_NCDESTROY => {
+            // Free the heap-allocated DialogData stashed at WM_NCCREATE via
+            // the shared helper — slot clear first, box second, the canonical
+            // order every window applies. DialogData owns no GDI objects, so
+            // nothing else tears down here. Every close path (OK/Cancel/
+            // close button) goes through DestroyWindow; without this the box
+            // leaked on each open.
+            release_window_state(hwnd, data_ptr);
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
         WM_ERASEBKGND => {
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
@@ -307,7 +351,201 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
 
 #[cfg(test)]
 mod tests {
-    use super::parse_duration_seconds;
+    use super::{
+        CLASS_GUARD, CLASS_NAME, DIALOG_STATE_CLAIMED, DialogData, dialog_proc, parse_duration_seconds,
+        show_duration_dialog,
+    };
+    use crate::winapi::{create_window, post_message, send_message};
+    use crate::winutil::{register_class_once, wide, window_state};
+    use std::ffi::c_void;
+    use std::sync::{Mutex, OnceLock, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, DestroyWindow, FindWindowW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_NCDESTROY, WS_CAPTION,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU,
+    };
+    use windows::core::PCWSTR;
+
+    /// Trivial default proc for the test parent window: the dialog's
+    /// `EnableWindow(parent, false)` and `SetForegroundWindow(parent)` only
+    /// need the parent to exist; `DefWindowProcW` is a Rust fn (not
+    /// `extern "system"`), so it cannot be the class proc directly.
+    unsafe extern "system" fn parent_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    // The two dialog tests below both create real windows of the dialog class
+    // and both touch DIALOG_STATE_CLAIMED, so they must not interleave — a
+    // concurrent FindWindowW (in the re-enable test) could otherwise latch
+    // onto the other test's same-class window. Serialize like the overlay
+    // wndproc harness does.
+    static DIALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn dialog_state_box_installs_through_nccreate_and_frees_through_ncdestroy() {
+        let _serialize = DIALOG_TEST_LOCK.lock().unwrap();
+        // The DialogData lifecycle runs through the shared state-slot guard:
+        // WM_NCCREATE installs the heap box via set_window_state, WM_NCDESTROY
+        // frees it and clears the slot via release_window_state. Driving the
+        // real class and wndproc end to end pins that wiring — the slot holds
+        // the box after create and is empty after destroy, so the dialog can
+        // never drift back to a hand-rolled SetWindowLongPtrW/GetWindowLongPtrW
+        // pair. (The box being *freed* — not just the slot cleared — is pinned
+        // by the winutil probe test; this e2e path cannot observe the free.)
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.expect("process module").into();
+        register_class_once(
+            &CLASS_GUARD,
+            instance,
+            &wide(CLASS_NAME),
+            Some(dialog_proc),
+            || None,
+            "the duration dialog",
+        )
+        .expect("the dialog class registers");
+        DIALOG_STATE_CLAIMED.reset();
+        let state_ptr = Box::into_raw(Box::new(DialogData {
+            chosen: None,
+            done: false,
+            edit: HWND::default(),
+        }));
+        let hwnd = unsafe {
+            create_window(
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                PCWSTR(wide(CLASS_NAME).as_ptr()),
+                PCWSTR(wide("test").as_ptr()),
+                WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                instance,
+                Some(state_ptr.cast()),
+            )
+        }
+        .expect("the test dialog window must be created");
+        assert_eq!(
+            window_state::<DialogData>(hwnd),
+            state_ptr,
+            "WM_NCCREATE must install the box through the shared guard"
+        );
+        // Teardown is observed while the window is still alive: a plain
+        // DestroyWindow-then-read cannot discriminate (GetWindowLongPtrW on
+        // a destroyed handle reads 0 regardless of whether WM_NCDESTROY
+        // cleared the slot), so WM_NCDESTROY is driven directly through the
+        // real wndproc. The box is freed here — the second release during
+        // the real DestroyWindow below is a no-op on the cleared slot.
+        unsafe {
+            let _ = send_message(hwnd, WM_NCDESTROY, WPARAM(0), LPARAM(0));
+        }
+        assert!(
+            window_state::<DialogData>(hwnd).is_null(),
+            "WM_NCDESTROY must clear the slot through the shared guard"
+        );
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn closing_the_dialog_re_enables_the_parent_window() {
+        // Regression pin for the EnableWindow(parent, true) restore on the
+        // dialog's exit path. The dialog runs a real modal loop, so it must
+        // live on its own thread: the test finds the dialog window by class
+        // name (the serialization lock guarantees no other same-class window
+        // exists), closes it via WM_CLOSE through the real wndproc, and
+        // asserts the parent — disabled when the dialog opened — is enabled
+        // again. Without the restore line the settings window would stay
+        // permanently disabled after the dialog closes.
+        let _serialize = DIALOG_TEST_LOCK.lock().unwrap();
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.expect("process module").into();
+        register_class_once(
+            &CLASS_GUARD,
+            instance,
+            &wide(CLASS_NAME),
+            Some(dialog_proc),
+            || None,
+            "the duration dialog",
+        )
+        .expect("the dialog class registers");
+        static PARENT_GUARD: OnceLock<()> = OnceLock::new();
+        const PARENT_CLASS: &str = "WinGlanceDialogTestParent";
+        register_class_once(
+            &PARENT_GUARD,
+            instance,
+            &wide(PARENT_CLASS),
+            Some(parent_proc),
+            || None,
+            "the dialog-test parent",
+        )
+        .expect("the parent class registers");
+        // The parent window must be created on the SAME thread that runs the
+        // dialog: the dialog's `EnableWindow(parent, false)` sends a
+        // WM_CANCELMODE synchronously to the owner of `parent`, and a
+        // cross-thread SendMessage blocks until that thread pumps — the test
+        // thread never pumps, so the worker would stall before the modal loop.
+        let (parent_tx, parent_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let instance_raw = instance.0 as usize;
+        let worker = thread::spawn(move || unsafe {
+            let instance = HINSTANCE(instance_raw as *mut c_void);
+            let parent = create_window(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(wide(PARENT_CLASS).as_ptr()),
+                PCWSTR(wide("dialog-test parent").as_ptr()),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                200,
+                120,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .expect("the parent window must be created");
+            let _ = parent_tx.send(parent.0 as usize);
+            let chosen = show_duration_dialog(parent, 3000);
+            // The parent is enabled/disabled on this thread, so observe its
+            // state here while the handle is still valid.
+            let parent_enabled = IsWindowEnabled(parent).as_bool();
+            let _ = result_tx.send((chosen, parent_enabled));
+            let _ = DestroyWindow(parent);
+        });
+        // Wait for the parent window to exist, then for the dialog window to
+        // appear, then close it. Both are top-level (WS_POPUP), so
+        // FindWindowW by class reaches them.
+        let _parent = parent_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the parent window must be created on the dialog thread");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut dialog = HWND::default();
+        while Instant::now() < deadline {
+            if let Ok(found) = unsafe { FindWindowW(PCWSTR(wide(CLASS_NAME).as_ptr()), PCWSTR::null()) }
+                && !found.0.is_null()
+            {
+                dialog = found;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!dialog.0.is_null(), "the dialog window must appear");
+        let _ = unsafe { post_message(dialog, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        let (chosen, parent_enabled) = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the dialog thread must return after WM_CLOSE");
+        let _ = worker.join();
+        assert!(chosen.is_none(), "WM_CLOSE cancels the dialog");
+        assert!(
+            parent_enabled,
+            "the parent window must be re-enabled after the dialog closes"
+        );
+    }
 
     #[test]
     fn parses_valid_durations_into_milliseconds() {

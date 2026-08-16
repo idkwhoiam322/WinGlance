@@ -937,12 +937,27 @@ fn main() -> Result<()> {
         overlay_wake.clone(),
         now_showing.clone(),
     )?;
-    let main_hwnd = main_window::create_window(
+    let main_hwnd = match main_window::create_window(
         shared_config.clone(),
         main_queue.clone(),
         overlay_hwnd,
         main_wake.clone(),
-    )?;
+    ) {
+        Ok(hwnd) => hwnd,
+        Err(error) => {
+            // The overlay was already created and armed (foreground hook,
+            // animation timer, name cell, state box). Teardown must not
+            // depend on process exit: destroy it now so its WM_NCDESTROY
+            // runs the full teardown — hook unhook, timer delete, name-cell
+            // null, box free — before the error propagates. No forwarder
+            // exists yet, so nothing can post to the overlay after this
+            // point.
+            unsafe {
+                let _ = DestroyWindow(overlay_hwnd);
+            }
+            return Err(error);
+        }
+    };
 
     let forwarder_handle = spawn_event_forwarder(
         main_hwnd,
