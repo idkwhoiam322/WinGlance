@@ -26,14 +26,17 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, HBITMAP, HDC, HFONT, HGDIOBJ, SelectObject, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
-use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+use windows::Win32::UI::Accessibility::{
+    HWINEVENTHOOK, SetWinEventHook, UiaReturnRawElementProvider, UiaRootObjectId, UnhookWinEvent,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, EVENT_SYSTEM_FOREGROUND, GetCursorPos, GetForegroundWindow,
     GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST, IsWindowVisible, KillTimer, MA_NOACTIVATE, MSG, PM_REMOVE,
     PeekMessageW, PostMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetTimer, SetWindowPos, ShowWindow, WINEVENT_OUTOFCONTEXT, WM_APP,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT,
-    WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_GETOBJECT, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY,
+    WM_NCHITTEST, WM_PAINT, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -529,6 +532,14 @@ struct OverlayState {
     /// last saw, so suppressing a re-report of it stays correct. Attached
     /// by `create_window`; `None` in tests.
     now_showing: Option<Arc<Mutex<Option<String>>>>,
+    /// Current track as the pill's accessible name, kept in a shared cell so
+    /// the read-only UIA name provider (which UIA core may call from any
+    /// thread, and which can outlive the window) never dereferences window
+    /// state: the UI thread writes the pill text here on every content
+    /// change (`resolve_pill_text`) and clears it on hide; the provider only
+    /// ever reads this cell. `None` in tests (no provider is ever built for
+    /// a test state).
+    pill_name: Option<Arc<Mutex<Option<String>>>>,
     /// When true (PersistentCompact + hide_for_auto_compact_sources, foreground
     /// is fullscreen/listed), the pill collapses to fully hidden on its normal
     /// dismiss instead of fading to idle opacity. Set in `show_with_duration`
@@ -946,6 +957,7 @@ impl OverlayState {
             last_anchor_edge: None,
             held_content: None,
             now_showing: None,
+            pill_name: None,
             last_cursor_over_pill: false,
             current_source: None,
             track_cache: HashMap::new(),
@@ -2052,6 +2064,11 @@ impl OverlayState {
     /// animation frames draw from `pill_text` without a per-frame TrackInfo
     /// clone or meta-line rebuild. `None` for a state pill whose source has
     /// no cached track: the caller falls back to the source-name layout.
+    /// The resolved text is also mirrored into the shared accessible-name
+    /// cell, so the read-only UIA name provider (callable from any thread)
+    /// always reflects what the pill is showing; a genuine track change
+    /// additionally raises the UIA name property-changed event so a screen
+    /// reader tracking the pill announces the new track.
     fn resolve_pill_text(&mut self) {
         self.pill_text = match &self.content {
             Some(MediaEvent::TrackChanged(track)) => Some(pill_text_from_track(track)),
@@ -2060,6 +2077,80 @@ impl OverlayState {
             }
             _ => None,
         };
+        // The accessible name is the pill's own text: title — artist
+        // (source), with empty parts dropped, so a screen reader announces
+        // exactly what the pill shows. A state pill with no cached track
+        // (the pill then renders the source-name layout) falls back to
+        // naming the source app.
+        let name = self.pill_text.as_ref().map(|text| {
+            let mut parts = Vec::new();
+            if !text.title.trim().is_empty() {
+                parts.push(text.title.trim().to_string());
+            }
+            if !text.artist.trim().is_empty() {
+                parts.push(text.artist.trim().to_string());
+            }
+            let joined = parts.join(" — ");
+            if joined.is_empty() {
+                text.source_app.clone()
+            } else if !text.source_app.trim().is_empty() {
+                format!("{joined} ({})", text.source_app.trim())
+            } else {
+                joined
+            }
+        });
+        // The state-pill source-name fallback: no cached track, so the pill
+        // text is None but the pill still names its source app on screen.
+        let name = name.or_else(|| match &self.content {
+            Some(MediaEvent::PlaybackStateChanged(_, source)) if !source.trim().is_empty() => {
+                Some(source.trim().to_string())
+            }
+            _ => None,
+        });
+        if let Some(cell) = &self.pill_name {
+            // Mirror the resolved name into the shared cell, then raise the
+            // UIA name property-changed event on a genuine track change, so a
+            // screen reader tracking the pill announces the new track. The
+            // cell always reflects the current name (re-queries stay correct);
+            // only the announcement is gated — a play/pause transition that
+            // alters the name must stay silent. The raise is best-effort and
+            // passive — announcement only, never focus or activation (see
+            // accessibility::raise_pill_name_changed).
+            let mut guard = cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let old = guard.take();
+            let changed = old != name;
+            *guard = name.clone();
+            drop(guard);
+            if changed && Self::announces_pill_name_change(&self.content) {
+                crate::accessibility::raise_pill_name_changed(self.hwnd, cell, old, name);
+            }
+        }
+    }
+
+    /// Whether a name change on the current content should be announced. Only
+    /// a genuine track change announces: a play/pause transition can alter the
+    /// resolved name too (the state-pill source-name fallback when the source
+    /// has no cached track) but must stay silent — announcements are for new
+    /// tracks, not state flips.
+    fn announces_pill_name_change(content: &Option<MediaEvent>) -> bool {
+        matches!(content, Some(MediaEvent::TrackChanged(_)))
+    }
+
+    /// Drops the overlay's reference to the shared accessible-name cell and
+    /// clears the cell's contents through the shared UIA teardown contract
+    /// (`accessibility::clear_uia_provider_state`, the same helper the main
+    /// window's settings-snapshot drop uses), so a UIA name provider that
+    /// outlives the window (UIA core holds a reference across the last
+    /// release) reads an empty name instead of the last track. Called from
+    /// WM_NCDESTROY — the overlay analog of the main window's snapshot drop.
+    /// The contents are cleared, not just the Arc dropped: the provider
+    /// holds its own clone, so dropping ours alone would leave it reading
+    /// the last track name. Clearing via the shared helper also recovers a
+    /// poisoned lock, which the previous `if let Ok` skip did not.
+    fn null_pill_name_cell(&mut self) {
+        if let Some(cell) = self.pill_name.take() {
+            crate::accessibility::clear_uia_provider_state(&cell);
+        }
     }
 
     fn show(&mut self, event: MediaEvent, full_animation: bool) {
@@ -3198,6 +3289,15 @@ impl OverlayState {
         self.content_palette = None;
         self.marquee_strips = [None, None, None, None];
         self.pill_text = None;
+        // Nothing is on screen anymore, so the accessible name must go quiet
+        // too: a screen reader that re-queries the hidden pill (which still
+        // exists as an HWND) must not announce a track that is no longer
+        // displayed.
+        if let Some(cell) = &self.pill_name
+            && let Ok(mut guard) = cell.lock()
+        {
+            *guard = None;
+        }
         // Clear the last-shown source label so a subsequent PlaybackStateChanged
         // from the same source is no longer treated as redundant with a track
         // pill that has already collapsed. The label is re-set in show_next()
@@ -3492,6 +3592,10 @@ pub(crate) fn create_window(
     let mut state = Box::new(OverlayState::new(config, queue));
     state.wake = wake;
     state.now_showing = Some(now_showing);
+    // The accessible-name cell is attached here so `resolve_pill_text` (the
+    // single content-change choke point) can always write it; the UIA
+    // provider built in `WM_GETOBJECT` reads the same cell.
+    state.pill_name = Some(Arc::new(Mutex::new(None)));
     let state_ptr = Box::into_raw(state);
     OVERLAY_STATE_CLAIMED.reset();
     let hwnd = unsafe {
@@ -3631,6 +3735,24 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
     match message {
         WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_GETOBJECT => {
+            // UI Automation asks for a provider with lParam == UiaRootObjectId;
+            // MSAA OBJID_* queries keep the DefWindowProcW answer. The pill
+            // gets a read-only name provider only (see accessibility.rs): it
+            // exposes the current track as the accessible name and nothing
+            // else — no patterns, no focus, no clicks, preserving the pill's
+            // passive architecture. The provider reads a shared name cell the
+            // UI thread updates on content changes, so no window state is
+            // dereferenced off the UI thread.
+            if lparam.0 == UiaRootObjectId as isize
+                && !state_ptr.is_null()
+                && let Some(cell) = &(*state_ptr).pill_name
+            {
+                let provider = crate::accessibility::pill_name_provider(hwnd, std::sync::Arc::clone(cell));
+                return UiaReturnRawElementProvider(hwnd, wparam, lparam, &provider);
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
         WM_PAINT => {
             let _ = ValidateRect(hwnd, None);
             LRESULT(0)
@@ -4022,6 +4144,54 @@ mod tests {
     }
 
     #[test]
+    fn accessible_name_cell_tracks_the_resolved_pill_text_and_clears_on_hide() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        let cell = Arc::new(Mutex::new(None));
+        state.pill_name = Some(cell.clone());
+
+        // A track pill names the title — artist (source).
+        state.content = Some(MediaEvent::TrackChanged(track_for(
+            "spotify",
+            "Love Me Not",
+            "Ravyn Lenae",
+        )));
+        state.resolve_pill_text();
+        assert_eq!(
+            *cell.lock().unwrap(),
+            Some("Love Me Not — Ravyn Lenae (spotify)".to_string())
+        );
+
+        // A state pill names the cached track of its source; without a cached
+        // track it falls back to the source app alone.
+        state.cache_track(&track_for("youtube-music", "Nights", "Frank Ocean"));
+        state.content = Some(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "youtube-music".into(),
+        ));
+        state.resolve_pill_text();
+        assert_eq!(
+            *cell.lock().unwrap(),
+            Some("Nights — Frank Ocean (youtube-music)".to_string())
+        );
+
+        state.content = Some(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            "unknown-source".into(),
+        ));
+        state.resolve_pill_text();
+        assert_eq!(
+            *cell.lock().unwrap(),
+            Some("unknown-source".to_string()),
+            "a state pill with no cached track names the source app"
+        );
+
+        // Hiding the pill goes quiet: the name must not linger for a hidden
+        // window.
+        state.hide();
+        assert_eq!(*cell.lock().unwrap(), None);
+    }
+
+    #[test]
     fn accessible_name_cell_builds_every_part_combination() {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         let cell = Arc::new(Mutex::new(None));
@@ -4043,6 +4213,19 @@ mod tests {
         state.resolve_pill_text();
         assert_eq!(*cell.lock().unwrap(), Some("Love Me Not — Ravyn Lenae".to_string()));
     }
+
+    #[test]
+    fn only_genuine_track_changes_announce_the_pill_name() {
+        let track = MediaEvent::TrackChanged(track_for("spotify", "Love Me Not", "Ravyn Lenae"));
+        let paused = MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "spotify".into());
+        assert!(OverlayState::announces_pill_name_change(&Some(track)));
+        assert!(
+            !OverlayState::announces_pill_name_change(&Some(paused)),
+            "a play/pause transition never announces, even when it changes the name"
+        );
+        assert!(!OverlayState::announces_pill_name_change(&None));
+    }
+
     #[test]
     fn retire_source_purges_the_retired_source_from_the_track_cache() {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());

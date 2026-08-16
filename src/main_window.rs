@@ -40,7 +40,7 @@ use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::System::Threading::{CreateEventW, GetCurrentThreadId, SetEvent, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::{
     ToggleState_Off, ToggleState_On, UIA_AutomationFocusChangedEventId, UIA_ButtonControlTypeId,
-    UIA_CheckBoxControlTypeId, UIA_ToggleToggleStatePropertyId, UiaRaiseAutomationEvent,
+    UIA_CheckBoxControlTypeId, UIA_NamePropertyId, UIA_ToggleToggleStatePropertyId, UiaRaiseAutomationEvent,
     UiaRaiseAutomationPropertyChangedEvent, UiaReturnRawElementProvider, UiaRootObjectId,
 };
 use windows::Win32::UI::Controls::{
@@ -72,7 +72,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN,
     WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{BSTR, PCWSTR, PWSTR};
 
 const WM_TRAY: u32 = WM_APP + 2;
 
@@ -4847,6 +4847,11 @@ fn apply_settings_row_click(
 ) {
     let control_rect = row_split(rect, scale).control;
     let toggle_before = setting_toggle_on(*id, &state.cfg());
+    // Capture the row's UIA name before the click mutates the config, so a
+    // value change (toggle, segment, anchor, custom duration) can be
+    // announced after; a click that leaves the value unchanged
+    // (picker-opener, copy/open) no-ops.
+    let before_name = setting_row_name(*id, &state.cfg());
     match id {
         SettingId::Notifications => {
             let new_value = !state.cfg().behavior.notifications_enabled;
@@ -5115,6 +5120,9 @@ fn apply_settings_row_click(
     if setting_is_toggle(*id) {
         raise_settings_toggle_event(hwnd, row_index, toggle_before, setting_toggle_on(*id, &state.cfg()));
     }
+    // Announce the row's new name when the click changed its value — the
+    // settings analogue of the pill's name-changed raise; a no-op otherwise.
+    raise_settings_name_changed(hwnd, row_index, &before_name, &setting_row_name(*id, &state.cfg()));
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -5729,8 +5737,10 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .take();
                 if let Some(patterns) = patterns {
-                    state.mutate_config(|cfg| cfg.behavior.media_sources = patterns);
-                    state.invalidate();
+                    apply_and_announce_settings_row(state, hwnd, SettingId::AllowedApps, |state| {
+                        state.mutate_config(|cfg| cfg.behavior.media_sources = patterns);
+                        state.invalidate();
+                    });
                 }
             }
             LRESULT(0)
@@ -5747,8 +5757,10 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .take();
                 if let Some(patterns) = patterns {
-                    state.mutate_config(|cfg| cfg.behavior.auto_compact_sources = patterns);
-                    state.invalidate();
+                    apply_and_announce_settings_row(state, hwnd, SettingId::AutoCompactApps, |state| {
+                        state.mutate_config(|cfg| cfg.behavior.auto_compact_sources = patterns);
+                        state.invalidate();
+                    });
                 }
             }
             LRESULT(0)
@@ -5769,9 +5781,11 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     .take();
                 if let Some(patterns) = patterns {
                     let pin = patterns.into_iter().next();
-                    state.mutate_config(|cfg| cfg.behavior.pinned_source = pin);
-                    set_pinned_source(state.overlay_hwnd, state.cfg().behavior.pinned_source.clone());
-                    state.invalidate();
+                    apply_and_announce_settings_row(state, hwnd, SettingId::PinnedSource, |state| {
+                        state.mutate_config(|cfg| cfg.behavior.pinned_source = pin);
+                        set_pinned_source(state.overlay_hwnd, state.cfg().behavior.pinned_source.clone());
+                        state.invalidate();
+                    });
                 }
             }
             LRESULT(0)
@@ -5915,6 +5929,19 @@ fn setting_is_toggle(id: SettingId) -> bool {
             | SettingId::HideForAutoCompactSources
             | SettingId::FadePersistentPill
     )
+}
+
+/// The UIA name a settings row answers with — the label alone when the
+/// value is empty, else "Label: value". Single source for both the
+/// provider (`settings_children_from`) and the name-changed announcements,
+/// so the announced name can never drift from what a client would read.
+fn setting_row_name(id: SettingId, cfg: &Config) -> String {
+    let value = setting_value(id, cfg);
+    if value.is_empty() {
+        setting_label(id).to_string()
+    } else {
+        format!("{}: {}", setting_label(id), value)
+    }
 }
 
 /// The current displayed value text for a row (used to build the UIA name).
@@ -6240,12 +6267,7 @@ fn settings_children_from(state: &MainWindowState, hwnd: HWND) -> Vec<crate::acc
         .map(|t| {
             let (name, control_type, toggle) = match row_ids.get(t.row_index).copied() {
                 Some(id) => {
-                    let value = setting_value(id, &cfg);
-                    let name = if value.is_empty() {
-                        setting_label(id).to_string()
-                    } else {
-                        format!("{}: {}", setting_label(id), value)
-                    };
+                    let name = setting_row_name(id, &cfg);
                     let control_type = if setting_is_toggle(id) {
                         UIA_CheckBoxControlTypeId
                     } else {
@@ -6277,6 +6299,31 @@ fn settings_children_from(state: &MainWindowState, hwnd: HWND) -> Vec<crate::acc
             }
         })
         .collect()
+}
+
+/// The row index (rows only, matching the UIA child enumeration and the
+/// click handler's count) of the settings row for `id` in the current
+/// layout, or None when the row is not laid out. Used to raise name-changed
+/// events from the async picker-result paths, where the click-time row is
+/// no longer in scope.
+fn settings_row_index(state: &MainWindowState, hwnd: HWND, id: SettingId) -> Option<usize> {
+    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+    let (client_w, _) = client_size(hwnd);
+    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+    let pad = (PAD * scale) as i32;
+    let mut row_index = 0usize;
+    for item in &state
+        .settings_items(sidebar_w, client_w, pad, scale, state.settings_scroll_y)
+        .items
+    {
+        if let SettingsItem::Row { id: item_id, .. } = item {
+            if *item_id == id {
+                return Some(row_index);
+            }
+            row_index += 1;
+        }
+    }
+    None
 }
 
 /// Raises the UIA focus-changed event for the Settings control the keyboard
@@ -6311,6 +6358,46 @@ fn raise_settings_toggle_event(hwnd: HWND, row_index: usize, before: bool, after
         unsafe { UiaRaiseAutomationPropertyChangedEvent(&provider, UIA_ToggleToggleStatePropertyId, &old, &new) }
     {
         debug!("raising the settings toggle UIA event failed: {error}");
+    }
+}
+
+/// Raises the UIA name property-changed event for a Settings control whose
+/// displayed name just changed — the settings-pane analogue of the pill's
+/// name-changed raise. The accessible name embeds the current value
+/// ("Label: value"), so a value change is a name change; announcing it keeps
+/// a screen reader tracking the focused control in sync with what the pane
+/// shows after the rebuild. Same fresh-provider-per-event pattern as the
+/// toggle event; failures log at debug level.
+fn raise_settings_name_changed(hwnd: HWND, row_index: usize, before: &str, after: &str) {
+    if hwnd.0.is_null() || before == after {
+        return;
+    }
+    let Some(provider) = crate::accessibility::settings_child_provider(hwnd, row_index, SettingSub::None) else {
+        return;
+    };
+    let old = windows::Win32::System::Variant::VARIANT::from(BSTR::from(before));
+    let new = windows::Win32::System::Variant::VARIANT::from(BSTR::from(after));
+    if let Err(error) = unsafe { UiaRaiseAutomationPropertyChangedEvent(&provider, UIA_NamePropertyId, &old, &new) } {
+        debug!("raising the settings name-changed UIA event failed: {error}");
+    }
+}
+
+/// Applies a picker result to a settings row and announces the row's new
+/// name when the displayed value actually changed. Captures the row's name
+/// (and index) before `apply` runs, applies it, then raises name-changed —
+/// a no-op when the row is not laid out or the confirmed result left the
+/// value unchanged.
+fn apply_and_announce_settings_row(
+    state: &mut MainWindowState,
+    hwnd: HWND,
+    id: SettingId,
+    apply: impl FnOnce(&mut MainWindowState),
+) {
+    let row = settings_row_index(state, hwnd, id);
+    let before = row.map(|_| setting_row_name(id, &state.cfg()));
+    apply(state);
+    if let (Some(row), Some(before)) = (row, before) {
+        raise_settings_name_changed(hwnd, row, &before, &setting_row_name(id, &state.cfg()));
     }
 }
 
@@ -6366,6 +6453,73 @@ fn focus_setting_at_body(hwnd: HWND, row_index: usize, sub: SettingSub) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setting_row_name_pins_the_provider_name_format() {
+        // The name-changed raise and the provider both build names through
+        // setting_row_name; these golden strings pin the "Label: value"
+        // format and the value spellings, so any drift — a format change, a
+        // re-spelled value, a reordered label — fails here and becomes a
+        // conscious, reviewed edit.
+        let mut cfg = Config::default();
+
+        // Toggles: label + On/Off.
+        cfg.behavior.notifications_enabled = true;
+        assert_eq!(setting_row_name(SettingId::Notifications, &cfg), "Notifications: On");
+        cfg.behavior.notifications_enabled = false;
+        assert_eq!(setting_row_name(SettingId::Notifications, &cfg), "Notifications: Off");
+        cfg.overlay.dismiss_on_hover = true;
+        assert_eq!(
+            setting_row_name(SettingId::DismissOnHover, &cfg),
+            "Dismiss on hover: On"
+        );
+
+        // Formatted values.
+        cfg.overlay.duration_ms = 5000;
+        assert_eq!(setting_row_name(SettingId::Duration, &cfg), "Duration: 5s");
+        cfg.overlay.layout = LayoutMode::PersistentCompact;
+        assert_eq!(setting_row_name(SettingId::Layout, &cfg), "Layout: PersistentCompact");
+        cfg.overlay.monitor = MonitorMode::ActiveWindow;
+        assert_eq!(
+            setting_row_name(SettingId::Monitor, &cfg),
+            "Monitor: ActiveWindow",
+            "the UIA name uses the Debug spelling the provider answers with"
+        );
+
+        // Position: the anchor label when uncustomized, custom coords when set.
+        cfg.overlay.position_x = None;
+        cfg.overlay.position_y = None;
+        assert_eq!(
+            setting_row_name(SettingId::Position, &cfg),
+            "Expanded Position: top-center"
+        );
+        cfg.overlay.position_x = Some(120);
+        cfg.overlay.position_y = Some(80);
+        assert_eq!(
+            setting_row_name(SettingId::Position, &cfg),
+            "Expanded Position: Custom (120, 80)"
+        );
+
+        // List rows: the empty-list spellings and a populated list.
+        cfg.behavior.media_sources = vec![];
+        assert_eq!(setting_row_name(SettingId::AllowedApps, &cfg), "Allowed apps: All apps");
+        cfg.behavior.media_sources = vec!["spotify".to_string()];
+        assert_eq!(setting_row_name(SettingId::AllowedApps, &cfg), "Allowed apps: spotify");
+        cfg.behavior.auto_compact_sources = vec![];
+        assert_eq!(
+            setting_row_name(SettingId::AutoCompactApps, &cfg),
+            "Auto-compact apps: None"
+        );
+
+        // Pin: None spelled out, or the pin name.
+        cfg.behavior.pinned_source = None;
+        assert_eq!(setting_row_name(SettingId::PinnedSource, &cfg), "Pinned source: None");
+        cfg.behavior.pinned_source = Some("spotify".to_string());
+        assert_eq!(
+            setting_row_name(SettingId::PinnedSource, &cfg),
+            "Pinned source: spotify"
+        );
+    }
 
     #[test]
     fn setting_sub_tag_round_trips_through_from_tag() {

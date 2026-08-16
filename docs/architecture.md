@@ -519,6 +519,62 @@ to the main window via `PICKER_RESULT_MSG`, which applies them to
 `behavior.media_sources` — so allow-list changes apply to the live worker
 without a restart.
 
+## UI Automation event surface
+
+Both windows expose UI Automation (UIA) providers; a screen reader only
+hears changes if the window raises events for them, so the event surface is
+a deliberate contract — and every raise is best-effort: no UIA client
+listening is normal, and failures log at debug level. The whole surface is
+passive: announcements only, never focus, activation, or click targets.
+
+**Pill** (`src/overlay`, `accessibility::pill_name_provider`) — a read-only
+name provider answering the current track as the accessible name and
+nothing else (no patterns, never keyboard-focusable, click-through). On a
+genuine track change, `OverlayState::resolve_pill_text` raises
+`UIA_NamePropertyChangedEvent` (`accessibility::raise_pill_name_changed`)
+with the old and new names, so a client tracking the pill announces the new
+track. The raise is best-effort like every event in the surface (a fresh
+provider per event, no-op without a listening client) and fires only when
+the resolved name *actually differs* from what the cell held — a same-track
+artwork refresh re-shows without re-announcing. It is also gated
+(`announces_pill_name_change`) to `TrackChanged` content: a play/pause
+transition that alters the resolved name (the source-name fallback when the
+track cache misses) stays silent — while the name *cell* still mirrors
+every content change, so a re-query is always correct. Raising the event is
+itself passive: announcement only, never focus, activation, or a click
+target.
+
+**Settings pane** (`src/main_window`, `SettingsProvider`) — a fragment
+provider built on demand from the UI thread's layout; provider threads read
+immutable `SettingsUiSnapshot`s requested by message and answered under a
+bounded wait (`SETTINGS_SNAPSHOT_WAIT_MS`), so the window-state box is never
+dereferenced off the UI thread. The events raised, each with a fresh
+provider instance (identity is the row's stable runtime id, not the
+instance):
+
+- **focus-changed** (`raise_settings_focus_event`) —
+  `UIA_AutomationFocusChangedEventId` when hover/keyboard focus moves to a
+  control;
+- **toggle state-changed** (`raise_settings_toggle_event`) —
+  `UIA_ToggleToggleStatePropertyId` when a row's ON/OFF value flips;
+- **name-changed** (`raise_settings_name_changed`) — `UIA_NamePropertyId`
+  when a row's displayed value changes. Announced from one central site in
+  the click handler, which captures the row's name before the mutation and
+  raises after (so toggles, layout/monitor/duration segments, position
+  anchors and reset all announce; picker-openers and copy/open no-op), and
+  from the three async picker-result handlers (`PICKER_RESULT_MSG`,
+  `AUTO_SOURCES_RESULT_MSG`, `PINNED_SOURCE_RESULT_MSG`) via
+  `apply_and_announce_settings_row`. Row names are built by
+  `setting_row_name` — the single builder the provider also answers from —
+  so an announced name can never drift from what a client reads.
+
+Teardown mirrors the surface on the way out: `detach_hwnd_provider` (both
+WM_DESTROY handlers) disconnects the provider while the window and its state
+still exist, and `clear_uia_provider_state` (both WM_NCDESTROY handlers,
+poison-recovered) empties the shared snapshot slot and the pill's name cell
+— a client-held provider degrades to empty answers instead of reading
+window data after the window is gone.
+
 ## Configuration
 
 `Config::load()` reads `%APPDATA%\WinGlance\WinGlance\data\config.toml`, falls back

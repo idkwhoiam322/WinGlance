@@ -21,6 +21,7 @@
 //! core holds a reference across the last release) degrades to empty answers
 //! instead of reading freed memory.
 
+use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Com::SAFEARRAY;
@@ -34,7 +35,8 @@ use windows::Win32::UI::Accessibility::{
     NavigateDirection_PreviousSibling, ProviderOptions_ServerSideProvider, ToggleState_Off, ToggleState_On,
     UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId, UIA_IsEnabledPropertyId,
     UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId, UIA_PATTERN_ID, UIA_PROPERTY_ID, UIA_PaneControlTypeId,
-    UIA_TogglePatternId, UiaAppendRuntimeId, UiaHostProviderFromHwnd, UiaRect,
+    UIA_TextControlTypeId, UIA_TogglePatternId, UiaAppendRuntimeId, UiaHostProviderFromHwnd,
+    UiaRaiseAutomationPropertyChangedEvent, UiaRect,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::implement;
@@ -395,6 +397,105 @@ fn runtime_id_array(id: i32) -> windows::core::Result<*mut SAFEARRAY> {
         }
     }
     Ok(array)
+}
+
+/// Read-only name provider for the passive overlay pill window. The pill is
+/// deliberately non-focusable and non-clickable (it never takes keyboard
+/// focus, never activates, and is click-through), so this provider exposes
+/// exactly one thing: the current track as the accessible name. It offers no
+/// patterns (no Invoke/Toggle — a screen reader cannot activate it), is never
+/// keyboard-focusable, and only ever answers properties. The name itself is
+/// read from a shared cell (`pill_name`) that the overlay UI thread updates
+/// on every content change, so the provider never dereferences window state
+/// off the UI thread — a provider instance that outlives the window (UIA
+/// core holds a reference across the last release) degrades to an empty name
+/// instead of reading freed memory.
+#[implement(IRawElementProviderSimple)]
+struct PillNameProvider {
+    hwnd: HWND,
+    name: Arc<Mutex<Option<String>>>,
+}
+
+impl IRawElementProviderSimple_Impl for PillNameProvider_Impl {
+    fn ProviderOptions(&self) -> windows::core::Result<windows::Win32::UI::Accessibility::ProviderOptions> {
+        Ok(ProviderOptions_ServerSideProvider)
+    }
+
+    fn GetPatternProvider(&self, _patternid: UIA_PATTERN_ID) -> windows::core::Result<IUnknown> {
+        // No patterns at all: the pill is passive by architecture, so a
+        // screen reader must never be able to activate, toggle, or select
+        // anything on it. An empty error is the "no provider" answer.
+        Err(Error::empty())
+    }
+
+    fn GetPropertyValue(&self, propertyid: UIA_PROPERTY_ID) -> windows::core::Result<VARIANT> {
+        let this = &self.this;
+        if propertyid == UIA_NamePropertyId {
+            let name = this
+                .name
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .unwrap_or_default();
+            return Ok(VARIANT::from(BSTR::from(name)));
+        }
+        if propertyid == windows::Win32::UI::Accessibility::UIA_ControlTypePropertyId {
+            return Ok(VARIANT::from(UIA_TextControlTypeId.0));
+        }
+        if propertyid == UIA_IsEnabledPropertyId {
+            return Ok(VARIANT::from(true));
+        }
+        if propertyid == UIA_IsKeyboardFocusablePropertyId {
+            // The pill never takes focus and never activates; a screen reader
+            // must not be able to focus it.
+            return Ok(VARIANT::from(false));
+        }
+        Ok(VARIANT::default())
+    }
+
+    fn HostRawElementProvider(&self) -> windows::core::Result<IRawElementProviderSimple> {
+        // Merge with the window's own default provider (it carries the
+        // window-level semantics — control type, window title) so the pill
+        // is exposed as a readable element of the overlay window, not a
+        // detached fragment.
+        if self.this.hwnd.0.is_null() {
+            return Err(Error::empty());
+        }
+        unsafe { UiaHostProviderFromHwnd(self.this.hwnd) }
+    }
+}
+
+/// Builds the read-only name provider for the overlay pill window. `name` is
+/// the shared cell the overlay updates on every content change. Used from the
+/// overlay's `WM_GETOBJECT`.
+pub fn pill_name_provider(hwnd: HWND, name: Arc<Mutex<Option<String>>>) -> IRawElementProviderSimple {
+    PillNameProvider { hwnd, name }.into()
+}
+
+/// Raises the UIA name property-changed event for the pill, so a screen
+/// reader tracking the pill announces the new track when the shared name
+/// cell changes. Same fresh-provider-per-event pattern as the settings
+/// pane's toggle/focus events; no UIA client listening is normal, so
+/// failures log at debug level. Announcement only — it never makes the pill
+/// focusable or activatable, preserving the passive architecture. The old
+/// and new values are encoded exactly like `PillNameProvider` answers them
+/// (an empty BSTR for a missing name), so the event matches what a client
+/// would read from the property.
+pub(crate) fn raise_pill_name_changed(
+    hwnd: HWND,
+    cell: &Arc<Mutex<Option<String>>>,
+    old: Option<String>,
+    new: Option<String>,
+) {
+    if hwnd.0.is_null() || old == new {
+        return;
+    }
+    let provider = pill_name_provider(hwnd, Arc::clone(cell));
+    let old = VARIANT::from(BSTR::from(old.unwrap_or_default()));
+    let new = VARIANT::from(BSTR::from(new.unwrap_or_default()));
+    if let Err(error) = unsafe { UiaRaiseAutomationPropertyChangedEvent(&provider, UIA_NamePropertyId, &old, &new) } {
+        log::debug!("raising the pill name-changed UIA event failed: {error}");
+    }
 }
 
 /// Builds the Settings-pane fragment-root provider, or None when there are no
