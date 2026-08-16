@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOHSCROLL, GetClientRect, GetMessageW, GetWindowRect, HMENU, IDCANCEL, IDOK,
@@ -123,7 +123,7 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
             y,
             outer_w,
             outer_h,
-            parent,
+            Some(parent),
             None,
             instance,
             Some(state_ptr.cast()),
@@ -143,7 +143,7 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
         };
         let font = GetStockObject(DEFAULT_GUI_FONT);
         let child = |class: &str, text: &str, x: i32, y: i32, w: i32, h: i32, id: usize, style: WINDOW_STYLE| {
-            let child = CreateWindowExW(
+            let child = create_window(
                 WINDOW_EX_STYLE(0),
                 PCWSTR(wide(class).as_ptr()),
                 PCWSTR(wide(text).as_ptr()),
@@ -152,13 +152,13 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
                 (y as f32 * scale).round() as i32,
                 (w as f32 * scale).round() as i32,
                 (h as f32 * scale).round() as i32,
-                hwnd,
-                Some(&HMENU(id as *mut c_void)),
+                Some(hwnd),
+                Some(HMENU(id as *mut c_void)),
                 instance,
                 None,
             );
             if let Ok(child) = child {
-                let _ = SendMessageW(child, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+                let _ = send_message(child, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
                 child
             } else {
                 HWND::default()
@@ -209,7 +209,7 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
         let _ = EnableWindow(parent, false);
         let _ = ShowWindow(hwnd, SW_SHOW);
         if !edit.0.is_null() {
-            let _ = SetFocus(edit);
+            let _ = set_focus(edit);
         }
 
         // Modal loop: IsDialogMessageW gives Enter (default button) and Esc
@@ -292,7 +292,7 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 // keep the dialog open with an error box.
                 let edit = (*data_ptr).edit;
                 let mut buffer = [0u16; 64];
-                let copied = SendMessageW(
+                let copied = send_message(
                     edit,
                     WM_GETTEXT,
                     WPARAM(buffer.len()),
@@ -304,13 +304,13 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     (*data_ptr).chosen = Some(ms);
                     (*data_ptr).done = true;
                 } else {
-                    let _ = MessageBoxW(
+                    let _ = message_box(
                         hwnd,
                         PCWSTR(wide("Enter a duration between 0.5 and 60 seconds.").as_ptr()),
                         PCWSTR(wide("Custom duration").as_ptr()),
                         MB_OK | MB_ICONWARNING,
                     );
-                    let _ = SetFocus(edit);
+                    let _ = set_focus(edit);
                 }
             } else if id == IDCANCEL.0 as u32 {
                 (*data_ptr).done = true;

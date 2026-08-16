@@ -12,6 +12,7 @@ use super::{
 use crate::config::{AppearanceConfig, Config};
 use crate::events::{MediaEvent, PlaybackState, PlaybackType, TrackInfo};
 use crate::palette::Palette;
+use crate::winapi::{select_object, set_window_pos};
 use anyhow::{Context, Result};
 use log::debug;
 use std::ffi::c_void;
@@ -19,12 +20,11 @@ use std::ptr::null_mut;
 use std::sync::Arc;
 use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, COLOR_HIGHLIGHT, COLOR_WINDOWTEXT, CreateCompatibleDC,
-    CreateDIBSection, DIB_RGB_COLORS, DT_CALCRECT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
-    DrawTextW, ETO_CLIPPED, ExtTextOutW, GdiFlush, GetSysColor, HBITMAP, HDC, HFONT, HGDIOBJ, SelectObject, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, COLOR_HIGHLIGHT, COLOR_WINDOWTEXT, CreateCompatibleDC, DIB_RGB_COLORS,
+    DT_CALCRECT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DrawTextW, ETO_CLIPPED,
+    ExtTextOutW, GdiFlush, GetSysColor, HBITMAP, HDC, HFONT, HGDIOBJ, SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowPos, ULW_ALPHA};
+use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW, ULW_ALPHA};
 use windows::core::PCWSTR;
 
 /// The cross-fade's blend weight from the fade's elapsed time: a smoothstep
@@ -203,7 +203,7 @@ pub(super) fn render_layered(
         AlphaFormat: 1,
     };
     let result = unsafe {
-        windows::Win32::UI::WindowsAndMessaging::UpdateLayeredWindow(
+        crate::winapi::update_layered_window(
             state.hwnd,
             None,
             Some(&position),
@@ -216,7 +216,7 @@ pub(super) fn render_layered(
         )
     };
     unsafe {
-        let _ = SetWindowPos(
+        let _ = set_window_pos(
             state.hwnd,
             HWND_TOPMOST,
             position.x,
@@ -383,15 +383,16 @@ pub(super) fn create_dc_with_dib(width: i32, height: i32) -> Result<(HDC, HBITMA
         ..Default::default()
     };
     let mut bits: *mut c_void = null_mut();
-    let bitmap = match unsafe { CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &mut bits, None, 0) } {
-        Ok(bitmap) => bitmap,
-        Err(error) => {
-            unsafe {
-                let _ = DeleteDC(hdc);
+    let bitmap =
+        match unsafe { crate::winapi::create_dib_section(Some(hdc), &info, DIB_RGB_COLORS, &mut bits, None, 0) } {
+            Ok(bitmap) => bitmap,
+            Err(error) => {
+                unsafe {
+                    let _ = DeleteDC(hdc);
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
-        }
-    };
+        };
     if bits.is_null() {
         unsafe {
             let _ = DeleteDC(hdc);
@@ -428,7 +429,7 @@ pub(super) fn dib_for(state: &mut OverlayState, width: i32, height: i32) -> Resu
     let alloc_w = width.max(bound_w).max(1);
     let alloc_h = height.max(bound_h).max(1);
     let (hdc, bitmap, bits) = create_dc_with_dib(alloc_w, alloc_h)?;
-    let old_bitmap = unsafe { SelectObject(hdc, bitmap) };
+    let old_bitmap = unsafe { select_object(hdc, bitmap) };
     state.dib = Some(DibCache {
         hdc,
         bitmap,
@@ -2332,7 +2333,7 @@ pub(super) fn draw_text_line_pixels(
     scratch_utf16.clear();
     scratch_utf16.extend(value.encode_utf16());
     unsafe {
-        let old_font = SelectObject(hdc, font);
+        let old_font = select_object(hdc, font);
         // Guard restores the previous selection on every exit path. The
         // overflow branch below restores explicitly BEFORE the strip build:
         // `build_marquee_strip` may replace/drop this scratch DC, and any
@@ -2519,7 +2520,7 @@ pub(super) fn build_marquee_strip(
     scratch_utf16.clear();
     scratch_utf16.extend(value.encode_utf16());
     unsafe {
-        let old_font = SelectObject(hdc, font);
+        let old_font = select_object(hdc, font);
         // Same structural restore as the draw path: the strip's DC must never
         // keep a live font selected across returns.
         let _font_guard = SelectedObjectGuard::new(hdc, old_font);
@@ -2744,7 +2745,7 @@ impl SelectedObjectGuard {
     fn restore(&mut self) {
         if !self.restored {
             unsafe {
-                let _ = SelectObject(self.hdc, self.previous);
+                let _ = select_object(self.hdc, self.previous);
             }
             self.restored = true;
         }
@@ -2778,7 +2779,7 @@ pub(super) fn text_scratch_for(
     let width = width.max(1);
     let height = height.max(1);
     let (hdc, bitmap, bits) = create_dc_with_dib(width, height)?;
-    let old_bitmap = unsafe { SelectObject(hdc, bitmap) };
+    let old_bitmap = unsafe { select_object(hdc, bitmap) };
     *scratch = Some(TextScratch {
         hdc,
         bitmap,
@@ -3240,17 +3241,16 @@ pub(super) fn draw_placeholder(pixels: &mut [u8], width: usize, x: usize, y: usi
 mod tests {
     use super::*;
     use crate::winutil::wide;
-    use windows::Win32::Foundation::FALSE;
     use windows::Win32::Graphics::Gdi::{
-        ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DeleteObject,
-        FF_DONTCARE, GetCurrentObject, OBJ_FONT, OUT_DEFAULT_PRECIS,
+        ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, GetCurrentObject,
+        OBJ_FONT, OUT_DEFAULT_PRECIS,
     };
 
     /// A real Segoe UI HFONT sized like the pill's drawing fonts.
     unsafe fn test_font() -> HFONT {
         let name = wide("Segoe UI");
         unsafe {
-            CreateFontW(
+            crate::winapi::create_font(
                 -16,
                 0,
                 0,
@@ -3283,7 +3283,7 @@ mod tests {
             assert!(!hdc.0.is_null());
             let font = test_font();
             let before = GetCurrentObject(hdc, OBJ_FONT);
-            let old_font = SelectObject(hdc, font);
+            let old_font = select_object(hdc, font);
             assert_ne!(
                 GetCurrentObject(hdc, OBJ_FONT).0,
                 before.0,
@@ -3297,7 +3297,10 @@ mod tests {
                 before.0,
                 "the guard must restore the prior selection on drop"
             );
-            assert!(DeleteObject(font) != FALSE, "an unselected font must delete cleanly");
+            assert!(
+                crate::winapi::delete_object(font),
+                "an unselected font must delete cleanly"
+            );
             let _ = DeleteDC(hdc);
         }
     }
@@ -3314,7 +3317,7 @@ mod tests {
             let font = test_font();
             let mut scratch: Option<TextScratch> = None;
             let (hdc, _, _, _) = text_scratch_for(&mut scratch, 32, 16).unwrap();
-            let old_font = SelectObject(hdc, font);
+            let old_font = select_object(hdc, font);
             let mut guard = SelectedObjectGuard::new(hdc, old_font);
             guard.restore();
             assert!(
@@ -3336,7 +3339,7 @@ mod tests {
                 GetCurrentObject(hdc2, OBJ_FONT).0 != font.0,
                 "the fresh strip DC must not carry our font"
             );
-            assert!(DeleteObject(font) != FALSE, "the font must delete cleanly");
+            assert!(crate::winapi::delete_object(font), "the font must delete cleanly");
         }
     }
 
@@ -3354,7 +3357,7 @@ mod tests {
             let baseline = GetCurrentObject(hdc, OBJ_FONT);
             for i in 0..100 {
                 let font = test_font();
-                let old_font = SelectObject(hdc, font);
+                let old_font = select_object(hdc, font);
                 {
                     let _guard = SelectedObjectGuard::new(hdc, old_font);
                 }
@@ -3363,7 +3366,10 @@ mod tests {
                     baseline.0,
                     "generation {i} left its font current in the scratch DC"
                 );
-                assert!(DeleteObject(font) != FALSE, "generation {i}'s font failed to delete");
+                assert!(
+                    crate::winapi::delete_object(font),
+                    "generation {i}'s font failed to delete"
+                );
             }
             let _ = DeleteDC(hdc);
         }

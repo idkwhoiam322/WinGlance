@@ -21,11 +21,13 @@
 //! core holds a reference across the last release) degrades to empty answers
 //! instead of reading freed memory.
 
+use crate::winapi::post_message;
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Com::SAFEARRAY;
 use windows::Win32::System::Ole::{SafeArrayCreateVector, SafeArrayDestroy, SafeArrayPutElement};
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::System::Variant::VT_I4;
 use windows::Win32::UI::Accessibility::{
     IInvokeProvider, IInvokeProvider_Impl, IRawElementProviderFragment, IRawElementProviderFragment_Impl,
@@ -38,9 +40,8 @@ use windows::Win32::UI::Accessibility::{
     UIA_TextControlTypeId, UIA_TogglePatternId, UiaAppendRuntimeId, UiaHostProviderFromHwnd,
     UiaRaiseAutomationPropertyChangedEvent, UiaRect, UiaReturnRawElementProvider,
 };
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::implement;
-use windows::core::{BSTR, Error, IUnknown, Interface, VARIANT};
+use windows::core::{BSTR, Error, IUnknown, Interface};
 
 /// One keyboard-focusable Settings control, as seen by UI Automation.
 #[derive(Clone)]
@@ -176,7 +177,7 @@ impl SettingsProvider {
             return;
         }
         let _ = unsafe {
-            PostMessageW(
+            post_message(
                 self.hwnd,
                 crate::main_window::WM_SETTINGS_ACTIVATE_MSG,
                 windows::Win32::Foundation::WPARAM(child.runtime_id as usize),
@@ -388,7 +389,7 @@ fn runtime_id_array(id: i32) -> windows::core::Result<*mut SAFEARRAY> {
     let elements = [UiaAppendRuntimeId as i32, id];
     let array = unsafe { SafeArrayCreateVector(VT_I4, 0, elements.len() as u32) };
     if array.is_null() {
-        return Err(Error::from_win32());
+        return Err(Error::from_thread());
     }
     for (i, value) in elements.iter().enumerate() {
         if let Err(error) = unsafe { SafeArrayPutElement(array, &(i as i32), value as *const i32 as *const _) } {

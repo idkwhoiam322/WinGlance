@@ -26,18 +26,17 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{COLORREF, GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BeginPaint, CLEARTYPE_QUALITY,
     CLIP_DEFAULT_PRECIS, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOWFRAME, COLOR_WINDOWTEXT,
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, FF_DONTCARE, FillRect, FrameRect, GetStockObject, GetSysColor,
-    HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SYS_COLOR_INDEX,
-    SelectObject, SetBkColor, SetTextColor,
+    CreateCompatibleDC, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC, EndPaint,
+    FF_DONTCARE, FillRect, FrameRect, GetStockObject, GetSysColor, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, SYS_COLOR_INDEX, SetBkColor, SetTextColor,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
-use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
@@ -59,19 +58,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFY_ICON_INFOTIP_FLAGS, NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
+    NOTIFY_ICON_INFOTIP_FLAGS, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GetClientRect, GetCursorPos, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindow, IsWindowVisible, KillTimer,
-    LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING,
-    LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED,
-    MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostMessageW, PostQuitMessage, RegisterWindowMessageW,
-    SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT,
-    SCROLLBAR_COMMAND, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE,
-    WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_GETOBJECT, WM_KEYDOWN,
+    AppendMenuW, CREATESTRUCTW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect,
+    GetCursorPos, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindowVisible, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT,
+    LB_GETITEMHEIGHT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX,
+    LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, PostQuitMessage, RegisterWindowMessageW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
+    SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLBAR_COMMAND, SCROLLINFO, SIF_PAGE, SIF_POS,
+    SIF_RANGE, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SetForegroundWindow, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_STYLE, WM_APP, WM_CLOSE,
+    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_GETOBJECT, WM_KEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL,
     WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN,
     WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
@@ -889,8 +887,8 @@ struct ArtBlit {
 impl Drop for ArtBlit {
     fn drop(&mut self) {
         unsafe {
-            let _ = SelectObject(self.mem, self.old);
-            let _ = DeleteObject(self.hbm);
+            let _ = select_object(self.mem, self.old);
+            let _ = delete_object(self.hbm);
             let _ = DeleteDC(self.mem);
         }
     }
@@ -1029,7 +1027,7 @@ pub fn create_window(
     let state_ptr = Box::into_raw(state);
     MAIN_STATE_CLAIMED.reset();
     let hwnd = unsafe {
-        CreateWindowExW(
+        crate::winapi::create_window(
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
             PCWSTR(class_name.as_ptr()),
             PCWSTR(wide("WinGlance").as_ptr()),
@@ -1074,7 +1072,7 @@ pub fn create_window(
             // The tooltip timer is normally started by show_window(); this
             // visible-at-start path bypasses it, so start it and sync once
             // here (the window is already shown, so sync_tooltips can run).
-            let _ = SetTimer(hwnd, TIMER_TOOLTIPS_ID, 1000, None);
+            let _ = set_timer(hwnd, TIMER_TOOLTIPS_ID, 1000, None);
             let state_ref = &mut *state_ptr;
             state_ref.sync_tooltips();
         }
@@ -1215,7 +1213,7 @@ impl MainWindowState {
     fn make_listbox_font(scale: f32) -> HFONT {
         let font_name = wide("Segoe UI");
         unsafe {
-            CreateFontW(
+            create_font(
                 -((13.0 * scale).round() as i32).max(1),
                 0,
                 0,
@@ -1242,7 +1240,7 @@ impl MainWindowState {
         debug!("DPI changed to {dpi}");
         unsafe {
             if !self.listbox_font.0.is_null() {
-                let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.listbox_font.0));
+                let _ = delete_object(HGDIOBJ(self.listbox_font.0));
             }
         }
         let scale = dpi.max(96) as f32 / 96.0;
@@ -1251,8 +1249,8 @@ impl MainWindowState {
         if !self.listbox.0.is_null() {
             unsafe {
                 let item_h = (18.0 * scale).round() as i32;
-                let _ = SendMessageW(self.listbox, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(item_h as isize));
-                let _ = SendMessageW(
+                let _ = send_message(self.listbox, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(item_h as isize));
+                let _ = send_message(
                     self.listbox,
                     WM_SETFONT,
                     WPARAM(self.listbox_font.0 as usize),
@@ -1292,7 +1290,7 @@ impl MainWindowState {
         self.rebuild_accent_brushes();
 
         self.listbox = unsafe {
-            CreateWindowExW(
+            crate::winapi::create_window(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
                 PCWSTR(wide("LISTBOX").as_ptr()),
                 PCWSTR::null(),
@@ -1304,8 +1302,8 @@ impl MainWindowState {
                 0,
                 0,
                 0,
-                self.hwnd,
-                HMENU(LISTBOX_ID as *mut c_void),
+                Some(self.hwnd),
+                Some(HMENU(LISTBOX_ID as *mut c_void)),
                 self.instance,
                 None,
             )
@@ -1315,15 +1313,15 @@ impl MainWindowState {
             unsafe {
                 let scale = GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0;
                 let item_h = (18.0 * scale).round() as i32;
-                let _ = SendMessageW(self.listbox, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(item_h as isize));
-                let _ = SendMessageW(
+                let _ = send_message(self.listbox, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(item_h as isize));
+                let _ = send_message(
                     self.listbox,
                     WM_SETFONT,
                     WPARAM(self.listbox_font.0 as usize),
                     LPARAM(1),
                 );
                 let header = wide("TIME     EVENT");
-                let _ = SendMessageW(self.listbox, LB_ADDSTRING, WPARAM(0), LPARAM(header.as_ptr() as isize));
+                let _ = send_message(self.listbox, LB_ADDSTRING, WPARAM(0), LPARAM(header.as_ptr() as isize));
             }
             self.layout();
             self.install_tooltip();
@@ -1336,7 +1334,7 @@ impl MainWindowState {
     /// subclassing are needed here.
     fn install_tooltip(&mut self) {
         self.tooltip_ctrl = unsafe {
-            CreateWindowExW(
+            crate::winapi::create_window(
                 WS_EX_TOPMOST,
                 TOOLTIPS_CLASSW,
                 PCWSTR::null(),
@@ -1345,7 +1343,7 @@ impl MainWindowState {
                 0,
                 0,
                 0,
-                self.hwnd,
+                Some(self.hwnd),
                 None,
                 self.instance,
                 None,
@@ -1354,7 +1352,7 @@ impl MainWindowState {
         .unwrap_or_default();
         if !self.tooltip_ctrl.0.is_null() {
             unsafe {
-                let _ = SendMessageW(self.tooltip_ctrl, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM(600));
+                let _ = send_message(self.tooltip_ctrl, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM(600));
             }
             self.sync_tooltips();
         }
@@ -1403,11 +1401,11 @@ impl MainWindowState {
             return;
         }
         unsafe {
-            let count = SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
-            let top = SendMessageW(self.listbox, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)).0 as usize;
+            let count = send_message(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
+            let top = send_message(self.listbox, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)).0 as usize;
             let mut client = RECT::default();
             let _ = GetClientRect(self.listbox, &mut client);
-            let item_h = SendMessageW(self.listbox, LB_GETITEMHEIGHT, WPARAM(0), LPARAM(0)).0 as usize;
+            let item_h = send_message(self.listbox, LB_GETITEMHEIGHT, WPARAM(0), LPARAM(0)).0 as usize;
             let visible = client.bottom as usize / item_h.max(1) + 1;
             let end = (top + visible).min(count);
             if self.tooltip_range == Some((top, end)) {
@@ -1427,7 +1425,7 @@ impl MainWindowState {
                         l_param: 0,
                         lp_reserved: std::ptr::null_mut(),
                     };
-                    let _ = SendMessageW(
+                    let _ = send_message(
                         self.tooltip_ctrl,
                         TTM_DELTOOLW,
                         WPARAM(0),
@@ -1437,7 +1435,7 @@ impl MainWindowState {
             }
             for index in top..end {
                 let mut rect = RECT::default();
-                let ok = SendMessageW(
+                let ok = send_message(
                     self.listbox,
                     LB_GETITEMRECT,
                     WPARAM(index),
@@ -1464,7 +1462,7 @@ impl MainWindowState {
                 } else {
                     TTM_ADDTOOLW
                 };
-                let _ = SendMessageW(
+                let _ = send_message(
                     self.tooltip_ctrl,
                     message,
                     WPARAM(0),
@@ -1544,7 +1542,7 @@ impl MainWindowState {
                 &mut self.settings_focus_brush,
             ] {
                 if !brush.0.is_null() {
-                    let _ = DeleteObject(HGDIOBJ(brush.0));
+                    let _ = delete_object(HGDIOBJ(brush.0));
                 }
             }
             let solid = |c: [u8; 4]| -> HBRUSH { CreateSolidBrush(colorref(c[0], c[1], c[2])) };
@@ -1601,7 +1599,7 @@ impl MainWindowState {
                 &mut self.history_selected_brush,
             ] {
                 if !brush.0.is_null() {
-                    let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
+                    let _ = delete_object(HGDIOBJ(brush.0));
                 }
             }
             self.accent_brush = CreateSolidBrush(colorref(accent[0], accent[1], accent[2]));
@@ -1788,21 +1786,21 @@ impl MainWindowState {
         if self.history.len() <= before && before > 0 {
             // The cap dropped the oldest entry, which sits at the bottom of
             // the listbox (newest-first rendering, header at index 0).
-            let count = unsafe { SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as usize;
+            let count = unsafe { send_message(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as usize;
             if count > 0 {
-                let _ = unsafe { SendMessageW(self.listbox, LB_DELETESTRING, WPARAM(count - 1), LPARAM(0)) };
+                let _ = unsafe { send_message(self.listbox, LB_DELETESTRING, WPARAM(count - 1), LPARAM(0)) };
             }
         }
         if !self.listbox.0.is_null() {
             unsafe {
-                let count = SendMessageW(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
+                let count = send_message(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
                 // Where the reader was before the insert: follow only when the
                 // new row would be visible anyway (top rows), otherwise shift
                 // the view down by one so the row under the cursor stays put.
-                let old_top = SendMessageW(self.listbox, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)).0 as usize;
-                let _ = SendMessageW(self.listbox, LB_INSERTSTRING, WPARAM(1), LPARAM(row.as_ptr() as isize));
+                let old_top = send_message(self.listbox, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)).0 as usize;
+                let _ = send_message(self.listbox, LB_INSERTSTRING, WPARAM(1), LPARAM(row.as_ptr() as isize));
                 let new_top = Self::history_top_after_insert(old_top, count);
-                let _ = SendMessageW(self.listbox, LB_SETTOPINDEX, WPARAM(new_top), LPARAM(0));
+                let _ = send_message(self.listbox, LB_SETTOPINDEX, WPARAM(new_top), LPARAM(0));
             }
         }
         // Tooltip rebuilds are coalesced per event batch (receive_events) or
@@ -1927,8 +1925,8 @@ impl MainWindowState {
                         // The header occupies row 0; data rows mirror the
                         // entries order (newest first).
                         let lb_row = index + 1;
-                        let _ = SendMessageW(self.listbox, LB_DELETESTRING, WPARAM(lb_row), LPARAM(0));
-                        let _ = SendMessageW(
+                        let _ = send_message(self.listbox, LB_DELETESTRING, WPARAM(lb_row), LPARAM(0));
+                        let _ = send_message(
                             self.listbox,
                             LB_INSERTSTRING,
                             WPARAM(lb_row),
@@ -3705,7 +3703,7 @@ impl MainWindowState {
         let top = ((ART_Y + ART_SIZE + SEP_GAP + HIST_GAP + HIST_H + LIST_GAP) * scale).round() as i32;
         let bottom_gap = (BOTTOM_GAP * scale).round() as i32;
         unsafe {
-            let _ = SetWindowPos(
+            let _ = set_window_pos(
                 self.listbox,
                 HWND::default(),
                 pad,
@@ -3725,11 +3723,11 @@ impl MainWindowState {
                 // The tooltip sync timer only runs while the window is
                 // visible; stop it so a tray-hidden window stops waking the
                 // UI thread once a second.
-                let _ = KillTimer(self.hwnd, TIMER_TOOLTIPS_ID);
+                let _ = kill_timer(self.hwnd, TIMER_TOOLTIPS_ID);
                 // Arm the idle release so a long tray-hidden window drops its
                 // cached artwork blit (a few hundred KB); show_window() kills
                 // the timer on restore.
-                let _ = SetTimer(self.hwnd, IDLE_ART_TIMER_ID, IDLE_ART_RELEASE_MS, None);
+                let _ = set_timer(self.hwnd, IDLE_ART_TIMER_ID, IDLE_ART_RELEASE_MS, None);
             } else {
                 debug!("window close requested; quitting (close to tray is off)");
                 let _ = DestroyWindow(self.hwnd);
@@ -3839,19 +3837,19 @@ impl MainWindowState {
             free_art_blit(&mut current.icon_blit);
         }
         unsafe {
-            let _ = KillTimer(self.hwnd, TIMER_TOOLTIPS_ID);
+            let _ = kill_timer(self.hwnd, TIMER_TOOLTIPS_ID);
             if !self.tooltip_ctrl.0.is_null() {
                 let _ = DestroyWindow(self.tooltip_ctrl);
                 self.tooltip_ctrl = HWND::default();
             }
             if !self.listbox_font.0.is_null() {
-                let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.listbox_font.0));
+                let _ = delete_object(HGDIOBJ(self.listbox_font.0));
             }
             if !self.gray_brush.0.is_null() {
-                let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.gray_brush.0));
+                let _ = delete_object(HGDIOBJ(self.gray_brush.0));
             }
             if !self.accent_brush.0.is_null() {
-                let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.accent_brush.0));
+                let _ = delete_object(HGDIOBJ(self.accent_brush.0));
             }
             for brush in [
                 &self.black_brush,
@@ -3871,7 +3869,7 @@ impl MainWindowState {
                 &self.settings_small_hover_brush,
             ] {
                 if !brush.0.is_null() {
-                    let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(brush.0));
+                    let _ = delete_object(HGDIOBJ(brush.0));
                 }
             }
         }
@@ -3884,7 +3882,7 @@ impl MainWindowState {
     /// value and hover state in the same frame.
     fn invalidate(&self) {
         unsafe {
-            let _ = InvalidateRect(self.hwnd, None, false);
+            let _ = invalidate_rect(self.hwnd, None, false);
         }
     }
 
@@ -3892,7 +3890,7 @@ impl MainWindowState {
     /// repaint a small band instead of the whole window.
     fn invalidate_rect(&self, rect: &RECT) {
         unsafe {
-            let _ = InvalidateRect(self.hwnd, Some(rect), false);
+            let _ = invalidate_rect(self.hwnd, Some(rect), false);
         }
     }
 
@@ -3927,14 +3925,14 @@ impl MainWindowState {
         unsafe {
             // A restored window invalidates the idle-release deadline; if the
             // blit was released, paint rebuilds it lazily.
-            let _ = KillTimer(self.hwnd, IDLE_ART_TIMER_ID);
+            let _ = kill_timer(self.hwnd, IDLE_ART_TIMER_ID);
             let _ = ShowWindow(self.hwnd, SW_SHOWMAXIMIZED);
             // The foreground lock can reject SetForegroundWindow (the thread
             // never held the foreground); without a fallback the window would
             // open silently behind the current app. Bring it to the top of the
             // z-order without stealing focus instead.
             if !SetForegroundWindow(self.hwnd).as_bool() {
-                let _ = SetWindowPos(
+                let _ = set_window_pos(
                     self.hwnd,
                     HWND_TOP,
                     0,
@@ -3949,7 +3947,7 @@ impl MainWindowState {
         // The tooltip timer only runs while the window is visible (see
         // install_tooltip and on_close), so it must be (re)started here.
         unsafe {
-            let _ = SetTimer(self.hwnd, TIMER_TOOLTIPS_ID, 1000, None);
+            let _ = set_timer(self.hwnd, TIMER_TOOLTIPS_ID, 1000, None);
         }
         // The window was hidden, so the timer skipped its syncs; rebuild
         // the tool definitions now so hover works immediately on restore.
@@ -3984,16 +3982,16 @@ impl MainWindowState {
                     // Lock failed: the buffer was never written, so it must
                     // not reach the clipboard (it would hold uninitialized
                     // bytes and the UI would report "Copied" on garbage).
-                    let _ = GlobalFree(hmem);
+                    let _ = global_free(hmem);
                     return false;
                 }
                 std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr.cast(), wide.len());
                 let _ = GlobalUnlock(hmem);
-                if SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0)).is_ok() {
+                if set_clipboard_data(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0)).is_ok() {
                     true
                 } else {
                     // Transfer failed; the memory is still ours to release.
-                    let _ = GlobalFree(hmem);
+                    let _ = global_free(hmem);
                     false
                 }
             });
@@ -4007,7 +4005,7 @@ impl MainWindowState {
         self.logs_copied_at = Some(Instant::now());
         info!("copied the live log to the clipboard");
         unsafe {
-            let _ = SetTimer(self.hwnd, TIMER_LOGS_ID, 2000, None);
+            let _ = set_timer(self.hwnd, TIMER_LOGS_ID, 2000, None);
         }
         self.invalidate();
     }
@@ -4024,7 +4022,7 @@ impl MainWindowState {
         let verb = wide("open");
         unsafe {
             let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
-            let result = ShellExecuteW(
+            let result = shell_execute(
                 self.hwnd,
                 PCWSTR(verb.as_ptr()),
                 PCWSTR(file.as_ptr()),
@@ -4035,7 +4033,7 @@ impl MainWindowState {
             if initialized {
                 CoUninitialize();
             }
-            result.0 as i32
+            result as i32
         }
     }
 
@@ -4264,7 +4262,7 @@ fn build_art_blit(pm: &[u8], base: i32) -> Option<ArtBlit> {
         ..Default::default()
     };
     let mut bits: *mut c_void = std::ptr::null_mut();
-    let hbm = unsafe { CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, None, 0) };
+    let hbm = unsafe { create_dib_section(Some(mem), &info, DIB_RGB_COLORS, &mut bits, None, 0) };
     let Ok(hbm) = hbm else {
         unsafe {
             let _ = DeleteDC(mem);
@@ -4273,14 +4271,14 @@ fn build_art_blit(pm: &[u8], base: i32) -> Option<ArtBlit> {
     };
     if bits.is_null() {
         unsafe {
-            let _ = DeleteObject(hbm);
+            let _ = delete_object(hbm);
             let _ = DeleteDC(mem);
         }
         return None;
     }
     unsafe {
         std::ptr::copy_nonoverlapping(pm.as_ptr(), bits.cast::<u8>(), pm.len());
-        let old = SelectObject(mem, hbm);
+        let old = select_object(mem, hbm);
         Some(ArtBlit { mem, hbm, old, base })
     }
 }
@@ -4693,7 +4691,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
             // or the menu will not disappear when the user clicks away from
             // it or presses Esc (documented Shell_NotifyIcon requirement).
             let _ = SetForegroundWindow(state.hwnd);
-            let command = TrackPopupMenu(
+            let command = track_popup_menu(
                 menu,
                 TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
                 point.x,
@@ -4701,8 +4699,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
                 0,
                 state.hwnd,
                 None,
-            )
-            .0 as usize;
+            ) as usize;
             match command {
                 MENU_OPEN_ID => state.show_window(),
                 // Show the pill now with the current track (or the sample
@@ -4714,7 +4711,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     let new_value = !state.cfg().behavior.notifications_enabled;
                     // Flip the overlay first; persist only when the toggle
                     // reaches it, so the config and the pill can never desync.
-                    if PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0)).is_err() {
+                    if post_message(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0)).is_err() {
                         error!("posting the notifications toggle to the overlay failed");
                     } else {
                         state.mutate_config(|cfg| cfg.behavior.notifications_enabled = new_value);
@@ -4796,7 +4793,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
         }
         // After the modal menu loop, flush the queue with a no-op message so
         // the popup fully tears down when it was dismissed by clicking away.
-        let _ = PostMessageW(state.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = post_message(state.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menu);
     }
 }
@@ -4866,7 +4863,7 @@ fn apply_settings_row_click(
             // Flip the overlay first; persist only when
             // the toggle reaches it, so the config and
             // the pill can never desync.
-            if unsafe { PostMessageW(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0)) }.is_err() {
+            if unsafe { post_message(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0)) }.is_err() {
                 error!("posting the notifications toggle to the overlay failed");
             } else {
                 state.mutate_config(|cfg| cfg.behavior.notifications_enabled = new_value);
@@ -5094,7 +5091,7 @@ fn apply_settings_row_click(
             if x >= open_rect.left && x < open_rect.right {
                 state.open_logs();
                 state.logs_opened_at = Some(Instant::now());
-                unsafe { SetTimer(hwnd, TIMER_OPENED_ID, 2000, None) };
+                unsafe { set_timer(hwnd, TIMER_OPENED_ID, 2000, None) };
                 state.invalidate();
             } else {
                 state.copy_logs();
@@ -5106,7 +5103,7 @@ fn apply_settings_row_click(
             if x >= open_rect.left && x < open_rect.right {
                 state.open_config();
                 state.config_opened_at = Some(Instant::now());
-                unsafe { SetTimer(hwnd, TIMER_OPENED_ID, 2000, None) };
+                unsafe { set_timer(hwnd, TIMER_OPENED_ID, 2000, None) };
                 state.invalidate();
             } else {
                 state.reload_config();
@@ -5207,7 +5204,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         }
         WM_TIMER if wparam.0 == TIMER_LOGS_ID => {
             unsafe {
-                let _ = KillTimer(hwnd, TIMER_LOGS_ID);
+                let _ = kill_timer(hwnd, TIMER_LOGS_ID);
             }
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
@@ -5218,7 +5215,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         }
         WM_TIMER if wparam.0 == TIMER_OPENED_ID => {
             unsafe {
-                let _ = KillTimer(hwnd, TIMER_OPENED_ID);
+                let _ = kill_timer(hwnd, TIMER_OPENED_ID);
             }
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
@@ -5410,7 +5407,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     VK_RETURN | VK_SPACE => {
                         if let Some(t) = targets.get(idx) {
                             let lp = LPARAM(t.cx as isize | (t.cy as isize) << 16);
-                            let _ = unsafe { PostMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp) };
+                            let _ = unsafe { post_message(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp) };
                         }
                     }
                     VK_ESCAPE => {
@@ -6172,7 +6169,7 @@ fn settings_ui_snapshot(hwnd: HWND) -> Arc<SettingsUiSnapshot> {
     }
     let wanted = snapshot_generation();
     let event = settings_snapshot_event();
-    let posted = unsafe { PostMessageW(hwnd, WM_SETTINGS_SNAPSHOT_MSG, WPARAM(0), LPARAM(0)) };
+    let posted = unsafe { post_message(hwnd, WM_SETTINGS_SNAPSHOT_MSG, WPARAM(0), LPARAM(0)) };
     let deadline = Instant::now() + Duration::from_millis(SETTINGS_SNAPSHOT_WAIT_MS);
     while posted.is_ok() && !event.0.is_null() {
         // The UI thread's answer may already be stored (or a concurrent
@@ -6184,7 +6181,7 @@ fn settings_ui_snapshot(hwnd: HWND) -> Arc<SettingsUiSnapshot> {
         }
         // The window is gone; the posted message was discarded and no build
         // will ever land.
-        if !unsafe { IsWindow(hwnd) }.as_bool() {
+        if !unsafe { is_window(hwnd) } {
             break;
         }
         let now = Instant::now();
@@ -6363,8 +6360,8 @@ fn raise_settings_toggle_event(hwnd: HWND, row_index: usize, before: bool, after
     let Some(provider) = crate::accessibility::settings_child_provider(hwnd, row_index, SettingSub::None) else {
         return;
     };
-    let old = windows::core::VARIANT::from(if before { ToggleState_On.0 } else { ToggleState_Off.0 });
-    let new = windows::core::VARIANT::from(if after { ToggleState_On.0 } else { ToggleState_Off.0 });
+    let old = windows::Win32::System::Variant::VARIANT::from(if before { ToggleState_On.0 } else { ToggleState_Off.0 });
+    let new = windows::Win32::System::Variant::VARIANT::from(if after { ToggleState_On.0 } else { ToggleState_Off.0 });
     if let Err(error) =
         unsafe { UiaRaiseAutomationPropertyChangedEvent(&provider, UIA_ToggleToggleStatePropertyId, &old, &new) }
     {
@@ -6423,7 +6420,7 @@ pub(crate) fn focus_setting_at(hwnd: HWND, row_index: usize, sub: SettingSub) {
         return;
     }
     let tag = setting_sub_tag(sub);
-    let _ = unsafe { PostMessageW(hwnd, WM_SETTINGS_FOCUS_MSG, WPARAM(row_index), LPARAM(tag as isize)) };
+    let _ = unsafe { post_message(hwnd, WM_SETTINGS_FOCUS_MSG, WPARAM(row_index), LPARAM(tag as isize)) };
 }
 
 /// The UI-thread half of `focus_setting_at`; runs on the thread that owns the

@@ -14,9 +14,11 @@ mod palette;
 mod positioner;
 mod process_picker;
 mod smtc;
+mod winapi;
 mod winutil;
 
 use crate::config::Config;
+use crate::winapi::{create_file, post_message};
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::collections::VecDeque;
@@ -35,7 +37,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+    FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, GetFileSize, OPEN_ALWAYS, SetEndOfFile, SetFilePointer,
     WriteFile,
 };
@@ -51,9 +53,7 @@ use windows::Win32::System::Threading::{
     WaitForSingleObject,
 };
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
-use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW, TranslateMessage,
-};
+use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, DispatchMessageW, GetMessageW, TranslateMessage};
 use windows::core::PCWSTR;
 
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, artwork_bytes};
@@ -188,7 +188,7 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // time, so no allocation happens here.
     if let Some(path) = CRASH_LOG_PATH.get() {
         let handle = unsafe {
-            CreateFileW(
+            create_file(
                 PCWSTR(path.as_ptr()),
                 FILE_APPEND_DATA.0 | FILE_WRITE_DATA.0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -1222,7 +1222,7 @@ fn push_and_wake(queue: &EventQueue, wake: &AtomicBool, event: Arc<MediaEvent>, 
     q.push_back(event);
     enforce_queue_cap(&mut q, name);
     if !wake.swap(true, Ordering::SeqCst)
-        && unsafe { PostMessageW(hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
+        && unsafe { post_message(hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
     {
         drop(q);
         clear_and_account(queue, wake, name);
@@ -1237,7 +1237,7 @@ pub(crate) fn repost_if_pending(queue: &EventQueue, wake: &AtomicBool, hwnd: HWN
     let more = queue.lock().map(|q| !q.is_empty()).unwrap_or(false);
     if more
         && !wake.swap(true, Ordering::SeqCst)
-        && unsafe { PostMessageW(hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
+        && unsafe { post_message(hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
     {
         clear_and_account(queue, wake, name);
     }

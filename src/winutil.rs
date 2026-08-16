@@ -1,8 +1,9 @@
+use crate::winapi::create_file;
 use log::{debug, error, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, DeleteObject, GetSysColor, HBRUSH, HGDIOBJ};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, GetSysColor, HBRUSH, HGDIOBJ};
 use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::Shell::DefSubclassProc;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -11,6 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SPI_GETHIGHCONTRAST, SPI_GETMESSAGEDURATION, SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     SetWindowLongPtrW, SystemParametersInfoW, WNDCLASS_STYLES, WNDCLASSEXW, WNDPROC,
 };
+use windows::core::BOOL;
 use windows::core::{PCWSTR, PWSTR};
 
 /// Registers a window class exactly once per window type (guarded by `guard`).
@@ -53,10 +55,10 @@ pub(crate) fn register_class_once(
     };
     if unsafe { RegisterClassExW(&class) } == 0 {
         if let Some(brush) = background {
-            let _ = unsafe { DeleteObject(HGDIOBJ(brush.0)) };
+            let _ = unsafe { crate::winapi::delete_object(HGDIOBJ(brush.0)) };
         }
         warn!("RegisterClassExW failed for {description}");
-        return Err(windows::core::Error::from_win32());
+        return Err(windows::core::Error::from_thread());
     }
     let _ = guard.set(());
     Ok(())
@@ -542,11 +544,11 @@ use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FlushFileBuffers, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-    OPEN_ALWAYS, OPEN_EXISTING, SetFileInformationByHandle, WriteFile,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES,
+    FILE_WRITE_DATA, FlushFileBuffers, GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_ALWAYS,
+    OPEN_EXISTING, SetFileInformationByHandle, WriteFile,
 };
 
 /// `FILE_DELETE_CHILD` (0x0040); `windows` 0.58 does not export it. Needed on
@@ -689,14 +691,14 @@ pub(crate) fn open_pinned_parent(dir: &Path) -> io::Result<DirGuard> {
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     let handle = unsafe {
-        CreateFileW(
+        create_file(
             windows::core::PCWSTR(wide.as_ptr()),
             desired,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
+            HANDLE::default(),
         )
     }
     .map_err(to_io)?;
@@ -799,14 +801,14 @@ pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<(
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
         let temp_handle = match unsafe {
-            CreateFileW(
+            create_file(
                 windows::core::PCWSTR(wide.as_ptr()),
                 FILE_GENERIC_WRITE.0 | DELETE_ACCESS,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-                None,
+                HANDLE::default(),
             )
         } {
             Ok(handle) => handle,
@@ -925,14 +927,14 @@ pub(crate) fn append_verified_bounded(path: &Path, data: &[u8], cap: u64) -> io:
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     let handle = unsafe {
-        CreateFileW(
+        create_file(
             windows::core::PCWSTR(wide.as_ptr()),
             (FILE_APPEND_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES).0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_ALWAYS,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
+            HANDLE::default(),
         )
     }
     .map_err(to_io)?;

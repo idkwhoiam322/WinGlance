@@ -11,14 +11,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
-    BOOL, COLORREF, CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
-    WPARAM,
+    COLORREF, CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BDR_SUNKENOUTER, BF_RECT, BeginPaint, ClientToScreen, CreateFontW, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS,
-    DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawEdge, DrawTextW, EndPaint, FillRect,
-    GetMonitorInfoW, HBRUSH, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
-    PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    BDR_SUNKENOUTER, BF_RECT, BeginPaint, ClientToScreen, CreateSolidBrush, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawEdge, DrawTextW, EndPaint, FillRect, GetMonitorInfoW, HBRUSH, HFONT,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -32,15 +30,15 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GetClientRect, GetParent,
+    CREATESTRUCTW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GetClientRect, GetParent,
     GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, LB_ADDSTRING,
     LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT, LB_GETTOPINDEX, LB_SETCURSEL, LB_SETITEMDATA, LB_SETITEMHEIGHT,
-    LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, PostMessageW, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetWindowPos, ShowWindow, WINDOW_STYLE,
-    WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
+    WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WS_BORDER,
+    WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
+use windows::core::BOOL;
 use windows::core::{PCWSTR, PWSTR};
 
 const CLASS_NAME: &str = "WinGlanceProcessPicker";
@@ -613,7 +611,7 @@ pub(crate) fn open(
         let state_ptr = Box::into_raw(state);
         PICKER_STATE_CLAIMED.reset();
 
-        let hwnd = CreateWindowExW(
+        let hwnd = create_window(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             PCWSTR(wide(CLASS_NAME).as_ptr()),
             PCWSTR(wide("Select apps").as_ptr()),
@@ -622,7 +620,7 @@ pub(crate) fn open(
             y,
             width,
             height,
-            owner,
+            Some(owner),
             None,
             instance,
             Some(state_ptr.cast()),
@@ -661,7 +659,7 @@ pub(crate) fn open(
         // would put the popup back under the taskbar or off-screen despite
         // the initial creation being clamped (the owner and picker DPI agree
         // in practice, so the owner-scale clamp stays valid).
-        let _ = SetWindowPos(
+        let _ = set_window_pos(
             hwnd,
             HWND_TOPMOST,
             x,
@@ -671,7 +669,7 @@ pub(crate) fn open(
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
 
-        let lb = CreateWindowExW(
+        let lb = create_window(
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
             PCWSTR(wide("LISTBOX").as_ptr()),
             PCWSTR::null(),
@@ -685,7 +683,7 @@ pub(crate) fn open(
             (HEADER_H as f32 * scale).round() as i32,
             phys_w,
             ((item_count as i32 * ROW_HEIGHT) as f32 * scale).round() as i32,
-            hwnd,
+            Some(hwnd),
             None,
             instance,
             None,
@@ -723,15 +721,15 @@ pub(crate) fn open(
             }
 
             let row_h = (ROW_HEIGHT as f32 * scale).round() as i32;
-            let _ = SendMessageW(lb, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(row_h as isize));
+            let _ = send_message(lb, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(row_h as isize));
             let font = state_ref.list_font;
-            let _ = SendMessageW(lb, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+            let _ = send_message(lb, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
 
             for (i, entry) in state_ref.list.iter().enumerate() {
                 let text = wide(&entry.display_name);
-                let idx = SendMessageW(lb, LB_ADDSTRING, WPARAM(0), LPARAM(text.as_ptr() as isize));
+                let idx = send_message(lb, LB_ADDSTRING, WPARAM(0), LPARAM(text.as_ptr() as isize));
                 let state_val = if checked[i] { BST_CHECKED } else { BST_UNCHECKED };
-                let _ = SendMessageW(lb, LB_SETITEMDATA, WPARAM(idx.0 as usize), LPARAM(state_val as isize));
+                let _ = send_message(lb, LB_SETITEMDATA, WPARAM(idx.0 as usize), LPARAM(state_val as isize));
             }
         }
 
@@ -749,16 +747,16 @@ pub(crate) fn open(
 fn rebuild_picker_fonts(state: &mut PickerState, scale: f32) {
     if !state.header_font.0.is_null() {
         unsafe {
-            let _ = DeleteObject(state.header_font);
+            let _ = delete_object(state.header_font);
         }
     }
     if !state.list_font.0.is_null() {
         unsafe {
-            let _ = DeleteObject(state.list_font);
+            let _ = delete_object(state.list_font);
         }
     }
     state.header_font = unsafe {
-        CreateFontW(
+        create_font(
             -((14.0 * scale).round() as i32),
             0,
             0,
@@ -780,7 +778,7 @@ fn rebuild_picker_fonts(state: &mut PickerState, scale: f32) {
     // cache flushes its handles on DPI change, which would leave the
     // listbox with a dangling HFONT.
     state.list_font = unsafe {
-        CreateFontW(
+        create_font(
             -((13.0 * scale).round() as i32).max(1),
             0,
             0,
@@ -800,7 +798,7 @@ fn rebuild_picker_fonts(state: &mut PickerState, scale: f32) {
 }
 
 fn read_checked(hwnd: HWND, lb: HWND) -> Vec<String> {
-    let count = unsafe { SendMessageW(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) };
+    let count = unsafe { send_message(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) };
     if count.0 <= 0 {
         return Vec::new();
     }
@@ -811,7 +809,7 @@ fn read_checked(hwnd: HWND, lb: HWND) -> Vec<String> {
     let state = unsafe { &*state_ptr };
     let mut result = Vec::new();
     for i in 0..(count.0 as usize) {
-        let data = unsafe { SendMessageW(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
+        let data = unsafe { send_message(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
         if data.0 as usize == BST_CHECKED
             && let Some(entry) = state.list.get(i)
             // The Auto-compact picker's "Full screen only" mode row has an
@@ -846,7 +844,7 @@ fn post_result(hwnd: HWND, cancelled: bool) {
         *slot = patterns.clone();
     }
 
-    if unsafe { PostMessageW(owner, state.result_msg, WPARAM(0), LPARAM(0)) }.is_err() {
+    if unsafe { post_message(owner, state.result_msg, WPARAM(0), LPARAM(0)) }.is_err() {
         warn!("posting the picker result failed");
     } else if let Some(patterns) = patterns {
         info!("picker result updated to {patterns:?}");
@@ -910,9 +908,9 @@ unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPAR
                 // clicked client row is relative to the top index.
                 let scale = unsafe { (*state_ptr).scale };
                 let row_h = (ROW_HEIGHT as f32 * scale).round() as i32;
-                let top = unsafe { SendMessageW(lb, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)) }.0 as i32;
+                let top = unsafe { send_message(lb, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)) }.0 as i32;
                 let item_idx = top + y / row_h.max(1);
-                let count = unsafe { SendMessageW(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as i32;
+                let count = unsafe { send_message(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as i32;
                 if item_idx >= 0 && item_idx < count {
                     let i = item_idx as usize;
                     let state = unsafe { &mut *state_ptr };
@@ -934,13 +932,13 @@ unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPAR
                     }
 
                     // Single click: toggle the checkbox and repaint the row.
-                    let data = unsafe { SendMessageW(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
+                    let data = unsafe { send_message(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
                     let toggled = if data.0 as usize == BST_CHECKED {
                         BST_UNCHECKED
                     } else {
                         BST_CHECKED
                     };
-                    let _ = unsafe { SendMessageW(lb, LB_SETCURSEL, WPARAM(i), LPARAM(0)) };
+                    let _ = unsafe { send_message(lb, LB_SETCURSEL, WPARAM(i), LPARAM(0)) };
                     // The Auto-compact picker's first row is the pinned
                     // "Full screen apps" status row: fullscreen coverage is
                     // unconditional, so its check is fixed — clicks select
@@ -949,7 +947,7 @@ unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPAR
                     if pinned_row {
                         return LRESULT(0);
                     }
-                    let _ = unsafe { SendMessageW(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
+                    let _ = unsafe { send_message(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
                     if state.single {
                         // Single-select (pinned-source picker): checking one
                         // row clears every other, so at most one pattern is
@@ -957,24 +955,24 @@ unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPAR
                         // it (clearing the pin), clicking any other row moves
                         // the selection. The whole list repaints because any
                         // other checked row just flipped too.
-                        let count = unsafe { SendMessageW(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as usize;
+                        let count = unsafe { send_message(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as usize;
                         for j in 0..count {
                             if j != i
-                                && unsafe { SendMessageW(lb, LB_GETITEMDATA, WPARAM(j), LPARAM(0)) }.0 as usize
+                                && unsafe { send_message(lb, LB_GETITEMDATA, WPARAM(j), LPARAM(0)) }.0 as usize
                                     == BST_CHECKED
                             {
                                 let _ = unsafe {
-                                    SendMessageW(lb, LB_SETITEMDATA, WPARAM(j), LPARAM(BST_UNCHECKED as isize))
+                                    send_message(lb, LB_SETITEMDATA, WPARAM(j), LPARAM(BST_UNCHECKED as isize))
                                 };
                             }
                         }
                         unsafe {
-                            let _ = InvalidateRect(lb, None, false);
+                            let _ = invalidate_rect(lb, None, false);
                         }
                     } else {
                         let mut item_rect = RECT::default();
                         let _ = unsafe {
-                            SendMessageW(
+                            send_message(
                                 lb,
                                 LB_GETITEMRECT,
                                 WPARAM(i),
@@ -982,7 +980,7 @@ unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPAR
                             )
                         };
                         unsafe {
-                            let _ = InvalidateRect(lb, Some(&item_rect), false);
+                            let _ = invalidate_rect(lb, Some(&item_rect), false);
                         }
                     }
                     return LRESULT(0);
@@ -1067,7 +1065,7 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 rebuild_picker_fonts(state, scale);
                 state.scale = scale;
                 let _ = unsafe {
-                    SetWindowPos(
+                    set_window_pos(
                         hwnd,
                         HWND_TOPMOST,
                         suggested.left,
@@ -1086,9 +1084,9 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 // system font, mirroring the open path below.
                 if !state.listbox.0.is_null() {
                     let _ = unsafe {
-                        SetWindowPos(
+                        set_window_pos(
                             state.listbox,
-                            None,
+                            HWND::default(),
                             0,
                             header_h,
                             phys_w,
@@ -1096,12 +1094,12 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                             SWP_NOACTIVATE | SWP_NOZORDER,
                         )
                     };
-                    let _ = unsafe { SendMessageW(state.listbox, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(row_h as isize)) };
+                    let _ = unsafe { send_message(state.listbox, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(row_h as isize)) };
                     let _ = unsafe {
-                        SendMessageW(state.listbox, WM_SETFONT, WPARAM(state.list_font.0 as usize), LPARAM(1))
+                        send_message(state.listbox, WM_SETFONT, WPARAM(state.list_font.0 as usize), LPARAM(1))
                     };
                 }
-                let _ = unsafe { InvalidateRect(hwnd, None, true) };
+                let _ = unsafe { invalidate_rect(hwnd, None, true) };
             }
             LRESULT(0)
         }
@@ -1128,7 +1126,7 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             // are deleted at the end of this paint.
             let (header_font, header_brush, close_brush, close_hover_brush, transient) = if state_ptr.is_null() {
                 let font = unsafe {
-                    CreateFontW(
+                    create_font(
                         -((14.0 * scale).round() as i32),
                         0,
                         0,
@@ -1179,7 +1177,7 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             let old_font = if header_font.0.is_null() {
                 None
             } else {
-                Some(unsafe { SelectObject(hdc, header_font) })
+                Some(unsafe { select_object(hdc, header_font) })
             };
             let _ = unsafe { SetBkMode(hdc, TRANSPARENT) };
             let _ = unsafe { SetTextColor(hdc, COLORREF(0x00F0F0F0)) };
@@ -1220,13 +1218,13 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             };
 
             if let Some(old_font) = old_font {
-                let _ = unsafe { SelectObject(hdc, old_font) };
+                let _ = unsafe { select_object(hdc, old_font) };
             }
             if transient {
-                let _ = unsafe { DeleteObject(header_font) };
-                let _ = unsafe { DeleteObject(header_brush) };
-                let _ = unsafe { DeleteObject(close_brush) };
-                let _ = unsafe { DeleteObject(close_hover_brush) };
+                let _ = unsafe { delete_object(header_font) };
+                let _ = unsafe { delete_object(header_brush) };
+                let _ = unsafe { delete_object(close_brush) };
+                let _ = unsafe { delete_object(close_hover_brush) };
             }
 
             let _ = unsafe { EndPaint(hwnd, &ps) };
@@ -1327,13 +1325,13 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     let _ = GetClientRect(hwnd, &mut client);
                     let scale = (*state_ptr).scale;
                     let btn = close_btn_rect(&client, scale);
-                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, Some(&btn), false);
+                    let _ = invalidate_rect(hwnd, Some(&btn), false);
                 };
                 // Change cursor; a failed load (broken system resources) just
                 // keeps the current cursor instead of panicking the picker.
                 if let Ok(cursor) = unsafe { LoadCursorW(None, windows::Win32::UI::WindowsAndMessaging::IDC_HAND) } {
                     unsafe {
-                        SetCursor(cursor);
+                        set_cursor(cursor);
                     }
                 } else {
                     warn!("LoadCursorW(IDC_HAND) failed; keeping the default cursor");

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
-use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
+use windows::Foundation::TypedEventHandler;
 use windows::Media::Control::{
     CurrentSessionChangedEventArgs, GlobalSystemMediaTransportControlsSession,
     GlobalSystemMediaTransportControlsSessionManager, GlobalSystemMediaTransportControlsSessionPlaybackStatus,
@@ -20,6 +20,7 @@ use windows::Storage::Streams::{Buffer, DataReader, InputStreamOptions};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
 use windows::core::Interface;
+use windows_future::AsyncStatus;
 
 enum Signal {
     /// Fired by SessionsChanged or CurrentSessionChanged: re-sync the
@@ -32,9 +33,13 @@ enum Signal {
 
 struct SessionSubscription {
     session: GlobalSystemMediaTransportControlsSession,
-    properties_token: EventRegistrationToken,
-    playback_token: EventRegistrationToken,
-    timeline_token: EventRegistrationToken,
+    // Windows 0.62's refreshed metadata declares the SMTC event tokens as
+    // plain 64-bit integers instead of the `EventRegistrationToken` struct;
+    // the worker flows the raw `Value` so the subscription state is
+    // version-agnostic (only the register/remove call sites convert).
+    properties_token: i64,
+    playback_token: i64,
+    timeline_token: i64,
 }
 
 /// The last known displayed state of one (source, session). Every field is a
@@ -3155,7 +3160,7 @@ mod winrt_containment_tests {
 fn register_sessions_handler(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
     signal_tx: SyncSender<Signal>,
-) -> Result<EventRegistrationToken> {
+) -> Result<i64> {
     let handler: TypedEventHandler<GlobalSystemMediaTransportControlsSessionManager, SessionsChangedEventArgs> =
         TypedEventHandler::new(move |_, _| {
             contained_winrt_event("the sessions handler", || {
@@ -3174,7 +3179,7 @@ fn register_sessions_handler(
 fn register_current_session_handler(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
     signal_tx: SyncSender<Signal>,
-) -> Result<EventRegistrationToken> {
+) -> Result<i64> {
     let handler: TypedEventHandler<GlobalSystemMediaTransportControlsSessionManager, CurrentSessionChangedEventArgs> =
         TypedEventHandler::new(move |_, _| {
             contained_winrt_event("the sessions handler", || {
@@ -3534,6 +3539,75 @@ fn is_session_gone(error: &anyhow::Error) -> bool {
             .is_some_and(|e| matches!(e.code().0 as u32, RPC_SERVER_UNAVAILABLE | DEVICE_NOT_READY))
     })
 }
+
+/// Synchronously waits for a WinRT async operation to complete and returns
+/// its result — the replacement for the `IAsyncOperation::get()` convenience
+/// method that windows 0.62 removes (windows 0.58 still generates `get()`
+/// with identical semantics: check `Status`; while it is `Started`, install a
+/// completed handler that signals a thread waiter and block until it fires;
+/// then return `GetResults`). The SMTC worker runs its WinRT calls
+/// synchronously on its own worker thread, so this mirrors the removed
+/// generated code exactly. Must only be called from a thread that may block
+/// (never the UI thread). Two instantiations cover the operation shapes the
+/// worker awaits — `IAsyncOperation<T>` and the artwork path's
+/// `IAsyncOperationWithProgress<T, u32>` — both of which lose `get()` in
+/// windows 0.62.
+///
+/// `timeout` bounds the block: `Some(limit)` abandons a never-completing
+/// operation after `limit` (returning an `AsyncReadTimeout` error, which the
+/// caller turns into a per-source exclusion — see `READ_ASYNC_TIMEOUT`),
+/// while `None` preserves the original unbounded `get()` semantics for the
+/// one site that cannot be blamed on a source (manager creation at worker
+/// startup). The abandoned operation is harmless: its completion handler
+/// fires later, the `send` lands in a channel nobody reads, and the handler
+/// is dropped with the operation.
+macro_rules! wait_async_op {
+    ($name:ident, $operation:ty, $handler:ty) => {
+        fn $name<TResult>(operation: &$operation, timeout: Option<Duration>) -> Result<TResult>
+        where
+            TResult: windows::core::RuntimeType + 'static,
+        {
+            if operation.Status()? == AsyncStatus::Started {
+                let (signal_tx, signal_rx) = mpsc::channel::<()>();
+                operation.SetCompleted(&<$handler>::new(move |_sender, _args| {
+                    let _ = signal_tx.send(());
+                    Ok(())
+                }))?;
+                match timeout {
+                    Some(limit) => match signal_rx.recv_timeout(limit) {
+                        Ok(()) => {}
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            return Err(anyhow::Error::new(AsyncReadTimeout {
+                                secs: limit.as_secs(),
+                            }));
+                        }
+                        // The operation completed and its handler was
+                        // replaced or dropped without signalling: treat as
+                        // completed and read the result below.
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                    },
+                    None => {
+                        // Unbounded: block until the operation completes,
+                        // exactly like the removed `get()`.
+                        let _ = signal_rx.recv();
+                    }
+                }
+            }
+            operation.GetResults().map_err(anyhow::Error::from)
+        }
+    };
+}
+
+wait_async_op!(
+    wait_async,
+    windows_future::IAsyncOperation<TResult>,
+    windows_future::AsyncOperationCompletedHandler<TResult>
+);
+wait_async_op!(
+    wait_async_progress,
+    windows_future::IAsyncOperationWithProgress<TResult, u32>,
+    windows_future::AsyncOperationWithProgressCompletedHandler<TResult, u32>
+);
 
 /// Marker error for an SMTC async read that did not complete within
 /// `READ_ASYNC_TIMEOUT`. Deliberately distinct from the ordinary read

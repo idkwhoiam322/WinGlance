@@ -5,7 +5,7 @@ use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, Vertica
 use log::{debug, warn};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR,
@@ -16,6 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindowVisible,
     MONITORINFOF_PRIMARY, WS_EX_TOOLWINDOW,
 };
+use windows::core::BOOL;
 use windows::core::PCWSTR;
 
 /// Samples the monitor's current refresh period in ms, so the animation timer

@@ -1,3 +1,4 @@
+use crate::winapi::reg_set_value;
 use crate::winutil::wide;
 use anyhow::{Context, Result};
 use log::{info, warn};
@@ -5,7 +6,6 @@ use std::path::Path;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, WIN32_ERROR};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyW, RegDeleteValueW, RegQueryValueExW,
-    RegSetValueExW,
 };
 use windows::core::PCWSTR;
 
@@ -83,7 +83,7 @@ pub fn apply(enabled: bool) -> Result<()> {
                         // ours, so rewriting it cannot clobber another
                         // program's entry.
                         let data = std::slice::from_raw_parts(target_wide.as_ptr().cast::<u8>(), target_wide.len() * 2);
-                        RegSetValueExW(key, PCWSTR(value.as_ptr()), 0, REG_SZ, Some(data))
+                        reg_set_value(key, PCWSTR(value.as_ptr()), REG_SZ, Some(data))
                     }
                 } else {
                     RegDeleteValueW(key, PCWSTR(value.as_ptr()))
@@ -95,7 +95,7 @@ pub fn apply(enabled: bool) -> Result<()> {
             }
             RunValue::Missing if enabled => {
                 let data = std::slice::from_raw_parts(target_wide.as_ptr().cast::<u8>(), target_wide.len() * 2);
-                RegSetValueExW(key, PCWSTR(value.as_ptr()), 0, REG_SZ, Some(data))
+                reg_set_value(key, PCWSTR(value.as_ptr()), REG_SZ, Some(data))
             }
             RunValue::Missing => {
                 // No entry to remove.

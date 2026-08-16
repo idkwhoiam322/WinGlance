@@ -1,12 +1,13 @@
+use crate::winapi::{create_font, delete_object, select_object};
 use crate::winutil::wide;
 use log::warn;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_DONTCARE,
-    GetTextMetricsW, HDC, HFONT, OUT_DEFAULT_PRECIS, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
+    ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER,
+    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DrawTextW, FF_DONTCARE, GetTextMetricsW, HDC,
+    HFONT, OUT_DEFAULT_PRECIS, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
 };
 use windows::core::PCWSTR;
 
@@ -62,7 +63,7 @@ impl FontProvider {
         }
         let font_name = wide("Segoe UI");
         let font = unsafe {
-            CreateFontW(
+            create_font(
                 -height.max(1),
                 0,
                 0,
@@ -84,12 +85,12 @@ impl FontProvider {
             unsafe {
                 let hdc = CreateCompatibleDC(None);
                 if !hdc.0.is_null() {
-                    let old_font = SelectObject(hdc, font);
+                    let old_font = select_object(hdc, font);
                     let mut tm = TEXTMETRICW::default();
                     if GetTextMetricsW(hdc, &mut tm).as_bool() {
                         tm_height = tm.tmHeight;
                     }
-                    SelectObject(hdc, old_font);
+                    select_object(hdc, old_font);
                     let _ = DeleteDC(hdc);
                 }
             }
@@ -112,7 +113,7 @@ impl FontProvider {
         });
         for (_, (font, _)) in guard.drain() {
             unsafe {
-                let _ = DeleteObject(font);
+                let _ = delete_object(font);
             }
         }
     }
@@ -149,7 +150,7 @@ pub(crate) fn draw_string(
     if font.0.is_null() {
         return;
     }
-    let old_font = unsafe { SelectObject(hdc, font) };
+    let old_font = unsafe { select_object(hdc, font) };
     let color = COLORREF(color[0] as u32 | (color[1] as u32) << 8 | (color[2] as u32) << 16);
     unsafe {
         SetTextColor(hdc, color);
@@ -159,6 +160,6 @@ pub(crate) fn draw_string(
             flags |= DT_CENTER;
         }
         let _ = DrawTextW(hdc, &mut text, rect, flags);
-        SelectObject(hdc, old_font);
+        select_object(hdc, old_font);
     }
 }

@@ -9,9 +9,14 @@ license = "MIT OR Apache-2.0"
 # (which references `::windows_core`) resolves. `windows` already pulls in this
 # exact crate transitively; promoting it to a direct dependency only makes the
 # codegen support crate nameable. No new behavioral dependency.
-windows-core = "0.58"
-windows = { version = "0.58", features = [
-    "implement",
+windows-core = "0.62"
+# Direct dependency so the `windows_future` async bindings (IAsyncOperation and
+# friends, which the refreshed metadata moved out of `windows::Foundation`)
+# are nameable from src/smtc.rs. `windows` pulls in this exact crate
+# transitively; the direct dependency only makes the codegen support crate
+# nameable.
+windows-future = "0.3"
+windows = { version = "0.62", features = [
     "Foundation",
     "Foundation_Collections",
     "Media_Control",

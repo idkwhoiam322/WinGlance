@@ -1,11 +1,11 @@
+use crate::winapi::delete_object;
 use log::{debug, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::Duration;
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDIBits,
-    HBITMAP, HDC,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, GetDIBits, HBITMAP, HDC,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize, IBindCtx};
 use windows::Win32::UI::Shell::{IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY};
@@ -97,7 +97,7 @@ fn extract_from_factory(factory: &IShellItemImageFactory, size: usize) -> Option
     let hdc = unsafe { CreateCompatibleDC(None) };
     if hdc.0.is_null() {
         unsafe {
-            let _ = DeleteObject(hbitmap);
+            let _ = delete_object(hbitmap);
         }
         return None;
     }
@@ -105,7 +105,7 @@ fn extract_from_factory(factory: &IShellItemImageFactory, size: usize) -> Option
     // (Microsoft's documented contract); the DC merely supplies the format.
     let result = hbitmap_to_bgra_premul(hdc, hbitmap, size);
     unsafe {
-        let _ = DeleteObject(hbitmap);
+        let _ = delete_object(hbitmap);
         let _ = DeleteDC(hdc);
     }
     result

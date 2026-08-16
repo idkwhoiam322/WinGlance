@@ -7,19 +7,18 @@ use log::debug;
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreatePen, CreateSolidBrush, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetMonitorInfoW, HBRUSH, HDC, HGDIOBJ, HPEN, InvalidateRect, LineTo, MONITOR_DEFAULTTONEAREST,
-    MONITORINFO, MonitorFromWindow, MoveToEx, PAINTSTRUCT, PS_SOLID, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    BeginPaint, CreatePen, CreateSolidBrush, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DrawTextW, EndPaint, FillRect,
+    GetMonitorInfoW, HBRUSH, HDC, HGDIOBJ, HPEN, LineTo, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    MoveToEx, PAINTSTRUCT, PS_SOLID, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect, HWND_TOPMOST,
-    PostMessageW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos,
-    ShowWindow, WM_CLOSE, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    CREATESTRUCTW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect, HWND_TOPMOST, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, ShowWindow, WM_CLOSE, WM_DPICHANGED, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
@@ -110,7 +109,7 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
         });
         let state_ptr = Box::into_raw(state);
         POSITIONER_STATE_CLAIMED.reset();
-        let hwnd = CreateWindowExW(
+        let hwnd = create_window(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             PCWSTR(class_name.as_ptr()),
             PCWSTR(wide("Place the WinGlance").as_ptr()),
@@ -119,7 +118,7 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
             0,
             (WIDTH as f32 * scale).round() as i32,
             (HEIGHT as f32 * scale).round() as i32,
-            owner,
+            Some(owner),
             None,
             instance,
             Some(state_ptr.cast()),
@@ -151,7 +150,7 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
                     let margin = (DEFAULT_MARGIN * scale).round() as i32;
                     (work.left + (work.right - work.left - pw) / 2, work.top + margin)
                 };
-                let _ = SetWindowPos(
+                let _ = set_window_pos(
                     hwnd,
                     HWND_TOPMOST,
                     x,
@@ -170,9 +169,9 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
                 // ran, the box still belongs to us and must be freed here —
                 // including its fixed GDI objects.
                 if let Some(state) = POSITIONER_STATE_CLAIMED.take_unclaimed(state_ptr) {
-                    let _ = DeleteObject(HGDIOBJ(state.bg_brush.0));
-                    let _ = DeleteObject(HGDIOBJ(state.x_brush.0));
-                    let _ = DeleteObject(HGDIOBJ(state.pen.0));
+                    let _ = delete_object(HGDIOBJ(state.bg_brush.0));
+                    let _ = delete_object(HGDIOBJ(state.x_brush.0));
+                    let _ = delete_object(HGDIOBJ(state.pen.0));
                 }
                 false
             }
@@ -207,7 +206,7 @@ pub(crate) fn reset_position() {
         let margin = (DEFAULT_MARGIN * scale).round() as i32;
         let x = work.left + (work.right - work.left - w) / 2;
         let y = work.top + margin;
-        if let Err(error) = SetWindowPos(
+        if let Err(error) = set_window_pos(
             hwnd,
             HWND_TOPMOST,
             x,
@@ -297,7 +296,7 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
         return;
     }
     if let Err(error) = unsafe {
-        PostMessageW(
+        post_message(
             state.owner,
             state.result_msg,
             WPARAM(log_x as usize),
@@ -384,7 +383,7 @@ unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                 if GetCursorPos(&mut cursor).is_ok() {
                     let x = cursor.x + state.drag_offset.x;
                     let y = cursor.y + state.drag_offset.y;
-                    if let Err(error) = SetWindowPos(
+                    if let Err(error) = set_window_pos(
                         hwnd,
                         HWND_TOPMOST,
                         x,
@@ -425,7 +424,7 @@ unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                 let new_dpi = (wparam.0 >> 16) as u32;
                 let scale = new_dpi.max(96) as f32 / 96.0;
                 unsafe {
-                    let _ = DeleteObject(HGDIOBJ(state.pen.0));
+                    let _ = delete_object(HGDIOBJ(state.pen.0));
                 }
                 state.pen = unsafe { CreatePen(PS_SOLID, (PEN_W * scale).round().max(1.0) as i32, COLORREF(0x999999)) };
                 let w = (WIDTH as f32 * scale).round() as i32;
@@ -433,7 +432,7 @@ unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                 let mut rect = RECT::default();
                 let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
                 let _ = unsafe {
-                    SetWindowPos(
+                    set_window_pos(
                         hwnd,
                         HWND_TOPMOST,
                         rect.left,
@@ -443,7 +442,7 @@ unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                         SWP_NOACTIVATE | SWP_NOZORDER,
                     )
                 };
-                let _ = unsafe { InvalidateRect(hwnd, None, true) };
+                let _ = unsafe { invalidate_rect(hwnd, None, true) };
             }
             LRESULT(0)
         }
@@ -490,13 +489,13 @@ unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                     };
                     let _ = FillRect(hdc, &x_rect, state.x_brush);
 
-                    let old_pen = SelectObject(hdc, state.pen);
+                    let old_pen = select_object(hdc, state.pen);
                     let inset = (8.0 * scale).round() as i32;
                     let _ = MoveToEx(hdc, x_rect.left + inset, x_rect.top + inset, None);
                     let _ = LineTo(hdc, x_rect.right - inset, x_rect.bottom - inset);
                     let _ = MoveToEx(hdc, x_rect.right - inset, x_rect.top + inset, None);
                     let _ = LineTo(hdc, x_rect.left + inset, x_rect.bottom - inset);
-                    SelectObject(hdc, old_pen);
+                    select_object(hdc, old_pen);
                 }
             }
             let _ = EndPaint(hwnd, &paint);
@@ -511,9 +510,9 @@ unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 unsafe {
-                    let _ = DeleteObject(HGDIOBJ(state.bg_brush.0));
-                    let _ = DeleteObject(HGDIOBJ(state.x_brush.0));
-                    let _ = DeleteObject(HGDIOBJ(state.pen.0));
+                    let _ = delete_object(HGDIOBJ(state.bg_brush.0));
+                    let _ = delete_object(HGDIOBJ(state.x_brush.0));
+                    let _ = delete_object(HGDIOBJ(state.pen.0));
                 }
                 // Slot clear first, box second — the canonical order every
                 // window applies via the shared helper.

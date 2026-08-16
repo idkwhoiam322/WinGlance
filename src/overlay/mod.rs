@@ -20,24 +20,18 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::BOOLEAN;
-use windows::Win32::Foundation::{
-    HANDLE, HINSTANCE, HMODULE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT, RECT, WPARAM,
-};
-use windows::Win32::Graphics::Gdi::{DeleteDC, DeleteObject, HBITMAP, HDC, HFONT, HGDIOBJ, SelectObject, ValidateRect};
+use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{DeleteDC, HBITMAP, HDC, HFONT, HGDIOBJ};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateTimerQueueTimer, DeleteTimerQueueTimer, WT_EXECUTEDEFAULT};
-use windows::Win32::UI::Accessibility::{
-    HWINEVENTHOOK, SetWinEventHook, UiaReturnRawElementProvider, UiaRootObjectId, UnhookWinEvent,
-};
+use windows::Win32::System::Threading::{CreateTimerQueueTimer, WT_EXECUTEDEFAULT};
+use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, UiaReturnRawElementProvider, UiaRootObjectId, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, EVENT_SYSTEM_FOREGROUND, GetCursorPos, GetForegroundWindow,
-    GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST, IsWindowVisible, KillTimer, MA_NOACTIVATE, MSG, PM_REMOVE,
-    PeekMessageW, PostMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetTimer, SetWindowPos, ShowWindow, WINEVENT_OUTOFCONTEXT, WM_APP,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_GETOBJECT, WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY,
-    WM_NCHITTEST, WM_PAINT, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CREATESTRUCTW, DefWindowProcW, EVENT_SYSTEM_FOREGROUND, GetCursorPos, GetForegroundWindow,
+    GetWindowThreadProcessId, HTTRANSPARENT, HWND_TOPMOST, IsWindowVisible, MA_NOACTIVATE, MSG, PM_REMOVE, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    ShowWindow, WINEVENT_OUTOFCONTEXT, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_GETOBJECT,
+    WM_MOUSEACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -180,12 +174,12 @@ struct DibCache {
 /// non-blocking, so the timer can be deleted with a completion wait at
 /// teardown without deadlocking (a blocking callback would wait on the very
 /// thread that is deleting the timer).
-unsafe extern "system" fn animation_timer_proc(parameter: *mut c_void, _fired: BOOLEAN) {
+unsafe extern "system" fn animation_timer_proc(parameter: *mut c_void, _fired: bool) {
     // A contained panic no-ops the tick; the next tick retries.
     crate::winutil::guarded_void("the animation timer callback", || {
         let hwnd = HWND(parameter);
         unsafe {
-            let _ = PostMessageW(hwnd, TIMER_ANIMATION_MSG, WPARAM(0), LPARAM(0));
+            let _ = post_message(hwnd, TIMER_ANIMATION_MSG, WPARAM(0), LPARAM(0));
         }
     });
 }
@@ -315,8 +309,8 @@ struct TextScratch {
 /// `TextScratch` `Drop` impls instead of being re-written at each free site.
 fn release_dib(hdc: HDC, bitmap: HBITMAP, old_bitmap: HGDIOBJ) {
     unsafe {
-        let _ = SelectObject(hdc, old_bitmap);
-        let _ = DeleteObject(bitmap);
+        let _ = select_object(hdc, old_bitmap);
+        let _ = delete_object(bitmap);
         let _ = DeleteDC(hdc);
     }
 }
@@ -1039,7 +1033,7 @@ impl OverlayState {
         // timer the pill freezes at its first frame and never dismisses.
         // Fall back to a plain window timer that drives the same tick.
         error!("CreateTimerQueueTimer failed; falling back to SetTimer");
-        if unsafe { SetTimer(self.hwnd, ANIM_TIMER_ID, self.tick_period, None) } != 0 {
+        if unsafe { set_timer(self.hwnd, ANIM_TIMER_ID, self.tick_period, None) } != 0 {
             self.anim_timer_fallback = true;
         }
     }
@@ -1154,13 +1148,13 @@ impl OverlayState {
             // PostMessageW, so the wait cannot deadlock, and no stale tick
             // message can be posted to a window that is being torn down.
             unsafe {
-                let _ = DeleteTimerQueueTimer(None, self.anim_timer, INVALID_HANDLE_VALUE);
+                let _ = crate::winapi::delete_timer_queue_timer(None, self.anim_timer, Some(INVALID_HANDLE_VALUE));
             }
             self.anim_timer = HANDLE::default();
         }
         if self.anim_timer_fallback {
             unsafe {
-                let _ = KillTimer(self.hwnd, ANIM_TIMER_ID);
+                let _ = kill_timer(self.hwnd, ANIM_TIMER_ID);
             }
             self.anim_timer_fallback = false;
         }
@@ -1478,8 +1472,8 @@ impl OverlayState {
             // caps the remaining time (EARLY_EXIT_MS) once the pill is no
             // longer held, so the queued notification shows promptly.
             unsafe {
-                let _ = KillTimer(self.hwnd, TIMER_DEBOUNCE);
-                SetTimer(
+                let _ = kill_timer(self.hwnd, TIMER_DEBOUNCE);
+                set_timer(
                     self.hwnd,
                     TIMER_DEBOUNCE,
                     self.config.behavior.debounce_ms.clamp(150, 250) as u32,
@@ -1649,7 +1643,7 @@ impl OverlayState {
     }
     fn flush_pending(&mut self) {
         unsafe {
-            let _ = KillTimer(self.hwnd, TIMER_DEBOUNCE);
+            let _ = kill_timer(self.hwnd, TIMER_DEBOUNCE);
         }
         // While a pill is on screen the queue waits: the next event shows when
         // the current one collapses, so notifications never clobber each other.
@@ -2192,7 +2186,7 @@ impl OverlayState {
         // A fresh pill invalidates the idle-release deadline: the frame
         // buffers are about to be reused.
         unsafe {
-            let _ = KillTimer(self.hwnd, IDLE_BUFFER_TIMER_ID);
+            let _ = kill_timer(self.hwnd, IDLE_BUFFER_TIMER_ID);
         }
         if let MediaEvent::TrackChanged(ref track) = event {
             self.apply_track_progress(track);
@@ -2434,7 +2428,7 @@ impl OverlayState {
                 if !IsWindowVisible(self.hwnd).as_bool() {
                     let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
                 }
-                if let Err(error) = SetWindowPos(
+                if let Err(error) = set_window_pos(
                     self.hwnd,
                     HWND_TOPMOST,
                     0,
@@ -2443,7 +2437,7 @@ impl OverlayState {
                     0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                 ) {
-                    debug!("pill SetWindowPos(topmost) failed: {error}");
+                    debug!("pill set_window_pos(topmost) failed: {error}");
                 }
             }
         }
@@ -3163,7 +3157,7 @@ impl OverlayState {
             return;
         };
         unsafe {
-            if let Err(error) = SetWindowPos(
+            if let Err(error) = set_window_pos(
                 self.hwnd,
                 HWND_TOPMOST,
                 point.x,
@@ -3172,7 +3166,7 @@ impl OverlayState {
                 0,
                 SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOOWNERZORDER,
             ) {
-                debug!("SetWindowPos(reposition) failed: {error}");
+                debug!("set_window_pos(reposition) failed: {error}");
             }
         }
     }
@@ -3313,7 +3307,7 @@ impl OverlayState {
             if !ShowWindow(self.hwnd, SW_HIDE).as_bool() {
                 debug!("ShowWindow(SW_HIDE) failed");
             }
-            if let Err(error) = SetWindowPos(
+            if let Err(error) = set_window_pos(
                 self.hwnd,
                 HWND_TOPMOST,
                 0,
@@ -3322,7 +3316,7 @@ impl OverlayState {
                 0,
                 SWP_HIDEWINDOW | SWP_NOACTIVATE | SWP_NOZORDER,
             ) {
-                debug!("SetWindowPos(hide) failed: {error}");
+                debug!("set_window_pos(hide) failed: {error}");
             }
         }
         // The size-reuse buffers (`dib`, `frame_scratch`) only pay off for
@@ -3331,7 +3325,7 @@ impl OverlayState {
         // kills the timer, so this only fires if no fresh pill appears within
         // the deadline; the buffers are rebuilt lazily on the next show.
         unsafe {
-            let _ = SetTimer(self.hwnd, IDLE_BUFFER_TIMER_ID, IDLE_BUFFER_RELEASE_MS, None);
+            let _ = set_timer(self.hwnd, IDLE_BUFFER_TIMER_ID, IDLE_BUFFER_RELEASE_MS, None);
         }
         // Advance the queue: the next pending notification shows as a fresh
         // pill. show() checks `enabled`, so a toggle-off collapse stays hidden.
@@ -3495,7 +3489,7 @@ impl OverlayState {
         // A sample pill is a show: cancel the idle-release deadline so the
         // buffers survive the preview.
         unsafe {
-            let _ = KillTimer(self.hwnd, IDLE_BUFFER_TIMER_ID);
+            let _ = kill_timer(self.hwnd, IDLE_BUFFER_TIMER_ID);
         }
         // The sample follows the same layout decision as a real pill (the
         // settings preview must show what a real notification would show).
@@ -3600,7 +3594,7 @@ pub(crate) fn create_window(
     let state_ptr = Box::into_raw(state);
     OVERLAY_STATE_CLAIMED.reset();
     let hwnd = unsafe {
-        CreateWindowExW(
+        crate::winapi::create_window(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             PCWSTR(class_name.as_ptr()),
             PCWSTR(wide("WinGlance").as_ptr()),
@@ -3625,10 +3619,10 @@ pub(crate) fn create_window(
             // static tick (`tick_layout_check`) — never block startup over it.
             OVERLAY_FG_HWND.store(hwnd.0 as u64, Ordering::SeqCst);
             let hook = unsafe {
-                SetWinEventHook(
+                crate::winapi::set_win_event_hook(
                     EVENT_SYSTEM_FOREGROUND,
                     EVENT_SYSTEM_FOREGROUND,
-                    HMODULE::default(),
+                    None,
                     Some(foreground_hook_cb),
                     0,
                     0,
@@ -3686,7 +3680,7 @@ unsafe extern "system" fn foreground_hook_cb(
             // Post only — never SendMessageW (would block the system foreground
             // dispatch). A null hwnd (teardown race) is harmless: PostMessageW to
             // an invalid window simply returns FALSE, which we discard.
-            let _ = PostMessageW(HWND(target as *mut c_void), FOREGROUND_CHANGE_MSG, WPARAM(0), LPARAM(0));
+            let _ = post_message(HWND(target as *mut c_void), FOREGROUND_CHANGE_MSG, WPARAM(0), LPARAM(0));
         }
     });
 }
@@ -3755,7 +3749,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_PAINT => {
-            let _ = ValidateRect(hwnd, None);
+            let _ = validate_rect(hwnd, None);
             LRESULT(0)
         }
         MEDIA_EVENT_MSG => {
@@ -3838,15 +3832,13 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 // one message per event, so drain the queued siblings before
                 // acting — the same coalescence the animation tick uses.
                 let mut pending = MSG::default();
-                while PeekMessageW(
+                while crate::winapi::peek_message(
                     &mut pending,
                     hwnd,
                     FOREGROUND_CHANGE_MSG,
                     FOREGROUND_CHANGE_MSG,
                     PM_REMOVE,
-                )
-                .as_bool()
-                {}
+                ) {}
                 state.on_foreground_change();
             }
             LRESULT(0)
@@ -3859,7 +3851,8 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             // cannot pile up).
             unsafe {
                 let mut msg = MSG::default();
-                while PeekMessageW(&mut msg, hwnd, TIMER_ANIMATION_MSG, TIMER_ANIMATION_MSG, PM_REMOVE).as_bool() {}
+                while crate::winapi::peek_message(&mut msg, hwnd, TIMER_ANIMATION_MSG, TIMER_ANIMATION_MSG, PM_REMOVE) {
+                }
             }
             if !state_ptr.is_null() {
                 (*state_ptr).tick();
@@ -3929,12 +3922,11 @@ mod tests {
     use std::ptr::null_mut;
     use windows::Win32::Foundation::COLORREF;
     use windows::Win32::Graphics::Gdi::{
-        ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE,
-        OUT_DEFAULT_PRECIS,
+        ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, OUT_DEFAULT_PRECIS,
     };
     use windows::Win32::Graphics::Gdi::{
-        BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DT_NOPREFIX, DT_SINGLELINE,
-        DT_VCENTER, DrawTextW, HMONITOR, SetBkMode, SetTextColor, TRANSPARENT,
+        BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        DrawTextW, HMONITOR, SetBkMode, SetTextColor, TRANSPARENT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         DestroyWindow, DispatchMessageW, GetMessageW, TranslateMessage, WINDOW_EX_STYLE, WM_NULL,
@@ -7138,16 +7130,17 @@ mod tests {
                 ..Default::default()
             };
             let mut bits: *mut c_void = null_mut();
-            let bitmap = CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            let bitmap =
+                crate::winapi::create_dib_section(Some(hdc), &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
             assert!(!bits.is_null());
-            let old = SelectObject(hdc, bitmap);
+            let old = select_object(hdc, bitmap);
             // Pre-fill the DIB with an opaque black background like the pill.
             std::ptr::write_bytes(bits.cast::<u8>(), 0, 200 * 40 * 4);
             for i in 0..(200 * 40) {
                 (bits.cast::<u8>()).add(i * 4 + 3).write(255);
             }
             let font_name = wide("Segoe UI");
-            let font = CreateFontW(
+            let font = crate::winapi::create_font(
                 -16,
                 0,
                 0,
@@ -7163,7 +7156,7 @@ mod tests {
                 DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
                 PCWSTR(font_name.as_ptr()),
             );
-            let old_font = SelectObject(hdc, font);
+            let old_font = select_object(hdc, font);
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, COLORREF(0x00FFFFFF));
             let mut text = wide("Hello");
@@ -7188,10 +7181,10 @@ mod tests {
                     lit_alpha = a;
                 }
             }
-            SelectObject(hdc, old_font);
-            let _ = DeleteObject(font);
-            SelectObject(hdc, old);
-            let _ = DeleteObject(bitmap);
+            select_object(hdc, old_font);
+            let _ = delete_object(font);
+            select_object(hdc, old);
+            let _ = delete_object(bitmap);
             let _ = DeleteDC(hdc);
             assert!(
                 rgb_lit > 50,
