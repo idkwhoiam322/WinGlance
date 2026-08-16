@@ -42,8 +42,11 @@ jobs:
           name: WinGlance-windows
           path: target/release/WinGlance.exe
           if-no-files-found: error
+      - uses: taiki-e/install-action@cargo-audit
+      - name: cargo-audit (advisories)
+        run: cargo audit
       - uses: taiki-e/install-action@cargo-deny
-      - name: cargo-deny
+      - name: cargo-deny (licenses, bans, advisories, sources)
         run: cargo deny check
 
   # Isolated from the check job: only workflow_dispatch runs (which the repo

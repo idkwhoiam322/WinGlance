@@ -4,8 +4,8 @@
 
 .DESCRIPTION
     Optional throttling, format and all-target checks, a locked Cargo build,
-    advisory dependency checks, and optional restart of an already-running
-    process.
+    hard-gated advisory checks (cargo-audit + cargo-deny; escape with
+    -SkipAudit), and optional restart of an already-running process.
 
 .PARAMETER Clean
     Remove target before building.
@@ -99,6 +99,15 @@ if (-not $SkipFormat) {
     $rustfmt = Get-Command rustfmt -ErrorAction SilentlyContinue
     if (-not $rustfmt) { Fail "rustfmt not found. Install the Rust component with rustup component add rustfmt" }
 }
+if (-not $SkipAudit) {
+    # The advisory checks are part of the gate (AGENTS.md), so a missing
+    # tool is a failure, not a skip — a guard that silently disables itself
+    # is not a guard. -SkipAudit is the escape for quick loops.
+    $audit = Get-Command cargo-audit -ErrorAction SilentlyContinue
+    if (-not $audit) { Fail "cargo-audit not found. Install with 'cargo install cargo-audit' (or use -SkipAudit for a quick loop)" }
+    $deny = Get-Command cargo-deny -ErrorAction SilentlyContinue
+    if (-not $deny) { Fail "cargo-deny not found. Install with 'cargo install cargo-deny' (or use -SkipAudit for a quick loop)" }
+}
 
 $cargoJobsFlag = ""
 if (-not $NoThrottle) {
@@ -133,7 +142,7 @@ try {
     if ($LASTEXITCODE -ne 0) { Fail "Clippy failed (exit code $LASTEXITCODE). Fix the warnings and retry." }
 
     Write-Step "Running tests"
-    cargo test --locked $cargoJobsFlag
+    cargo test --locked $cargoJobsFlag --quiet --no-fail-fast
     if ($LASTEXITCODE -ne 0) { Fail "Tests failed (exit code $LASTEXITCODE). Fix the failures and retry." }
 
     $profileFlag = if ($Release) { "--release" } else { "" }
@@ -146,23 +155,16 @@ try {
     if (-not (Test-Path -LiteralPath $exePath)) { Fail "No executable at $exePath" }
 
     if (-not $SkipAudit) {
-        $audit = Get-Command cargo-audit -ErrorAction SilentlyContinue
-        if ($audit) {
-            Write-Step "Running cargo-audit (advisory)"
-            cargo audit
-            if ($LASTEXITCODE -ne 0) { Write-Host "cargo-audit reported issues; continuing." -ForegroundColor Yellow }
-        } else {
-            Write-Host "cargo-audit not installed; skipping" -ForegroundColor Yellow
-        }
+        # Hard gates: a vulnerable or license-violating dependency fails the
+        # build, matching what CI enforces. The tools were verified present
+        # in the tool check above, so a non-zero exit here is a real finding.
+        Write-Step "Running cargo-audit (advisory)"
+        cargo audit
+        if ($LASTEXITCODE -ne 0) { Fail "cargo-audit found advisories (exit code $LASTEXITCODE). Vet them and retry, or use -SkipAudit." }
 
-        $deny = Get-Command cargo-deny -ErrorAction SilentlyContinue
-        if ($deny) {
-            Write-Step "Running cargo-deny (advisory)"
-            cargo deny check
-            if ($LASTEXITCODE -ne 0) { Write-Host "cargo-deny reported issues; continuing." -ForegroundColor Yellow }
-        } else {
-            Write-Host "cargo-deny not installed; skipping" -ForegroundColor Yellow
-        }
+        Write-Step "Running cargo-deny (advisory)"
+        cargo deny check
+        if ($LASTEXITCODE -ne 0) { Fail "cargo-deny check failed (exit code $LASTEXITCODE). Fix the violations and retry, or use -SkipAudit." }
     }
 
     if ($Start -or ($wasRunning -and -not $NoRestart)) {

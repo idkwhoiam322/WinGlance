@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Keep the Rust dependency tree current: Cargo.lock is the file CI builds
+  # against (create_exe.ps1 and the CI workflow build with --locked), so a
+  # bump lands here before it reaches the repo. Weekly cadence matches the
+  # bump policy (windows + image reviewed on a schedule).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    # Group nothing: windows/image bumps are reviewed manually (they can carry
+    # breaking API changes), but keep transitive churn visible.
+    versioning-strategy: lockfile-only
+
+  # Keep the CI workflow itself current (runner images, actions versions).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
