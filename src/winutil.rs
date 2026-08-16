@@ -216,6 +216,22 @@ pub(crate) fn system_preferences() -> SystemPreferences {
     }
 }
 
+/// Bounded, escaped preview of an untrusted string for log output: at most
+/// `cap` scalar values, each escaped so control and invisible characters are
+/// visible, plus the count of characters omitted. Keeps log-line allocations
+/// independent of the raw input length. Shared by `smtc` and `icon` so the
+/// two bounded-preview sites cannot drift apart.
+pub(crate) fn log_preview(value: &str, cap: usize) -> (String, usize) {
+    let mut preview = String::new();
+    for (i, c) in value.chars().enumerate() {
+        if i >= cap {
+            return (preview, value.chars().count() - cap);
+        }
+        preview.extend(c.escape_debug());
+    }
+    (preview, 0)
+}
+
 /// Whether motion is currently allowed (client-area animation on, overlapped
 /// content not minimized).
 pub(crate) fn animations_enabled() -> bool {

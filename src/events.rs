@@ -254,6 +254,24 @@ pub fn media_event_into_owned(event: Arc<MediaEvent>) -> MediaEvent {
     Arc::try_unwrap(event).unwrap_or_else(|shared| (*shared).clone())
 }
 
+/// The artwork bytes an event pins in flight: the raw cover plus the fixed
+/// 256² decode buffer. Only `TrackChanged` carries image payloads; every
+/// other variant is plain data. The palette (a few hundred bytes) and the
+/// cached app icon (bounded by the per-app icon cache, shared across clones)
+/// are not counted — the raw cover (up to `MAX_THUMBNAIL_BYTES`) and the
+/// decode dominate and are exactly what a wedged forwarder would retain.
+/// Shared by both sides of the in-flight artwork byte budget: the SMTC
+/// worker counts the bytes it queues, the forwarder frees them as it pops.
+pub(crate) fn artwork_bytes(event: &MediaEvent) -> u64 {
+    match event {
+        MediaEvent::TrackChanged(track) => {
+            track.artwork.as_deref().map_or(0, |bytes| bytes.len() as u64)
+                + track.decoded_art.as_deref().map_or(0, |bytes| bytes.len() as u64)
+        }
+        _ => 0,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackState {
     Playing,
@@ -304,6 +322,13 @@ pub enum MediaEvent {
     WorkerFailed {
         reason: String,
     },
+    /// The in-flight artwork byte budget dropped a cover payload at emit time
+    /// (`MAX_IN_FLIGHT_ARTWORK_BYTES`): the UI was not keeping up, so queued
+    /// artwork exceeded the budget and the payload was stripped (metadata
+    /// kept, the pill renders a placeholder). Emitted at most once per app
+    /// run by the worker; the main window surfaces it as a one-shot tray
+    /// note. Never rendered as a pill and never stored in history.
+    ArtworkBudgetExceeded,
     /// Live playback position update, separate from `TrackChanged` so the
     /// progress bar can track position and seeks without re-emitting a track
     /// pill. Carries position, duration and rate; the overlay re-bases its

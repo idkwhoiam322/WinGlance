@@ -156,6 +156,7 @@ pub(super) fn content_size_of(config: &Config, content: &MediaEvent, compact: bo
         MediaEvent::SessionRejected { .. }
         | MediaEvent::SourceGone { .. }
         | MediaEvent::WorkerFailed { .. }
+        | MediaEvent::ArtworkBudgetExceeded
         | MediaEvent::ProgressChanged { .. } => (0.0, 0.0),
     }
 }

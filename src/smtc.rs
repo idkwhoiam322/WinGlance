@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::events::{MediaEvent, PlaybackState, PlaybackType, TrackInfo, decode_artwork_pm};
+use crate::events::{MediaEvent, PlaybackState, PlaybackType, TrackInfo, artwork_bytes, decode_artwork_pm};
 use crate::palette::{Palette, palette_from_rgba};
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
@@ -169,9 +169,31 @@ const MAX_RETAINED_ARTWORK_BYTES: usize = 64 * 1024 * 1024;
 /// at the next event-loop turn. 256 matches the per-window queue caps.
 const OUTPUT_RETRY_CAP: usize = 256;
 
+/// Total artwork bytes the worker will hold in its outbound queues (the
+/// event channel plus the retry mailbox) at once. Queue *counts* are capped,
+/// but a `TrackChanged` can carry up to `MAX_THUMBNAIL_BYTES` of cover art
+/// behind its `Arc`, so count caps alone admit ~1280 × 4 MiB ≈ 5 GiB of
+/// queued art while a wedged forwarder drains slowly. The byte budget closes
+/// that: when an event would push in-flight artwork past the budget, its
+/// payload is dropped at emit time — raw cover, decode and derived palette
+/// stripped, metadata kept, the pill renders a placeholder — the same trade
+/// `MAX_RETAINED_ARTWORK_BYTES` makes. The shared counter is decremented as
+/// the forwarder pops events and as the mailbox frees them, so a legitimate
+/// cover flow resumes as soon as the UI catches up. Matches the retained-art
+/// budget; normal operation (a few MiB of queued art at most) never
+/// approaches it.
+const MAX_IN_FLIGHT_ARTWORK_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Minimum gap between two overflow warnings, so a hostile storm of rejected
 /// sessions cannot flood the log with one WARN per rejected session.
 const OVERFLOW_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Bound on the once-per-appearance reporting sets (`rejected_seen`,
+/// `ignored_seen`): a hostile storm of ever-new session keys cannot grow the
+/// dedup sets without bound. When the cap is met, an arbitrary recorded key
+/// is evicted so the set stays bounded; the evicted session may report once
+/// more, which keeps the log volume bounded by unique keys either way.
+const MAX_REPORTED_SESSIONS: usize = 1024;
 
 /// Source labels of every currently open SMTC session, refreshed at each
 /// subscription re-sync. The process picker reads this so media apps that run
@@ -197,6 +219,21 @@ struct ListenerState {
     manager: GlobalSystemMediaTransportControlsSessionManager,
     config: Arc<RwLock<Config>>,
     output: SyncSender<Arc<MediaEvent>>,
+    /// Shared in-flight artwork byte counter. The worker adds the artwork
+    /// bytes of every event it queues (channel or mailbox) and the forwarder
+    /// subtracts them as it pops, so the counter tracks the distinct artwork
+    /// allocations held by the outbound queues. `emit` consults it against
+    /// `MAX_IN_FLIGHT_ARTWORK_BYTES` and drops the payload (metadata kept)
+    /// when the budget would be exceeded; mailbox supersede/over-cap/clear
+    /// drops free their bytes too. Shared with the forwarder across worker
+    /// restarts, so queued events from a replaced worker stay accounted.
+    in_flight_art: Arc<AtomicU64>,
+    /// One-shot latch for the user-facing budget warning: set (via `swap`)
+    /// the first time `emit` drops a cover payload, and `MediaEvent::
+    /// ArtworkBudgetExceeded` is emitted exactly once per app run. Shared
+    /// across worker restarts like the counter, so a replacement worker does
+    /// not re-warn.
+    budget_warned: Arc<AtomicBool>,
     /// Recoverable retry mailbox for events the bounded output channel could
     /// not accept immediately. Bounded; coalesced by (kind, source) with the
     /// newest superseding, drained in arrival order at every event-loop turn.
@@ -236,8 +273,13 @@ struct ListenerState {
     churn_cooldown: HashMap<String, Instant>,
     /// Keys of rejected sessions already reported to the history, so a
     /// rejected session is logged once per appearance instead of on every
-    /// re-sync (the 2-second poll re-lists all sessions).
+    /// re-sync (the 2-second poll re-lists all sessions). Bounded by
+    /// `MAX_REPORTED_SESSIONS`.
     rejected_seen: HashSet<usize>,
+    /// Keys of allowed-but-not-current sessions already reported, so the
+    /// once-per-appearance gate applies to the "ignored" detail line the same
+    /// way it does to rejected sessions. Bounded like `rejected_seen`.
+    ignored_seen: HashSet<usize>,
     /// Source apps whose last session reported Closed (or vanished from the
     /// session snapshot between syncs) and still owe the overlay a terminal
     /// `Stopped`, so a persistent pill does not linger at idle opacity
@@ -322,6 +364,13 @@ struct ListenerState {
 
 pub struct SmtcListener {
     output: SyncSender<Arc<MediaEvent>>,
+    /// Shared in-flight artwork byte counter (see `MAX_IN_FLIGHT_ARTWORK_BYTES`
+    /// and `ListenerState::in_flight_art`).
+    in_flight_art: Arc<AtomicU64>,
+    /// One-shot latch: set when the in-flight artwork budget drops a cover
+    /// payload, so the user gets exactly one tray warning per app run (see
+    /// `ListenerState::budget_warned`).
+    budget_warned: Arc<AtomicBool>,
     config: Arc<RwLock<Config>>,
     /// Updated by the event loop every few seconds so a supervisor can detect
     /// a stalled worker (a WinRT call hanging under session churn) and
@@ -345,6 +394,8 @@ impl SmtcListener {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         output: SyncSender<Arc<MediaEvent>>,
+        in_flight_art: Arc<AtomicU64>,
+        budget_warned: Arc<AtomicBool>,
         config: Arc<RwLock<Config>>,
         heartbeat: Arc<Mutex<Instant>>,
         live_generation: Arc<AtomicU64>,
@@ -354,6 +405,8 @@ impl SmtcListener {
     ) -> Self {
         Self {
             output,
+            in_flight_art,
+            budget_warned,
             config,
             heartbeat,
             live_generation,
@@ -383,6 +436,8 @@ impl SmtcListener {
             manager,
             self.config,
             self.output,
+            self.in_flight_art,
+            self.budget_warned,
             signal_tx,
             self.heartbeat,
             self.live_generation,
@@ -410,6 +465,8 @@ impl ListenerState {
         manager: GlobalSystemMediaTransportControlsSessionManager,
         config: Arc<RwLock<Config>>,
         output: SyncSender<Arc<MediaEvent>>,
+        in_flight_art: Arc<AtomicU64>,
+        budget_warned: Arc<AtomicBool>,
         signal_tx: SyncSender<Signal>,
         heartbeat: Arc<Mutex<Instant>>,
         live_generation: Arc<AtomicU64>,
@@ -430,6 +487,8 @@ impl ListenerState {
             manager,
             config,
             output,
+            in_flight_art,
+            budget_warned,
             pending_output: VecDeque::new(),
             signal_tx,
             subscriptions: HashMap::new(),
@@ -443,6 +502,7 @@ impl ListenerState {
             churn: HashMap::new(),
             churn_cooldown: HashMap::new(),
             rejected_seen: HashSet::new(),
+            ignored_seen: HashSet::new(),
             terminal_pending: HashMap::new(),
             last_track_per_source: HashMap::new(),
             last_known_playback_per_source: HashMap::new(),
@@ -1236,38 +1296,34 @@ impl ListenerState {
 
         // Admission priority for the global caps: current session first, then
         // sessions already subscribed (preserving snapshot order), then
-        // genuinely new sessions. A hostile storm of new sessions therefore
-        // cannot evict existing subscriptions when the caps are applied:
-        // overflow is rejected, and a brand-new *current* session displaces
-        // the weakest survivor(s) instead of being starved
-        // (`displace_survivors`) — the caps still bound the total tracked
-        // set. The allow-list and current-session filters are applied within
-        // the loop; the cap itself only counts sessions that pass those
-        // filters.
-        let mut prioritized: Vec<(GlobalSystemMediaTransportControlsSession, usize, String)> =
-            Vec::with_capacity(sessions.len());
-        if let Some(cur) = current.as_ref() {
-            let cur_key = session_key(cur);
-            if alive.contains(&cur_key) {
-                prioritized.push((cur.clone(), cur_key, read_source_app(cur)));
-            }
-        }
-        for session in &sessions {
-            let key = session_key(session);
-            if Some(key) == current_key {
-                continue;
-            }
-            if before.contains(&key) {
-                prioritized.push((session.clone(), key, read_source_app(session)));
-            }
-        }
-        for session in &sessions {
-            let key = session_key(session);
-            if Some(key) == current_key || before.contains(&key) {
-                continue;
-            }
-            prioritized.push((session.clone(), key, read_source_app(session)));
-        }
+        // genuinely new sessions truncated to the session cap. A hostile
+        // storm of new sessions therefore cannot evict existing subscriptions
+        // when the caps are applied: overflow is rejected, and a brand-new
+        // *current* session displaces the weakest survivor(s) instead of
+        // being starved (`displace_survivors`) — the caps still bound the
+        // total tracked set. The ordering is computed by the pure
+        // `prioritize_sessions` over lightweight (key, source) pairs, shared
+        // with the tests so the priority contract is pinned by both; the
+        // allow-list and current-session filters are applied within the loop
+        // below. Truncating the new-candidate enumeration to the session cap
+        // also extends the caps' DoS intent to the per-sync work (WinRT
+        // source reads and allocations) performed before they apply.
+        let snapshot_keys: Vec<(usize, String)> = sessions
+            .iter()
+            .map(|session| (session_key(session), read_source_app(session)))
+            .collect();
+        let ordered = prioritize_sessions(
+            &snapshot_keys,
+            current_key.zip(current_source.clone()),
+            &before,
+            MAX_TRACKED_SESSIONS,
+        );
+        let by_key: HashMap<usize, &GlobalSystemMediaTransportControlsSession> =
+            sessions.iter().map(|session| (session_key(session), session)).collect();
+        let prioritized: Vec<(GlobalSystemMediaTransportControlsSession, usize, String)> = ordered
+            .into_iter()
+            .filter_map(|(key, source)| by_key.get(&key).map(|s| ((*s).clone(), key, source)))
+            .collect();
         // Running source/session tallies seeded from subscriptions that
         // survive this sync, so the caps bound the total tracked set, not
         // only new additions. A stale subscription being evicted later in
@@ -1286,22 +1342,23 @@ impl ListenerState {
             .values()
             .filter(|s| alive.contains(&session_key(&s.session)))
             .count();
+        // Per-sync admission counters feeding one aggregate debug line after
+        // the loop, so a hostile session storm cannot erode the live log with
+        // one line per candidate per sync.
         let mut rejected_overflow: usize = 0;
+        let mut rejected_allow: usize = 0;
+        let mut ignored: usize = 0;
+        let mut accepted: usize = 0;
         for (session, key, source) in &prioritized {
             let allowed = self.session_source_allowed(session);
-            debug!(
-                "SMTC session {} | key={key} | source={source} | media_sources={:?}",
-                if allowed { "accepted" } else { "rejected" },
-                self.config
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .behavior
-                    .media_sources
-            );
             if !allowed {
-                // Log rejected sessions once per appearance so the history
-                // shows every media source, not just the tracked ones.
-                if self.rejected_seen.insert(*key) {
+                // Rejected sessions are reported once per appearance (the
+                // history shows every media source, not just the tracked
+                // ones); the per-session debug line rides the same gate, so
+                // a storm of rejected sessions logs each key once instead of
+                // on every 2-second re-sync.
+                if note_appearance(&mut self.rejected_seen, *key) {
+                    debug!("SMTC session rejected | key={key} | source={source}");
                     let source_app = read_source_app(session);
                     let (title, artist) = read_session_text(session, &source_app);
                     let state = read_session_state(session);
@@ -1313,6 +1370,7 @@ impl ListenerState {
                         accepted: false,
                     });
                 }
+                rejected_allow += 1;
                 // A session that became disallowed (allow-list edit) or whose
                 // source tripped the churn cool-down must not keep its event
                 // subscriptions: it would otherwise keep firing signals that
@@ -1321,7 +1379,14 @@ impl ListenerState {
                 continue;
             }
             if !session_matches_current_source(*key, source, current_key, current_source.as_deref()) {
-                debug!("SMTC session ignored | reason=not-current-session | key={key} | source={source}");
+                // Same once-per-appearance gate: an allowed-but-not-current
+                // session (e.g. a second tab of a browser) is uninteresting
+                // in volume, and under a storm every new candidate would hit
+                // this line per sync.
+                if note_appearance(&mut self.ignored_seen, *key) {
+                    debug!("SMTC session ignored | reason=not-current-session | key={key} | source={source}");
+                }
+                ignored += 1;
                 continue;
             }
             // A previously-rejected session that became allowed (config edit)
@@ -1362,11 +1427,6 @@ impl ListenerState {
                     );
                     if displaced == 0 {
                         rejected_overflow += 1;
-                        debug!(
-                            "SMTC current session not admitted | reason=admission-cap-not-relievable | key={key} | source={source} | sessions={} | sources={}",
-                            admitted_sessions,
-                            admitted_sources.len()
-                        );
                         continue;
                     }
                     debug!(
@@ -1374,14 +1434,16 @@ impl ListenerState {
                     );
                 } else {
                     rejected_overflow += 1;
-                    debug!(
-                        "SMTC session not admitted | reason=admission-cap | key={key} | source={source} | sessions={} | sources={}",
-                        admitted_sessions,
-                        admitted_sources.len()
-                    );
                     continue;
                 }
             }
+            // Admitted sessions keep a trimmed per-session detail line (no
+            // allow-list dump): at normal volumes this is the "which session
+            // is this event for" trail. Placed after the caps so a saturated
+            // sync never relabels rejected storm candidates as accepted; the
+            // aggregate below bounds the rejected-side volume.
+            accepted += 1;
+            debug!("SMTC session accepted | key={key} | source={source}");
             let subscribed = match self.ensure_subscribed(session) {
                 Ok(subscribed) => subscribed,
                 Err(error) => {
@@ -1402,6 +1464,22 @@ impl ListenerState {
                 admitted_sources.insert(source.clone());
                 admitted_sessions += 1;
             }
+        }
+        // One aggregate debug line per sync when any session was not fully
+        // accepted, so the storm cost in the log is O(1) lines per sync (the
+        // per-session detail lines are gated once-per-appearance above). The
+        // throttled WARN below remains the operator-facing overflow signal.
+        if rejected_allow + ignored + rejected_overflow > 0 {
+            let allow_list_len = self
+                .config
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .behavior
+                .media_sources
+                .len();
+            debug!(
+                "SMTC admission: {accepted} accepted, {rejected_allow} rejected (allow-list/cooldown), {ignored} ignored (not current), {rejected_overflow} cap-rejected | allow_list_len={allow_list_len}"
+            );
         }
         if rejected_overflow > 0 && self.may_warn_overflow() {
             warn!(
@@ -1485,17 +1563,29 @@ impl ListenerState {
             // notifications re-enable.
             self.emit(MediaEvent::SourceGone { source_app: source });
         }
-        // Forget rejected sessions that vanished so a later reappearance is
-        // reported again.
+        // Forget rejected/ignored sessions that vanished so a later
+        // reappearance is reported again.
         self.rejected_seen.retain(|key| alive.contains(key));
+        self.ignored_seen.retain(|key| alive.contains(key));
         self.churn_cooldown.retain(|_, until| *until > Instant::now());
         // Keep the picker's candidate list in sync with what is actually
         // open, including apps whose sessions were rejected: checking them
         // is how the user adds them to the allow-list. Dedup and cap it
         // separately so a hostile session storm cannot grow the picker list
         // without bound.
-        let active_sources: Vec<String> =
-            dedup_capped(sessions.iter().map(read_source_app).collect(), MAX_TRACKED_SOURCES);
+        let active_sources: Vec<String> = dedup_capped(
+            // Truncate the enumeration to the first MAX_TRACKED_SESSIONS
+            // sessions: the source cap bounds the distinct sources the
+            // picker can list anyway, and bounding the WinRT reads ahead of
+            // it keeps a hostile session storm from paying for the whole
+            // snapshot.
+            sessions
+                .iter()
+                .take(MAX_TRACKED_SESSIONS)
+                .map(read_source_app)
+                .collect(),
+            MAX_TRACKED_SOURCES,
+        );
         let active: HashSet<String> = active_sources.iter().cloned().collect();
         set_active_session_sources(active_sources);
         // Evict source-level caches for apps that no longer have an open
@@ -1583,7 +1673,19 @@ impl ListenerState {
         // even when the source is paused.
         let (playback, rate) = match session.GetPlaybackInfo() {
             Ok(playback_info) => {
-                let status = playback_info.PlaybackStatus()?;
+                let status = match playback_info.PlaybackStatus() {
+                    Ok(status) => status,
+                    Err(error) => {
+                        // Count a failed status read against the retry budget
+                        // too, exactly like the failed prefetch below: a
+                        // session whose reads keep failing must not be
+                        // retried forever.
+                        if let Some(state) = self.states.get_mut(&key) {
+                            state.artwork_attempts += 1;
+                        }
+                        return Err(error.into());
+                    }
+                };
                 // A session that reported Closed has nothing to surface; the
                 // normal refresh path settles its terminal state.
                 if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed {
@@ -1615,7 +1717,26 @@ impl ListenerState {
             }
         };
         let prev = self.states.get(&key).cloned().unwrap_or_default();
-        let merged = merge_track(&prev, &read, true);
+        let mut merged = merge_track(&prev, &read, true);
+        // The stale-thumbnail guard from the refresh path applies here too:
+        // a retry read can still pair the NEW identity with the PREVIOUS
+        // track's bytes (SMTC updates the thumbnail stream after the text
+        // fields). The refresh that deferred the emit already recorded the
+        // new title, so `emit_track` sees no content change against it — the
+        // stale pairing would otherwise surface as an "artwork gain" with
+        // the wrong cover. Drop the bytes, refresh the deferral, and let the
+        // next retry (or the ARTWORK_TIMEOUT force once the budget is spent)
+        // deliver the real cover.
+        let stale_dropped = stale_thumbnail(&merged, self.last_track_per_source.get(&merged.source_app));
+        if stale_dropped {
+            merged.artwork = None;
+            if let Some(state) = self.states.get_mut(&key) {
+                state.deferred_at = Some(Instant::now());
+                state.deferred_for_stale_art = true;
+            }
+            let label = track_label(&merged);
+            debug!("track emit deferred | reason=stale-art-drop (retry) | {label}");
+        }
         // The retry only surfaces artwork the normal path missed: no artwork
         // found, or a recreated session re-reporting a track whose cover is
         // already shown, must not emit a duplicate pill.
@@ -2004,14 +2125,54 @@ impl ListenerState {
     /// worker: when the forwarder cannot keep up, the event waits in the
     /// bounded retry mailbox (`pending_output`) and is re-sent at the next
     /// event-loop turn instead of being permanently dropped.
+    ///
+    /// The in-flight artwork byte budget is applied here, before anything is
+    /// queued: a hostile source emitting byte-distinct covers back-to-back
+    /// while the forwarder is wedged must not be able to hold ~5 GiB of
+    /// artwork in the channel + mailbox (count caps alone allow 1280 ×
+    /// `MAX_THUMBNAIL_BYTES`). When the budget would be exceeded, the
+    /// payload is dropped — metadata kept, pill renders a placeholder — and
+    /// the bytes are never counted.
     fn emit(&mut self, event: MediaEvent) {
         if !self.is_current_generation() {
             return;
         }
+        let mut event = event;
+        let in_flight = self.in_flight_art.load(Ordering::Relaxed);
+        let had_art = matches!(&event, MediaEvent::TrackChanged(track) if track.artwork.is_some());
+        let bytes = budget_artwork(&mut event, in_flight, MAX_IN_FLIGHT_ARTWORK_BYTES);
+        if had_art && matches!(&event, MediaEvent::TrackChanged(track) if track.artwork.is_none()) {
+            // Stripped: the bytes were not counted, so nothing is added. The
+            // event is still queued — the metadata (and thus the pill) is the
+            // authoritative state; only the cover is missing.
+            if let MediaEvent::TrackChanged(track) = &event {
+                let label = track_label(track);
+                debug!(
+                    "artwork dropped from queued event | reason=in-flight-byte-budget | \
+                     in_flight={in_flight} | {label}"
+                );
+            }
+            // One-shot user-facing warning: the budget tripped because the
+            // UI is not keeping up. The tray note fires once per app run (the
+            // latch is shared across worker restarts), not on every dropped
+            // cover. The warning travels through the normal event path, so it
+            // is delivered (via the retry mailbox) as soon as the forwarder
+            // drains.
+            if !self.budget_warned.swap(true, Ordering::Relaxed) {
+                self.emit(MediaEvent::ArtworkBudgetExceeded);
+            }
+        } else {
+            self.in_flight_art.fetch_add(bytes, Ordering::Relaxed);
+        }
         match self.output.try_send(Arc::new(event)) {
             Ok(()) => {}
             Err(mpsc::TrySendError::Full(returned)) => {
-                let dropped = coalesce_pending_event(&mut self.pending_output, returned, OUTPUT_RETRY_CAP);
+                let dropped = coalesce_pending_event(
+                    &mut self.pending_output,
+                    returned,
+                    OUTPUT_RETRY_CAP,
+                    &self.in_flight_art,
+                );
                 if dropped > 0 && self.may_warn_overflow() {
                     warn!(
                         "SMTC output retry mailbox overflowed: {dropped} queued event(s) dropped \
@@ -2021,7 +2182,7 @@ impl ListenerState {
                 }
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
-                self.pending_output.clear();
+                self.clear_pending_output();
                 debug!("signal dropped | kind=MediaEvent | reason=closed");
             }
         }
@@ -2033,12 +2194,39 @@ impl ListenerState {
     /// drops the mailbox — the forwarder is gone, nothing can be delivered.
     fn flush_output(&mut self) {
         if drain_pending_to_channel(&mut self.pending_output, &self.output) {
-            self.pending_output.clear();
+            self.clear_pending_output();
         }
+    }
+
+    /// Drops every event still in the retry mailbox and frees its in-flight
+    /// artwork accounting. Called when the output channel disconnected (the
+    /// forwarder is gone, so nothing queued can ever be delivered) and from
+    /// `Drop`, so a worker ending with a non-empty mailbox returns its bytes
+    /// to the shared counter instead of starving the next worker's budget.
+    fn clear_pending_output(&mut self) {
+        release_pending_bytes(&mut self.pending_output, &self.in_flight_art);
     }
 
     fn is_current_generation(&self) -> bool {
         self.live_generation.load(Ordering::SeqCst) == self.my_generation
+    }
+}
+
+impl Drop for ListenerState {
+    fn drop(&mut self) {
+        // Return the artwork accounting of whatever is still in the retry
+        // mailbox to the shared counter when this worker ends (clean exit,
+        // shutdown join, or panic unwind). The counter survives into the
+        // replacement worker, and every mailbox event's bytes were counted
+        // at emit time and only freed when the event left the mailbox — so
+        // without this, a worker that dies with a non-empty mailbox (a full
+        // output channel at exit) would leave its bytes counted forever and
+        // the next worker would strip every cover, permanently, until the
+        // app restarts. The one path this cannot cover is a hard stall,
+        // where the worker thread is leaked mid-call and `drop` never runs:
+        // those bytes stay counted (and their memory stays live), bounded by
+        // the mailbox cap and documented as a residual in the threat model.
+        self.clear_pending_output();
     }
 }
 
@@ -2054,6 +2242,29 @@ fn event_coalesce_key(event: &MediaEvent) -> (&'static str, Option<&str>) {
         MediaEvent::SourceGone { source_app } => ("gone", Some(source_app.as_str())),
         MediaEvent::ProgressChanged { source_app, .. } => ("progress", Some(source_app.as_str())),
         MediaEvent::WorkerFailed { .. } => ("worker-failed", None),
+        MediaEvent::ArtworkBudgetExceeded => ("art-budget", None),
+    }
+}
+
+/// Applies the in-flight artwork byte budget to an event about to be queued:
+/// when adding its artwork would exceed the budget, the payload is dropped —
+/// raw cover, decode and derived palette stripped — while the metadata is
+/// kept, so the pill renders a placeholder instead of pinning megabytes
+/// behind a queued event. Returns the artwork bytes the caller must add to
+/// the shared in-flight counter: the event's full artwork when it fits
+/// within the budget, or 0 when it was stripped (nothing was queued). Pure,
+/// so the budget decision is unit-testable without a live session manager.
+fn budget_artwork(event: &mut MediaEvent, in_flight: u64, budget: u64) -> u64 {
+    let bytes = artwork_bytes(event);
+    if bytes > 0 && in_flight.saturating_add(bytes) > budget {
+        if let MediaEvent::TrackChanged(track) = event {
+            track.artwork = None;
+            track.decoded_art = None;
+            track.palette = None;
+        }
+        0
+    } else {
+        bytes
     }
 }
 
@@ -2061,31 +2272,55 @@ fn event_coalesce_key(event: &MediaEvent) -> (&'static str, Option<&str>) {
 /// same coalesce key is superseded in place — the newest authoritative state
 /// wins — while events for different sources/kinds keep their arrival order.
 /// On over-cap the oldest queued event is dropped, never the newest; returns
-/// how many were dropped so the caller can report the overflow.
-fn coalesce_pending_event(queue: &mut VecDeque<Arc<MediaEvent>>, event: Arc<MediaEvent>, cap: usize) -> usize {
+/// how many were dropped so the caller can report the overflow. Every event
+/// that leaves the mailbox (superseded or over-cap) had its artwork bytes
+/// counted when it was queued, so those bytes are freed from `in_flight`
+/// here — the counter tracks distinct live allocations, not queue slots.
+fn coalesce_pending_event(
+    queue: &mut VecDeque<Arc<MediaEvent>>,
+    event: Arc<MediaEvent>,
+    cap: usize,
+    in_flight: &AtomicU64,
+) -> usize {
     let key = event_coalesce_key(&event);
-    if let Some(index) = queue.iter().position(|queued| event_coalesce_key(queued) == key) {
-        queue.remove(index);
+    if let Some(index) = queue.iter().position(|queued| event_coalesce_key(queued) == key)
+        && let Some(superseded) = queue.remove(index)
+    {
+        in_flight.fetch_sub(artwork_bytes(&superseded), Ordering::Relaxed);
     }
     queue.push_back(event);
     let mut dropped = 0;
     while queue.len() > cap {
-        queue.pop_front();
-        dropped += 1;
+        if let Some(oldest) = queue.pop_front() {
+            in_flight.fetch_sub(artwork_bytes(&oldest), Ordering::Relaxed);
+            dropped += 1;
+        }
     }
     dropped
+}
+
+/// Drops every event in a mailbox and frees its in-flight artwork accounting
+/// (the inverse of the queueing-time `fetch_add` in `emit`). Used when the
+/// output channel disconnects and nothing queued can ever be delivered.
+fn release_pending_bytes(queue: &mut VecDeque<Arc<MediaEvent>>, in_flight: &AtomicU64) {
+    while let Some(event) = queue.pop_front() {
+        in_flight.fetch_sub(artwork_bytes(&event), Ordering::Relaxed);
+    }
 }
 
 /// Drains a retry mailbox into the output channel, oldest first. Stops at the
 /// first full send so ordering is preserved; returns true when the channel
 /// disconnected so the caller can clear the mailbox.
 fn drain_pending_to_channel(queue: &mut VecDeque<Arc<MediaEvent>>, output: &SyncSender<Arc<MediaEvent>>) -> bool {
-    while let Some(event) = queue.front().cloned() {
+    while let Some(event) = queue.pop_front() {
         match output.try_send(event) {
-            Ok(()) => {
-                queue.pop_front();
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(event)) => {
+                // The event did not fit: put it back at the front so the
+                // next drain pass retries it oldest-first.
+                queue.push_front(event);
+                return false;
             }
-            Err(mpsc::TrySendError::Full(_)) => return false,
             Err(mpsc::TrySendError::Disconnected(_)) => return true,
         }
     }
@@ -2170,6 +2405,61 @@ fn stale_thumbnail(merged: &TrackInfo, last_emitted: Option<&TrackInfo>) -> bool
     }
 }
 
+/// Records `key` in a once-per-appearance reporting set (`rejected_seen`,
+/// `ignored_seen`), evicting an arbitrary key first when the set is at
+/// `MAX_REPORTED_SESSIONS` so a hostile storm of ever-new session keys cannot
+/// grow the dedup sets without bound. Returns whether this was a new
+/// appearance (the caller reports the session once).
+fn note_appearance(seen: &mut HashSet<usize>, key: usize) -> bool {
+    if seen.len() >= MAX_REPORTED_SESSIONS
+        && let Some(victim) = seen.iter().next().copied()
+    {
+        seen.remove(&victim);
+    }
+    seen.insert(key)
+}
+
+/// Priority-ordered candidate list for the admission caps, computed over
+/// lightweight (key, source) pairs so the live sync loop and the tests share
+/// one ordering contract: current session first, then surviving existing
+/// subscriptions (snapshot order), then genuinely new sessions truncated to
+/// `session_cap` (an overflow candidate can never be admitted this sync, so
+/// enumerating beyond the cap is wasted storm-time work). The current session
+/// is included even when absent from the snapshot (browser churn makes
+/// `GetCurrentSession` authoritative over a stale `GetSessions` list); the
+/// loops below skip it by key, so it is never duplicated.
+fn prioritize_sessions(
+    snapshot: &[(usize, String)],
+    current: Option<(usize, String)>,
+    before: &HashSet<usize>,
+    session_cap: usize,
+) -> Vec<(usize, String)> {
+    let mut ordered = Vec::with_capacity(snapshot.len() + usize::from(current.is_some()));
+    if let Some((cur_key, cur_source)) = current.as_ref() {
+        ordered.push((*cur_key, cur_source.clone()));
+    }
+    for (key, source) in snapshot {
+        if Some(*key) == current.as_ref().map(|(k, _)| *k) {
+            continue;
+        }
+        if before.contains(key) {
+            ordered.push((*key, source.clone()));
+        }
+    }
+    let mut new_candidates = 0usize;
+    for (key, source) in snapshot {
+        if Some(*key) == current.as_ref().map(|(k, _)| *k) || before.contains(key) {
+            continue;
+        }
+        if new_candidates >= session_cap {
+            break;
+        }
+        new_candidates += 1;
+        ordered.push((*key, source.clone()));
+    }
+    ordered
+}
+
 /// Whether admitting one more session of `source` would breach the global SMTC
 /// caps: either the session cap is already at its ceiling, or `source` is a new
 /// identity and the distinct-source cap is already at its ceiling. A source
@@ -2225,12 +2515,15 @@ fn displacement_victim(
 /// Test-only model of the sync loop's admission pass: the live loop applies
 /// `admission_blocked` inline (its decisions interleave with subscription,
 /// displacement and eviction side effects), so this function exists purely to
-/// make the current-first / existing-before-new priority contract directly
-/// testable. The model assumes every admitted session subscribes successfully;
-/// in the live loop a session can still fail to subscribe (cap race with the
-/// event-driven path, or a WinRT error) without the caps reconsidering it here,
-/// and a brand-new *current* session displaces survivors instead of being
-/// rejected (see `displace_survivors`) — neither is modeled.
+/// make the cap decisions directly testable. Callers build `ordered` through
+/// the shared `prioritize_sessions` — the same current-first /
+/// existing-before-new ordering the live loop uses — so the priority contract
+/// is pinned by both. The model assumes every admitted session subscribes
+/// successfully; in the live loop a session can still fail to subscribe (cap
+/// race with the event-driven path, or a WinRT error) without the caps
+/// reconsidering it here, and a brand-new *current* session displaces
+/// survivors instead of being rejected (see `displace_survivors`) — neither
+/// is modeled.
 #[cfg(test)]
 fn admit_sessions(
     ordered: &[(usize, String)],
@@ -2294,10 +2587,16 @@ fn store_last_track(
 /// `cap` entries, so the picker's candidate list cannot grow with a hostile
 /// session storm.
 fn dedup_capped(mut sources: Vec<String>, cap: usize) -> Vec<String> {
-    let mut seen: HashSet<String> = HashSet::with_capacity(sources.len());
+    let mut seen: HashSet<String> = HashSet::with_capacity(sources.len().min(cap));
     let mut out: Vec<String> = Vec::with_capacity(sources.len().min(cap));
     for s in sources.drain(..) {
-        if seen.insert(s.clone()) && out.len() < cap {
+        // Once the cap is full no later source can be pushed: stop hashing
+        // into the seen-set (unobservable beyond this point) to bound
+        // storm-time work.
+        if out.len() == cap {
+            break;
+        }
+        if seen.insert(s.clone()) {
             out.push(s);
         }
     }
@@ -2802,7 +3101,7 @@ fn cap_meta(value: String) -> String {
         // The raw value must never be logged in full (it can be arbitrarily
         // long): a bounded escaped preview plus the omitted count keeps the
         // log line independent of the raw metadata length.
-        let (preview, omitted) = metadata_preview(trimmed);
+        let (preview, omitted) = crate::winutil::log_preview(trimmed, MAX_PREVIEW_CHARS);
         let omitted_note = if omitted > 0 {
             format!(" (+{omitted} omitted)")
         } else {
@@ -2839,21 +3138,7 @@ fn display_unsafe(c: char) -> bool {
 
 const MAX_META_CHARS: usize = 256;
 
-/// Bounded, escaped preview of a metadata value for a log line: at most
-/// `MAX_PREVIEW_CHARS` scalar values, each escaped so control and invisible
-/// characters are visible, plus the number of characters omitted. Keeps log
-/// formatting allocations independent of the raw metadata length.
-fn metadata_preview(value: &str) -> (String, usize) {
-    let mut preview = String::new();
-    for (i, c) in value.chars().enumerate() {
-        if i >= MAX_PREVIEW_CHARS {
-            return (preview, value.chars().count() - MAX_PREVIEW_CHARS);
-        }
-        preview.extend(c.escape_debug());
-    }
-    (preview, 0)
-}
-
+/// The shared preview cap (see `winutil::log_preview`).
 const MAX_PREVIEW_CHARS: usize = 128;
 
 /// Best-effort title/artist for a session's history row. Reads can fail or
@@ -3380,16 +3665,16 @@ mod tests {
     fn metadata_preview_is_bounded_and_escaped() {
         // Control characters are escaped, so raw control bytes never reach
         // the log output verbatim. `escape_debug` writes NUL as `\0`.
-        let (preview, omitted) = metadata_preview("a\u{0}b\nc");
+        let (preview, omitted) = crate::winutil::log_preview("a\u{0}b\nc", MAX_PREVIEW_CHARS);
         assert_eq!(preview, "a\\0b\\nc");
         assert_eq!(omitted, 0);
         // A long value is cut at the preview cap and reports what was left
         // out.
-        let (preview, omitted) = metadata_preview(&"x".repeat(300));
+        let (preview, omitted) = crate::winutil::log_preview(&"x".repeat(300), MAX_PREVIEW_CHARS);
         assert_eq!(preview, "x".repeat(128));
         assert_eq!(omitted, 172);
         // The boundary itself: exactly MAX_PREVIEW_CHARS omits nothing.
-        let (preview, omitted) = metadata_preview(&"y".repeat(128));
+        let (preview, omitted) = crate::winutil::log_preview(&"y".repeat(128), MAX_PREVIEW_CHARS);
         assert_eq!(preview, "y".repeat(128));
         assert_eq!(omitted, 0);
     }
@@ -4255,6 +4540,42 @@ mod tests {
     }
 
     #[test]
+    fn stale_thumbnail_pairing_cannot_pass_the_retry_emit_gate() {
+        // The retry path drops stale art BEFORE the emit gate (the same
+        // `stale_thumbnail` guard the refresh path applies), so a read
+        // pairing the NEW identity with the PREVIOUS track's bytes can never
+        // surface the wrong cover. This pins the invariant the drop relies
+        // on: `retry_should_emit` ALONE would let the stale pairing through
+        // (identity differs, art present) — the guard must be applied, not
+        // skipped, on the retry path.
+        let old = TrackInfo {
+            title: "Old".into(),
+            artist: "Artist".into(),
+            artwork: Some(Arc::from(vec![9])),
+            ..TrackInfo::default()
+        };
+        let stale = TrackInfo {
+            title: "New".into(),
+            artist: "Artist".into(),
+            artwork: Some(Arc::from(vec![9])),
+            ..TrackInfo::default()
+        };
+        assert!(stale_thumbnail(&stale, Some(&old)));
+        assert!(retry_should_emit(&stale, Some(&old)));
+        // The real cover (different bytes) passes the guard and the gate.
+        let real = TrackInfo {
+            title: "New".into(),
+            artist: "Artist".into(),
+            artwork: Some(Arc::from(vec![10])),
+            ..TrackInfo::default()
+        };
+        assert!(!stale_thumbnail(&real, Some(&old)));
+        assert!(retry_should_emit(&real, Some(&old)));
+        // Same identity with art already shown stays suppressed (recreation).
+        assert!(!retry_should_emit(&old, Some(&old)));
+    }
+
+    #[test]
     fn artwork_refresh_absorbed_when_a_state_event_is_in_the_batch() {
         let with_art = TrackInfo {
             title: "Battle Symphony".into(),
@@ -4499,6 +4820,81 @@ mod tests {
     }
 
     #[test]
+    fn prioritize_sessions_orders_current_existing_then_new() {
+        // Current session first, then surviving existing subscriptions in
+        // snapshot order, then genuinely new sessions — the exact contract
+        // the live sync loop feeds to the caps.
+        let before: HashSet<usize> = [4, 5].into_iter().collect();
+        let snapshot: Vec<(usize, String)> = vec![
+            (1, "one".into()),
+            (2, "two".into()),
+            (3, "three".into()),
+            (4, "four".into()),
+            (5, "five".into()),
+            (6, "six".into()),
+        ];
+        let ordered = prioritize_sessions(&snapshot, Some((2, "two".into())), &before, 64);
+        let keys: Vec<usize> = ordered.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![2, 4, 5, 1, 3, 6]);
+    }
+
+    #[test]
+    fn prioritize_sessions_truncates_new_candidates_to_the_session_cap() {
+        // A hostile storm of brand-new sessions is truncated at the session
+        // cap before the loop, so the per-sync work (and the log lines) stay
+        // bounded; overflow candidates are never even enumerated.
+        let before: HashSet<usize> = [1, 2].into_iter().collect();
+        let snapshot: Vec<(usize, String)> = (1..=100).map(|k| (k, format!("src-{k}"))).collect();
+        let ordered = prioritize_sessions(&snapshot, None, &before, MAX_TRACKED_SESSIONS);
+        let keys: Vec<usize> = ordered.iter().map(|(k, _)| *k).collect();
+        // Existing subscriptions first (1, 2), then new candidates truncated
+        // at the session cap (3..=66); the overflow is never enumerated.
+        assert_eq!(keys, (1..=(2 + MAX_TRACKED_SESSIONS)).collect::<Vec<usize>>());
+        assert_eq!(ordered.len(), 2 + MAX_TRACKED_SESSIONS);
+    }
+
+    #[test]
+    fn prioritize_sessions_includes_a_current_session_missing_from_the_snapshot() {
+        // GetCurrentSession can outrun a stale GetSessions snapshot (browser
+        // churn); the current session is authoritative and comes first.
+        let before: HashSet<usize> = HashSet::new();
+        let snapshot: Vec<(usize, String)> = vec![(1, "one".into()), (2, "two".into())];
+        let ordered = prioritize_sessions(&snapshot, Some((9, "nine".into())), &before, 64);
+        let keys: Vec<usize> = ordered.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![9, 1, 2], "the current session must lead and not duplicate");
+    }
+
+    #[test]
+    fn prioritize_sessions_feeds_admit_sessions_like_the_live_loop() {
+        // The exact chain the live loop performs: prioritize, then cap. A
+        // storm of 100 new sessions with a session cap of 64 — the caps bind
+        // only after truncation, existing subscriptions survive, and the
+        // overflow is never enumerated (bounded per-sync work).
+        let existing_keys: HashSet<usize> = [1].into_iter().collect();
+        let existing_sources: HashSet<String> = ["spotify".to_string()].into_iter().collect();
+        // One hostile source with 99 sessions: only the session cap can bind.
+        let snapshot: Vec<(usize, String)> = std::iter::once((1, "spotify".to_string()))
+            .chain((2..=100).map(|k| (k, "storm-src".to_string())))
+            .collect();
+        let ordered = prioritize_sessions(&snapshot, None, &existing_keys, MAX_TRACKED_SESSIONS);
+        let (admitted, rejected) = admit_sessions(
+            &ordered,
+            &existing_keys,
+            &existing_sources,
+            MAX_TRACKED_SESSIONS,
+            MAX_TRACKED_SOURCES,
+        );
+        assert!(admitted.contains(&1), "the existing subscription survives the storm");
+        assert_eq!(admitted.len(), MAX_TRACKED_SESSIONS);
+        // The session cap binds within the truncated enumeration (the 65th
+        // session is rejected), and the storm candidates beyond the
+        // truncation are never seen by the caps at all — that is the point
+        // of the enumeration cap.
+        assert_eq!(rejected, 1);
+        assert!(ordered.iter().all(|(k, _)| *k <= 2 + MAX_TRACKED_SESSIONS));
+    }
+
+    #[test]
     fn displacement_victim_prefers_dead_then_weakest() {
         // Candidate keys in reverse admission priority: the current session
         // (10) is last; before-group members 3, 2, 1 appear weakest-first;
@@ -4658,8 +5054,8 @@ mod tests {
         let mut queue = VecDeque::new();
         let first = Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "src".into()));
         let second = Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "src".into()));
-        coalesce_pending_event(&mut queue, first, OUTPUT_RETRY_CAP);
-        coalesce_pending_event(&mut queue, second.clone(), OUTPUT_RETRY_CAP);
+        coalesce_pending_event(&mut queue, first, OUTPUT_RETRY_CAP, &AtomicU64::new(0));
+        coalesce_pending_event(&mut queue, second.clone(), OUTPUT_RETRY_CAP, &AtomicU64::new(0));
         assert_eq!(queue.len(), 1, "the superseded event must be removed");
         assert!(Arc::ptr_eq(&queue[0], &second), "the newest event must be the survivor");
         // Progress updates for one source coalesce the same way (latest position wins).
@@ -4673,6 +5069,7 @@ mod tests {
                 playback_rate: Some(1.0),
             }),
             OUTPUT_RETRY_CAP,
+            &AtomicU64::new(0),
         );
         coalesce_pending_event(
             &mut queue,
@@ -4683,6 +5080,7 @@ mod tests {
                 playback_rate: Some(1.0),
             }),
             OUTPUT_RETRY_CAP,
+            &AtomicU64::new(0),
         );
         assert_eq!(queue.len(), 1, "progress coalesces per source");
         match queue[0].as_ref() {
@@ -4702,8 +5100,8 @@ mod tests {
         tb.source_app = "src-b".into();
         let track_a = Arc::new(MediaEvent::TrackChanged(ta));
         let track_b = Arc::new(MediaEvent::TrackChanged(tb));
-        coalesce_pending_event(&mut queue, track_a.clone(), OUTPUT_RETRY_CAP);
-        coalesce_pending_event(&mut queue, track_b.clone(), OUTPUT_RETRY_CAP);
+        coalesce_pending_event(&mut queue, track_a.clone(), OUTPUT_RETRY_CAP, &AtomicU64::new(0));
+        coalesce_pending_event(&mut queue, track_b.clone(), OUTPUT_RETRY_CAP, &AtomicU64::new(0));
         assert_eq!(queue.len(), 2, "cross-source tracks keep arrival order");
         assert!(Arc::ptr_eq(&queue[0], &track_a), "first-arrived track stays first");
 
@@ -4714,16 +5112,19 @@ mod tests {
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "a".into())),
             2,
+            &AtomicU64::new(0),
         );
         coalesce_pending_event(
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "b".into())),
             2,
+            &AtomicU64::new(0),
         );
         coalesce_pending_event(
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "c".into())),
             2,
+            &AtomicU64::new(0),
         );
         assert_eq!(queue.len(), 2, "cap must hold");
         match queue[0].as_ref() {
@@ -4757,11 +5158,13 @@ mod tests {
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "src".into())),
             OUTPUT_RETRY_CAP,
+            &AtomicU64::new(0),
         );
         coalesce_pending_event(
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "src".into())),
             OUTPUT_RETRY_CAP,
+            &AtomicU64::new(0),
         );
         assert_eq!(queue.len(), 1, "the older Paused was superseded in the mailbox");
         let _ = rx.recv().unwrap();
@@ -4789,11 +5192,13 @@ mod tests {
             &mut queue,
             Arc::new(MediaEvent::TrackChanged(track("A", "1"))),
             OUTPUT_RETRY_CAP,
+            &AtomicU64::new(0),
         );
         coalesce_pending_event(
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "a".into())),
             OUTPUT_RETRY_CAP,
+            &AtomicU64::new(0),
         );
         assert!(
             !drain_pending_to_channel(&mut queue, &tx),
@@ -4823,10 +5228,160 @@ mod tests {
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "src".into())),
             OUTPUT_RETRY_CAP,
+            &AtomicU64::new(0),
         );
         drop(rx);
         assert!(drain_pending_to_channel(&mut queue, &tx), "disconnect must be reported");
         queue.clear();
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn artwork_bytes_counts_only_track_payloads() {
+        // Only TrackChanged carries image payloads; the raw cover plus the
+        // fixed decode are what a wedged forwarder would retain.
+        let with_art = TrackInfo {
+            title: "Song".into(),
+            artwork: Some(Arc::from(vec![0u8; 8])),
+            decoded_art: Some(Arc::from(vec![0u8; 4])),
+            ..TrackInfo::default()
+        };
+        assert_eq!(artwork_bytes(&MediaEvent::TrackChanged(with_art)), 12);
+        // An artless track and every non-track variant count nothing.
+        assert_eq!(artwork_bytes(&MediaEvent::TrackChanged(track("Song", "A"))), 0);
+        assert_eq!(
+            artwork_bytes(&MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "s".into())),
+            0
+        );
+        assert_eq!(
+            artwork_bytes(&MediaEvent::ProgressChanged {
+                source_app: "s".into(),
+                position_secs: Some(1.0),
+                duration_secs: None,
+                playback_rate: None,
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn budget_artwork_strips_only_when_the_budget_would_be_exceeded() {
+        // The G1 budget decision: an event whose artwork would push the
+        // in-flight bytes past the budget loses its payload (raw cover,
+        // decode and derived palette) while the metadata survives, so the
+        // pill still renders the track with a placeholder instead of pinning
+        // megabytes behind a queued event.
+        let art = |len: usize| TrackInfo {
+            title: "Song".into(),
+            artwork: Some(Arc::from(vec![0u8; len])),
+            decoded_art: Some(Arc::from(vec![0u8; 4])),
+            palette: Some(Palette {
+                primary: [0; 4],
+                secondary: [0; 4],
+            }),
+            ..TrackInfo::default()
+        };
+        // Fits: the full artwork is counted (raw + decode) and untouched.
+        let mut event = MediaEvent::TrackChanged(art(10));
+        assert_eq!(budget_artwork(&mut event, 0, 100), 14);
+        match &event {
+            MediaEvent::TrackChanged(track) => assert!(track.artwork.is_some()),
+            other => panic!("expected TrackChanged, got {other:?}"),
+        }
+        // Exactly at the budget still fits.
+        let mut event = MediaEvent::TrackChanged(art(96));
+        assert_eq!(budget_artwork(&mut event, 0, 100), 100);
+        // Over the budget: stripped, nothing counted, metadata kept.
+        let mut event = MediaEvent::TrackChanged(art(97));
+        assert_eq!(budget_artwork(&mut event, 0, 100), 0);
+        match event {
+            MediaEvent::TrackChanged(track) => {
+                assert!(track.artwork.is_none(), "the raw cover must be dropped");
+                assert!(track.decoded_art.is_none(), "the decode must be dropped too");
+                assert!(track.palette.is_none(), "the cover-derived palette must go with it");
+                assert_eq!(track.title, "Song", "the metadata must survive the strip");
+            }
+            other => panic!("expected TrackChanged, got {other:?}"),
+        }
+        // The budget counts against in-flight bytes, not per event: a second
+        // event that fits alone is still stripped when the first already
+        // consumed the budget. art(60) counts 64 (60 raw + 4 decode).
+        let mut first = MediaEvent::TrackChanged(art(60));
+        let mut second = MediaEvent::TrackChanged(art(60));
+        assert_eq!(budget_artwork(&mut first, 0, 100), 64);
+        assert_eq!(budget_artwork(&mut second, 64, 100), 0, "64 of 100 already in flight");
+        // Artless and non-track events are never counted or touched.
+        let mut artless = MediaEvent::TrackChanged(track("Song", "A"));
+        assert_eq!(budget_artwork(&mut artless, 100, 100), 0);
+        let mut playback = MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "s".into());
+        assert_eq!(budget_artwork(&mut playback, u64::MAX, 1), 0);
+    }
+
+    #[test]
+    fn coalesce_pending_event_frees_bytes_for_dropped_events() {
+        // The mailbox accounting mirrors `emit`: queueing adds bytes, and
+        // every event that leaves the mailbox — superseded by a newer
+        // same-key event, or popped by the over-cap rule — frees them. The
+        // counter must track distinct live allocations, not queue slots.
+        // The source distinguishes coalesce keys (same source supersedes,
+        // different sources coexist).
+        let art = |len: usize, source: &str| {
+            Arc::new(MediaEvent::TrackChanged(TrackInfo {
+                title: "Song".into(),
+                source_app: source.into(),
+                artwork: Some(Arc::from(vec![0u8; len])),
+                ..TrackInfo::default()
+            }))
+        };
+        // Supersede: the older same-source event's bytes are freed.
+        let mut queue = VecDeque::new();
+        let counter = AtomicU64::new(0);
+        counter.fetch_add(10, Ordering::Relaxed); // emit counted art(10)
+        coalesce_pending_event(&mut queue, art(10, "src"), OUTPUT_RETRY_CAP, &counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 10, "queued bytes stay counted");
+        counter.fetch_add(20, Ordering::Relaxed); // emit counted art(20)
+        coalesce_pending_event(&mut queue, art(20, "src"), OUTPUT_RETRY_CAP, &counter);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            20,
+            "the superseded 10-byte event is freed"
+        );
+        // Over-cap: the oldest event's bytes are freed, never the newest's.
+        let mut queue = VecDeque::new();
+        let counter = AtomicU64::new(0);
+        for (len, source) in [(10u64, "a"), (20, "b"), (30, "c")] {
+            counter.fetch_add(len, Ordering::Relaxed); // emit counted each
+            coalesce_pending_event(&mut queue, art(len as usize, source), 2, &counter);
+        }
+        assert_eq!(queue.len(), 2, "the cap must hold");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            50,
+            "the oldest 10-byte event was freed by the over-cap pop"
+        );
+    }
+
+    #[test]
+    fn release_pending_bytes_frees_every_queued_payload() {
+        // The disconnect path drops the whole mailbox; every queued payload's
+        // bytes must be freed so the counter ends where it started.
+        let mut queue = VecDeque::new();
+        let counter = AtomicU64::new(100);
+        let art = |len: usize| {
+            Arc::new(MediaEvent::TrackChanged(TrackInfo {
+                title: "Song".into(),
+                artwork: Some(Arc::from(vec![0u8; len])),
+                ..TrackInfo::default()
+            }))
+        };
+        queue.push_back(art(10));
+        queue.push_back(art(30));
+        queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+            PlaybackState::Stopped,
+            "s".into(),
+        )));
+        release_pending_bytes(&mut queue, &counter);
+        assert!(queue.is_empty(), "the mailbox must be fully drained");
+        assert_eq!(counter.load(Ordering::Relaxed), 60, "the two payloads' bytes are freed");
     }
 }

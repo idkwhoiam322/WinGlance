@@ -133,23 +133,21 @@ fn extract_from_aumid(aumid: &str, size: usize) -> Option<Vec<u8>> {
     try_parsing_name(&apps_path, size)
 }
 
-/// Bounded escaped preview for untrusted strings in log output.
-/// Mirrors the `metadata_preview` pattern in `smtc.rs` so the log line is
-/// independent of the raw input length.
+/// Bounded escaped preview for untrusted strings in log output, via the
+/// shared `winutil::log_preview` helper (with the omission note appended), so
+/// the log line is independent of the raw input length.
 const ICON_LOG_PREVIEW: usize = 128;
 
 fn log_preview(value: &str) -> String {
-    let mut out = String::new();
-    for (i, c) in value.chars().enumerate() {
-        if i >= ICON_LOG_PREVIEW {
-            let omitted = value.chars().count() - ICON_LOG_PREVIEW;
-            use std::fmt::Write;
-            let _ = write!(out, " (+{omitted} omitted)");
-            return out;
-        }
-        out.extend(c.escape_debug());
+    let (preview, omitted) = crate::winutil::log_preview(value, ICON_LOG_PREVIEW);
+    if omitted > 0 {
+        let mut out = preview;
+        use std::fmt::Write;
+        let _ = write!(out, " (+{omitted} omitted)");
+        out
+    } else {
+        preview
     }
-    out
 }
 
 /// Accepts only AUMIDs that match the Windows app-user-model grammar: 1-128

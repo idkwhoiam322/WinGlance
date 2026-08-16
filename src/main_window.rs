@@ -51,8 +51,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-    Shell_NotifyIconW, ShellExecuteW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFY_ICON_INFOTIP_FLAGS, NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -1608,6 +1608,7 @@ impl MainWindowState {
                     accepted,
                 } => self.add_session(source_app, title, artist, state, accepted),
                 MediaEvent::WorkerFailed { reason } => self.add_worker_failure(&reason),
+                MediaEvent::ArtworkBudgetExceeded => self.add_budget_warning(),
                 // A live position refresh is not a notification: it does not add
                 // a history row, only updates the in-memory progress state below.
                 MediaEvent::ProgressChanged { .. } => {}
@@ -1739,7 +1740,22 @@ impl MainWindowState {
             ..TrackInfo::default()
         };
         self.push_history(track, PlaybackState::Stopped, false);
-        show_tray_note(self.hwnd, "Media notifications stopped", reason);
+        show_tray_note(self.hwnd, "Media notifications stopped", reason, NIIF_ERROR);
+    }
+
+    /// Surfaces the one-shot in-flight artwork budget warning as a tray note
+    /// (emitted at most once per app run by the worker). The budget tripping
+    /// means the UI was not keeping up and some cover payloads were skipped;
+    /// it is transient — covers return as soon as the UI drains — so there is
+    /// no history row, only the note. Informational, not an error.
+    fn add_budget_warning(&mut self) {
+        show_tray_note(
+            self.hwnd,
+            "Album covers skipped",
+            "The app could not keep up with media updates, so some album covers \
+             were skipped. Covers return once it catches up.",
+            NIIF_INFO,
+        );
     }
 
     /// Updates the current activity (and its history row) for a track
@@ -4201,16 +4217,17 @@ fn tray_data(hwnd: HWND) -> Result<NOTIFYICONDATAW> {
     Ok(data)
 }
 
-/// Shows a one-shot balloon note on the tray icon (NIF_INFO). Used for the
-/// permanent SMTC worker failure: the note is visible even while the tracking
-/// window is hidden (start in tray), unlike the history row alone.
-fn show_tray_note(hwnd: HWND, title: &str, text: &str) {
+/// Shows a one-shot balloon note on the tray icon (NIF_INFO), with the given
+/// info flag (error vs informational). Used for the permanent SMTC worker
+/// failure and the one-shot budget-drop warning: both are visible even while
+/// the tracking window is hidden (start in tray).
+fn show_tray_note(hwnd: HWND, title: &str, text: &str, flags: NOTIFY_ICON_INFOTIP_FLAGS) {
     // Best-effort by design (see below): a missing icon skips the balloon.
     let Ok(mut data) = tray_data(hwnd) else {
         return;
     };
     data.uFlags |= NIF_INFO;
-    data.dwInfoFlags = NIIF_ERROR;
+    data.dwInfoFlags = flags;
     let title_wide = wide(title);
     let count = title_wide.len().min(data.szInfoTitle.len());
     data.szInfoTitle[..count].copy_from_slice(&title_wide[..count]);

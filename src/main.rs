@@ -52,7 +52,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-use crate::events::{MEDIA_EVENT_MSG, MediaEvent};
+use crate::events::{MEDIA_EVENT_MSG, MediaEvent, artwork_bytes};
 use crate::overlay::EventQueue;
 use crate::winutil::wide;
 
@@ -598,6 +598,22 @@ fn main() -> Result<()> {
     }
 
     let (event_tx, event_rx) = mpsc::sync_channel::<Arc<MediaEvent>>(EVENT_CHANNEL_CAP);
+    // Shared in-flight artwork byte counter for the event path (see
+    // `smtc::MAX_IN_FLIGHT_ARTWORK_BYTES`): the SMTC worker adds the artwork
+    // bytes of every event it queues and drops the payload when the budget is
+    // exceeded; the forwarder frees the bytes as it pops, so the count tracks
+    // the distinct artwork allocations held by the outbound queues. Shared
+    // across worker restarts so events a replaced worker left queued stay
+    // accounted.
+    let in_flight_art: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let supervisor_art = in_flight_art.clone();
+    let forwarder_art = in_flight_art.clone();
+    // One-shot latch for the budget-drop tray warning: the worker sets it the
+    // first time the in-flight artwork budget strips a cover payload, so the
+    // user gets exactly one "the UI is not keeping up" note per app run, not
+    // one per dropped cover. Shared across worker restarts like the counter.
+    let budget_warned: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let supervisor_budget_warned = budget_warned.clone();
     // Dedicated one-shot status channel for the supervisor's permanent-failure
     // report, deliberately *not* the bounded event channel: under the very
     // overload that motivates the event cap, try_send into it could drop the
@@ -672,6 +688,8 @@ fn main() -> Result<()> {
                 let worker_shutdown = supervisor_shutdown.clone();
                 let my_generation = supervisor_generation.fetch_add(1, Ordering::SeqCst) + 1;
                 let event_tx_worker = event_tx.clone();
+                let art_worker = supervisor_art.clone();
+                let budget_warned_worker = supervisor_budget_warned.clone();
                 let listener_config_worker = listener_config.clone();
                 let now_showing_worker = now_showing_supervisor.clone();
                 let worker_started = Instant::now();
@@ -693,6 +711,8 @@ fn main() -> Result<()> {
                     .spawn(move || {
                         let _ = smtc::SmtcListener::new(
                             event_tx_worker,
+                            art_worker,
+                            budget_warned_worker,
                             listener_config_worker,
                             worker_heartbeat,
                             worker_generation,
@@ -814,6 +834,7 @@ fn main() -> Result<()> {
         event_rx,
         supervisor_rx,
         forwarder_shutdown,
+        forwarder_art,
     );
 
     let message_result = message_loop();
@@ -917,13 +938,16 @@ enum WorkerExit {
 }
 
 /// Whether an event must be delivered to the overlay queue. Worker failures
-/// are history-only: the overlay never renders them, so they must not wake
-/// the pill or occupy its queue. Every other event — including
-/// `SessionRejected`, which drives the overlay's retire logic for sources
-/// that leave the allow-list — is forwarded even though rejections are never
-/// rendered as pills.
+/// and the budget-drop tray warning are history/tray-only: the overlay never
+/// renders them, so they must not wake the pill or occupy its queue. Every
+/// other event — including `SessionRejected`, which drives the overlay's
+/// retire logic for sources that leave the allow-list — is forwarded even
+/// though rejections are never rendered as pills.
 fn overlay_bound(event: &MediaEvent) -> bool {
-    !matches!(event, MediaEvent::WorkerFailed { .. })
+    !matches!(
+        event,
+        MediaEvent::WorkerFailed { .. } | MediaEvent::ArtworkBudgetExceeded
+    )
 }
 
 /// Drains SMTC events into each window's queue and wakes both windows.
@@ -942,6 +966,7 @@ fn spawn_event_forwarder(
     receiver: mpsc::Receiver<Arc<MediaEvent>>,
     supervisor_rx: mpsc::Receiver<Arc<MediaEvent>>,
     shutdown: Arc<AtomicBool>,
+    in_flight_art: Arc<AtomicU64>,
 ) -> std::thread::JoinHandle<()> {
     // HWND is not Send; the raw handle value is all the forwarder needs to
     // post with.
@@ -965,7 +990,15 @@ fn spawn_event_forwarder(
                     );
                 }
                 let event = match receiver.recv_timeout(Duration::from_millis(200)) {
-                    Ok(event) => event,
+                    Ok(event) => {
+                        // The event left the worker's outbound queue: its
+                        // artwork bytes are no longer in flight here. The
+                        // window queues share the same `Arc` allocations and
+                        // are separately count-capped, so freeing at the pop
+                        // keeps the counter at the distinct live allocations.
+                        in_flight_art.fetch_sub(artwork_bytes(&event), Ordering::Relaxed);
+                        event
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
@@ -1354,7 +1387,8 @@ mod tests {
         // SessionRejected drives the overlay's retire logic (content from a
         // source that left the allow-list must leave the pill), so it must
         // reach the overlay even though it is never rendered. WorkerFailed is
-        // history-only and must not wake the pill or occupy its queue.
+        // history-only and must not wake the pill or occupy its queue, and
+        // the one-shot budget-drop warning is tray-only.
         let rejected = MediaEvent::SessionRejected {
             source_app: "Brave".into(),
             title: "t".into(),
@@ -1367,6 +1401,10 @@ mod tests {
             reason: "worker died".into(),
         };
         assert!(!overlay_bound(&failed), "WorkerFailed is history-only");
+        assert!(
+            !overlay_bound(&MediaEvent::ArtworkBudgetExceeded),
+            "the budget warning is tray-only and must not wake the pill"
+        );
         let changed = MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "Brave".into());
         assert!(overlay_bound(&changed), "playback events must reach the overlay");
     }

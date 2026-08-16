@@ -482,15 +482,13 @@ pub(super) fn draw_pixels(
             if source_app.is_empty() {
                 None
             } else {
-                state
-                    .track_cache
-                    .get(source_app)
-                    .and_then(|(t, _)| t.decoded_art.clone())
+                state.track_cache.get(source_app).and_then(|t| t.decoded_art.clone())
             }
         }
         MediaEvent::SessionRejected { .. }
         | MediaEvent::SourceGone { .. }
         | MediaEvent::WorkerFailed { .. }
+        | MediaEvent::ArtworkBudgetExceeded
         | MediaEvent::ProgressChanged { .. } => None,
     };
     state.ensure_art(decoded.as_ref());
@@ -637,6 +635,7 @@ pub(super) fn draw_pixels(
                 MediaEvent::SessionRejected { .. }
                 | MediaEvent::SourceGone { .. }
                 | MediaEvent::WorkerFailed { .. }
+                | MediaEvent::ArtworkBudgetExceeded
                 | MediaEvent::ProgressChanged { .. },
                 _,
             ) => return Ok(()),
@@ -1783,7 +1782,7 @@ pub(super) fn draw_expanded_pill_text(
                 if source_app.is_empty() {
                     None
                 } else {
-                    state.track_cache.get(source_app).map(|(t, _)| pill_text_from_track(t))
+                    state.track_cache.get(source_app).map(pill_text_from_track)
                 }
             });
             if let Some(pill) = pill {
@@ -1897,6 +1896,7 @@ pub(super) fn draw_expanded_pill_text(
         MediaEvent::SessionRejected { .. }
         | MediaEvent::SourceGone { .. }
         | MediaEvent::WorkerFailed { .. }
+        | MediaEvent::ArtworkBudgetExceeded
         | MediaEvent::ProgressChanged { .. } => {}
     }
 }
@@ -1989,7 +1989,7 @@ pub(super) fn draw_compact_pill(
                 if source_app.is_empty() {
                     None
                 } else {
-                    state.track_cache.get(source_app).map(|(t, _)| pill_text_from_track(t))
+                    state.track_cache.get(source_app).map(pill_text_from_track)
                 }
             });
             match pill {
@@ -2015,6 +2015,7 @@ pub(super) fn draw_compact_pill(
         MediaEvent::SessionRejected { .. }
         | MediaEvent::SourceGone { .. }
         | MediaEvent::WorkerFailed { .. }
+        | MediaEvent::ArtworkBudgetExceeded
         | MediaEvent::ProgressChanged { .. } => {
             return;
         }
@@ -2114,7 +2115,7 @@ pub(super) fn draw_morph_content(
                 if source_app.is_empty() {
                     None
                 } else {
-                    state.track_cache.get(source_app).map(|(t, _)| pill_text_from_track(t))
+                    state.track_cache.get(source_app).map(pill_text_from_track)
                 }
             });
             match pill {
@@ -2139,6 +2140,7 @@ pub(super) fn draw_morph_content(
         MediaEvent::SessionRejected { .. }
         | MediaEvent::SourceGone { .. }
         | MediaEvent::WorkerFailed { .. }
+        | MediaEvent::ArtworkBudgetExceeded
         | MediaEvent::ProgressChanged { .. } => {
             return;
         }

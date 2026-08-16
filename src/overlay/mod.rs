@@ -223,17 +223,20 @@ const PENDING_CAP: usize = 4;
 /// track's decoded cover (up to 256 KB at the cap; typically 64 KB at 100 %
 /// DPI) plus the pill text, and the worker evicts its own source-level
 /// caches when sessions close — the overlay has no session knowledge, so an
-/// LRU + idle timeout keeps long-idle sources from accumulating covers that
-/// will never be shown again. Three entries bound the retained cover memory
-/// while covering a realistic source mix (music + video + podcast).
+/// LRU cache: three entries bound the retained cover memory while covering
+/// a realistic source mix (music + video + podcast). Retention is indefinite
+/// once inserted — a source's last track stays available as a successor
+/// while its playback state says it is still playing — so the cap alone
+/// bounds the memory (per entry: pill text + one 256² decoded cover).
 const TRACK_CACHE_CAP: usize = 3;
 
-/// Entries untouched for this long are evicted at the next insert. Eviction
-/// is lazy (sweep inside `cache_track`), so an expired entry remains
-/// readable until new data arrives: a state pill is never robbed of the
-/// cached track by the timeout alone. Time-bounds what the cap cannot: a
-/// source that played once and never returns still drops out after this.
-const TRACK_CACHE_TTL: Duration = Duration::from_secs(600);
+/// Bound on the per-source playback-state ledger (`OverlayState.source_state`).
+/// Live sources are capped at the worker's admission limits (32 sources), so
+/// the ledger never needs more than that for live entries; the headroom
+/// covers settled/rejected sources still awaiting eviction. A Stopped entry
+/// is inert (never a successor), so evicting a Stopped entry first is always
+/// safe.
+const LEDGER_STATE_CAP: usize = 64;
 
 /// Per-line marquee state for the pill's text rows. The offset advances on the
 /// 16ms animation tick; a short hold before the first movement reads better.
@@ -542,13 +545,22 @@ struct OverlayState {
     current_source: Option<String>,
     /// Per-source track cache: the last TrackChanged shown for each source app,
     /// so that a later PlaybackStateChanged for that source can render the
-    /// correct track info instead of the most-recently-shown app's track.
+    /// correct track info instead of the most-recently-shown app's track, and
+    /// a retired source can be succeeded by a source that is still playing.
     /// Entries hold the pill text and decoded cover (raw artwork stripped at
-    /// insert — see `cache_track`). LRU-ordered and time-bounded (see
-    /// `TRACK_CACHE_CAP`/`TRACK_CACHE_TTL`), so a source that stops playing
-    /// eventually drops out instead of holding its cover forever. The
-    /// `Instant` is the last insert time.
-    track_cache: HashMap<String, (TrackInfo, Instant)>,
+    /// insert — see `cache_track`). LRU-ordered and bounded by
+    /// `TRACK_CACHE_CAP` alone: retention is indefinite once inserted, so a
+    /// source that stops playing drops out only when the cap evicts it.
+    track_cache: HashMap<String, TrackInfo>,
+    /// Last known playback state per source app, so successor selection knows
+    /// which cached tracks belong to sources that are *actually playing* (see
+    /// `best_successor`). Fed by TrackChanged snapshots (only when the
+    /// snapshot carries a state — a transitional `None` never downgrades a
+    /// source), PlaybackStateChanged events, and retirement (a settled,
+    /// allow-list-removed or churn-excluded source is marked Stopped and can
+    /// never surface again until it emits a new event). Bounded by
+    /// `LEDGER_STATE_CAP`, evicting Stopped entries first.
+    source_state: HashMap<String, PlaybackState>,
     /// Recency order of `track_cache` keys (front = oldest). Kept in sync by
     /// `cache_track`.
     track_cache_order: VecDeque<String>,
@@ -937,6 +949,7 @@ impl OverlayState {
             last_cursor_over_pill: false,
             current_source: None,
             track_cache: HashMap::new(),
+            source_state: HashMap::new(),
             track_cache_order: VecDeque::new(),
             pill_text: None,
             text_scratch: None,
@@ -1171,6 +1184,24 @@ impl OverlayState {
         // never copies the event; recover the owned event here (zero-copy
         // when this window is the last holder, a clone otherwise).
         for event in batch.into_iter().map(media_event_into_owned) {
+            // Playback-state ledger: remember the last known state per source
+            // so successor selection only ever announces sources that are
+            // actually playing (see `best_successor`). Updated even while
+            // notifications are disabled — the ledger is liveness truth, not
+            // display policy. A TrackChanged whose snapshot carries no state
+            // (transitional read) leaves the existing entry untouched rather
+            // than downgrading a playing source.
+            match &event {
+                MediaEvent::TrackChanged(track) => {
+                    if let Some(state) = track.playback_state {
+                        self.remember_source_state(&track.source_app, state);
+                    }
+                }
+                MediaEvent::PlaybackStateChanged(state, source) => {
+                    self.remember_source_state(source, *state);
+                }
+                _ => {}
+            }
             // A source retired from the allow-list must drop its content
             // even while notifications are disabled: hygiene for the next
             // show, not a notification.
@@ -1419,11 +1450,13 @@ impl OverlayState {
                     self.enqueue(MediaEvent::PlaybackStateChanged(state, source_app));
                 }
                 MediaEvent::TrackChanged(_) | MediaEvent::PlaybackStateChanged(_, _) => {}
-                // Rejected sessions, settled sources and worker failures are
-                // history-only: never shown as a pill.
+                // Rejected sessions, settled sources, worker failures and the
+                // budget-drop warning are history/tray-only: never shown as a
+                // pill.
                 MediaEvent::SessionRejected { .. }
                 | MediaEvent::SourceGone { .. }
-                | MediaEvent::WorkerFailed { .. } => {}
+                | MediaEvent::WorkerFailed { .. }
+                | MediaEvent::ArtworkBudgetExceeded => {}
             }
         }
         if !self.pending.is_empty() {
@@ -1464,31 +1497,46 @@ impl OverlayState {
         // duplicate marker.
         self.track_cache_order.retain(|s| *s != source);
         self.track_cache_order.push_back(source.clone());
-        let now = Instant::now();
-        // Insert first so the sweep below sees the fresh entry: a brand-new
-        // source must never look like an expired cache miss.
+        // Insert first so the cap sweep below sees the fresh entry: a
+        // brand-new source must never look like an eviction candidate.
         let mut cached = track.clone();
         // The cache only ever serves pill text and the decoded cover; nothing
         // reads the raw artwork bytes from it. Stripping them keeps the raw
         // cover (typically 50-500 KB) from being retained per source after
         // that source stops playing.
         cached.artwork = None;
-        self.track_cache.insert(source, (cached, now));
-        // Lazy sweep: expire idle entries first, then enforce the cap. Only
-        // runs here (on insert), so an expired entry is still readable by a
-        // pill that arrives before the next insert — the timeout never
-        // degrades a pill on its own.
-        while let Some(front) = self.track_cache_order.front().cloned() {
-            let expired = self
-                .track_cache
-                .get(&front)
-                .is_none_or(|(_, last_used)| now.duration_since(*last_used) > TRACK_CACHE_TTL);
-            if self.track_cache_order.len() <= TRACK_CACHE_CAP && !expired {
-                break;
-            }
-            self.track_cache_order.pop_front();
+        self.track_cache.insert(source, cached);
+        // Lazy cap sweep: evict the oldest entries until the cap is met. Only
+        // runs here (on insert). Entries are otherwise retained indefinitely
+        // — a state pill is never robbed of a cached track by a timeout.
+        while self.track_cache_order.len() > TRACK_CACHE_CAP {
+            let front = self
+                .track_cache_order
+                .pop_front()
+                .expect("the recency order stays in lockstep with the cache");
             self.track_cache.remove(&front);
         }
+    }
+
+    /// Records a source's last known playback state, evicting a Stopped
+    /// entry first when the ledger cap is exceeded. Stopped entries are inert
+    /// (never successors), so evicting one never drops live state; if the
+    /// ledger somehow exceeds the cap with no Stopped entry (the worker's
+    /// admission caps keep live sources far below `LEDGER_STATE_CAP`), any
+    /// entry is evicted as a defense.
+    fn remember_source_state(&mut self, source: &str, state: PlaybackState) {
+        self.source_state.insert(source.to_owned(), state);
+        if self.source_state.len() <= LEDGER_STATE_CAP {
+            return;
+        }
+        let evict = self
+            .source_state
+            .iter()
+            .find(|(_, s)| **s == PlaybackState::Stopped)
+            .map(|(key, _)| key.clone())
+            .or_else(|| self.source_state.keys().next().cloned())
+            .expect("the ledger is non-empty past the cap");
+        self.source_state.remove(&evict);
     }
 
     /// Adds a notification to the pending queue. At the cap, the oldest unshown
@@ -1544,6 +1592,7 @@ impl OverlayState {
             MediaEvent::SessionRejected { .. }
             | MediaEvent::SourceGone { .. }
             | MediaEvent::WorkerFailed { .. }
+            | MediaEvent::ArtworkBudgetExceeded
             | MediaEvent::ProgressChanged { .. } => {}
         }
         if self.pending.len() >= PENDING_CAP {
@@ -1580,6 +1629,9 @@ impl OverlayState {
             MediaEvent::SourceGone { .. } => {
                 debug!("source-gone event reached the pill queue; ignoring");
             }
+            MediaEvent::ArtworkBudgetExceeded => {
+                debug!("artwork-budget event reached the pill queue; ignoring");
+            }
         }
     }
     fn flush_pending(&mut self) {
@@ -1605,17 +1657,20 @@ impl OverlayState {
         }
     }
 
-    /// The most recent cached track from a source other than `retired`
-    /// (recency order, back = newest), skipping entries idle past the cache
-    /// TTL the same way the insert sweep drops them.
-    fn latest_valid_track(&self, retired: &str) -> Option<TrackInfo> {
-        let now = Instant::now();
+    /// The most recent cached track from a source other than `excluded` that
+    /// is *actually playing* (last known playback state Playing). A source
+    /// whose state is Paused, Stopped, or unknown is never a successor:
+    /// swapping the pill to it would announce "now playing" content that is
+    /// not playing. Returns None when no playing source has a cached track.
+    fn best_successor(&self, excluded: &str) -> Option<TrackInfo> {
         self.track_cache_order.iter().rev().find_map(|source| {
-            if source.as_str() == retired {
+            if source.as_str() == excluded {
                 return None;
             }
-            let (track, last_used) = self.track_cache.get(source)?;
-            (now.duration_since(*last_used) <= TRACK_CACHE_TTL).then(|| track.clone())
+            self.track_cache
+                .get(source)
+                .filter(|_| self.source_state.get(source.as_str()) == Some(&PlaybackState::Playing))
+                .cloned()
         })
     }
 
@@ -1681,11 +1736,15 @@ impl OverlayState {
     /// session tripped the churn cool-down). Its content must not stay on the
     /// pill, in the persistent resume hold, behind the settings sample pill,
     /// or queued for a later notification: swap every holding site to the most
-    /// recent cached track from a source that still matters, and hide the pill
-    /// when nothing valid remains. Runs regardless of the notifications toggle
-    /// — a disabled overlay must not resurrect a retired source's content at
-    /// the next show.
+    /// recent cached track from a source that is still playing, and hide the
+    /// pill when nothing playing remains. Runs regardless of the notifications
+    /// toggle — a disabled overlay must not resurrect a retired source's
+    /// content at the next show.
     fn retire_source(&mut self, retired: &str) {
+        // The retired source must never be a successor again: mark it Stopped
+        // in the ledger before the early return below, so a later successor
+        // lookup (for another source) cannot surface its cached track.
+        self.remember_source_state(retired, PlaybackState::Stopped);
         // The retired source must never surface again from the track cache:
         // drop its entry and recency marker before the early return below,
         // so a later successor lookup or re-show cannot resurrect it. The
@@ -1711,17 +1770,17 @@ impl OverlayState {
         if !content_is_retired && !held_is_retired && !last_is_retired {
             return;
         }
-        let successor = self.latest_valid_track(retired);
+        let successor = self.best_successor(retired);
         if content_is_retired {
             if let Some(track) = &successor {
-                debug!("retired source {retired}: swapping the pill to the most recent valid source");
+                debug!("retired source {retired}: swapping the pill to the most recent playing source");
                 let full = Duration::from_millis(self.config.overlay.duration_ms.max(500));
                 self.current_source = Some(track.source_app.clone());
                 self.last_track = Some(track.clone());
                 self.cache_track(track);
                 self.update_content(MediaEvent::TrackChanged(track.clone()), full);
             } else {
-                debug!("retired source {retired}: hiding the pill (no valid content remains)");
+                debug!("retired source {retired}: hiding the pill (no playing source remains)");
                 self.held_content = None;
                 self.last_track = None;
                 self.hide();
@@ -1747,9 +1806,9 @@ impl OverlayState {
     /// source may legitimately return, so its `track_cache` entry and the
     /// now-showing cell are left to their normal lifetimes — only the
     /// restoreable standby dies: queued notifications, the resume hold and
-    /// `last_track` swap to the most recent valid source or are cleared, and
-    /// a pill that is showing the gone source's **track** is retired so it
-    /// cannot linger as a stale "now playing".
+    /// `last_track` swap to the most recent *playing* source or are cleared,
+    /// and a pill that is showing the gone source's **track** is retired so
+    /// it cannot linger as a stale "now playing".
     /// A `PlaybackStateChanged` pill for the gone source is deliberately left
     /// alone: the settle's terminal Stopped was emitted immediately before
     /// this event in the same sync, so a state pill on screen is the
@@ -1757,6 +1816,11 @@ impl OverlayState {
     /// UX. Runs regardless of the notifications toggle — a disabled overlay
     /// must not restore the gone source's content at the next show.
     fn retire_source_gone(&mut self, gone: &str) {
+        // The settled source must never be a successor again: mark it Stopped
+        // unconditionally (before the content checks), so a later SourceGone
+        // for another source cannot surface its cached track. A returning
+        // source re-inserts its live state with its next event.
+        self.remember_source_state(gone, PlaybackState::Stopped);
         // Queued notifications from the gone source can never show now; drop
         // them before hide() -> show_next() could re-show one.
         self.pending.retain(|event| Self::event_source(event) != Some(gone));
@@ -1772,17 +1836,17 @@ impl OverlayState {
         if !content_is_gone_track && !held_is_gone_track && !last_is_gone {
             return;
         }
-        let successor = self.latest_valid_track(gone);
+        let successor = self.best_successor(gone);
         if content_is_gone_track {
             if let Some(track) = &successor {
-                debug!("settled source {gone}: swapping the pill to the most recent valid source");
+                debug!("settled source {gone}: swapping the pill to the most recent playing source");
                 let full = Duration::from_millis(self.config.overlay.duration_ms.max(500));
                 self.current_source = Some(track.source_app.clone());
                 self.last_track = Some(track.clone());
                 self.cache_track(track);
                 self.update_content(MediaEvent::TrackChanged(track.clone()), full);
             } else {
-                debug!("settled source {gone}: hiding the pill (no valid content remains)");
+                debug!("settled source {gone}: hiding the pill (no playing source remains)");
                 self.held_content = None;
                 self.last_track = None;
                 self.hide();
@@ -1991,10 +2055,9 @@ impl OverlayState {
     fn resolve_pill_text(&mut self) {
         self.pill_text = match &self.content {
             Some(MediaEvent::TrackChanged(track)) => Some(pill_text_from_track(track)),
-            Some(MediaEvent::PlaybackStateChanged(_, source)) if !source.is_empty() => self
-                .track_cache
-                .get(source)
-                .map(|(track, _)| pill_text_from_track(track)),
+            Some(MediaEvent::PlaybackStateChanged(_, source)) if !source.is_empty() => {
+                self.track_cache.get(source).map(pill_text_from_track)
+            }
             _ => None,
         };
     }
@@ -4024,29 +4087,32 @@ mod tests {
     }
 
     #[test]
-    fn track_cache_expires_sources_idle_beyond_the_ttl() {
+    fn track_cache_retains_idle_entries_until_the_cap_evicts_them() {
+        // Retention is indefinite once an entry is inserted: only the cap
+        // evicts. An idle (never-refreshed) entry survives inserts below the
+        // cap — the successor rule's playback-state gate, not a timeout, is
+        // what keeps a stopped source's track from ever being announced.
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
-        state.track_cache.insert(
-            "stale".into(),
-            (
-                track_for("stale", "Old", "Song"),
-                Instant::now() - TRACK_CACHE_TTL - Duration::from_secs(1),
-            ),
-        );
+        state
+            .track_cache
+            .insert("stale".into(), track_for("stale", "Old", "Song"));
         state.track_cache_order.push_back("stale".into());
-        // Lazy eviction: nothing sweeps between inserts, so an expired entry
-        // stays readable for a state pill that arrives before the next one.
-        assert!(
-            state.track_cache.contains_key("stale"),
-            "expired entries are readable until the next insert"
-        );
         state.cache_track(&track_for("fresh", "New", "Song"));
         assert!(
-            !state.track_cache.contains_key("stale"),
-            "an entry idle past the TTL must be evicted at the next insert"
+            state.track_cache.contains_key("stale"),
+            "an idle entry must be retained below the cap"
         );
         assert!(state.track_cache.contains_key("fresh"));
-        assert_eq!(state.track_cache.len(), 1);
+        assert_eq!(state.track_cache.len(), 2);
+        // ... and the cap still evicts the oldest entries once exceeded.
+        for i in 0..TRACK_CACHE_CAP {
+            state.cache_track(&track_for(&format!("more-{i}"), "Song", "Artist"));
+        }
+        assert_eq!(state.track_cache.len(), TRACK_CACHE_CAP);
+        assert!(
+            !state.track_cache.contains_key("stale"),
+            "the oldest entries must be evicted at the cap"
+        );
     }
 
     #[test]
@@ -4058,7 +4124,7 @@ mod tests {
         // suppression the state pill would render it stale.
         state.track_cache.insert(
             "youtube-music".into(),
-            (track_for("youtube-music", "Old Song", "Old Artist"), Instant::now()),
+            track_for("youtube-music", "Old Song", "Old Artist"),
         );
 
         queue
@@ -4090,10 +4156,9 @@ mod tests {
         let config = Config::default();
         let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
         let mut state = OverlayState::new(config, queue.clone());
-        state.track_cache.insert(
-            "youtube-music".into(),
-            (track_for("youtube-music", "Song", "Artist"), Instant::now()),
-        );
+        state
+            .track_cache
+            .insert("youtube-music".into(), track_for("youtube-music", "Song", "Artist"));
 
         queue
             .lock()
@@ -4224,9 +4289,7 @@ mod tests {
             let track = track_for("youtube-music", "Song", "Artist");
             // The track pill caches its track so the in-place state pill can
             // resolve the title/artist without a new TrackChanged.
-            state
-                .track_cache
-                .insert("youtube-music".into(), (track.clone(), Instant::now()));
+            state.track_cache.insert("youtube-music".into(), track.clone());
             state.content = Some(MediaEvent::TrackChanged(track));
             state.phase = Phase::Shown;
             state.dismiss_at = Some(Instant::now() + Duration::from_secs(3));
@@ -4484,11 +4547,14 @@ mod tests {
 
     #[test]
     fn session_rejected_swaps_shown_content_to_the_latest_valid_track() {
-        // Brave is on screen; YTM's track was shown earlier this run and is
-        // cached. Retiring Brave must swap the pill to YTM's track in place,
-        // not leave stale Brave content behind.
+        // Brave is on screen; YTM's track was shown earlier this run, is
+        // cached, and YTM is still playing. Retiring Brave must swap the pill
+        // to YTM's track in place, not leave stale Brave content behind.
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.cache_track(&ytm_track("Last YTM Track"));
+        state
+            .source_state
+            .insert("youtube-music".into(), PlaybackState::Playing);
         state.content = Some(MediaEvent::TrackChanged(brave_track("Brave Song")));
         state.current_source = Some("Brave".into());
         state.last_track = Some(brave_track("Brave Song"));
@@ -4539,6 +4605,9 @@ mod tests {
         state.held_content = Some(MediaEvent::TrackChanged(brave_track("Brave Song")));
         state.last_track = Some(brave_track("Brave Song"));
         state.cache_track(&ytm_track("Last YTM Track"));
+        state
+            .source_state
+            .insert("youtube-music".into(), PlaybackState::Playing);
         state.queue.lock().unwrap().push_back(Arc::new(reject("Brave")));
         state.receive_events();
 
@@ -4586,6 +4655,9 @@ mod tests {
         state.phase = Phase::Hidden;
         state.last_track = Some(brave_track("Brave Song"));
         state.cache_track(&ytm_track("Last YTM Track"));
+        state
+            .source_state
+            .insert("youtube-music".into(), PlaybackState::Playing);
         state.queue.lock().unwrap().push_back(Arc::new(reject("Brave")));
         state.receive_events();
 
@@ -4606,6 +4678,9 @@ mod tests {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.enabled = false;
         state.cache_track(&ytm_track("Last YTM Track"));
+        state
+            .source_state
+            .insert("youtube-music".into(), PlaybackState::Playing);
         state.content = Some(MediaEvent::TrackChanged(brave_track("Brave Song")));
         state.last_track = Some(brave_track("Brave Song"));
         state.phase = Phase::Shown;
@@ -5931,7 +6006,7 @@ mod tests {
     #[test]
     fn source_gone_swaps_the_standby_to_the_most_recent_valid_source() {
         // A pill (and its standby sites) showing the gone source swaps to the
-        // newest cached track from a source that still matters — same
+        // newest cached track from a source that is still playing — same
         // succession rule as retire_source.
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.phase = Phase::Shown;
@@ -5939,6 +6014,7 @@ mod tests {
         let survivor = track_for("brave", "Survivor", "Artist");
         state.cache_track(&gone);
         state.cache_track(&survivor);
+        state.source_state.insert("brave".into(), PlaybackState::Playing);
         state.content = Some(MediaEvent::TrackChanged(gone.clone()));
         state.held_content = Some(MediaEvent::TrackChanged(gone.clone()));
         state.last_track = Some(gone);
@@ -5960,6 +6036,148 @@ mod tests {
             matches!(&state.held_content, Some(MediaEvent::TrackChanged(t)) if t.source_app == "brave"),
             "the resume hold must swap to the survivor"
         );
+    }
+
+    #[test]
+    fn source_gone_hides_when_the_only_survivor_is_not_playing() {
+        // The successor rule only announces sources that are actually playing:
+        // a paused (or stopped) survivor must not surface its cached track as
+        // "now playing" when the shown source settles.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Shown;
+        let gone = track_for("spotify", "Song", "Artist");
+        let paused = track_for("brave", "Paused Survivor", "Artist");
+        state.cache_track(&gone);
+        state.cache_track(&paused);
+        state.source_state.insert("brave".into(), PlaybackState::Paused);
+        state.content = Some(MediaEvent::TrackChanged(gone.clone()));
+        state.last_track = Some(gone);
+
+        state.queue.lock().unwrap().push_back(Arc::new(MediaEvent::SourceGone {
+            source_app: "spotify".into(),
+        }));
+        state.receive_events();
+
+        assert!(
+            state.content.is_none(),
+            "a paused survivor must not be announced as now playing"
+        );
+        assert!(state.last_track.is_none());
+        assert!(matches!(state.phase, Phase::Hidden));
+    }
+
+    #[test]
+    fn source_gone_prefers_a_playing_source_over_a_newer_paused_one() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Shown;
+        let gone = track_for("spotify", "Song", "Artist");
+        let playing = track_for("yt", "Playing Track", "Artist");
+        let paused = track_for("brave", "Paused Track", "Artist");
+        state.cache_track(&gone);
+        state.cache_track(&playing);
+        state.cache_track(&paused); // newest entry, but paused
+        state.source_state.insert("yt".into(), PlaybackState::Playing);
+        state.source_state.insert("brave".into(), PlaybackState::Paused);
+        state.content = Some(MediaEvent::TrackChanged(gone));
+        state.last_track = Some(track_for("spotify", "Song", "Artist"));
+
+        state.queue.lock().unwrap().push_back(Arc::new(MediaEvent::SourceGone {
+            source_app: "spotify".into(),
+        }));
+        state.receive_events();
+
+        assert!(
+            matches!(&state.content, Some(MediaEvent::TrackChanged(t)) if t.source_app == "yt" && t.title == "Playing Track"),
+            "the playing source must win over a newer paused one"
+        );
+    }
+
+    #[test]
+    fn settled_sources_are_marked_stopped_and_cannot_succeed_each_other() {
+        // Two sources settle in one batch: after the first swap, the second
+        // SourceGone must not re-announce the first source's track — each
+        // settle marks its source Stopped in the ledger, converging to a hide.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Shown;
+        let spotify = track_for("spotify", "Song", "Artist");
+        let brave = track_for("brave", "Song", "Artist");
+        state.cache_track(&spotify);
+        state.cache_track(&brave);
+        state.source_state.insert("spotify".into(), PlaybackState::Playing);
+        state.source_state.insert("brave".into(), PlaybackState::Playing);
+        state.content = Some(MediaEvent::TrackChanged(spotify));
+        state.last_track = Some(track_for("spotify", "Song", "Artist"));
+
+        state.queue.lock().unwrap().push_back(Arc::new(MediaEvent::SourceGone {
+            source_app: "spotify".into(),
+        }));
+        state.queue.lock().unwrap().push_back(Arc::new(MediaEvent::SourceGone {
+            source_app: "brave".into(),
+        }));
+        state.receive_events();
+
+        assert!(
+            state.content.is_none(),
+            "with both sources settled there is nothing playing to announce"
+        );
+        assert!(matches!(state.phase, Phase::Hidden));
+    }
+
+    #[test]
+    fn source_state_tracks_playback_from_events() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Paused,
+                "yt".into(),
+            )));
+        let mut playing = track_for("spotify", "Song", "Artist");
+        playing.playback_state = Some(PlaybackState::Playing);
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(playing)));
+        state.receive_events();
+        assert_eq!(state.source_state.get("yt"), Some(&PlaybackState::Paused));
+        assert_eq!(state.source_state.get("spotify"), Some(&PlaybackState::Playing));
+
+        // A TrackChanged whose snapshot carries no state (transitional read)
+        // must not downgrade a known state.
+        let mut transitional = track_for("spotify", "Song", "Artist");
+        transitional.playback_state = None;
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(transitional)));
+        state.receive_events();
+        assert_eq!(
+            state.source_state.get("spotify"),
+            Some(&PlaybackState::Playing),
+            "a transitional snapshot must not erase a playing state"
+        );
+    }
+
+    #[test]
+    fn source_state_evicts_a_stopped_entry_at_the_ledger_cap() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        for i in 0..(LEDGER_STATE_CAP - 1) {
+            state.remember_source_state(&format!("live-{i}"), PlaybackState::Playing);
+        }
+        state.remember_source_state("stopped-old", PlaybackState::Stopped);
+        // Overflow evicts the inert Stopped entry; live sources survive.
+        state.remember_source_state("live-last", PlaybackState::Playing);
+        assert_eq!(state.source_state.len(), LEDGER_STATE_CAP);
+        assert!(
+            !state.source_state.contains_key("stopped-old"),
+            "a Stopped entry must be evicted first"
+        );
+        assert!(state.source_state.contains_key("live-last"));
+        assert!(state.source_state.contains_key("live-0"));
     }
 
     #[test]
