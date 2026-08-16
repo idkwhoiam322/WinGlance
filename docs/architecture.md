@@ -82,7 +82,17 @@ after one hung shell call)
   a dedicated unbounded status channel, so that report can never be dropped
   by an overloaded event channel. Each window queue is bounded (cap 256,
   newest wins); a failed wake post clears and accounts the affected queue
-  instead of stranding events in it.
+  instead of stranding events in it. Between the worker and the channel sits
+  a retry mailbox (cap 256): an event that cannot enqueue (channel full)
+  waits there and is re-pushed on the next emit, superseding an older event
+  with the same coalesce key so the newest authoritative state wins. The
+  worker also budgets the artwork bytes in flight across channel + mailbox
+  (`MAX_IN_FLIGHT_ARTWORK_BYTES` = 64 MiB, a shared counter freed as events
+  pop): a cover that would exceed the budget is stripped from the event
+  (metadata kept, pill renders a placeholder), and the first such drop per
+  app run emits a one-shot `ArtworkBudgetExceeded` that the main window
+  surfaces as a tray note, so the user learns the UI fell behind instead of
+  covers silently vanishing.
 - The UI thread owns all Win32 windows, the queues, and GDI surfaces. The
   SMTC worker performs the metadata + artwork reads and the fixed-size
   artwork *decode* (into a fixed `ARTWORK_DECODE`² = 256² premultiplied
@@ -93,6 +103,39 @@ after one hung shell call)
   `ensure_art` (~0.1 ms, cached for the animation frames); the palette is
   derived from that same converted buffer, so no separate full-resolution
   decode is ever needed.
+
+## Single instance and restart handoff
+
+WinGlance allows exactly one running instance per session. Startup
+(`acquire_singleton`, `src/main.rs`) creates the session-scoped named mutex
+`WinGlanceSingleInstance` with initial ownership; `ERROR_ALREADY_EXISTS` is
+resolved by a zero-timeout wait — `WAIT_OBJECT_0` takes ownership,
+`WAIT_ABANDONED` (a crashed predecessor) is taken over so a dead instance
+never blocks the next launch, `WAIT_TIMEOUT` (a live duplicate) exits
+fail-closed before touching log or config, and `WAIT_FAILED` exits with an
+annotated error. The mutex is held for the whole process lifetime by
+`SingletonGuard`. The name is deliberately session-scoped (no `Global\`
+prefix), so separate sessions get independent namespaces.
+
+The in-app "Restart app" handoff (`relaunch_self`) spawns
+`WinGlance.exe --reload-config --winglance-restart-nonce {nonce}`, where the
+nonce (`{pid}-{nanos}`) names an auto-reset ready event the child can open.
+The child signals ready *before* waiting on the mutex; on the signal the old
+process releases the mutex and exits (10 s ready timeout), and the child
+takes ownership (15 s wait, `WAIT_ABANDONED` accepted — covering the old
+process dying mid-handoff). A spawn failure or ready timeout leaves the old
+instance fully intact; a failed handoff never leaves the app unprotected.
+
+Same-session name squatting is a diagnosed availability issue, not a
+security boundary: a duplicate launch whose wait times out probes for a live
+`WinGlance.exe` (Toolhelp snapshot, own pid excluded, retried 3×) and
+reports a suspected squatted name to `crash.log` (`report_suspected_squat`)
+instead of exiting silently. Fail-open on a squatted mutex and a `Global\`
+namespace are deliberately rejected — two instances would truncate each
+other's live log and race on `config.toml`. The `is_our_instance`
+classification (casing, NUL padding, own-pid exclusion) is pinned by unit
+tests in `src/main.rs`; the live handoff itself is not exercised by the test
+suite.
 
 ## SMTC session selection
 
@@ -193,6 +236,53 @@ with nothing actually playing hides the pill instead of announcing stale
 event. The track cache itself is cap-bounded (3 entries, text plus one
 decoded cover each) with indefinite retention — a playing source's track is
 never evicted by time, only by newer inserts.
+
+## Hostile-input hardening
+
+SMTC is a public API: any local process, a crafted media file played by any
+SMTC-aware player, or any web page can feed arbitrary metadata, artwork and
+timeline values into the pill. All hardening sits at the worker boundary
+(`smtc.rs`) or in the worker's outbound queues; the UI thread only ever
+receives sanitized, bounded payloads:
+
+- **Metadata strings** — `cap_meta` is the single choke point every displayed
+  and logged field passes through (including the AUMID-derived source label):
+  it strips C0 control characters (0x00–0x1F), DEL + C1 (0x7F–0x9F), bidi
+  overrides (0x202A–0x202E, 0x2066–0x2069) and Zl/Zp line separators
+  (0x2028–0x2029), trims, and caps at `MAX_META_CHARS` = 256. Raw values
+  reach logs only through Debug-escaping `log_preview`. Fuzz-pinned
+  (`cap_meta_never_emits_hostile_characters_or_grows_the_input`,
+  `hostile_identity_fuzz`,
+  `log_lines_cannot_be_injected_through_hostile_metadata`).
+- **Artwork** — `read_thumbnail` caps the stream at `MAX_THUMBNAIL_BYTES` =
+  4 MiB *before* creating the buffer; `decode_limited` caps dimensions at
+  2048×2048; decoding runs on the worker only, once per emitted track, into a
+  fixed 256×256 premultiplied buffer the UI thread converts but never
+  re-decodes. Retained covers are bounded by `MAX_RETAINED_ARTWORK_BYTES` =
+  64 MiB with eviction; in-flight queued covers by
+  `MAX_IN_FLIGHT_ARTWORK_BYTES` = 64 MiB across the channel + retry mailbox
+  (see the event-forwarder note in *Threading model*).
+- **Timeline values** — `normalize_timeline` rejects non-finite values,
+  clamps position to `0..=duration` and rate to `0.0..=16.0`; the overlay
+  clamps again before drawing.
+- **Session churn** — admission caps (`MAX_TRACKED_SESSIONS` = 64,
+  `MAX_TRACKED_SOURCES` = 32) with priority ordering; a source recreating
+  content-free sessions is excluded and evicted for a cool-down window.
+- **Hangs** — the supervisor watchdog restarts a worker stalled 30 s with
+  backoff (5 s → 60 s), capped at `MAX_WORKER_RESTARTS` = 5, then surfaces a
+  one-shot `WorkerFailed`; a hung thread is leaked but bounded by the cap.
+- **Panics and ABI crossings** — every callback that crosses an ABI boundary
+  routes through `catch_callback_panic` / `guarded_wndproc` /
+  `contained_winrt_event`; a contained panic degrades to a logged error.
+  AUMID strings pass a strict allowlist grammar (`valid_aumid`) before any
+  shell parsing-name call.
+- **Rendering** — the UI thread never touches raw artwork bytes; GDI fonts
+  are per-DPI with `Drop` flush, and scratch DIBs are bounded by config
+  maxima.
+
+Spoofed "now playing" content is inherent, not a defect: the pill shows
+whatever SMTC claims, and the `media_sources` allow-list is the only opt-in
+filter. The pill itself is fully passive (no focus, no clicks, no input).
 
 ## Rendering pipeline
 
