@@ -20,6 +20,41 @@ pub const POSITION_MSG: u32 = WM_APP + 5;
 /// positioner, handled by the same single-owner rule.
 pub const COMPACT_POSITION_MSG: u32 = WM_APP + 9;
 
+/// Every app-private window message id in the binary, as one inventory the
+/// compiler checks for collisions. Each message is currently posted only to
+/// the window whose proc handles its id; a duplicated numeric id would make
+/// the next change — routing any message to another window — silently execute
+/// the wrong handler. The `WM_APP + 13` UIA activation id is enumerated here
+/// too, so the assertion covers the newest message class as it grows.
+pub(crate) const APP_PRIVATE_MESSAGE_IDS: [u32; 13] = [
+    MEDIA_EVENT_MSG,
+    TOGGLE_MSG,
+    POSITION_MSG,
+    COMPACT_POSITION_MSG,
+    crate::main_window::WM_TRAY,
+    crate::main_window::WM_SETTINGS_ACTIVATE_MSG,
+    crate::main_window::WM_SETTINGS_SNAPSHOT_MSG,
+    crate::main_window::WM_SETTINGS_FOCUS_MSG,
+    crate::overlay::TIMER_ANIMATION_MSG,
+    crate::overlay::FOREGROUND_CHANGE_MSG,
+    crate::process_picker::PICKER_RESULT_MSG,
+    crate::process_picker::AUTO_SOURCES_RESULT_MSG,
+    crate::process_picker::PINNED_SOURCE_RESULT_MSG,
+];
+const _: () = {
+    let ids = APP_PRIVATE_MESSAGE_IDS;
+    let len = ids.len();
+    let mut i = 0;
+    while i < len {
+        let mut j = i + 1;
+        while j < len {
+            assert!(ids[i] != ids[j], "app-private window message ids must be unique");
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
 #[derive(Debug, Clone, Default)]
 pub struct TrackInfo {
     pub title: String,

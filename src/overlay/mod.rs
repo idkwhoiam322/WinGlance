@@ -146,7 +146,7 @@ const PROGRESS_LATENCY_TOL_SECS: f64 = 3.0;
 const FADE_DURATION_MS: u64 = 300;
 
 /// Posted by the high-resolution animation timer to drive pill frames.
-const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
+pub(crate) const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
 /// Posted to the overlay window by the `EVENT_SYSTEM_FOREGROUND` WinEvent hook
 /// callback whenever the system foreground window changes. The callback only
 /// posts this message; the real re-resolve happens on the UI thread in its
@@ -155,7 +155,7 @@ const TIMER_ANIMATION_MSG: u32 = WM_APP + 6;
 /// decisioning. This constant is overlay-internal: it lives next to
 /// `TIMER_ANIMATION_MSG`, not in `events.rs` (the `WM_APP + 2` slot there is
 /// already taken by the main window's `WM_TRAY` on main_window.rs).
-const FOREGROUND_CHANGE_MSG: u32 = WM_APP + 4;
+pub(crate) const FOREGROUND_CHANGE_MSG: u32 = WM_APP + 4;
 
 /// Reusable device context + DIB section for the pill's frames. The overlay
 /// redraws every animation tick; recreating the DIB per frame is pure waste.

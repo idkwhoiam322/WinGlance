@@ -76,7 +76,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BSTR, PCWSTR, PWSTR};
 
-const WM_TRAY: u32 = WM_APP + 2;
+pub(crate) const WM_TRAY: u32 = WM_APP + 2;
 
 /// UIA activation: a Settings control's stable runtime id, posted by the
 /// provider's Invoke/Toggle. The id is re-resolved against the live layout in
@@ -86,10 +86,10 @@ pub(crate) const WM_SETTINGS_ACTIVATE_MSG: u32 = WM_APP + 13;
 /// UIA provider threads post this to ask the UI thread (the only thread that
 /// may touch the window-state box) to rebuild the Settings snapshot. The
 /// requesting thread waits on `SETTINGS_SNAPSHOT_EVENT` for the answer.
-const WM_SETTINGS_SNAPSHOT_MSG: u32 = WM_APP + 3;
+pub(crate) const WM_SETTINGS_SNAPSHOT_MSG: u32 = WM_APP + 10;
 /// A UIA `SetFocus` handoff: the focus state lives in the window-state box,
 /// so provider threads post this instead of mutating it themselves.
-const WM_SETTINGS_FOCUS_MSG: u32 = WM_APP + 4;
+pub(crate) const WM_SETTINGS_FOCUS_MSG: u32 = WM_APP + 8;
 const TRAY_ID: u32 = 1;
 const MENU_OPEN_ID: usize = 1001;
 const MENU_PREVIEW_NOTIFY_ID: usize = 1029;
