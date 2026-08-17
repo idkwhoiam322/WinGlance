@@ -16,7 +16,7 @@ use windows::Media::Control::{
     TimelinePropertiesChangedEventArgs,
 };
 use windows::Media::MediaPlaybackType;
-use windows::Storage::Streams::{Buffer, DataReader, InputStreamOptions};
+use windows::Storage::Streams::{Buffer, DataReader, IRandomAccessStreamReference, InputStreamOptions};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
 use windows::core::Interface;
@@ -3379,36 +3379,15 @@ fn read_track_info(
     let subtitle = cap_meta(non_empty(properties.Subtitle()?.to_string(), ""));
     let artwork = if read_artwork {
         // Artwork reads fail transiently under heavy session churn (overlapping
-        // async WinRT calls on one thread); retry once before giving up, and
-        // log which call failed with its raw HRESULT. When the session itself
-        // is gone (RPC-unavailable / device-not-ready), retrying cannot
-        // succeed — return None immediately.
-        match read_thumbnail(&properties) {
-            Ok(artwork) => artwork,
-            Err(first) => {
-                debug!("album-art read failed (attempt 1): {first:#}");
-                if is_session_gone(&first) {
-                    None
-                } else if is_wait_timeout(&first) {
-                    // A wedged thumbnail stream (the source's own async
-                    // operation never completes) is definitive, not a
-                    // transient failure: surface it so the caller excludes
-                    // the source instead of retrying a hung read.
-                    return Err(first);
-                } else {
-                    match read_thumbnail(&properties) {
-                        Ok(artwork) => artwork,
-                        Err(second) => {
-                            debug!("album-art read failed (attempt 2): {second:#}");
-                            if is_wait_timeout(&second) {
-                                return Err(second);
-                            }
-                            None
-                        }
-                    }
-                }
-            }
-        }
+        // async WinRT calls on one thread); the retry decision tree in
+        // read_artwork_with_retry tries once more before giving up, and logs
+        // which call failed with its raw HRESULT. A session-gone failure
+        // (RPC-unavailable / device-not-ready) cannot succeed on retry; a
+        // wedged thumbnail stream (the source's own async operation never
+        // completes) is definitive, not transient — both surface/exclude via
+        // the extracted helper, which the seam tests drive with the mocked
+        // reference stack.
+        read_artwork_with_retry(|| read_thumbnail(&properties))?
     } else {
         None
     };
@@ -3574,18 +3553,9 @@ macro_rules! wait_async_op {
                     Ok(())
                 }))?;
                 match timeout {
-                    Some(limit) => match signal_rx.recv_timeout(limit) {
-                        Ok(()) => {}
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            return Err(anyhow::Error::new(AsyncReadTimeout {
-                                secs: limit.as_secs(),
-                            }));
-                        }
-                        // The operation completed and its handler was
-                        // replaced or dropped without signalling: treat as
-                        // completed and read the result below.
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {}
-                    },
+                    Some(limit) => {
+                        wait_outcome(signal_rx.recv_timeout(limit), limit)?;
+                    }
                     None => {
                         // Unbounded: block until the operation completes,
                         // exactly like the removed `get()`.
@@ -3609,6 +3579,19 @@ wait_async_op!(
     windows_future::AsyncOperationWithProgressCompletedHandler<TResult, u32>
 );
 
+/// Classifies the outcome of the wait for an async operation's completion
+/// signal. `Ok(())` (the completion handler fired) and a disconnected
+/// channel (the operation completed but its handler was replaced or dropped
+/// without signalling) both mean the read may proceed to `GetResults`; a
+/// timeout is the wedged-read marker — the operation is never completing,
+/// so the caller excludes the source instead of retrying a hung read.
+fn wait_outcome(outcome: Result<(), mpsc::RecvTimeoutError>, limit: Duration) -> Result<(), AsyncReadTimeout> {
+    match outcome {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(AsyncReadTimeout { secs: limit.as_secs() }),
+    }
+}
+
 /// Marker error for an SMTC async read that did not complete within
 /// `READ_ASYNC_TIMEOUT`. Deliberately distinct from the ordinary read
 /// failures (which are transient and retried): a timeout means the source's
@@ -3630,7 +3613,9 @@ impl std::error::Error for AsyncReadTimeout {}
 /// Whether an error marks a wedged async read (an `AsyncReadTimeout`)
 /// rather than a transient failure. Drives the per-source exclusion: only
 /// timeouts exclude; an RPC-unavailable session, a failed `Thumbnail()` or
-/// a `Size()` rejection all stay retryable.
+/// a `Size()` rejection all stay retryable. `downcast_ref` searches the
+/// whole error structure, so the marker is found even under the contexts
+/// `read_thumbnail_from` wraps it in.
 fn is_wait_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<AsyncReadTimeout>().is_some()
 }
@@ -3641,11 +3626,59 @@ fn read_thumbnail(
     let reference = properties
         .Thumbnail()
         .map_err(|e| anyhow::Error::new(e).context("Thumbnail failed"))?;
+    read_thumbnail_from(&reference, Some(READ_ASYNC_TIMEOUT))
+}
+
+/// Reads the artwork with its single retry: attempt 1, and on a transient
+/// failure (a `Thumbnail()` fetch error or a Size/read rejection — not a
+/// session-gone error, not the wedged-read marker) attempt 2. The wedged
+/// marker (`AsyncReadTimeout`) is definitive on either attempt and surfaces
+/// so the caller excludes the source instead of retrying a hung read; a
+/// session-gone failure cannot succeed on retry and yields None
+/// immediately; two transient failures yield None. Parameterized by the
+/// attempt closure so the decision tree is headless-testable with the
+/// mocked reference stack — production passes `read_thumbnail(&properties)`,
+/// which re-fetches the thumbnail reference on every attempt.
+fn read_artwork_with_retry(read: impl Fn() -> Result<Option<Vec<u8>>>) -> Result<Option<Vec<u8>>> {
+    match read() {
+        Ok(artwork) => Ok(artwork),
+        Err(first) => {
+            debug!("album-art read failed (attempt 1): {first:#}");
+            if is_session_gone(&first) {
+                Ok(None)
+            } else if is_wait_timeout(&first) {
+                Err(first)
+            } else {
+                match read() {
+                    Ok(artwork) => Ok(artwork),
+                    Err(second) => {
+                        debug!("album-art read failed (attempt 2): {second:#}");
+                        if is_wait_timeout(&second) {
+                            Err(second)
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The artwork pipeline from the stream reference onward. Split out of
+/// `read_thumbnail` (whose `Thumbnail()` fetch stays untouched; the retry
+/// decision tree lives in `read_artwork_with_retry`) and parameterized by
+/// the wait bound so the
+/// `OpenReadAsync`/`ReadAsync` timeouts are headless-testable with a mocked
+/// reference; production calls it with `READ_ASYNC_TIMEOUT`. Both wait
+/// errors are wrapped in contexts here; `is_wait_timeout` still recognizes
+/// the marker through the wrapping, which the seam test pins.
+fn read_thumbnail_from(reference: &IRandomAccessStreamReference, timeout: Option<Duration>) -> Result<Option<Vec<u8>>> {
     let stream = wait_async(
         &reference
             .OpenReadAsync()
             .map_err(|e| anyhow::Error::new(e).context("OpenReadAsync failed"))?,
-        Some(READ_ASYNC_TIMEOUT),
+        timeout,
     )
     .map_err(|e| e.context("OpenReadAsync get failed"))?;
     let size = stream
@@ -3663,7 +3696,7 @@ fn read_thumbnail(
         &stream
             .ReadAsync(&buffer, size, InputStreamOptions::None)
             .map_err(|e| anyhow::Error::new(e).context("ReadAsync failed"))?,
-        Some(READ_ASYNC_TIMEOUT),
+        timeout,
     )
     .map_err(|e| e.context("ReadAsync get failed"))?;
     let reader =
@@ -6035,6 +6068,986 @@ mod tests {
         );
         queue.push_back(Arc::new(MediaEvent::ArtworkBudgetExceeded));
         assert!(mailbox_holds_budget_warning(&queue), "the warning must be recognized");
+    }
+
+    #[test]
+    fn wait_outcome_timeout_is_the_wedged_read_marker() {
+        // A timed-out wait is the marker error, carrying the bound for the
+        // WARN; is_wait_timeout recognizes it, driving the per-source
+        // exclusion instead of a retry.
+        let outcome = wait_outcome(Err(mpsc::RecvTimeoutError::Timeout), Duration::from_secs(10));
+        let error = outcome.expect_err("a timeout is an error");
+        assert_eq!(error.secs, 10);
+        assert_eq!(error.to_string(), "SMTC async read did not complete within 10s");
+        assert!(
+            is_wait_timeout(&anyhow::Error::new(error)),
+            "the marker must drive the exclusion"
+        );
+    }
+
+    #[test]
+    fn wait_outcome_ok_and_disconnected_both_proceed() {
+        // The handler fired, or the channel disconnected because the handler
+        // was replaced or dropped: both mean the read may proceed to
+        // GetResults.
+        assert!(wait_outcome(Ok(()), Duration::from_secs(10)).is_ok());
+        assert!(
+            wait_outcome(Err(mpsc::RecvTimeoutError::Disconnected), Duration::from_secs(10)).is_ok(),
+            "a disconnected channel is a completed operation, not a timeout"
+        );
+    }
+
+    #[test]
+    fn is_wait_timeout_rejects_transient_read_failures() {
+        // Only the marker excludes a source; ordinary read failures stay
+        // retryable.
+        assert!(!is_wait_timeout(&anyhow!("RPC-unavailable session")));
+        assert!(!is_wait_timeout(&anyhow::Error::from(std::io::Error::other(
+            "read rejected"
+        ))));
+    }
+
+    // ----------------------------------------------------------------------
+    // Shared COM mock for the plain `IAsyncOperation<i32>` wait path.
+    //
+    // The two wait_async race tests used to hand-roll two inline structs
+    // (NeverCompleting, CompletesInTime) with identical
+    // IAsyncInfo/IAsyncOperation boilerplate; MockAsyncOp replaces both.
+    // `fire_after` selects the behavior and the mock manages its own firing
+    // thread, so each test shrinks to a constructor call plus the wait.
+    // ----------------------------------------------------------------------
+    use windows::core::implement;
+    use windows_future::{
+        AsyncOperationCompletedHandler, AsyncOperationProgressHandler, AsyncOperationWithProgressCompletedHandler,
+        IAsyncInfo, IAsyncInfo_Impl, IAsyncOperation, IAsyncOperation_Impl, IAsyncOperationWithProgress,
+        IAsyncOperationWithProgress_Impl,
+    };
+
+    /// One `IAsyncInfo_Impl` implementation serving every operation mock —
+    /// the single source of truth for the five hand-rolled copies
+    /// (MockAsyncOp, MockAsyncOpProgress, ReadyStreamOp, MockProgressReadOp,
+    /// MockNeverCompletingStreamOp) that were byte-identical except
+    /// `Status`. `$impl_ty` is the `_Impl` type `#[implement]` generates
+    /// from the struct name; `$status` is the operation's initial status —
+    /// `Started` for the mocks that drive the wait path, `Completed` for
+    /// `ReadyStreamOp` (whose fast-path role the OpenReadAsync success seam
+    /// leans on). A change to any IAsyncInfo method is one edit instead of
+    /// five, and the copies can never drift again.
+    macro_rules! mock_async_info {
+        ($impl_ty:ty, $status:expr) => {
+            impl IAsyncInfo_Impl for $impl_ty {
+                fn Id(&self) -> windows::core::Result<u32> {
+                    Ok(1)
+                }
+                fn Status(&self) -> windows::core::Result<AsyncStatus> {
+                    Ok($status)
+                }
+                fn ErrorCode(&self) -> windows::core::Result<windows::core::HRESULT> {
+                    Ok(windows::core::HRESULT(0))
+                }
+                fn Cancel(&self) -> windows::core::Result<()> {
+                    Ok(())
+                }
+                fn Close(&self) -> windows::core::Result<()> {
+                    Ok(())
+                }
+            }
+        };
+    }
+
+    // The windows delegate is not `Send` (its IUnknown is a NonNull), but
+    // its callback is Send by `AsyncOperationCompletedHandler::new`'s
+    // bound, and cross-thread invocation is the designed use of a
+    // completion handler — WinRT fires them on the completing thread, which
+    // is often not the thread that created them. So wrapping it for the
+    // firing thread is sound.
+    #[derive(Clone)]
+    struct SendHandler(AsyncOperationCompletedHandler<i32>);
+    // SAFETY: invoking the delegate from another thread runs its Send
+    // closure there — the designed use of an async completion handler.
+    unsafe impl Send for SendHandler {}
+
+    /// State shared between the mock and its firing thread: the retained
+    /// completion handler, and the operation handle the thread passes to
+    /// `Invoke`. The handle is wired by the constructor only in the firing
+    /// case and `take()`n back by the thread at fire time, so the COM object
+    /// never holds a reference to itself past the fire (a retained
+    /// self-reference would leak the object past the test).
+    struct MockShared {
+        handler: Option<SendHandler>,
+        op: Option<IAsyncOperation<i32>>,
+    }
+
+    /// One COM mock serving both plain `IAsyncOperation<i32>` races.
+    /// `fire_after: None` retains the completion handler and never invokes
+    /// it — the wedged read, so the wait must time out. (Retention is what
+    /// keeps the signal channel open: the macro's own handler temporary is
+    /// dropped at the end of the `SetCompleted` statement, so a dropped
+    /// mock-side handler would disconnect the channel and make the wait
+    /// *proceed* to `GetResults` — the opposite outcome.) `fire_after:
+    /// Some(delay)` additionally spawns a thread that invokes the retained
+    /// handler `delay` after `SetCompleted` installs it — the completion
+    /// race, so the wait must return `result` instead of excluding the
+    /// source.
+    #[implement(IAsyncOperation<i32>, IAsyncInfo)]
+    struct MockAsyncOp {
+        fire_after: Option<Duration>,
+        result: i32,
+        shared: Arc<Mutex<MockShared>>,
+    }
+
+    impl MockAsyncOp {
+        // The COM mock is consumed by `.into()` the moment it exists, so the
+        // construction point must hand back the interface it produced rather
+        // than `Self` — the mock cannot outlive its conversion.
+        #[allow(clippy::new_ret_no_self)]
+        fn new(fire_after: Option<Duration>, result: i32) -> IAsyncOperation<i32> {
+            let shared = Arc::new(Mutex::new(MockShared {
+                handler: None,
+                op: None,
+            }));
+            let op: IAsyncOperation<i32> = MockAsyncOp {
+                fire_after,
+                result,
+                shared: shared.clone(),
+            }
+            .into();
+            if fire_after.is_some() {
+                // The firing thread must pass the completing operation to
+                // Invoke, and the operation cannot know itself before
+                // `.into()`, so the constructor wires the handle in once it
+                // exists.
+                shared.lock().unwrap().op = Some(op.clone());
+            }
+            op
+        }
+    }
+
+    mock_async_info!(MockAsyncOp_Impl, AsyncStatus::Started);
+
+    impl IAsyncOperation_Impl<i32> for MockAsyncOp_Impl {
+        fn SetCompleted(
+            &self,
+            handler: windows::core::Ref<AsyncOperationCompletedHandler<i32>>,
+        ) -> windows::core::Result<()> {
+            let mut guard = self.shared.lock().unwrap();
+            guard.handler = handler.ok().ok().cloned().map(SendHandler);
+            drop(guard);
+            if let Some(delay) = self.fire_after {
+                let shared = self.shared.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(delay);
+                    let (handler, op) = {
+                        let mut guard = shared.lock().unwrap();
+                        (
+                            guard
+                                .handler
+                                .clone()
+                                .expect("the handler must be installed before it fires"),
+                            guard.op.take().expect("the operation handle must be wired"),
+                        )
+                    };
+                    handler
+                        .0
+                        .Invoke(&op, AsyncStatus::Completed)
+                        .expect("the delegate must invoke");
+                });
+            }
+            Ok(())
+        }
+        fn Completed(&self) -> windows::core::Result<AsyncOperationCompletedHandler<i32>> {
+            Err(windows::core::Error::empty())
+        }
+        fn GetResults(&self) -> windows::core::Result<i32> {
+            Ok(self.result)
+        }
+    }
+
+    // The progress-shape twin of `MockAsyncOp`: the two race tests for
+    // `IAsyncOperationWithProgress<i32, u32>` (NeverCompletingProgress,
+    // CompletesInTimeProgress) used to hand-roll the same
+    // IAsyncInfo/IAsyncOperationWithProgress boilerplate this one struct now
+    // serves. `fire_after` selects the behavior exactly like the plain mock.
+    #[derive(Clone)]
+    struct SendHandlerProgress(AsyncOperationWithProgressCompletedHandler<i32, u32>);
+    // SAFETY: invoking the delegate from another thread runs its Send
+    // closure there — the designed use of an async completion handler.
+    unsafe impl Send for SendHandlerProgress {}
+
+    // The progress delegate is not `Send` either (same IUnknown NonNull);
+    // wrapping it for the firing thread follows the completed-handler
+    // pattern — cross-thread invocation is the designed use.
+    #[derive(Clone)]
+    struct SendProgressHandler(AsyncOperationProgressHandler<i32, u32>);
+    // SAFETY: invoking the delegate from another thread runs its Send
+    // closure there — the designed use of an async progress handler.
+    unsafe impl Send for SendProgressHandler {}
+
+    /// State shared between the progress mock and its firing thread — same
+    /// contract as `MockShared`, with the progress handler/operation types.
+    /// `progress` holds the handler installed via SetProgress, so the firing
+    /// thread can report progress while the wait blocks.
+    struct MockSharedProgress {
+        handler: Option<SendHandlerProgress>,
+        progress: Option<SendProgressHandler>,
+        op: Option<IAsyncOperationWithProgress<i32, u32>>,
+    }
+
+    /// One COM mock serving both `IAsyncOperationWithProgress<i32, u32>`
+    /// races, mirroring `MockAsyncOp`: `fire_after: None` retains the
+    /// completed handler and never invokes it (wedged read — the wait must
+    /// time out); `Some(delay)` spawns a thread that invokes it `delay`
+    /// after `SetCompleted` installs it (completion race — the wait must
+    /// return `result`).
+    #[implement(IAsyncOperationWithProgress<i32, u32>, IAsyncInfo)]
+    struct MockAsyncOpProgress {
+        fire_after: Option<Duration>,
+        result: i32,
+        shared: Arc<Mutex<MockSharedProgress>>,
+    }
+
+    impl MockAsyncOpProgress {
+        // Same construction contract as `MockAsyncOp::new`: the COM mock is
+        // consumed by `.into()` the moment it exists, so the construction
+        // point must hand back the interface it produced rather than `Self`.
+        #[allow(clippy::new_ret_no_self)]
+        fn new(fire_after: Option<Duration>, result: i32) -> IAsyncOperationWithProgress<i32, u32> {
+            let shared = Arc::new(Mutex::new(MockSharedProgress {
+                handler: None,
+                progress: None,
+                op: None,
+            }));
+            let op: IAsyncOperationWithProgress<i32, u32> = MockAsyncOpProgress {
+                fire_after,
+                result,
+                shared: shared.clone(),
+            }
+            .into();
+            if fire_after.is_some() {
+                // The firing thread must pass the completing operation to
+                // Invoke, and the operation cannot know itself before
+                // `.into()`, so the constructor wires the handle in once it
+                // exists.
+                shared.lock().unwrap().op = Some(op.clone());
+            }
+            op
+        }
+    }
+
+    mock_async_info!(MockAsyncOpProgress_Impl, AsyncStatus::Started);
+
+    impl IAsyncOperationWithProgress_Impl<i32, u32> for MockAsyncOpProgress_Impl {
+        fn SetProgress(
+            &self,
+            handler: windows::core::Ref<AsyncOperationProgressHandler<i32, u32>>,
+        ) -> windows::core::Result<()> {
+            // Retain the progress handler alongside the completed handler so
+            // the firing thread can report progress while the wait blocks;
+            // the progress-report seam test drives this path.
+            self.shared.lock().unwrap().progress = handler.ok().ok().cloned().map(SendProgressHandler);
+            Ok(())
+        }
+        fn Progress(&self) -> windows::core::Result<AsyncOperationProgressHandler<i32, u32>> {
+            Err(windows::core::Error::empty())
+        }
+        fn SetCompleted(
+            &self,
+            handler: windows::core::Ref<AsyncOperationWithProgressCompletedHandler<i32, u32>>,
+        ) -> windows::core::Result<()> {
+            let mut guard = self.shared.lock().unwrap();
+            guard.handler = handler.ok().ok().cloned().map(SendHandlerProgress);
+            drop(guard);
+            if let Some(delay) = self.fire_after {
+                let shared = self.shared.clone();
+                std::thread::spawn(move || {
+                    // Report progress partway through the work, then
+                    // complete: WinRT operations report progress as they
+                    // run. The reports land while the wait is still
+                    // blocking — the completion signal that wakes it is only
+                    // sent at the very end, after both reports.
+                    let third = delay / 3;
+                    std::thread::sleep(third);
+                    let (handler, op, progress) = {
+                        let mut guard = shared.lock().unwrap();
+                        (
+                            guard
+                                .handler
+                                .clone()
+                                .expect("the handler must be installed before it fires"),
+                            guard.op.take().expect("the operation handle must be wired"),
+                            guard.progress.clone(),
+                        )
+                    };
+                    if let Some(progress) = progress.as_ref() {
+                        progress.0.Invoke(&op, 1).expect("the progress delegate must invoke");
+                    }
+                    std::thread::sleep(third);
+                    if let Some(progress) = progress.as_ref() {
+                        progress.0.Invoke(&op, 2).expect("the progress delegate must invoke");
+                    }
+                    std::thread::sleep(third);
+                    handler
+                        .0
+                        .Invoke(&op, AsyncStatus::Completed)
+                        .expect("the delegate must invoke");
+                });
+            }
+            Ok(())
+        }
+        fn Completed(&self) -> windows::core::Result<AsyncOperationWithProgressCompletedHandler<i32, u32>> {
+            Err(windows::core::Error::empty())
+        }
+        fn GetResults(&self) -> windows::core::Result<i32> {
+            Ok(self.result)
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Shared artwork-pipeline mocks.
+    //
+    // The read_thumbnail_from seam tests share one stream stack: a reference
+    // whose OpenReadAsync returns the configured operation, a stream that
+    // answers Size() and fills the real Buffer on ReadAsync, and a read
+    // operation whose completion behavior is configurable (never completes
+    // → the ReadAsync-timeout seam; fires after a delay → the success seam).
+    // These were previously inlined per test; hoisting them here makes each
+    // seam test a construction site instead of a second copy of the stack.
+    // ----------------------------------------------------------------------
+    use windows::Foundation::{IClosable, IClosable_Impl};
+    use windows::Storage::Streams::{
+        IBuffer, IContentTypeProvider, IContentTypeProvider_Impl, IInputStream, IInputStream_Impl, IOutputStream,
+        IOutputStream_Impl, IRandomAccessStream, IRandomAccessStream_Impl, IRandomAccessStreamReference,
+        IRandomAccessStreamReference_Impl, IRandomAccessStreamWithContentType, IRandomAccessStreamWithContentType_Impl,
+        InputStreamOptions,
+    };
+    use windows::Win32::System::WinRT::IBufferByteAccess;
+
+    /// A reference whose OpenReadAsync returns the configured operation —
+    /// the seam tests pick ready (Completed) or never-completing per case.
+    #[implement(IRandomAccessStreamReference)]
+    struct MockReference {
+        op: IAsyncOperation<IRandomAccessStreamWithContentType>,
+    }
+    impl IRandomAccessStreamReference_Impl for MockReference_Impl {
+        fn OpenReadAsync(&self) -> windows::core::Result<IAsyncOperation<IRandomAccessStreamWithContentType>> {
+            Ok(self.op.clone())
+        }
+    }
+
+    /// The OpenReadAsync operation already completed: wait_async takes the
+    /// fast path and GetResults hands the stream straight back.
+    #[implement(IAsyncOperation<IRandomAccessStreamWithContentType>, IAsyncInfo)]
+    struct ReadyStreamOp {
+        stream: IRandomAccessStreamWithContentType,
+    }
+    mock_async_info!(ReadyStreamOp_Impl, AsyncStatus::Completed);
+    impl IAsyncOperation_Impl<IRandomAccessStreamWithContentType> for ReadyStreamOp_Impl {
+        fn SetCompleted(
+            &self,
+            _handler: windows::core::Ref<AsyncOperationCompletedHandler<IRandomAccessStreamWithContentType>>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn Completed(
+            &self,
+        ) -> windows::core::Result<AsyncOperationCompletedHandler<IRandomAccessStreamWithContentType>> {
+            Err(windows::core::Error::empty())
+        }
+        fn GetResults(&self) -> windows::core::Result<IRandomAccessStreamWithContentType> {
+            Ok(self.stream.clone())
+        }
+    }
+
+    // The windows delegate is not `Send` (see the wait_async race mocks);
+    // wrapping it for the firing thread is sound — the callback closure is
+    // Send by contract, and cross-thread invocation is the designed use of a
+    // completion handler.
+    #[derive(Clone)]
+    struct SendReadHandler(AsyncOperationWithProgressCompletedHandler<IBuffer, u32>);
+    // SAFETY: invoking the delegate from another thread runs its Send
+    // closure there — the designed use of an async completion handler.
+    unsafe impl Send for SendReadHandler {}
+
+    /// State shared between the read op and its firing thread: the retained
+    /// completed handler, and the operation handle the thread passes to
+    /// `Invoke` (wired by `MockStream::ReadAsync`, `take()`n back at fire
+    /// time so the op never retains a self-reference past the fire).
+    struct ReadShared {
+        handler: Option<SendReadHandler>,
+        op: Option<IAsyncOperationWithProgress<IBuffer, u32>>,
+    }
+
+    /// The ReadAsync operation, configurable like the wait mocks:
+    /// `fire_after: None` retains the completed handler and never invokes it
+    /// — the wedged read, so wait_async_progress times out; `Some(delay)`
+    /// spawns a thread that invokes it `delay` after SetCompleted installs
+    /// it — the completion race, so the wait wakes on the signal. The buffer
+    /// the stream filled is what GetResults hands back.
+    #[implement(IAsyncOperationWithProgress<IBuffer, u32>, IAsyncInfo)]
+    struct MockProgressReadOp {
+        buffer: IBuffer,
+        fire_after: Option<Duration>,
+        shared: Arc<Mutex<ReadShared>>,
+    }
+    mock_async_info!(MockProgressReadOp_Impl, AsyncStatus::Started);
+    impl IAsyncOperationWithProgress_Impl<IBuffer, u32> for MockProgressReadOp_Impl {
+        fn SetProgress(
+            &self,
+            _handler: windows::core::Ref<AsyncOperationProgressHandler<IBuffer, u32>>,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn Progress(&self) -> windows::core::Result<AsyncOperationProgressHandler<IBuffer, u32>> {
+            Err(windows::core::Error::empty())
+        }
+        fn SetCompleted(
+            &self,
+            handler: windows::core::Ref<AsyncOperationWithProgressCompletedHandler<IBuffer, u32>>,
+        ) -> windows::core::Result<()> {
+            let mut guard = self.shared.lock().unwrap();
+            guard.handler = handler.ok().ok().cloned().map(SendReadHandler);
+            drop(guard);
+            if let Some(delay) = self.fire_after {
+                let shared = self.shared.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(delay);
+                    let (handler, op) = {
+                        let mut guard = shared.lock().unwrap();
+                        (
+                            guard
+                                .handler
+                                .clone()
+                                .expect("the handler must be installed before it fires"),
+                            guard.op.take().expect("the operation handle must be wired"),
+                        )
+                    };
+                    handler
+                        .0
+                        .Invoke(&op, AsyncStatus::Completed)
+                        .expect("the delegate must invoke");
+                });
+            }
+            Ok(())
+        }
+        fn Completed(&self) -> windows::core::Result<AsyncOperationWithProgressCompletedHandler<IBuffer, u32>> {
+            Err(windows::core::Error::empty())
+        }
+        fn GetResults(&self) -> windows::core::Result<IBuffer> {
+            Ok(self.buffer.clone())
+        }
+    }
+
+    /// A stream whose Size() answers and whose ReadAsync fills the real
+    /// Buffer (through its byte-access interface) and returns a
+    /// `MockProgressReadOp` with the configured behavior — `None` for the
+    /// ReadAsync-timeout seam (the op never completes), `Some(delay)` for
+    /// the success seam (the op fires `delay` after install).
+    #[implement(
+        IRandomAccessStreamWithContentType,
+        IRandomAccessStream,
+        IContentTypeProvider,
+        IInputStream,
+        IOutputStream,
+        IClosable
+    )]
+    struct MockStream {
+        bytes: Vec<u8>,
+        read_fire_after: Option<Duration>,
+    }
+    impl IClosable_Impl for MockStream_Impl {
+        fn Close(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+    }
+    impl IContentTypeProvider_Impl for MockStream_Impl {
+        fn ContentType(&self) -> windows::core::Result<windows::core::HSTRING> {
+            Ok(windows::core::HSTRING::from("image/png"))
+        }
+    }
+    impl IInputStream_Impl for MockStream_Impl {
+        fn ReadAsync(
+            &self,
+            buffer: windows::core::Ref<IBuffer>,
+            count: u32,
+            _options: InputStreamOptions,
+        ) -> windows::core::Result<windows_future::IAsyncOperationWithProgress<IBuffer, u32>> {
+            let ibuf = buffer.ok().expect("the pipeline must pass a buffer");
+            // Fill the real buffer through its byte-access interface and
+            // report the filled length, so the pipeline's DataReader reads
+            // the artwork back (success seam; harmless on the timeout seam,
+            // whose wait never reaches the read).
+            let access: IBufferByteAccess = ibuf.cast()?;
+            let data = unsafe { access.Buffer()? };
+            let n = count.min(self.bytes.len() as u32);
+            unsafe { std::ptr::copy_nonoverlapping(self.bytes.as_ptr(), data, n as usize) };
+            ibuf.SetLength(n)?;
+            let shared = Arc::new(Mutex::new(ReadShared {
+                handler: None,
+                op: None,
+            }));
+            let op: IAsyncOperationWithProgress<IBuffer, u32> = MockProgressReadOp {
+                buffer: ibuf.clone(),
+                fire_after: self.read_fire_after,
+                shared: shared.clone(),
+            }
+            .into();
+            if self.read_fire_after.is_some() {
+                // The firing thread must pass the completing operation to
+                // Invoke, and the operation cannot know itself before
+                // `.into()`, so wire the handle in once it exists.
+                shared.lock().unwrap().op = Some(op.clone());
+            }
+            Ok(op)
+        }
+    }
+    impl IOutputStream_Impl for MockStream_Impl {
+        fn WriteAsync(
+            &self,
+            _buffer: windows::core::Ref<IBuffer>,
+        ) -> windows::core::Result<windows_future::IAsyncOperationWithProgress<u32, u32>> {
+            // Unreachable on the read path.
+            Err(windows::core::Error::empty())
+        }
+        fn FlushAsync(&self) -> windows::core::Result<windows_future::IAsyncOperation<bool>> {
+            Err(windows::core::Error::empty())
+        }
+    }
+    impl IRandomAccessStream_Impl for MockStream_Impl {
+        fn Size(&self) -> windows::core::Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+        fn SetSize(&self, _value: u64) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn GetInputStreamAt(&self, _position: u64) -> windows::core::Result<IInputStream> {
+            Err(windows::core::Error::empty())
+        }
+        fn GetOutputStreamAt(&self, _position: u64) -> windows::core::Result<IOutputStream> {
+            Err(windows::core::Error::empty())
+        }
+        fn Position(&self) -> windows::core::Result<u64> {
+            Ok(0)
+        }
+        fn Seek(&self, _position: u64) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn CloneStream(&self) -> windows::core::Result<IRandomAccessStream> {
+            Err(windows::core::Error::empty())
+        }
+        fn CanRead(&self) -> windows::core::Result<bool> {
+            Ok(true)
+        }
+        fn CanWrite(&self) -> windows::core::Result<bool> {
+            Ok(false)
+        }
+    }
+    impl IRandomAccessStreamWithContentType_Impl for MockStream_Impl {}
+
+    /// A stream operation that is alive (handler installed, channel open)
+    /// yet never completes — the wedged OpenReadAsync, so wait_async times
+    /// out and the AsyncReadTimeout marker surfaces. Used by the
+    /// OpenReadAsync timeout seam and the artwork-retry seam's wedged case.
+    #[implement(IAsyncOperation<IRandomAccessStreamWithContentType>, IAsyncInfo)]
+    struct MockNeverCompletingStreamOp {
+        // Retained but never invoked — the operation is alive (channel
+        // open) yet never completes, exactly like the wait_async mocks.
+        completed: std::sync::Mutex<Option<AsyncOperationCompletedHandler<IRandomAccessStreamWithContentType>>>,
+    }
+    mock_async_info!(MockNeverCompletingStreamOp_Impl, AsyncStatus::Started);
+    impl IAsyncOperation_Impl<IRandomAccessStreamWithContentType> for MockNeverCompletingStreamOp_Impl {
+        fn SetCompleted(
+            &self,
+            handler: windows::core::Ref<AsyncOperationCompletedHandler<IRandomAccessStreamWithContentType>>,
+        ) -> windows::core::Result<()> {
+            *self.completed.lock().unwrap() = handler.ok().ok().cloned();
+            Ok(())
+        }
+        fn Completed(
+            &self,
+        ) -> windows::core::Result<AsyncOperationCompletedHandler<IRandomAccessStreamWithContentType>> {
+            Err(windows::core::Error::empty())
+        }
+        fn GetResults(&self) -> windows::core::Result<IRandomAccessStreamWithContentType> {
+            // Never reached on the timeout path.
+            Err(windows::core::Error::empty())
+        }
+    }
+
+    /// Drives one wait shape through its macro expansion with the operation
+    /// already built, and asserts the timeout contract both shapes share:
+    /// the wait blocks the full bound and the AsyncReadTimeout marker
+    /// survives unchanged — the Started status plus the retained handler are
+    /// what make it block, and the elapsed floor is what pins that, not the
+    /// marker alone. `wait` is the shape's macro entry (`wait_async` or
+    /// `wait_async_progress`) closed over its mock operation; both shapes
+    /// answer `i32`, so the one driver serves all four wait tests.
+    fn assert_wait_times_out(wait: impl FnOnce(Option<Duration>) -> anyhow::Result<i32>) {
+        const BOUND: Duration = Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        let err = wait(Some(BOUND)).expect_err("a never-signalling operation must time out");
+        assert!(
+            started.elapsed() >= BOUND,
+            "the wait must actually block for the bound before timing out"
+        );
+        assert!(
+            is_wait_timeout(&err),
+            "the AsyncReadTimeout marker must survive the macro unchanged"
+        );
+    }
+
+    /// Drives one wait shape whose mock fires FIRE_AFTER into the BOUND and
+    /// asserts the completion contract both shapes share: the wait wakes on
+    /// the completion signal — well before the bound expires — and
+    /// GetResults answers `expected`, pinning the *value* flow through the
+    /// macro, not just Ok. A lost signal would race the deadline instead.
+    fn assert_wait_completes_with(expected: i32, wait: impl FnOnce(Option<Duration>) -> anyhow::Result<i32>) {
+        const BOUND: Duration = Duration::from_millis(500);
+        let started = std::time::Instant::now();
+        let result = wait(Some(BOUND)).expect("a completed wait must return the result, not the timeout marker");
+        assert_eq!(
+            result, expected,
+            "GetResults must answer the mock's value after the handler fired"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "the wait must complete on the signal, well before the 500 ms bound"
+        );
+    }
+
+    #[test]
+    fn wait_async_timeout_marker_flows_through_the_macro_unchanged() {
+        // Drives wait_outcome through the FULL wait_async_op macro expansion
+        // with a simulated never-signalling operation. The shared mock
+        // (fire_after = None) reports Started and retains the completion
+        // handler without ever invoking it — the retained handler keeps the
+        // signal channel open, so the wait must block for the whole bound,
+        // and the error that propagates out of the macro must be the
+        // AsyncReadTimeout marker is_wait_timeout recognizes, unchanged
+        // through the `?`.
+        let op = MockAsyncOp::new(None, 0);
+        assert_wait_times_out(|bound| wait_async(&op, bound));
+    }
+
+    #[test]
+    fn wait_async_progress_timeout_marker_flows_through_the_macro_unchanged() {
+        // The same wedged-read contract for the progress shape: the shared
+        // progress mock (fire_after = None) retains the completed handler
+        // without ever invoking it, so the wait times out and the
+        // AsyncReadTimeout marker must propagate out of wait_async_progress
+        // — the IAsyncOperationWithProgress<TResult, u32> macro expansion —
+        // unchanged, recognized by is_wait_timeout to drive the per-source
+        // exclusion.
+        let op = MockAsyncOpProgress::new(None, 0);
+        assert_wait_times_out(|bound| wait_async_progress(&op, bound));
+    }
+
+    #[test]
+    fn wait_async_returns_the_result_when_the_handler_fires_before_the_timeout() {
+        // The completion race won: the shared mock's firing thread invokes
+        // the retained handler FIRE_AFTER into the wait bound, so
+        // recv_timeout returns the signal and wait_async proceeds to
+        // GetResults — the result comes back and the source is never
+        // excluded. If the signal were lost or the wait misread a completed
+        // operation, the bound would expire and the AsyncReadTimeout marker
+        // would surface instead.
+        let op = MockAsyncOp::new(Some(Duration::from_millis(300)), 0);
+        assert_wait_completes_with(0, |bound| wait_async(&op, bound));
+    }
+
+    #[test]
+    fn wait_async_progress_returns_the_result_when_the_handler_fires_before_the_timeout() {
+        // The progress shape's completion race won: the shared mock's firing
+        // thread invokes the retained completed handler FIRE_AFTER into the
+        // wait bound, so recv_timeout returns the signal and
+        // wait_async_progress proceeds to GetResults — the value comes back
+        // and the source is never excluded. The opposite outcome (the wedged
+        // read) is pinned by the sibling progress timeout test; this one
+        // proves the result survives the macro expansion too.
+        let op = MockAsyncOpProgress::new(Some(Duration::from_millis(300)), 7);
+        assert_wait_completes_with(7, |bound| wait_async_progress(&op, bound));
+    }
+
+    #[test]
+    fn wait_async_progress_reports_progress_while_the_wait_blocks() {
+        // The progress side of IAsyncOperationWithProgress, driven through
+        // the shared mock: the test installs a progress handler via
+        // SetProgress, and while wait_async_progress blocks for the
+        // operation, the mock's firing thread reports progress partway
+        // through (1 then 2) before completing. The reports must actually
+        // reach the installed handler — a no-op SetProgress would drop them,
+        // leaving the sequence empty — and the first must land before the
+        // wait returns, i.e. while it is still blocking.
+        const BOUND: Duration = Duration::from_millis(500);
+        const FIRE_AFTER: Duration = Duration::from_millis(300);
+
+        let reported = Arc::new(Mutex::new((None::<Instant>, Vec::<u32>::new())));
+        let op = MockAsyncOpProgress::new(Some(FIRE_AFTER), 7);
+        let progress_handler = AsyncOperationProgressHandler::new({
+            let reported = reported.clone();
+            move |_op, progress| {
+                let mut guard = reported.lock().unwrap();
+                if guard.0.is_none() {
+                    guard.0 = Some(Instant::now());
+                }
+                guard.1.push(*progress);
+                Ok(())
+            }
+        });
+        op.SetProgress(&progress_handler)
+            .expect("the progress handler must install");
+
+        let started = Instant::now();
+        let result = wait_async_progress(&op, Some(BOUND))
+            .expect("a completed progress wait must return the result, not the timeout marker");
+        let wait_returned = Instant::now();
+        assert_eq!(result, 7, "GetResults answers 7 after the handler fired");
+        let (first_report, values) = &*reported.lock().unwrap();
+        assert_eq!(
+            *values,
+            vec![1, 2],
+            "the progress reports must reach the installed handler"
+        );
+        assert!(
+            first_report.is_some_and(|at| at < wait_returned),
+            "the first progress report must land while the wait is still blocking"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "the wait must complete on the signal, well before the 500 ms bound"
+        );
+    }
+
+    #[test]
+    fn is_wait_timeout_recognizes_the_marker_under_read_thumbnail_contexts() {
+        // read_thumbnail_from wraps the marker in contexts ("OpenReadAsync
+        // get failed"); the exclusion check must still recognize it — the
+        // seam test proves the same end-to-end, this pins the unit contract.
+        let wrapped = anyhow::Error::new(AsyncReadTimeout { secs: 10 }).context("OpenReadAsync get failed");
+        assert!(is_wait_timeout(&wrapped), "the marker must be found under the context");
+        assert!(is_wait_timeout(&wrapped.context("a second wrap")));
+    }
+
+    #[test]
+    fn read_thumbnail_openreadasync_timeout_flows_through_the_pipeline() {
+        // The artwork pipeline's wedged read, driven through the real
+        // read_thumbnail_from: the mocked reference's OpenReadAsync returns
+        // a never-completing operation, so the wait times out and the error
+        // must come back through the pipeline's context wraps still
+        // recognizable as the AsyncReadTimeout marker — read_track_info
+        // relies on that to surface it and exclude the source instead of
+        // retrying a hung read.
+        // The reference and its never-completing operation are the shared
+        // stream-stack mocks (MockReference, MockNeverCompletingStreamOp).
+        let op: IAsyncOperation<IRandomAccessStreamWithContentType> = MockNeverCompletingStreamOp {
+            completed: std::sync::Mutex::new(None),
+        }
+        .into();
+        let reference: IRandomAccessStreamReference = MockReference { op }.into();
+        let started = std::time::Instant::now();
+        let err = read_thumbnail_from(&reference, Some(Duration::from_millis(100)))
+            .expect_err("a wedged OpenReadAsync must surface as a timeout");
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the wait must actually block for the bound before timing out"
+        );
+        assert!(
+            is_wait_timeout(&err),
+            "the marker must survive read_thumbnail_from's context wraps"
+        );
+    }
+
+    #[test]
+    fn read_thumbnail_completion_flows_through_the_pipeline() {
+        // The success path end to end, through the real read_thumbnail_from
+        // and the shared stream stack: OpenReadAsync is already completed
+        // (wait_async fast path), the stream answers Size() and fills the
+        // real Buffer on ReadAsync, and ReadAsync returns a Started op whose
+        // handler fires FIRE_AFTER later — so wait_async_progress actually
+        // blocks and wakes on the completion signal, the progress-wait shape
+        // running through the pipeline rather than the Completed-skip fast
+        // path.
+        const BOUND: Duration = Duration::from_millis(100);
+        // ReadAsync's handler fires well inside the bound (30ms of 100ms),
+        // so the wait returns the completion signal instead of racing the
+        // deadline, while the timing floor below still proves it blocked.
+        const FIRE_AFTER: Duration = Duration::from_millis(30);
+
+        // The artwork the stream hands out: 128 bytes, within the accepted
+        // thumbnail range and distinctive enough to assert byte-for-byte.
+        let artwork: Vec<u8> = (0..128u8).collect();
+        let stream: IRandomAccessStreamWithContentType = MockStream {
+            bytes: artwork.clone(),
+            read_fire_after: Some(FIRE_AFTER),
+        }
+        .into();
+        let op: IAsyncOperation<IRandomAccessStreamWithContentType> = ReadyStreamOp { stream: stream.clone() }.into();
+        let reference: IRandomAccessStreamReference = MockReference { op }.into();
+
+        // The pipeline activates real WinRT objects (Buffer, DataReader),
+        // which need an initialized apartment on this thread — the same
+        // MTA convention the worker uses.
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok();
+        let started = std::time::Instant::now();
+        let result = read_thumbnail_from(&reference, Some(BOUND));
+        let call_elapsed = started.elapsed();
+        unsafe { CoUninitialize() };
+
+        match result {
+            Ok(Some(bytes)) => {
+                assert_eq!(bytes, artwork, "the artwork must flow through the full pipeline");
+                // The ReadAsync wait must actually block until the operation
+                // fires (~FIRE_AFTER): if the op reported Completed, the wait
+                // would be skipped and the call would return in well under
+                // this floor even though the bytes still come back.
+                assert!(
+                    call_elapsed >= Duration::from_millis(20),
+                    "the ReadAsync wait must block for the operation's completion signal"
+                );
+            }
+            other => panic!("the pipeline must return the artwork, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_thumbnail_readasync_timeout_flows_through_the_pipeline() {
+        // The second artwork wait, closed: OpenReadAsync succeeds (the
+        // completed fast path), Size() is acceptable, and ReadAsync returns
+        // a never-completing progress operation (read_fire_after = None) —
+        // so wait_async_progress blocks for the whole bound and the
+        // AsyncReadTimeout marker must come back through the pipeline's
+        // "ReadAsync get failed" context wraps, exactly the way the
+        // OpenReadAsync seam pins its side.
+        let stream: IRandomAccessStreamWithContentType = MockStream {
+            bytes: vec![0xAB; 128],
+            read_fire_after: None,
+        }
+        .into();
+        let op: IAsyncOperation<IRandomAccessStreamWithContentType> = ReadyStreamOp { stream: stream.clone() }.into();
+        let reference: IRandomAccessStreamReference = MockReference { op }.into();
+
+        // Buffer::Create runs before ReadAsync, so the pipeline needs an
+        // apartment even though the wedged read never produces artwork.
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok();
+        let started = std::time::Instant::now();
+        let err = read_thumbnail_from(&reference, Some(Duration::from_millis(100)))
+            .expect_err("a wedged ReadAsync must surface as a timeout");
+        unsafe { CoUninitialize() };
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the wait must actually block for the bound before timing out"
+        );
+        assert!(
+            is_wait_timeout(&err),
+            "the marker must survive read_thumbnail_from's ReadAsync context wraps"
+        );
+    }
+
+    #[test]
+    fn read_artwork_with_retry_recovers_after_a_transient_first_attempt() {
+        // The attempt-1-then-retry behavior, end-to-end through the shared
+        // stream stack: attempt 1 fails transiently (like a Thumbnail fetch
+        // error under session churn), attempt 2 succeeds — the artwork comes
+        // back and the retry ran exactly once.
+        const FIRE_AFTER: Duration = Duration::from_millis(5);
+        let artwork: Vec<u8> = (0..128u8).collect();
+        let stream: IRandomAccessStreamWithContentType = MockStream {
+            bytes: artwork.clone(),
+            read_fire_after: Some(FIRE_AFTER),
+        }
+        .into();
+        let op: IAsyncOperation<IRandomAccessStreamWithContentType> = ReadyStreamOp { stream: stream.clone() }.into();
+        let reference: IRandomAccessStreamReference = MockReference { op }.into();
+        let attempts = std::cell::Cell::new(0u32);
+        // The healthy attempt activates real WinRT objects (Buffer,
+        // DataReader), which need an initialized apartment on this thread.
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok();
+        let result = read_artwork_with_retry(|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                // A transient Thumbnail-fetch failure: retryable, neither a
+                // session-gone error nor the wedged marker.
+                Err(anyhow!("Thumbnail failed (transient)"))
+            } else {
+                read_thumbnail_from(&reference, Some(Duration::from_millis(100)))
+            }
+        });
+        unsafe { CoUninitialize() };
+        assert_eq!(attempts.get(), 2, "a transient failure must trigger exactly one retry");
+        match result {
+            Ok(Some(bytes)) => assert_eq!(bytes, artwork, "the retried read must return the artwork"),
+            other => panic!("the retried read must succeed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_artwork_with_retry_surfaces_a_wedged_first_attempt_without_retrying() {
+        // A wedged reference (OpenReadAsync never completes) is definitive,
+        // not a transient failure: the marker surfaces and the attempt
+        // closure is NOT called again — the source is excluded instead of
+        // retrying a hung read.
+        let op: IAsyncOperation<IRandomAccessStreamWithContentType> = MockNeverCompletingStreamOp {
+            completed: std::sync::Mutex::new(None),
+        }
+        .into();
+        let reference: IRandomAccessStreamReference = MockReference { op }.into();
+        let attempts = std::cell::Cell::new(0u32);
+        let started = std::time::Instant::now();
+        let err = read_artwork_with_retry(|| {
+            attempts.set(attempts.get() + 1);
+            read_thumbnail_from(&reference, Some(Duration::from_millis(100)))
+        })
+        .expect_err("a wedged first attempt must surface as a timeout");
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the wait must actually block for the bound before timing out"
+        );
+        assert!(is_wait_timeout(&err), "the marker must drive the exclusion");
+        assert_eq!(attempts.get(), 1, "a wedged read must not be retried");
+    }
+
+    #[test]
+    fn read_artwork_with_retry_returns_none_after_two_transient_failures() {
+        let attempts = std::cell::Cell::new(0u32);
+        let result = read_artwork_with_retry(|| {
+            attempts.set(attempts.get() + 1);
+            Err(anyhow!("Thumbnail failed (transient #{})", attempts.get()))
+        });
+        assert_eq!(attempts.get(), 2, "two transient failures consume the retry budget");
+        match result {
+            Ok(None) => {}
+            other => panic!("two transient failures must yield None, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_artwork_with_retry_surfaces_a_wedged_second_attempt() {
+        // Transient attempt 1, wedged attempt 2: the retry runs, and the
+        // second attempt's marker surfaces — a retry never masks a wedged
+        // read.
+        let op: IAsyncOperation<IRandomAccessStreamWithContentType> = MockNeverCompletingStreamOp {
+            completed: std::sync::Mutex::new(None),
+        }
+        .into();
+        let reference: IRandomAccessStreamReference = MockReference { op }.into();
+        let attempts = std::cell::Cell::new(0u32);
+        let err = read_artwork_with_retry(|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(anyhow!("Thumbnail failed (transient)"))
+            } else {
+                read_thumbnail_from(&reference, Some(Duration::from_millis(100)))
+            }
+        })
+        .expect_err("a wedged second attempt must surface as a timeout");
+        assert_eq!(
+            attempts.get(),
+            2,
+            "the retry must run before the wedged attempt surfaces"
+        );
+        assert!(
+            is_wait_timeout(&err),
+            "the second attempt's marker must drive the exclusion"
+        );
     }
 }
 
