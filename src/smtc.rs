@@ -222,6 +222,16 @@ const MAX_REPORTED_SESSIONS: usize = 1024;
 /// subscription re-sync. The process picker reads this so media apps that run
 /// without a visible window (tray-only Electron apps, background browser
 /// tabs) still appear as selectable entries.
+///
+/// Deliberately a plain `OnceLock<Mutex<Vec<String>>>`, **not** the guarded
+/// `winutil::Registered` slot the positioner/picker registrations use: this
+/// is a cross-thread *cache* with whole-value replace semantics — the worker
+/// rebuilds the dedup-capped list each re-sync and swaps it in wholesale
+/// (the single write path), the picker reads a clone (never a guard), and
+/// there is no teardown, no window identity, and no stale-write-vs-newer
+/// registration scenario for a match-guard to protect. The newest snapshot
+/// is always the truth, so the opaque-mutex machinery `Registered` exists
+/// to enforce would guard nothing here.
 static ACTIVE_SESSION_SOURCES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 pub(crate) fn active_session_sources() -> Vec<String> {

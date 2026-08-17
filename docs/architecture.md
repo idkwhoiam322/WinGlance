@@ -593,6 +593,43 @@ no window can drift back to a partial clear. A new window serving UIA from a
 shared slot must route its teardown through the helper, and (for a
 window-owned cell, like the pill's) drop its own reference alongside it.
 
+**Window state release order.** Every window in the codebase conforms:
+each one's WM_NCDESTROY releases its per-instance state box through
+`winutil::release_window_state`, which clears GWLP_USERDATA first and drops
+the box second — so a stale pointer is never left readable in the slot after
+the box is freed. The five conforming windows are the main settings window,
+the overlay, the positioner, the process picker, and the duration dialog —
+the last to convert, and the only one that previously had **no** teardown at
+all (its `DialogData` box leaked on every open). The order is **not
+observable through e2e teardown tests**: during WM_NCDESTROY the window is
+mid-destroy, nothing reads the slot between the two operations, and every
+observable teardown effect (hook/timer teardown, the UIA name-cell null, GDI
+deletes, registered-slot clears) precedes or follows the release
+independently. Mutation-checked at all three sites that were hand-rolled
+before the helper extraction (overlay, positioner, process picker):
+reversing the order passes the full test suite — the exact blind spot the
+compiler guard below closes.
+
+**Enforcement — the probe-test pin and the compile-time guard.** The order
+is pinned where it *is* observable — at the box's own drop. The
+`release_window_state_clears_the_slot_before_dropping_the_box` test in
+winutil.rs stores a probe whose `Drop` reads the slot: slot-first leaves it
+null when the box drops, box-first still holds the pointer, so the test
+fails under a reversed helper — the runtime half of the pair. The compile
+half: `clear_window_state` is **private**, so `release_window_state` is the
+only module-visible path that clears GWLP_USERDATA and a window that
+inlines its teardown cannot drop the box before clearing the slot — that
+exact reorder is a compile error (E0603), never a silent test-suite blind
+spot. A raw `SetWindowLongPtrW` write to GWLP_USERDATA in a window file is
+therefore a review **must-fix** by construction; the install side
+(`set_window_state`) stays public because windows must store their box at
+WM_NCCREATE.
+
+The claim side is equally uniform: all five windows take their box in
+WM_NCCREATE through the same `StateClaim` null-guard — claim only flips
+alongside a non-empty slot, so a failed create always returns the unclaimed
+box to the caller's failure branch.
+
 ## Configuration
 
 `Config::load()` reads `%APPDATA%\WinGlance\WinGlance\data\config.toml`, falls back

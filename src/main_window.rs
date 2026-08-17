@@ -977,7 +977,11 @@ struct MainWindowState {
     config_status: Option<ConfigStatus>,
     /// Shared slot for the process picker's confirmed allow-list patterns. The
     /// picker writes the result here and posts a bare `PICKER_RESULT_MSG`; no
-    /// pointer ever crosses the message boundary.
+    /// pointer ever crosses the message boundary. A same-thread handoff: the
+    /// write (the picker's wndproc) and the take (this handler) both run in
+    /// UI-thread message handlers serialized by the loop, so the slot is a
+    /// memory-sharing vehicle, not a cross-thread guard — a stale or
+    /// foreign-posted message takes `None` and is a no-op.
     picker_result: Arc<Mutex<Option<Vec<String>>>>,
     /// Shared slot for the Auto-compact apps picker, which posts
     /// `AUTO_SOURCES_RESULT_MSG` (same contract as `picker_result`).
@@ -6050,6 +6054,12 @@ static UI_THREAD_ID: OnceLock<u32> = OnceLock::new();
 /// read is never answered with a build that predates its own request. The UI
 /// thread replaces the slot wholesale under the lock, so a reader always
 /// sees one complete snapshot.
+///
+/// The UI thread is the **only** writer: stores are serialized and strictly
+/// monotonic in generation, and the WM_NCDESTROY clear is the terminal write
+/// (no store can follow a destroyed window), so the guarded-write question —
+/// a stale writer clobbering a newer value — never arises; provider threads
+/// only ever read clones of the Arc.
 static SETTINGS_UI_SNAPSHOT: Mutex<Option<(u64, Arc<SettingsUiSnapshot>)>> = Mutex::new(None);
 
 /// How long a provider thread waits for the UI thread to rebuild the
