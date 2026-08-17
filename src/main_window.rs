@@ -12,6 +12,7 @@ use crate::overlay::{
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG, PINNED_SOURCE_RESULT_MSG};
+use crate::smtc::{ControlCommand, Signal};
 use crate::winapi::{
     create_dib_section, create_font, delete_object, global_free, invalidate_rect, is_window, kill_timer, post_message,
     select_object, send_message, set_clipboard_data, set_timer, set_window_pos, shell_execute, track_popup_menu,
@@ -24,6 +25,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -999,6 +1001,11 @@ struct MainWindowState {
     /// flight. The forwarder and this window only post when the flag was
     /// clear, so an event burst collapses into one wake message per drain.
     wake: Arc<AtomicBool>,
+    /// Sender half of the worker's merged signal+control channel. The worker
+    /// never polls the shared config, so every settings/tray change that
+    /// affects its behavior (notifications toggle, media-sources allow list)
+    /// is pushed as a `ControlCommand` here.
+    control_tx: SyncSender<Signal>,
     /// Whether the position indicator in the Activity pane is hovered.
     position_hover: bool,
 }
@@ -1016,13 +1023,20 @@ pub fn create_window(
     queue: EventQueue,
     overlay_hwnd: HWND,
     wake: Arc<AtomicBool>,
+    control_tx: SyncSender<Signal>,
 ) -> Result<HWND> {
     let module = unsafe { GetModuleHandleW(None) }.context("getting the process module")?;
     let instance: HINSTANCE = module.into();
     let class_name = wide("WinGlanceMainWindow");
     register_main_class(instance, &class_name)?;
 
-    let mut state = Box::new(MainWindowState::new(config.clone(), queue, overlay_hwnd, instance));
+    let mut state = Box::new(MainWindowState::new(
+        config.clone(),
+        queue,
+        overlay_hwnd,
+        instance,
+        control_tx,
+    ));
     state.wake = wake;
     let state_ptr = Box::into_raw(state);
     MAIN_STATE_CLAIMED.reset();
@@ -1153,7 +1167,13 @@ impl MainWindowState {
         }
     }
 
-    fn new(config: Arc<RwLock<Config>>, queue: EventQueue, overlay_hwnd: HWND, instance: HINSTANCE) -> Self {
+    fn new(
+        config: Arc<RwLock<Config>>,
+        queue: EventQueue,
+        overlay_hwnd: HWND,
+        instance: HINSTANCE,
+        control_tx: SyncSender<Signal>,
+    ) -> Self {
         Self {
             hwnd: HWND::default(),
             instance,
@@ -1204,6 +1224,7 @@ impl MainWindowState {
             source_states: HashMap::new(),
             source_order: VecDeque::new(),
             wake: Arc::new(AtomicBool::new(false)),
+            control_tx,
             position_hover: false,
         }
     }
@@ -4712,6 +4733,11 @@ fn show_tray_menu(state: &mut MainWindowState) {
                         error!("posting the notifications toggle to the overlay failed");
                     } else {
                         state.mutate_config(|cfg| cfg.behavior.notifications_enabled = new_value);
+                        push_control(
+                            &state.control_tx,
+                            ControlCommand::SetNotificationsEnabled(new_value),
+                            "notifications toggle (tray menu)",
+                        );
                     }
                 }
                 MENU_AUTOSTART_ID => {
@@ -4867,6 +4893,11 @@ fn apply_settings_row_click(
                 error!("posting the notifications toggle to the overlay failed");
             } else {
                 state.mutate_config(|cfg| cfg.behavior.notifications_enabled = new_value);
+                push_control(
+                    &state.control_tx,
+                    ControlCommand::SetNotificationsEnabled(new_value),
+                    "notifications toggle (settings)",
+                );
             }
             state.invalidate();
         }
@@ -5743,7 +5774,9 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     .take();
                 if let Some(patterns) = patterns {
                     apply_and_announce_settings_row(state, hwnd, SettingId::AllowedApps, |state| {
+                        let command = ControlCommand::SetAllowedSources(patterns.clone());
                         state.mutate_config(|cfg| cfg.behavior.media_sources = patterns);
+                        push_control(&state.control_tx, command, "media sources (picker)");
                         state.invalidate();
                     });
                 }
@@ -6418,6 +6451,18 @@ fn apply_and_announce_settings_row(
     }
 }
 
+/// Pushes a worker control command onto the merged signal+control channel.
+/// The worker never polls the shared config anymore, so every behavior
+/// change made here must be pushed, or the worker would keep its stale
+/// snapshot until the next restart. The channel is bounded; a dropped push
+/// (overloaded worker) is logged, and the supervisor's restart reseeds from
+/// the same config, so the lost command cannot go unnoticed forever.
+fn push_control(control_tx: &SyncSender<Signal>, command: ControlCommand, who: &str) {
+    if control_tx.try_send(Signal::Control(command)).is_err() {
+        debug!("control command dropped | {who}");
+    }
+}
+
 /// Moves the keyboard focus to a control (used by the provider's SetFocus and
 /// Invoke/Toggle). Reuses the focus path including auto-scroll, so the control
 /// stays on screen. The focus state lives in the window-state box, which only
@@ -6798,6 +6843,10 @@ mod tests {
             EventQueue::default(),
             HWND::default(),
             HINSTANCE::default(),
+            {
+                let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+                tx
+            },
         );
         let scale = 1.0;
         let client_w = 1000;
@@ -6842,6 +6891,10 @@ mod tests {
             EventQueue::default(),
             HWND::default(),
             HINSTANCE::default(),
+            {
+                let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+                tx
+            },
         );
         let client_w = 1000;
         for scale in [1.0f32, 1.5, 2.0] {

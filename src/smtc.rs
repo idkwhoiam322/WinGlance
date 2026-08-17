@@ -1,4 +1,3 @@
-use crate::config::Config;
 use crate::events::{MediaEvent, PlaybackState, PlaybackType, TrackInfo, artwork_bytes, decode_artwork_pm};
 use crate::palette::{Palette, palette_from_rgba};
 use anyhow::{Context, Result};
@@ -6,7 +5,7 @@ use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Foundation::TypedEventHandler;
 use windows::Media::Control::{
@@ -22,13 +21,37 @@ use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
 use windows::core::Interface;
 use windows_future::AsyncStatus;
 
-enum Signal {
+/// Configuration commands the main window pushes to the worker over the
+/// shared signal+control channel. The worker applies them on the next
+/// event-loop turn (`handle_control`) instead of polling the shared config
+/// lock — the listener's per-turn config poll and its last-seen markers
+/// existed only to paper over the up-to-2s lag of that poll, and a pushed
+/// command is current the moment it is received.
+pub(crate) enum ControlCommand {
+    /// The user toggled `behavior.notifications_enabled` in the settings
+    /// pane or the tray menu. `true` also forces a one-shot re-show of the
+    /// current session's track (the old poll's false→true transition), so
+    /// the pill surfaces the live state immediately; `false` is a no-op
+    /// here, because the overlay owns the actual suppression.
+    SetNotificationsEnabled(bool),
+    /// The user edited `behavior.media_sources`; the worker re-normalizes
+    /// the patterns once at apply time and stores them, replacing its last
+    /// pushed copy.
+    SetAllowedSources(Vec<String>),
+}
+
+pub(crate) enum Signal {
     /// Fired by SessionsChanged or CurrentSessionChanged: re-sync the
     /// subscription map at the next flush (one re-sync per burst).
     Sessions,
     MediaProperties(GlobalSystemMediaTransportControlsSession),
     PlaybackInfo(GlobalSystemMediaTransportControlsSession),
     Timeline(GlobalSystemMediaTransportControlsSession),
+    /// A typed command pushed by the main window (see `ControlCommand`).
+    /// Commands share the channel with the WinRT wake-ups, so the worker's
+    /// single receive loop applies them on the next turn without a second
+    /// receiver or a select.
+    Control(ControlCommand),
 }
 
 struct SessionSubscription {
@@ -159,13 +182,15 @@ const SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// retires its pill ~4s after the last session goes.
 const TERMINAL_STOP_GRACE: Duration = Duration::from_secs(4);
 
-/// Capacity of the signal channel between the WinRT event handlers and the
-/// listener loop. `try_send` drops a signal when the queue is full; that is
-/// safe because every dropped signal is a coalescible wake-up — the dirty-set
-/// membership it would have recorded is re-covered by the periodic safety-net
-/// poll within 2s. The bound keeps a session storm from accumulating
-/// unbounded queued COM session references.
-const SIGNAL_QUEUE_CAP: usize = 256;
+/// Capacity of the merged signal+control channel between the WinRT event
+/// handlers, the main window, and the listener loop. `try_send` drops a
+/// signal when the queue is full; that is safe because every dropped signal
+/// is a coalescible wake-up — the dirty-set membership it would have
+/// recorded is re-covered by the periodic safety-net poll within 2s, and a
+/// dropped control command is re-covered by the next settings click (the
+/// worker's startup seed rebuilds state on restarts). The bound keeps a
+/// session storm from accumulating unbounded queued COM session references.
+pub(crate) const SIGNAL_QUEUE_CAP: usize = 256;
 
 /// Hard admission caps defending the worker against a hostile process that
 /// registers unbounded GSMTC sessions/sources. A single desktop attacker can
@@ -255,7 +280,6 @@ fn set_active_session_sources(sources: Vec<String>) {
 
 struct ListenerState {
     manager: GlobalSystemMediaTransportControlsSessionManager,
-    config: Arc<RwLock<Config>>,
     output: SyncSender<Arc<MediaEvent>>,
     /// Shared in-flight artwork byte counter. The worker adds the artwork
     /// bytes of every event it queues (channel or mailbox) and the forwarder
@@ -369,12 +393,12 @@ struct ListenerState {
     /// overlay side, so attributing from this worker's emissions would
     /// suppress a re-emit whose pill never actually appeared.
     now_showing: Arc<Mutex<Option<String>>>,
-    /// Last-seen value of `config.behavior.notifications_enabled` on this worker
-    /// thread. A false→true transition (the toggle coming back on) triggers a
-    /// one-shot re-emit of the current session's track, so the pill surfaces the
-    /// live state immediately instead of waiting for the next media event —
-    /// which never diff-emits an unchanged track.
-    last_seen_enabled: bool,
+    /// Debounce window for flush scheduling, seeded once at worker startup
+    /// (the supervisor samples `behavior.debounce_ms` at each spawn). The
+    /// field is set-only after startup: `debounce_ms` has no settings-pane
+    /// row, so a hand edit needs a restart anyway; a control command would
+    /// only add a write path nothing ever uses.
+    debounce: Duration,
     /// Cached app icons keyed by source_app label (derived from AUMID via
     /// `source_app_label`). Populated on first encounter of a source.
     icon_cache: HashMap<String, Option<Arc<[u8]>>>,
@@ -382,10 +406,12 @@ struct ListenerState {
     /// to one line per `OVERFLOW_WARN_INTERVAL` during a hostile session storm,
     /// instead of one WARN per rejected session.
     last_overflow_warn: Option<Instant>,
-    /// Last-seen `media_sources` config list plus its pre-normalized
-    /// patterns. The per-session check runs on the hot path (every re-sync
-    /// of every session), so the clone of the config list and the per-pattern
-    /// normalization only re-run when the config actually changed.
+    /// Last pushed `media_sources` list plus its pre-normalized patterns,
+    /// seeded at worker startup and replaced by `SetAllowedSources`. The
+    /// per-session check runs on the hot path (every re-sync of every
+    /// session), so the patterns are normalized once at apply time instead
+    /// of per check; there is no comparison against a live config because
+    /// the settings UI is the only writer and it pushes every change.
     cached_allowed: Option<(Vec<String>, Vec<String>)>,
     /// When the last TrackChanged was emitted per source, used to time-gate
     /// the artwork-changed re-emit: SMTC re-reads the thumbnail within ~1s
@@ -404,6 +430,19 @@ struct ListenerState {
     palette_per_identity: HashMap<String, Palette>,
 }
 
+/// The worker's config values, sampled once by the supervisor at each spawn.
+/// The worker never reads the shared config lock again: live changes arrive
+/// as `ControlCommand`s on the merged channel, and the allow-list half of a
+/// command posted just before a restart is re-covered because the seed is
+/// taken from the same in-memory config the write landed on. The
+/// notifications toggle is not seed-recovered — suppression lives in the
+/// overlay, and the overlay's last-track restore covers the re-show if its
+/// `SetNotificationsEnabled(true)` command is lost to a restart.
+pub(crate) struct ListenerSeed {
+    pub(crate) media_sources: Vec<String>,
+    pub(crate) debounce_ms: u64,
+}
+
 pub struct SmtcListener {
     output: SyncSender<Arc<MediaEvent>>,
     /// Shared in-flight artwork byte counter (see `MAX_IN_FLIGHT_ARTWORK_BYTES`
@@ -413,7 +452,19 @@ pub struct SmtcListener {
     /// payload, so the user gets exactly one tray warning per app run (see
     /// `ListenerState::budget_warned`).
     budget_warned: Arc<AtomicBool>,
-    config: Arc<RwLock<Config>>,
+    seed: ListenerSeed,
+    /// Sender half of the merged signal+control channel, cloned into the
+    /// WinRT event handlers and into `ListenerState` for its per-session
+    /// subscriptions. The channel itself is created in `main` and survives
+    /// worker restarts, so a control command posted by the main window is
+    /// never lost to a restart.
+    control_tx: SyncSender<Signal>,
+    /// Receiver half of the same channel. `main` wraps it in a mutex because
+    /// a replacement worker must receive from the channel its predecessor
+    /// left behind; the worker's event loop is the only receive site and
+    /// senders never take this lock, so it is held at most across one
+    /// `recv_timeout`.
+    control_rx: Arc<Mutex<mpsc::Receiver<Signal>>>,
     /// Updated by the event loop every few seconds so a supervisor can detect
     /// a stalled worker (a WinRT call hanging under session churn) and
     /// restart the listener.
@@ -438,18 +489,22 @@ impl SmtcListener {
         output: SyncSender<Arc<MediaEvent>>,
         in_flight_art: Arc<AtomicU64>,
         budget_warned: Arc<AtomicBool>,
-        config: Arc<RwLock<Config>>,
+        seed: ListenerSeed,
         heartbeat: Arc<Mutex<Instant>>,
         live_generation: Arc<AtomicU64>,
         my_generation: u64,
         shutdown: Arc<AtomicBool>,
         now_showing: Arc<Mutex<Option<String>>>,
+        control_tx: SyncSender<Signal>,
+        control_rx: Arc<Mutex<mpsc::Receiver<Signal>>>,
     ) -> Self {
         Self {
             output,
             in_flight_art,
             budget_warned,
-            config,
+            seed,
+            control_tx,
+            control_rx,
             heartbeat,
             live_generation,
             my_generation,
@@ -473,12 +528,12 @@ impl SmtcListener {
         // a startup failure the supervisor's restart budget covers).
         let manager = wait_async(&GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?, None)
             .context("requesting the SMTC session manager")?;
-        let (signal_tx, signal_rx) = mpsc::sync_channel(SIGNAL_QUEUE_CAP);
+        let signal_tx = self.control_tx.clone();
         let sessions_token = register_sessions_handler(&manager, signal_tx.clone())?;
         let current_token = register_current_session_handler(&manager, signal_tx.clone())?;
         let mut state = ListenerState::new(
             manager,
-            self.config,
+            self.seed,
             self.output,
             self.in_flight_art,
             self.budget_warned,
@@ -494,7 +549,7 @@ impl SmtcListener {
         // Initial read: report what is already playing so the pill does not
         // wait for the first event.
         state.poll_sessions();
-        state.event_loop(signal_rx)?;
+        state.event_loop(self.control_rx.clone())?;
 
         let _ = state.manager.RemoveSessionsChanged(sessions_token);
         let _ = state.manager.RemoveCurrentSessionChanged(current_token);
@@ -507,7 +562,7 @@ impl ListenerState {
     #[allow(clippy::too_many_arguments)]
     fn new(
         manager: GlobalSystemMediaTransportControlsSessionManager,
-        config: Arc<RwLock<Config>>,
+        seed: ListenerSeed,
         output: SyncSender<Arc<MediaEvent>>,
         in_flight_art: Arc<AtomicU64>,
         budget_warned: Arc<AtomicBool>,
@@ -518,18 +573,8 @@ impl ListenerState {
         shutdown: Arc<AtomicBool>,
         now_showing: Arc<Mutex<Option<String>>>,
     ) -> Self {
-        // Sample the shared notifications flag before it is moved into the
-        // state: the worker polls it on every loop turn to detect a toggle back
-        // on (the worker has no main→worker control channel and must not miss
-        // the transition on a restart).
-        let last_seen_enabled = config
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .behavior
-            .notifications_enabled;
         Self {
             manager,
-            config,
             output,
             in_flight_art,
             budget_warned,
@@ -551,9 +596,17 @@ impl ListenerState {
             last_track_per_source: HashMap::new(),
             last_known_playback_per_source: HashMap::new(),
             now_showing,
-            last_seen_enabled,
+            // Seed the allow list once; the settings UI keeps it current
+            // with `SetAllowedSources` from here on.
+            debounce: debounce_duration_ms(seed.debounce_ms),
             icon_cache: HashMap::new(),
-            cached_allowed: None,
+            cached_allowed: Some((
+                seed.media_sources.clone(),
+                seed.media_sources
+                    .iter()
+                    .map(|pattern| normalize_for_match(pattern))
+                    .collect(),
+            )),
             last_emit_at: HashMap::new(),
             palette_per_identity: HashMap::new(),
             last_overflow_warn: None,
@@ -564,7 +617,7 @@ impl ListenerState {
         }
     }
 
-    fn event_loop(&mut self, signal_rx: Receiver<Signal>) -> Result<()> {
+    fn event_loop(&mut self, signal_rx: Arc<Mutex<Receiver<Signal>>>) -> Result<()> {
         loop {
             // Set by main at exit: leave promptly (within the receive
             // timeout) so run_initialized's cleanup unsubscribes every
@@ -594,7 +647,6 @@ impl ListenerState {
                     }
                 }
             }
-            self.check_notifications_reenable();
             let timeout = self
                 .pending_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
@@ -604,7 +656,21 @@ impl ListenerState {
                 .unwrap_or(SESSION_CHECK_INTERVAL)
                 .min(SESSION_CHECK_INTERVAL);
 
-            match signal_rx.recv_timeout(timeout) {
+            // The receiver is shared across worker restarts (`main` owns it),
+            // so a replacement worker drains whatever its predecessor left in
+            // the queue. Senders use `control_tx`/`signal_tx`, never this
+            // mutex. The guard must end with the receive, before the match
+            // arms run: a WinRT call hanging inside an arm (the
+            // supervisor-restart scenario) would otherwise pin the receiver
+            // mutex, and the replacement worker would block on the lock
+            // before ever reaching its first receive — its heartbeat would
+            // go stale and the supervisor would burn the global restart
+            // budget.
+            let received = signal_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(timeout);
+            match received {
                 Ok(signal) => {
                     self.handle_signal(signal)?;
                     // A continuous signal stream must not starve the debounce
@@ -685,33 +751,50 @@ impl ListenerState {
                 }
                 self.schedule_flush();
             }
+            Signal::Control(command) => {
+                // Main-window commands run on this same turn; they are rare
+                // (settings clicks) and need no debounce.
+                self.handle_control(command)?;
+            }
         }
         Ok(())
     }
 
-    /// Polls the shared `notifications_enabled` flag once per event-loop turn
-    /// and, on a false→true transition, forces the worker to re-emit the
-    /// current session's track. The overlay flips first (`TOGGLE_MSG` is posted
-    /// before `mutate_config` persists the write), so the re-emit always lands
-    /// on an enabled overlay; the overlay's own `last_track` restore covers the
-    /// narrow case where a queued `MEDIA_EVENT_MSG` is drained and dropped
-    /// before the toggle flips it. Without this, the worker keeps reading
-    /// sessions while notifications are off (it only suppresses at the overlay)
-    /// and has no media event to re-announce an unchanged track, so the pill
-    /// would wait for the next real action.
-    fn check_notifications_reenable(&mut self) {
-        let now_enabled = self
-            .config
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .behavior
-            .notifications_enabled;
-        if reenable_reshow_warranted(self.last_seen_enabled, now_enabled)
-            && let Err(error) = self.reshow_current()
-        {
-            warn!("forced re-show on notifications re-enable failed: {error:#}");
+    /// Applies a command pushed by the main window. Runs on the next
+    /// event-loop turn; commands are settings clicks, so a turn of latency —
+    /// the same granularity the deleted per-turn config poll had — is
+    /// acceptable.
+    fn handle_control(&mut self, command: ControlCommand) -> Result<()> {
+        match command {
+            ControlCommand::SetNotificationsEnabled(true) => {
+                // The overlay flips first (`TOGGLE_MSG` is posted before
+                // `mutate_config` persists the write), so the re-emit always
+                // lands on an enabled overlay; the overlay's own `last_track`
+                // restore covers the narrow case where a queued
+                // `MEDIA_EVENT_MSG` is drained and dropped before the toggle
+                // flips it. Without this, the worker keeps reading sessions
+                // while notifications are off (it only suppresses at the
+                // overlay) and has no media event to re-announce an unchanged
+                // track, so the pill would wait for the next real action.
+                if let Err(error) = self.reshow_current() {
+                    warn!("forced re-show on notifications re-enable failed: {error:#}");
+                }
+            }
+            ControlCommand::SetNotificationsEnabled(false) => {
+                // The overlay owns suppression while off; the worker keeps
+                // reading sessions so the pill restores instantly on
+                // re-enable. Nothing to do here.
+            }
+            ControlCommand::SetAllowedSources(sources) => {
+                // Normalize the patterns once at apply time instead of on the
+                // hot path. `cached_allowed` stays current from here on: the
+                // settings UI is its only writer.
+                let normalized = sources.iter().map(|pattern| normalize_for_match(pattern)).collect();
+                self.cached_allowed = Some((sources, normalized));
+                debug!("media-sources allow list pushed by the settings UI");
+            }
         }
-        self.last_seen_enabled = now_enabled;
+        Ok(())
     }
 
     /// Re-emits the current session's track on a notifications re-enable,
@@ -1514,13 +1597,7 @@ impl ListenerState {
         // per-session detail lines are gated once-per-appearance above). The
         // throttled WARN below remains the operator-facing overflow signal.
         if rejected_allow + ignored + rejected_overflow > 0 {
-            let allow_list_len = self
-                .config
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .behavior
-                .media_sources
-                .len();
+            let allow_list_len = self.cached_allowed.as_ref().map_or(0, |(raw, _)| raw.len());
             debug!(
                 "SMTC admission: {accepted} accepted, {rejected_allow} rejected (allow-list/cooldown), {ignored} ignored (not current), {rejected_overflow} cap-rejected | allow_list_len={allow_list_len}"
             );
@@ -1925,23 +2002,9 @@ impl ListenerState {
         if self.source_on_cooldown(&label) {
             return false;
         }
-        // The media_sources list only changes through the settings UI, so
-        // compare the live config against the cached copy (element-wise, no
-        // clone) and only re-normalize when it actually differs.
-        {
-            let cfg = self.config.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let raw = &cfg.behavior.media_sources;
-            let stale = self
-                .cached_allowed
-                .as_ref()
-                .is_none_or(|(cached_raw, _)| cached_raw != raw);
-            if stale {
-                self.cached_allowed = Some((
-                    raw.clone(),
-                    raw.iter().map(|pattern| normalize_for_match(pattern)).collect(),
-                ));
-            }
-        }
+        // The allow list is seeded at worker startup and replaced by
+        // `SetAllowedSources` pushes from the settings UI, so the cached copy
+        // is always current; no live config read on this hot path.
         let Some((_, normalized)) = &self.cached_allowed else {
             return true;
         };
@@ -2204,7 +2267,7 @@ impl ListenerState {
     }
 
     fn schedule_flush(&mut self) {
-        let deadline = Instant::now() + debounce_duration(&self.config.read().unwrap_or_else(|p| p.into_inner()));
+        let deadline = Instant::now() + self.debounce;
         self.pending_deadline = Some(self.pending_deadline.map_or(deadline, |d| d.min(deadline)));
     }
 
@@ -3015,15 +3078,6 @@ fn session_playback_type(session: &GlobalSystemMediaTransportControlsSession) ->
         .unwrap_or(PlaybackType::Unknown)
 }
 
-/// Whether a `notifications_enabled` toggle warrants a forced worker re-emit
-/// of the current track. Only false→true does: the worker keeps reading
-/// sessions (and the overlay keeps dropping while disabled), so there is no
-/// media event to re-announce an unchanged track when notifications come back
-/// on. Pure, so the transition rule is directly testable.
-fn reenable_reshow_warranted(previously_enabled: bool, now_enabled: bool) -> bool {
-    !previously_enabled && now_enabled
-}
-
 /// Whether any displayed content field differs from the stored state.
 fn content_differ(prev: &LogicalState, read: &TrackInfo) -> bool {
     read.title != prev.title
@@ -3747,8 +3801,12 @@ pub(crate) fn normalize_for_match(s: &str) -> String {
     s.to_lowercase().replace(['-', '_', '.', ' '], "")
 }
 
-fn debounce_duration(config: &Config) -> Duration {
-    Duration::from_millis(config.behavior.debounce_ms.clamp(150, 250))
+/// The flush-scheduling debounce window. The worker's value comes from the
+/// supervisor's seed, not from a live config, so it is clamped here to the
+/// coalescing range (150–250 ms): a mis-set config value can starve (too
+/// long) or flood (too short) the pill.
+fn debounce_duration_ms(ms: u64) -> Duration {
+    Duration::from_millis(ms.clamp(150, 250))
 }
 
 /// Whether a source that just lost its last session still owes the overlay a
@@ -3809,21 +3867,6 @@ mod tests {
         assert!(!thumbnail_stream_size_acceptable(MAX_THUMBNAIL_BYTES + 1));
         // The WinRT buffer is u32-sized; larger streams are rejected too.
         assert!(!thumbnail_stream_size_acceptable(u64::from(u32::MAX) + 1));
-    }
-
-    #[test]
-    fn reenable_reshow_warrants_only_the_false_to_true_toggle() {
-        // The worker keeps reading sessions while notifications are off (the
-        // overlay only suppresses the pill), so it has nothing new to emit for
-        // an unchanged track. Only a false→true transition needs a forced
-        // re-emit; toggling on twice, or off, or staying off, is a no-op.
-        assert!(!reenable_reshow_warranted(true, true), "no change while on");
-        assert!(!reenable_reshow_warranted(false, false), "no change while off");
-        assert!(!reenable_reshow_warranted(true, false), "turning off needs no re-emit");
-        assert!(
-            reenable_reshow_warranted(false, true),
-            "turning back on must force a re-show of the current track"
-        );
     }
 
     #[test]
@@ -4108,11 +4151,9 @@ mod tests {
 
     #[test]
     fn debounce_window_is_clamped_to_the_coalescing_range() {
-        let mut config = Config::default();
-        config.behavior.debounce_ms = 1;
-        assert_eq!(debounce_duration(&config), Duration::from_millis(150));
-        config.behavior.debounce_ms = 1000;
-        assert_eq!(debounce_duration(&config), Duration::from_millis(250));
+        assert_eq!(debounce_duration_ms(1), Duration::from_millis(150));
+        assert_eq!(debounce_duration_ms(1000), Duration::from_millis(250));
+        assert_eq!(debounce_duration_ms(200), Duration::from_millis(200));
     }
 
     fn track(title: &str, artist: &str) -> TrackInfo {
@@ -4559,7 +4600,10 @@ mod tests {
         let (signal_tx, _signal_rx) = mpsc::sync_channel(1);
         ListenerState::new(
             unsafe { GlobalSystemMediaTransportControlsSessionManager::from_raw(std::ptr::null_mut()) },
-            Arc::new(RwLock::new(Config::default())),
+            ListenerSeed {
+                media_sources: Vec::new(),
+                debounce_ms: 1,
+            },
             output,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicBool::new(false)),
@@ -4570,6 +4614,76 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
         )
+    }
+
+    #[test]
+    fn seed_snapshots_the_allow_list_and_clamps_the_debounce() {
+        // The worker never reads the shared config again after `new`: the
+        // seed is the only source for the allow list and the debounce, so
+        // the snapshot must be normalized at construction and the debounce
+        // clamped to the coalescing range like the old live read was.
+        let (output, _rx) = mpsc::sync_channel(1);
+        let (signal_tx, _signal_rx) = mpsc::sync_channel(1);
+        let state = ListenerState::new(
+            unsafe { GlobalSystemMediaTransportControlsSessionManager::from_raw(std::ptr::null_mut()) },
+            ListenerSeed {
+                media_sources: vec!["YouTube-Music".to_string()],
+                debounce_ms: 1,
+            },
+            output,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            signal_tx,
+            Arc::new(Mutex::new(Instant::now())),
+            Arc::new(AtomicU64::new(0)),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+        );
+        let (raw, normalized) = state.cached_allowed.as_ref().expect("seed cached");
+        assert_eq!(raw, &["YouTube-Music".to_string()]);
+        assert_eq!(normalized, &["youtubemusic".to_string()]);
+        assert_eq!(
+            state.debounce,
+            Duration::from_millis(150),
+            "a sub-floor seed clamps to the coalescing floor"
+        );
+        std::mem::forget(state);
+    }
+
+    #[test]
+    fn control_set_allowed_sources_replaces_the_cached_allow_list() {
+        // The settings UI pushes the confirmed patterns as a command; the
+        // worker must store and normalize them once at apply time, replacing
+        // the snapshot the seed took.
+        let (output, _rx) = mpsc::sync_channel(1);
+        let (signal_tx, _signal_rx) = mpsc::sync_channel(1);
+        let mut state = ListenerState::new(
+            unsafe { GlobalSystemMediaTransportControlsSessionManager::from_raw(std::ptr::null_mut()) },
+            ListenerSeed {
+                media_sources: vec!["old-app".to_string()],
+                debounce_ms: 200,
+            },
+            output,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            signal_tx,
+            Arc::new(Mutex::new(Instant::now())),
+            Arc::new(AtomicU64::new(0)),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+        );
+        state
+            .handle_control(ControlCommand::SetAllowedSources(vec![
+                " Spotify ".to_string(),
+                "youtube-music".to_string(),
+            ]))
+            .unwrap();
+        let (raw, normalized) = state.cached_allowed.as_ref().expect("allow list stored");
+        assert_eq!(raw, &[" Spotify ".to_string(), "youtube-music".to_string()]);
+        assert_eq!(normalized, &["spotify".to_string(), "youtubemusic".to_string()]);
+        std::mem::forget(state);
     }
 
     #[test]
