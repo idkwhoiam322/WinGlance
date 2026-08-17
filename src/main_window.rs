@@ -4837,6 +4837,9 @@ fn setting_sub_click_point(id: SettingId, sub: SettingSub, rect: &RECT, scale: f
 /// activated for a click at client `(x, y)` within its `rect`. Shared by the
 /// real `WM_LBUTTONDOWN` hit-test and the UIA activation message, so both
 /// stay on a single dispatch.
+/// Single dispatch point for every way a settings row is activated (mouse
+/// click, UIA invoke, UIA toggle); the argument list mirrors the click data.
+#[allow(clippy::too_many_arguments)]
 fn apply_settings_row_click(
     state: &mut MainWindowState,
     hwnd: HWND,
