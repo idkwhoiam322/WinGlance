@@ -1422,6 +1422,42 @@ mod tests {
     }
 
     #[test]
+    fn a_still_allowed_stored_pin_is_offered_as_a_normal_row() {
+        // The happy-path complement to the disallowed-pin test: a stored pin
+        // that still matches the allow-list is a normal pre-checked row — no
+        // "(not allowed)" label, no "(not running)" duplicate.
+        let entries = vec![entry("spotify"), entry("chrome")];
+        let allowed = vec!["spotify".to_string()];
+        let list = build_pinned_source_list(&["spotify".to_string()], &allowed, entries);
+        assert_eq!(list.len(), 1, "chrome is filtered, spotify is offered");
+        assert_eq!(list[0].pattern, "spotify");
+        assert!(
+            !list[0].display_name.contains("not allowed"),
+            "a still-allowed pin must not be labeled, got '{}'",
+            list[0].display_name
+        );
+    }
+
+    #[test]
+    fn disallowed_stored_pins_sort_above_the_live_rows() {
+        // Multiple disallowed pins are sorted by name and pinned above the
+        // live allowed rows, so the clearable group is always findable.
+        let entries = vec![entry("spotify")];
+        let allowed = vec!["spotify".to_string()];
+        let current = vec!["zebra".to_string(), "alpha".to_string()];
+        let list = build_pinned_source_list(&current, &allowed, entries);
+        let patterns: Vec<&str> = list.iter().map(|e| e.pattern.as_str()).collect();
+        assert_eq!(
+            patterns,
+            ["alpha", "zebra", "spotify"],
+            "sorted disallowed pins first, the live allowed row last"
+        );
+        assert!(list[0].display_name.contains("not allowed"));
+        assert!(list[1].display_name.contains("not allowed"));
+        assert!(!list[2].display_name.contains("not allowed"));
+    }
+
+    #[test]
     fn strip_exe_suffix_preserves_stem_ending_in_e_x_or_dot() {
         assert_eq!(strip_exe_suffix("firefox.exe"), "firefox");
         assert_eq!(strip_exe_suffix("Plex.exe"), "Plex");

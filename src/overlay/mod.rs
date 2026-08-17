@@ -3678,6 +3678,28 @@ mod tests {
     }
 
     #[test]
+    fn accessible_name_cell_builds_every_part_combination() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        let cell = Arc::new(Mutex::new(None));
+        state.pill_name = Some(cell.clone());
+
+        // Title only: the empty artist part is dropped, the source is
+        // parenthesized.
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Love Me Not", "")));
+        state.resolve_pill_text();
+        assert_eq!(*cell.lock().unwrap(), Some("Love Me Not (spotify)".to_string()));
+
+        // No title and no artist: the name degrades to the source app alone.
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "", "")));
+        state.resolve_pill_text();
+        assert_eq!(*cell.lock().unwrap(), Some("spotify".to_string()));
+
+        // No source: the joined title — artist stands alone.
+        state.content = Some(MediaEvent::TrackChanged(track_for("", "Love Me Not", "Ravyn Lenae")));
+        state.resolve_pill_text();
+        assert_eq!(*cell.lock().unwrap(), Some("Love Me Not — Ravyn Lenae".to_string()));
+    }
+    #[test]
     fn retire_source_purges_the_retired_source_from_the_track_cache() {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.cache_track(&track_for("alpha", "Song A", "Artist"));
