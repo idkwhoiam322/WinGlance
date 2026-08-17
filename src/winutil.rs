@@ -575,22 +575,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
-    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES,
-    FILE_WRITE_DATA, FlushFileBuffers, GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_ALWAYS,
-    OPEN_EXISTING, SetFileInformationByHandle, WriteFile,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_DISPOSITION_FLAG_DELETE, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FlushFileBuffers,
+    GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_ALWAYS, OPEN_EXISTING, SetFileInformationByHandle,
+    WriteFile,
 };
-
-/// `FILE_DELETE_CHILD` (0x0040); `windows` 0.58 does not export it. Needed on
-/// the pinned parent so a rename-with-replace may exchange a child entry.
-const FILE_DELETE_CHILD: u32 = 0x0000_0040;
 
 /// The Win32 DELETE access right (0x0001_0000); `windows` 0.58 does not export
 /// it. Needed so the temp's handle can also delete it (disposition delete).
 const DELETE_ACCESS: u32 = 0x0001_0000;
-/// `FILE_DISPOSITION_FLAG_DELETE` from winnt.h; not exported by `windows`
-/// 0.58.
-const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
 /// `SetFileInformationByHandle` disposition-ex information class from winnt.h.
 /// The `windows` crate exports the `FileDispositionInfoEx` *value* but not
 /// the struct definition it pairs with, so both live here (documented, stable
@@ -713,8 +707,8 @@ pub(crate) fn open_pinned_parent(dir: &Path) -> io::Result<DirGuard> {
         | FILE_TRAVERSE
         | FILE_WRITE_DATA // = FILE_ADD_FILE: lets the flush write directory entries through
         | FILE_APPEND_DATA // = FILE_ADD_SUBDIRECTORY
-        | windows::Win32::Storage::FileSystem::FILE_ACCESS_RIGHTS(FILE_DELETE_CHILD))
-    .0;
+        | FILE_DELETE_CHILD)
+        .0;
     let wide = dir
         .as_os_str()
         .encode_wide()
@@ -780,7 +774,7 @@ fn temp_name() -> String {
 /// it. Only called on failure paths; best-effort.
 fn delete_temp(handle: HANDLE) {
     let info = FileDispositionInfoEx {
-        flags: FILE_DISPOSITION_FLAG_DELETE,
+        flags: FILE_DISPOSITION_FLAG_DELETE.0,
     };
     unsafe {
         let _ = SetFileInformationByHandle(
