@@ -6205,6 +6205,9 @@ pub(crate) fn settings_focus(hwnd: HWND) -> Option<(usize, SettingSub)> {
 /// A stable small tag per `SettingSub` variant, used to derive UIA runtime ids
 /// that survive provider rebuilds. Distinct variants get distinct tags; the
 /// `Seg`/`Anchor` indices fold into the same tag space via their payload.
+/// Layouts today never exceed a handful of segments or anchors; a row that
+/// would overflow the 16-slot tag space is a programming error, so it panics
+/// here instead of silently colliding with another control's runtime id.
 pub(crate) fn setting_sub_tag(sub: SettingSub) -> i32 {
     match sub {
         SettingSub::None => 0x00,
@@ -6214,8 +6217,14 @@ pub(crate) fn setting_sub_tag(sub: SettingSub) -> i32 {
         SettingSub::Copy => 0x21,
         SettingSub::OpenConfig => 0x22,
         SettingSub::ReloadConfig => 0x23,
-        SettingSub::Seg(i) => 0x40 + (i as i32).min(0x0F),
-        SettingSub::Anchor(i) => 0x50 + (i as i32).min(0x0F),
+        SettingSub::Seg(i) => {
+            assert!(i <= 0x0F, "a settings row cannot exceed 16 segments");
+            0x40 + i as i32
+        }
+        SettingSub::Anchor(i) => {
+            assert!(i <= 0x0F, "a settings row cannot exceed 16 anchor targets");
+            0x50 + i as i32
+        }
     }
 }
 
