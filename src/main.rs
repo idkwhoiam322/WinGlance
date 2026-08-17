@@ -373,20 +373,23 @@ fn winglance_instance_running_retried() -> bool {
     false
 }
 
-/// Records a suspected single-instance squat to `crash.log` — the only log
-/// available before `logging::init_logging` runs. The mutex is live-held by a
-/// process that is not a running WinGlance instance, so this launch exits
-/// with no feedback anywhere; without this line the app would silently refuse
-/// to start. Bounded like the panic hook so a launch loop cannot grow the
-/// file without limit.
-fn report_suspected_squat() {
+/// Appends a diagnostic line to `crash.log` — the only log available before
+/// `logging::init_logging` runs. Bounded like the panic hook so a launch
+/// loop cannot grow the file without limit.
+fn append_crash_log_line(message: &[u8]) {
     if let Some(dir) = config::Config::data_dir().ok().map(|d| d.join("logs")) {
-        let _ = crate::winutil::append_verified_bounded(
-            &dir.join("crash.log"),
-            b"suspected single-instance mutex squat: 'WinGlanceSingleInstance' is held by a live process that is not a running WinGlance instance; this launch exits without starting\n",
-            CRASH_LOG_CAP,
-        );
+        let _ = crate::winutil::append_verified_bounded(&dir.join("crash.log"), message, CRASH_LOG_CAP);
     }
+}
+
+/// Records a suspected single-instance squat to `crash.log`. The mutex is
+/// live-held by a process that is not a running WinGlance instance, so this
+/// launch exits with no feedback anywhere; without this line the app would
+/// silently refuse to start.
+fn report_suspected_squat() {
+    append_crash_log_line(
+        b"suspected single-instance mutex squat: 'WinGlanceSingleInstance' is held by a live process that is not a running WinGlance instance; this launch exits without starting\n",
+    );
 }
 
 /// Acquires the single-instance mutex for the process lifetime. Returns the
@@ -427,22 +430,43 @@ fn acquire_singleton(restart_nonce: Option<&str>) -> anyhow::Result<Option<Singl
                 let event_name = wide(&format!("WinGlanceRestartReady-{nonce}"));
                 match OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(event_name.as_ptr())) {
                     Ok(ready) => {
-                        let _ = SetEvent(ready);
+                        // Only proceed when the signal landed: a failed SetEvent
+                        // means the old process closed the event mid-handoff, so
+                        // fall through to the plain conflict path, whose
+                        // abandoned-mutex takeover covers a crashed predecessor.
+                        if SetEvent(ready).is_ok() {
+                            let _ = CloseHandle(ready);
+                            return match WaitForSingleObject(handle, RESTART_READY_WAIT.as_millis() as u32) {
+                                WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(SingletonGuard::new(handle))),
+                                WAIT_TIMEOUT => {
+                                    let _ = CloseHandle(handle);
+                                    // The old process either kept the guard (its own
+                                    // ready wait failed, so it is still the live
+                                    // owner) or a concurrent launch acquired the
+                                    // mutex while it was briefly unowned between the
+                                    // old process's release and this wait. Both
+                                    // outcomes leave the singleton with exactly one
+                                    // owner and make this launch the duplicate; the
+                                    // crash.log line makes a stolen handoff
+                                    // diagnosable when the old process is already
+                                    // gone. Logging is not initialized yet, so
+                                    // crash.log it is.
+                                    append_crash_log_line(
+                                        b"restart handoff timed out waiting for the single-instance mutex; the old process either kept the singleton or a concurrent launch acquired it; this launch exits without starting\n",
+                                    );
+                                    Ok(None)
+                                }
+                                WAIT_FAILED => {
+                                    let _ = CloseHandle(handle);
+                                    Ok(None)
+                                }
+                                _ => {
+                                    let _ = CloseHandle(handle);
+                                    anyhow::bail!("unexpected wait result on the single-instance mutex")
+                                }
+                            };
+                        }
                         let _ = CloseHandle(ready);
-                        return match WaitForSingleObject(handle, RESTART_READY_WAIT.as_millis() as u32) {
-                            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(SingletonGuard::new(handle))),
-                            WAIT_TIMEOUT | WAIT_FAILED => {
-                                // The old process never handed off (it failed the
-                                // ready wait and kept running): this launch is a
-                                // duplicate after all.
-                                let _ = CloseHandle(handle);
-                                Ok(None)
-                            }
-                            _ => {
-                                let _ = CloseHandle(handle);
-                                anyhow::bail!("unexpected wait result on the single-instance mutex")
-                            }
-                        };
                     }
                     Err(_) => {
                         // The old process died before the handoff; fall through to
@@ -559,7 +583,22 @@ pub fn relaunch_self() {
     // consumes the signal.
     let event_name = wide(&format!("WinGlanceRestartReady-{nonce}"));
     let ready = match unsafe { CreateEventW(None, false, false, PCWSTR(event_name.as_ptr())) } {
-        Ok(event) => event,
+        Ok(event) => {
+            // A fresh 128-bit nonce must yield a fresh event. An already-
+            // existing name means the object was pre-created by something
+            // that saw this command line: never wait on an event this
+            // process did not create, or a forged signal could release the
+            // singleton while the successor is not yet waiting.
+            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                error!("restart: the ready event already exists; keeping this instance running");
+                unsafe {
+                    let _ = CloseHandle(event);
+                }
+                *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+                return;
+            }
+            event
+        }
         Err(error) => {
             error!("restart: creating the ready event failed: {error}; keeping this instance running");
             *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
