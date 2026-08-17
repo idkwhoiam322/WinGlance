@@ -9,7 +9,7 @@
 //! dispatches through the same function as a real mouse click, so no behavior is
 //! duplicated.
 //!
-//! windows-0.58 conventions used here: the `#[implement]` macro generates a
+//! windows COM class conventions used here: the `#[implement]` macro generates a
 //! `SettingsProvider_Impl` COM class whose `this` field holds our struct, and
 //! the `*_Impl` traits are implemented for that generated type. "No value"
 //! answers use `Err(Error::empty())` — the encoding the crate itself produces

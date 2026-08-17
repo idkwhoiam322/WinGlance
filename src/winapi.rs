@@ -3,9 +3,10 @@
 //! The `windows` 0.62 crate changed many Win32 signatures from 0.58:
 //! handle/pointer parameters are `Option<T>` (a null handle is an explicit
 //! `None`), GDI object handles need an explicit `.into()` to `HGDIOBJ`, and
-//! `CreateFontW` gained typed charset / precision / quality newtypes. Call
-//! sites go through this module, never through the `windows` crate directly,
-//! so a future `windows` bump stays a body-only edit inside this one file.
+//! `CreateFontW` gained typed charset / precision / quality newtypes. Win32
+//! API call sites go through this module, never through the `windows` crate
+//! directly, so a future `windows` bump stays a body-only edit inside this
+//! one file. (COM/UIA code legitimately uses `windows` COM types directly.)
 
 use core::ffi::c_void;
 

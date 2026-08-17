@@ -26,6 +26,8 @@ pub const COMPACT_POSITION_MSG: u32 = WM_APP + 9;
 /// the next change — routing any message to another window — silently execute
 /// the wrong handler. The `WM_APP + 13` UIA activation id is enumerated here
 /// too, so the assertion covers the newest message class as it grows.
+/// Maintenance contract: adding (or renumbering) any app-private message id
+/// must update this list — the compiler only checks ids it can see.
 pub(crate) const APP_PRIVATE_MESSAGE_IDS: [u32; 13] = [
     MEDIA_EVENT_MSG,
     TOGGLE_MSG,
