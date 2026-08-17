@@ -1,18 +1,11 @@
 //! Thin, version-stable facade over the raw Win32 API WinGlance calls.
 //!
-//! The `windows` crate changed many Win32 signatures between 0.58 and 0.62:
-//! handle/pointer parameters became `Option<T>` (a null handle is now an
-//! explicit `None`), GDI object handles need an explicit `.into()` to
-//! `HGDIOBJ`, and `CreateFontW` gained typed charset / precision / quality
-//! newtypes. Those changes only affect the function bodies below; the
-//! signatures in this module are identical on both versions, so call sites
-//! never see the churn and the next `windows` bump is a body-only edit.
-//!
-//! Bodies are written in the 0.58 form; the 0.62 form of each body is shown
-//! in the trailing comment and is the only part the migration's bump commit
-//! flips. (On 0.58, `None`-able handles are passed as `Option<&T>` through
-//! `Param`; on 0.62 they are passed as `Option<T>` directly.) New call sites
-//! go through this module, never through the `windows` crate directly.
+//! The `windows` 0.62 crate changed many Win32 signatures from 0.58:
+//! handle/pointer parameters are `Option<T>` (a null handle is an explicit
+//! `None`), GDI object handles need an explicit `.into()` to `HGDIOBJ`, and
+//! `CreateFontW` gained typed charset / precision / quality newtypes. Call
+//! sites go through this module, never through the `windows` crate directly,
+//! so a future `windows` bump stays a body-only edit inside this one file.
 
 use core::ffi::c_void;
 
