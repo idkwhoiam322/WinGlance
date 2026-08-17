@@ -6436,21 +6436,24 @@ fn focus_setting_at_body(hwnd: HWND, row_index: usize, sub: SettingSub) {
         return;
     }
     let old = state.settings_hover;
-    state.settings_hover = new_hover;
     let (client_w, client_h) = client_size(hwnd);
     let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
     let sidebar_w = (SIDEBAR_W * scale).round() as i32;
     let pad = (PAD * scale) as i32;
+    // Commit hover only when the pair exists in the live layout: a stale
+    // provider snapshot (taken before a settings change removed the row) or
+    // a crafted message must not leave hover pointing at a control that does
+    // not exist. Mirrors the strict validation on the activate path.
+    let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
+    let Some(target) = targets.iter().find(|t| t.row_index == row_index && t.sub == sub) else {
+        return;
+    };
+    state.settings_hover = new_hover;
     // Recenter the focused control if it would fall outside the visible band
     // (mirrors `focus_settings_target`).
     let row_h = (34.0 * scale) as i32;
-    if let Some(t) = state
-        .settings_focus_targets(sidebar_w, client_w, pad, scale)
-        .iter()
-        .find(|t| t.row_index == row_index && t.sub == sub)
-        && (t.cy < state.settings_scroll_y + row_h / 2 || t.cy > state.settings_scroll_y + client_h - row_h / 2)
-    {
-        state.settings_scroll_y = t.cy - client_h / 2;
+    if target.cy < state.settings_scroll_y + row_h / 2 || target.cy > state.settings_scroll_y + client_h - row_h / 2 {
+        state.settings_scroll_y = target.cy - client_h / 2;
         state.sync_settings_scroll(client_w, client_h);
     }
     state.invalidate_hover_rows(client_w, old, new_hover);
