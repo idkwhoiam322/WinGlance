@@ -683,6 +683,16 @@ impl ListenerState {
             if self.shutdown.load(Ordering::SeqCst) {
                 break;
             }
+            // A stalled worker is leaked, not joined, so this thread can
+            // outlive the restart that superseded it. A superseded worker
+            // must not take further turns: draining the control mailbox
+            // would consume commands meant for the successor, and each
+            // poll is wasted COM work. Exit so run_initialized's cleanup
+            // unsubscribes this worker's sessions.
+            if !self.is_current_generation() {
+                debug!("SMTC worker superseded by a newer generation; exiting");
+                break;
+            }
             // Control commands apply on this turn, before any receive, so a
             // push whose wake-up hint was dropped by a saturated queue still
             // lands within one loop iteration (the loop wakes at least every
@@ -830,11 +840,20 @@ impl ListenerState {
     /// worker restarts, so a push made just before a restart is applied by
     /// the replacement worker.
     fn drain_control(&mut self) -> Result<()> {
-        let commands = self
-            .control_mailbox
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .drain();
+        // Verify-take under the mailbox lock: the supervisor bumps the
+        // generation under this same lock when it restarts the worker, so a
+        // superseded worker that reaches this turn cannot consume the
+        // commands — they stay in the mailbox for the successor.
+        let commands = {
+            let mut mailbox = self
+                .control_mailbox
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !self.is_current_generation() {
+                return Ok(());
+            }
+            mailbox.drain()
+        };
         for command in commands {
             self.handle_control(command)?;
         }
@@ -4841,6 +4860,96 @@ mod tests {
         assert_eq!(raw, &["new-app".to_string()]);
         assert_eq!(normalized, &["newapp".to_string()]);
         drop(signal_rx);
+        std::mem::forget(state);
+    }
+
+    #[test]
+    fn stale_worker_drain_leaves_commands_for_the_successor() {
+        // A worker superseded by a restart must not consume control commands:
+        // the mailbox survives restarts precisely so the replacement worker
+        // applies them. The drain's verify-take under the mailbox lock is
+        // what enforces this; the supervisor's bump takes the same lock, so
+        // verify-and-take is atomic with the restart.
+        let (output, _rx) = mpsc::sync_channel(1);
+        let (signal_tx, _signal_rx) = mpsc::sync_channel::<Signal>(SIGNAL_QUEUE_CAP);
+        let mailbox = Arc::new(Mutex::new(ControlMailbox::default()));
+        let live_generation = Arc::new(AtomicU64::new(0));
+        let mut state = ListenerState::new(
+            unsafe { GlobalSystemMediaTransportControlsSessionManager::from_raw(std::ptr::null_mut()) },
+            ListenerSeed {
+                media_sources: vec!["seed-app".to_string()],
+                debounce_ms: 200,
+            },
+            output,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            signal_tx,
+            Arc::new(Mutex::new(Instant::now())),
+            live_generation.clone(),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            mailbox.clone(),
+        );
+        mailbox
+            .lock()
+            .unwrap()
+            .push(ControlCommand::SetAllowedSources(vec!["new-app".to_string()]));
+        // The supervisor bumps the generation the moment it restarts the
+        // worker; the stale worker's drain must then leave the mailbox alone.
+        live_generation.store(1, Ordering::SeqCst);
+        state.drain_control().unwrap();
+        // The command is still pending for the successor.
+        let pending = mailbox.lock().unwrap().drain();
+        assert!(
+            matches!(&pending[0], ControlCommand::SetAllowedSources(sources) if sources == &["new-app".to_string()]),
+            "a superseded worker must not consume the successor's commands"
+        );
+        // And the stale worker's own state was untouched.
+        assert_eq!(
+            state.cached_allowed.as_ref().expect("seed allow list stored").0,
+            &["seed-app".to_string()]
+        );
+        std::mem::forget(state);
+    }
+
+    #[test]
+    fn superseded_worker_exits_its_event_loop_promptly() {
+        // The turn-top generation check makes a superseded worker leave
+        // without draining the mailbox, polling sessions, or waiting out its
+        // receive timeout. Without the check the loop runs until `shutdown`
+        // (never set here), so the elapsed assertion fails instead of the
+        // test hanging.
+        let (output, _rx) = mpsc::sync_channel(1);
+        let (signal_tx, signal_rx) = mpsc::sync_channel::<Signal>(SIGNAL_QUEUE_CAP);
+        let mailbox = Arc::new(Mutex::new(ControlMailbox::default()));
+        let live_generation = Arc::new(AtomicU64::new(0));
+        let mut state = ListenerState::new(
+            unsafe { GlobalSystemMediaTransportControlsSessionManager::from_raw(std::ptr::null_mut()) },
+            ListenerSeed {
+                media_sources: vec![],
+                debounce_ms: 200,
+            },
+            output,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            signal_tx.clone(),
+            Arc::new(Mutex::new(Instant::now())),
+            live_generation.clone(),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            mailbox.clone(),
+        );
+        live_generation.store(1, Ordering::SeqCst);
+        let started = Instant::now();
+        state
+            .event_loop(Arc::new(Mutex::new(signal_rx)))
+            .expect("a superseded worker exits cleanly");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a superseded worker must exit without waiting out its receive timeout"
+        );
         std::mem::forget(state);
     }
 

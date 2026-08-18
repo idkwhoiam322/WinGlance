@@ -848,7 +848,16 @@ fn main() -> Result<()> {
                 let worker_heartbeat = supervisor_heartbeat.clone();
                 let worker_generation = supervisor_generation.clone();
                 let worker_shutdown = supervisor_shutdown.clone();
-                let my_generation = supervisor_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                let my_generation = {
+                    // Bump under the mailbox lock so the verify-take in the
+                    // worker's `drain_control` (same lock) is atomic with the
+                    // restart: a superseded worker can never consume a control
+                    // command meant for its successor.
+                    let _guard = supervisor_control_mailbox
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    supervisor_generation.fetch_add(1, Ordering::SeqCst) + 1
+                };
                 let event_tx_worker = event_tx.clone();
                 let art_worker = supervisor_art.clone();
                 let budget_warned_worker = supervisor_budget_warned.clone();
