@@ -6598,7 +6598,7 @@ mod tests {
         // A failed save: the in-memory change applies, the disk does not move,
         // and the persistent SaveFailed banner appears (category Other for the
         // injected non-OS error).
-        test_hooks::set_fail_next_save();
+        test_hooks::set_fail_next_save(&config_path);
         state.mutate_config(|c| c.overlay.duration_ms = 5000);
         assert_eq!(state.config_status, Some(ConfigStatus::SaveFailed(SaveFailKind::Other)));
         assert_eq!(state.cfg().overlay.duration_ms, 5000, "the change applies in memory");
@@ -6629,7 +6629,7 @@ mod tests {
         assert!(with_banner.content_extent > 800, "the banner adds document height");
 
         // The banner persists across further failed saves.
-        test_hooks::set_fail_next_save();
+        test_hooks::set_fail_next_save(&config_path);
         state.mutate_config(|c| c.overlay.duration_ms = 6000);
         assert_eq!(
             state.config_status,

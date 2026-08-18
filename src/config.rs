@@ -11,25 +11,40 @@ use std::time::Duration;
 /// without real I/O faults. Nothing here is reachable from production code.
 #[cfg(test)]
 pub(crate) mod test_hooks {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// When set, `Config::config_path()` resolves here instead of the real
     /// `%APPDATA%` data dir. Set once per test process by the save-failure
     /// regression; no other test resolves the real path.
     pub(crate) static CONFIG_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
-    /// When armed, the next `write_temp_and_rename` fails before touching the
-    /// filesystem, simulating a disk-full or permission-denied save failure.
-    static FAIL_NEXT_CONFIG_WRITE: AtomicBool = AtomicBool::new(false);
+    /// When armed for a path, the next `write_temp_and_rename` to that exact
+    /// path fails before touching the filesystem, simulating a disk-full or
+    /// permission-denied save failure. The injection is scoped to the save
+    /// target so tests running in parallel cannot consume each other's armed
+    /// failure: only a save to the armed path takes it.
+    static FAIL_NEXT_CONFIG_WRITE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-    pub(crate) fn set_fail_next_save() {
-        FAIL_NEXT_CONFIG_WRITE.store(true, Ordering::SeqCst);
+    pub(crate) fn set_fail_next_save(path: &Path) {
+        *FAIL_NEXT_CONFIG_WRITE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.to_path_buf());
     }
 
-    pub(crate) fn take_fail_next_save() -> bool {
-        FAIL_NEXT_CONFIG_WRITE.swap(false, Ordering::SeqCst)
+    /// Consumes the armed failure only for a save to the exact armed path; a
+    /// save to any other path leaves the arm in place for the arming test.
+    pub(crate) fn take_fail_next_save(path: &Path) -> bool {
+        let mut armed = FAIL_NEXT_CONFIG_WRITE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if armed.as_deref() == Some(path) {
+            armed.take();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -713,7 +728,7 @@ impl Config {
     fn write_temp_and_rename(config_path: &Path, content: &[u8]) -> anyhow::Result<()> {
         #[cfg(test)]
         {
-            if test_hooks::take_fail_next_save() {
+            if test_hooks::take_fail_next_save(config_path) {
                 return Err(anyhow::anyhow!(
                     "injected save failure (simulated disk-full/permission error)"
                 ));
@@ -1163,7 +1178,7 @@ nested_appearance = [1, 2, 3]
         let mut config = Config::load_from_path(&config_path).unwrap();
         config.overlay.duration_ms = 5000;
 
-        test_hooks::set_fail_next_save();
+        test_hooks::set_fail_next_save(&config_path);
         let result = config.save_checked_to(&config_path);
         assert!(result.is_err(), "the injected failure must surface as a save error");
         assert_eq!(
