@@ -11,7 +11,9 @@ use std::time::Duration;
 /// without real I/O faults. Nothing here is reachable from production code.
 #[cfg(test)]
 pub(crate) mod test_hooks {
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use std::sync::LazyLock;
     use std::sync::Mutex;
     use std::sync::OnceLock;
 
@@ -20,31 +22,37 @@ pub(crate) mod test_hooks {
     /// regression; no other test resolves the real path.
     pub(crate) static CONFIG_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
-    /// When armed for a path, the next `write_temp_and_rename` to that exact
-    /// path fails before touching the filesystem, simulating a disk-full or
-    /// permission-denied save failure. The injection is scoped to the save
-    /// target so tests running in parallel cannot consume each other's armed
-    /// failure: only a save to the armed path takes it.
-    static FAIL_NEXT_CONFIG_WRITE: Mutex<Option<PathBuf>> = Mutex::new(None);
+    /// Armed save failures, keyed by the exact target path, counted per arm.
+    /// `set_fail_next_save` increments the path's count; a save to that path
+    /// consumes one arm (`take_fail_next_save` decrements, removing the entry
+    /// at zero). Tests running in parallel are isolated on both sides: a
+    /// concurrent save to another path cannot consume the arm, and another
+    /// test arming a different path cannot replace it — the failure is bound
+    /// to the path and the number of times it was armed.
+    static FAIL_NEXT_CONFIG_WRITE: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
     pub(crate) fn set_fail_next_save(path: &Path) {
-        *FAIL_NEXT_CONFIG_WRITE
+        let mut armed = FAIL_NEXT_CONFIG_WRITE
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.to_path_buf());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *armed.entry(path.to_path_buf()).or_insert(0) += 1;
     }
 
-    /// Consumes the armed failure only for a save to the exact armed path; a
-    /// save to any other path leaves the arm in place for the arming test.
+    /// Consumes one armed failure for the exact path; a save to any other
+    /// path leaves every arm in place.
     pub(crate) fn take_fail_next_save(path: &Path) -> bool {
         let mut armed = FAIL_NEXT_CONFIG_WRITE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if armed.as_deref() == Some(path) {
-            armed.take();
-            true
-        } else {
-            false
+        let Some(count) = armed.get_mut(path) else {
+            return false;
+        };
+        *count -= 1;
+        if *count == 0 {
+            armed.remove(path);
         }
+        true
     }
 }
 
@@ -1192,6 +1200,54 @@ nested_appearance = [1, 2, 3]
             config.save_checked_to(&config_path).unwrap(),
             SaveOutcome::Saved(_)
         ));
+    }
+
+    #[test]
+    fn injected_failures_arm_independently_per_path() {
+        // Two saves armed for different paths, before either save runs, must
+        // each fail exactly once: a parallel test arming another path must
+        // not clobber this test's arm (the regression the single-slot
+        // injector had). The arms are also consumed by the save to their own
+        // path only — the production call path is the witness, not the hook.
+        let guard_a = TempDir::new("save-fail-a");
+        let path_a = guard_a.dir.join("config.toml");
+        let guard_b = TempDir::new("save-fail-b");
+        let path_b = guard_b.dir.join("config.toml");
+        std::fs::write(&path_a, "overlay.duration_ms = 4000\n").unwrap();
+        std::fs::write(&path_b, "overlay.duration_ms = 4000\n").unwrap();
+        let mut config_a = Config::load_from_path(&path_a).unwrap();
+        let mut config_b = Config::load_from_path(&path_b).unwrap();
+        config_a.overlay.duration_ms = 5000;
+        config_b.overlay.duration_ms = 5000;
+
+        test_hooks::set_fail_next_save(&path_a);
+        test_hooks::set_fail_next_save(&path_b);
+
+        assert!(
+            config_a.save_checked_to(&path_a).is_err(),
+            "path A's arm must not be clobbered by the arm for path B"
+        );
+        assert!(
+            config_b.save_checked_to(&path_b).is_err(),
+            "path B's arm must not be clobbered by the arm for path A"
+        );
+        assert!(
+            matches!(config_a.save_checked_to(&path_a).unwrap(), SaveOutcome::Saved(_)),
+            "each arm fails exactly one save"
+        );
+    }
+
+    #[test]
+    fn repeated_arms_for_the_same_path_each_fail_once() {
+        // Arming the same path twice must fail two saves, not collapse into
+        // one arm (a same-path double arm happens when the main-window banner
+        // test arms twice across two failed saves).
+        let path = std::env::temp_dir().join(format!("winglance-inject-repeat-{}", std::process::id()));
+        test_hooks::set_fail_next_save(&path);
+        test_hooks::set_fail_next_save(&path);
+        assert!(test_hooks::take_fail_next_save(&path), "first arm consumed");
+        assert!(test_hooks::take_fail_next_save(&path), "second arm must not be lost");
+        assert!(!test_hooks::take_fail_next_save(&path), "both arms consumed");
     }
 
     #[test]
