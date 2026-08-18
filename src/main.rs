@@ -18,17 +18,17 @@ mod winapi;
 mod winutil;
 
 use crate::config::Config;
-use crate::winapi::{create_file, post_message};
+use crate::winapi::post_message;
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::collections::VecDeque;
 use std::env;
 use std::ffi::c_void;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::IntoRawHandle;
 use std::path::Path;
 use std::process;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
@@ -36,11 +36,7 @@ use windows::Win32::Foundation::{
     WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
-use windows::Win32::Storage::FileSystem::{
-    FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, GetFileSize, OPEN_ALWAYS, SetEndOfFile, SetFilePointer,
-    WriteFile,
-};
+use windows::Win32::Storage::FileSystem::{FILE_BEGIN, GetFileSize, SetEndOfFile, SetFilePointer, WriteFile};
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
 };
@@ -60,7 +56,18 @@ use crate::events::{MEDIA_EVENT_MSG, MediaEvent, artwork_bytes};
 use crate::overlay::EventQueue;
 use crate::winutil::wide;
 
-static CRASH_LOG_PATH: OnceLock<Vec<u16>> = OnceLock::new();
+/// The verified `crash.log` handle retained for the exception handler's
+/// lifetime. Opened at startup under the pinned-verified discipline (parent
+/// pinned through the open, final component not followed, identity validated
+/// before any write), so the allocation-free handler can append through this
+/// handle without any open — a reparse swap of any path component after
+/// startup can never redirect a crash write, because the handle names the
+/// object that was verified. Stored as a raw `usize` because `HANDLE` is
+/// neither `Send` nor `Sync`; zero means the open failed and the handler
+/// silently skips the crash log. The OS closes the handle at process exit;
+/// it is deliberately never closed in the handler (which must stay
+/// allocation- and teardown-free).
+static CRASH_LOG_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
 /// Writes literal bytes into the stack buffer, truncating if the buffer is full.
 /// Returns the new write position.
@@ -183,52 +190,44 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         pos = crash_write_str(&mut buf, pos, b")\n");
     }
 
-    // Write via raw Win32 APIs: CreateFileW (append), WriteFile, CloseHandle.
-    // The path was pre-computed as a null-terminated UTF-16 string at install
-    // time, so no allocation happens here.
-    if let Some(path) = CRASH_LOG_PATH.get() {
-        let handle = unsafe {
-            create_file(
-                PCWSTR(path.as_ptr()),
-                FILE_APPEND_DATA.0 | FILE_WRITE_DATA.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                None,
-                OPEN_ALWAYS,
-                // FILE_FLAG_OPEN_REPARSE_POINT: the entry is opened without
-                // following a pre-created crash.log symlink, so a hostile link
-                // can redirect the crash write to nothing (the link entry
-                // itself gets appended to or fails) — never to an
-                // attacker-chosen target. This handler cannot verify the
-                // surrounding path (allocation-free); the logs dir itself is
-                // verified at startup by init_logging.
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-                HANDLE::default(),
-            )
-        };
-        if let Ok(handle) = handle {
+    // Append through the verified handle retained at install time: the object
+    // was opened under the pinned parent and identity-validated before the
+    // open returned, so no path component can be swapped out from under the
+    // crash write. No open, no close and no allocation happen here.
+    let raw = CRASH_LOG_HANDLE.load(Ordering::SeqCst);
+    if raw != 0 {
+        let handle = HANDLE(raw as *mut c_void);
+        unsafe {
             // Keep crash.log bounded even on the allocation-free handler path:
-            // a crash loop must not grow it without limit.
-            unsafe {
-                if GetFileSize(handle, None) > CRASH_LOG_CAP as u32 {
-                    let _ = SetFilePointer(handle, 0, None, FILE_BEGIN);
-                    let _ = SetEndOfFile(handle);
-                }
+            // a crash loop must not grow it without limit. The pointer is
+            // positioned at EOF first so the crash record is always APPENDED,
+            // never written over earlier records (the handle carries both
+            // FILE_APPEND_DATA and FILE_WRITE_DATA, so the OS does not force
+            // appends automatically).
+            if GetFileSize(handle, None) > CRASH_LOG_CAP as u32 {
+                let _ = SetFilePointer(handle, 0, None, FILE_BEGIN);
+                let _ = SetEndOfFile(handle);
             }
+            let _ = SetFilePointer(handle, 0, None, windows::Win32::Storage::FileSystem::FILE_END);
             let mut written: u32 = 0;
-            let _ = unsafe { WriteFile(handle, Some(&buf[..pos]), Some(&mut written as *mut _), None) };
-            let _ = unsafe { CloseHandle(handle) };
+            let _ = WriteFile(handle, Some(&buf[..pos]), Some(&mut written as *mut _), None);
         }
     }
     0 // EXCEPTION_CONTINUE_SEARCH
 }
 
 fn install_crash_handler(logs_dir: &Path) {
-    // Pre-build the crash.log path as a null-terminated UTF-16 string so the
-    // exception handler can pass it to CreateFileW without any heap allocation
-    // during a crash.
-    let full_path = logs_dir.join("crash.log");
-    let wide: Vec<u16> = full_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let _ = CRASH_LOG_PATH.set(wide);
+    // Pre-open crash.log under the verified-write discipline and retain the
+    // handle: the allocation-free exception handler appends through it, so a
+    // reparse swap of any path component after startup can never redirect a
+    // crash write (the object was opened under the pinned parent and
+    // identity-validated before the open returned). An empty crash.log may
+    // appear at startup — that is the point: it pins the verified object. If
+    // the open fails the handler degrades to skipping the crash log, exactly
+    // as it did when the per-crash open failed.
+    if let Ok(file) = crate::winutil::open_verified_file(&logs_dir.join("crash.log"), false) {
+        CRASH_LOG_HANDLE.store(file.into_raw_handle() as usize, Ordering::SeqCst);
+    }
     unsafe {
         AddVectoredExceptionHandler(1, Some(crash_handler));
     }
@@ -1335,6 +1334,48 @@ fn message_loop() -> Result<()> {
 mod tests {
     use super::*;
     use crate::events::{PlaybackState, media_event_into_owned};
+
+    #[test]
+    fn crash_log_handle_is_retained_under_the_verified_discipline_at_install() {
+        // AF-001 regression for the exception-handler path: install must open
+        // crash.log under the verified-write discipline (pinned parent,
+        // no-reparse-follow, identity-checked) and RETAIN the handle, so the
+        // allocation-free handler can append without any open — a reparse
+        // swap of any path component after startup can never redirect the
+        // crash write. The vectored handler this installs is inert for the
+        // rest of the test process (it always returns EXCEPTION_CONTINUE_SEARCH
+        // and only fires on access violations, which no test raises).
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("winglance-crash-handle-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        install_crash_handler(&dir);
+
+        let raw = CRASH_LOG_HANDLE.load(Ordering::SeqCst);
+        assert_ne!(raw, 0, "the verified crash-log handle must be retained at install");
+        let crash_log = dir.join("crash.log");
+        assert!(
+            crash_log.is_file(),
+            "install must pre-open the verified crash.log ({} exists)",
+            crash_log.display()
+        );
+        // The retained handle is a real append-capable handle: appending
+        // through it lands in crash.log.
+        let handle = HANDLE(raw as *mut c_void);
+        unsafe {
+            let _ = SetFilePointer(handle, 0, None, windows::Win32::Storage::FileSystem::FILE_END);
+            let mut written: u32 = 0;
+            let _ = WriteFile(handle, Some(b"test crash record\n"), Some(&mut written as *mut _), None);
+        }
+        assert_eq!(
+            std::fs::read(&crash_log).unwrap(),
+            b"test crash record\n",
+            "writes through the retained handle must land in the verified crash.log"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn worker_restart_budget_is_shared_by_every_failure_kind() {

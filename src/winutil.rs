@@ -566,9 +566,10 @@ pub(crate) fn copy_wide_terminated(buffer: &mut [u16], value: &str) {
 // ────────────────────────────────────────────────────────────────────────────
 
 use std::ffi::OsString;
-use std::io;
+use std::fs::File;
+use std::io::{self, Seek, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::os::windows::io::RawHandle;
+use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -576,10 +577,10 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_DISPOSITION_FLAG_DELETE, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FlushFileBuffers,
-    GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_ALWAYS, OPEN_EXISTING, SetFileInformationByHandle,
-    WriteFile,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FlushFileBuffers,
+    GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_ALWAYS, OPEN_EXISTING, SetEndOfFile,
+    SetFileInformationByHandle, SetFilePointer, WriteFile,
 };
 
 /// The Win32 DELETE access right (0x0001_0000); `windows` 0.58 does not export
@@ -674,11 +675,6 @@ fn final_path_of_raw(handle: HANDLE) -> io::Result<PathBuf> {
         }
         capacity = len + 1;
     }
-}
-
-/// `final_path_of_raw` for any Rust handle (e.g. a `std::fs::File`).
-pub(crate) fn final_path_of(raw: RawHandle) -> io::Result<PathBuf> {
-    final_path_of_raw(HANDLE(raw))
 }
 
 /// A pinned, verified directory handle. While the guard lives the directory
@@ -925,26 +921,31 @@ pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<(
     Err(io::Error::other("could not create a unique temp file after 4 attempts"))
 }
 
-/// Appends `data` to `path`, verifying the parent's identity and opening the
-/// final component with `FILE_FLAG_OPEN_REPARSE_POINT` so a pre-created
-/// symlink is never followed (an append goes to the link's own entry or
-/// fails, never to the link target). Used by the crash.log writers, which
-/// run where a full temp+rename transaction is not warranted.
-pub(crate) fn append_verified(path: &Path, data: &[u8]) -> io::Result<()> {
-    append_verified_bounded(path, data, u64::MAX)
-}
-
-/// `append_verified` with a size cap: when the file already exceeds `cap`,
-/// it is truncated to zero before the append, so a crash loop cannot grow it
-/// without bound (matches the cap applied on the allocation-free handler
-/// path).
-pub(crate) fn append_verified_bounded(path: &Path, data: &[u8], cap: u64) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let _guard = open_pinned_parent(parent)?;
+/// Opens `path` for writing under the verified-write discipline, with the
+/// parent pinned and identity-verified through the open, the final component
+/// opened with `FILE_FLAG_OPEN_REPARSE_POINT` so a pre-created link is never
+/// followed, and the handle's final path checked against the expected path
+/// BEFORE any mutation happens. The opened object is additionally rejected
+/// when it carries the reparse attribute or is a directory, so a
+/// final-component link is refused outright instead of being written through
+/// or truncated. `truncate` (the caller's one destructive open) applies only
+/// to the validated object. On any rejection the target entry and everything
+/// outside the verified parent are byte-identical; nothing is ever created,
+/// truncated, or written through a link or a swapped parent.
+pub(crate) fn open_verified_file(path: &Path, truncate: bool) -> io::Result<File> {
+    let parent = path.parent();
+    if let Some(parent) = parent
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
     }
+    // Held through the open, validation and (when requested) the truncate:
+    // while the guard lives the parent cannot be renamed or removed, so no
+    // swap synchronized between validation and open can redirect the write.
+    let _guard = match parent {
+        Some(parent) => Some(open_pinned_parent(parent)?),
+        None => None,
+    };
     let wide = path
         .as_os_str()
         .encode_wide()
@@ -954,7 +955,7 @@ pub(crate) fn append_verified_bounded(path: &Path, data: &[u8], cap: u64) -> io:
         create_file(
             windows::core::PCWSTR(wide.as_ptr()),
             (FILE_APPEND_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES).0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_ALWAYS,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -962,47 +963,87 @@ pub(crate) fn append_verified_bounded(path: &Path, data: &[u8], cap: u64) -> io:
         )
     }
     .map_err(to_io)?;
-    let result = (|| -> io::Result<()> {
-        let final_path = final_path_of_raw(handle)?;
-        if !paths_equal(&final_path, &extended_path(path)) {
-            return Err(io::Error::other(format!(
-                "append target final path does not match the expected path (resolved to {})",
-                final_path.display()
-            )));
-        }
-        if cap != u64::MAX {
-            let mut info = BY_HANDLE_FILE_INFORMATION::default();
-            unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(to_io)?;
-            let size = ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64;
-            if size > cap {
-                unsafe {
-                    let _ = windows::Win32::Storage::FileSystem::SetFilePointer(
-                        handle,
-                        0,
-                        None,
-                        windows::Win32::Storage::FileSystem::FILE_BEGIN,
-                    );
-                    let _ = windows::Win32::Storage::FileSystem::SetEndOfFile(handle);
-                }
-            }
-        }
-        // With FILE_WRITE_DATA granted (needed for the truncation above) the
-        // OS no longer writes at EOF automatically, so position the pointer
-        // explicitly before every append.
+
+    let reject = |message: &str| {
         unsafe {
-            let _ = windows::Win32::Storage::FileSystem::SetFilePointer(
-                handle,
-                0,
-                None,
-                windows::Win32::Storage::FileSystem::FILE_END,
-            );
+            let _ = CloseHandle(handle);
         }
-        unsafe { WriteFile(handle, Some(data), None, None) }.map_err(to_io)
-    })();
-    unsafe {
-        let _ = CloseHandle(handle);
+        Err(io::Error::other(message))
+    };
+
+    // Identity checks on the OPENED OBJECT (the handle names it; the path
+    // cannot be re-resolved) BEFORE any truncation or append.
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if let Err(error) = unsafe { GetFileInformationByHandle(handle, &mut info) } {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Err(to_io(error));
     }
-    result
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return reject(&format!(
+            "refusing to open a reparse point as a log file ({} resolves to a link)",
+            path.display()
+        ));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+        return reject(&format!(
+            "refusing to open a directory as a log file ({})",
+            path.display()
+        ));
+    }
+    let final_path = match final_path_of_raw(handle) {
+        Ok(path) => path,
+        Err(error) => {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err(error);
+        }
+    };
+    if !paths_equal(&final_path, &extended_path(path)) {
+        return reject(&format!(
+            "open target final path does not match the expected path (resolved to {})",
+            final_path.display()
+        ));
+    }
+
+    if truncate {
+        unsafe {
+            let _ = SetFilePointer(handle, 0, None, windows::Win32::Storage::FileSystem::FILE_BEGIN);
+            let _ = SetEndOfFile(handle);
+        }
+    }
+    // SAFETY: `handle` is a real, owned, non-null kernel handle with no other
+    // owner; the returned File closes it on drop.
+    Ok(unsafe { File::from_raw_handle(handle.0) })
+}
+
+/// Appends `data` to `path` through `open_verified_file`: the parent is
+/// pinned through the open, the final component is opened without following a
+/// reparse point and rejected if it IS one, and the identity check lands
+/// before any mutation. Used by the crash.log writers, which run where a full
+/// temp+rename transaction is not warranted.
+pub(crate) fn append_verified(path: &Path, data: &[u8]) -> io::Result<()> {
+    append_verified_bounded(path, data, u64::MAX)
+}
+
+/// `append_verified` with a size cap: when the file already exceeds `cap`,
+/// it is truncated to zero before the append, so a crash loop cannot grow it
+/// without bound (matches the cap applied on the allocation-free handler
+/// path). The truncation happens through the already-verified handle, never
+/// through a re-resolved path.
+pub(crate) fn append_verified_bounded(path: &Path, data: &[u8], cap: u64) -> io::Result<()> {
+    let mut file = open_verified_file(path, false)?;
+    if cap != u64::MAX && file.metadata()?.len() > cap {
+        file.set_len(0)?;
+    }
+    // With FILE_WRITE_DATA granted (needed for the cap truncation) the OS no
+    // longer writes at EOF automatically, so position the pointer explicitly
+    // before every append.
+    file.seek(std::io::SeekFrom::End(0))?;
+    file.write_all(data)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1504,6 +1545,104 @@ mod tests {
 
         assert!(append_verified(&link.join("crash.log"), b"x").is_err());
         assert!(!real.join("target").join("crash.log").exists());
+    }
+
+    #[test]
+    fn open_verified_file_truncates_only_after_validation_and_appends_on_request() {
+        // Truncating open: prior content is removed only after the object was
+        // identity-validated (it is a plain file at the expected path).
+        let guard = TestDir::new("open-truncate");
+        let path = guard.dir.join("live.log");
+        std::fs::write(&path, b"previous session\n").unwrap();
+        let mut file = open_verified_file(&path, true).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0, "the validated file is truncated");
+        file.write_all(b"new session\n").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new session\n");
+
+        // Non-truncating open (the append path): existing content survives
+        // and writes land at EOF.
+        let mut file = open_verified_file(&path, false).unwrap();
+        file.seek(std::io::SeekFrom::End(0)).unwrap();
+        file.write_all(b"second line\n").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new session\nsecond line\n");
+    }
+
+    #[test]
+    fn open_verified_file_creates_a_missing_parent_chain() {
+        let guard = TestDir::new("open-deep");
+        let path = guard.dir.join("a").join("b").join("live.log");
+        let mut file = open_verified_file(&path, true).unwrap();
+        file.write_all(b"x").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+    }
+
+    #[test]
+    fn open_verified_file_rejects_a_final_component_link_and_leaves_the_target() {
+        // A pre-created link at the final name must never be followed: the
+        // open refuses it outright (the object carries the reparse
+        // attribute), and the external target stays byte-identical.
+        let guard = TestDir::new("open-final-link");
+        let real = guard.dir.join("victim.log");
+        let original = b"EXTERNAL TARGET DATA";
+        std::fs::write(&real, original).unwrap();
+        let link = guard.dir.join("log-Live.log");
+        if std::os::windows::fs::symlink_file(&real, &link).is_err() {
+            return;
+        }
+
+        assert!(open_verified_file(&link, true).is_err(), "a link must be rejected");
+        assert!(
+            std::fs::read(&real).unwrap() == original,
+            "the external target must stay byte-identical"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the link entry must not have been replaced or written through"
+        );
+    }
+
+    #[test]
+    fn open_verified_file_rejects_a_parent_junction_and_creates_nothing() {
+        // A junction swapped into the parent chain must reject the open
+        // before any create: nothing may be created inside the link target.
+        let guard = TestDir::new("open-parent-junction");
+        let real = guard.dir.join("real");
+        std::fs::create_dir_all(real.join("logs")).unwrap();
+        let evil = guard.dir.join("evil");
+        if std::os::windows::fs::symlink_dir(&real, &evil).is_err() {
+            return;
+        }
+
+        let target = evil.join("logs").join("live.log");
+        assert!(open_verified_file(&target, true).is_err());
+        assert!(
+            !real.join("logs").join("live.log").exists(),
+            "no file may be created through the junction"
+        );
+    }
+
+    #[test]
+    fn pinned_parent_rejects_a_rename_while_the_guard_is_held() {
+        // The pin is what closes the validation-to-open swap window: while
+        // the guard lives the parent directory cannot be renamed or removed,
+        // so a swap synchronized between validation and open cannot land.
+        // After the guard drops the rename succeeds, proving the guard was
+        // the blocker.
+        let guard = TestDir::new("pin-rename");
+        let pinned = guard.dir.join("logs");
+        std::fs::create_dir_all(&pinned).unwrap();
+        let pinned_guard = open_pinned_parent(&pinned).unwrap();
+        let renamed = guard.dir.join("logs-renamed");
+        assert!(
+            std::fs::rename(&pinned, &renamed).is_err(),
+            "the pinned parent must refuse a rename while the guard is held"
+        );
+        drop(pinned_guard);
+        std::fs::rename(&pinned, &renamed).unwrap();
+        assert!(renamed.is_dir());
     }
 
     #[test]

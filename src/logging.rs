@@ -1,8 +1,7 @@
 use chrono::Local;
 use log::{LevelFilter, Log, Metadata, Record};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
-use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -21,35 +20,20 @@ const LIVE_LOG_CAP: u64 = 1024 * 1024;
 /// count from: the file's length at open, so the cap bounds the total file
 /// and repeated restarts with short sessions cannot grow it without bound.
 ///
-/// The parent directory is pinned and identity-verified before the
-/// open (a junction swapped into the logs dir rejects the launch), and the
-/// opened file's final handle path must match the expected path, so a
-/// pre-created `log-Live.log` symlink cannot redirect the session's writes.
+/// The open is the verified-write transaction (`winutil::open_verified_file`):
+/// the parent directory is pinned and identity-verified THROUGH the open, the
+/// final component is opened with `FILE_FLAG_OPEN_REPARSE_POINT` and rejected
+/// when it is a link, and the handle's final path must equal the expected
+/// path before the file is truncated or appended — so a pre-created
+/// `log-Live.log` symlink, a junction swapped into the logs dir, or a parent
+/// swap racing the open can never create, truncate, or append outside the
+/// logs directory.
 fn open_live_log(live_path: &Path, preserve: bool) -> std::io::Result<(File, u64)> {
-    if let Some(parent) = live_path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Held only for the open: the file handle is the anchor from here on.
-        let _guard = crate::winutil::open_pinned_parent(parent)?;
-    }
-    let mut options = OpenOptions::new();
-    options.create(true).write(true);
+    let mut file = crate::winutil::open_verified_file(live_path, /*truncate=*/ !preserve)?;
     if preserve {
-        options.append(true);
-    } else {
-        options.truncate(true);
-    }
-    let mut file = options.open(live_path)?;
-    let final_path = crate::winutil::final_path_of(file.as_raw_handle())?;
-    if !crate::winutil::paths_equal(&final_path, &crate::winutil::extended_path(live_path)) {
-        return Err(std::io::Error::other(format!(
-            "live log resolved outside the expected path ({} vs {})",
-            final_path.display(),
-            live_path.display()
-        )));
-    }
-    if preserve {
+        // The boundary line is appended after the verified open, at the real
+        // end of the preserved file (the open leaves the pointer at 0).
+        file.seek(SeekFrom::End(0))?;
         file.write_all(
             format!(
                 "===== restarted via the Settings 'Restart app' action at {} =====\n",
@@ -180,6 +164,60 @@ mod tests {
         assert_eq!(file.metadata().unwrap().len(), 0, "the file must be truncated");
         // Drop the handle before the guard removes the directory.
         drop(file);
+    }
+
+    #[test]
+    fn live_log_open_rejects_a_final_component_link_and_leaves_the_target() {
+        // A pre-created log-Live.log link must be refused before any
+        // truncate/append: the launch fails and the external target stays
+        // byte-identical (the final component carries the reparse attribute
+        // and is rejected outright by the verified open).
+        let guard = TestDir::new("live-log-link");
+        let real = guard.dir.join("victim.log");
+        let original = b"EXTERNAL TARGET DATA";
+        std::fs::write(&real, original).unwrap();
+        let live_path = guard.dir.join("log-Live.log");
+        if std::os::windows::fs::symlink_file(&real, &live_path).is_err() {
+            return;
+        }
+
+        assert!(
+            open_live_log(&live_path, false).is_err(),
+            "a link at the live log name must be rejected"
+        );
+        assert!(
+            open_live_log(&live_path, true).is_err(),
+            "even the preserve path must reject a link"
+        );
+        assert_eq!(
+            std::fs::read(&real).unwrap(),
+            original,
+            "the external target must stay byte-identical"
+        );
+        assert!(
+            std::fs::symlink_metadata(&live_path).unwrap().file_type().is_symlink(),
+            "the link entry itself must not be truncated or replaced"
+        );
+    }
+
+    #[test]
+    fn live_log_open_rejects_a_parent_junction_and_creates_nothing() {
+        // A junction swapped into the logs directory must reject the launch
+        // before any file is created or truncated inside the link target.
+        let guard = TestDir::new("live-log-junction");
+        let real = guard.dir.join("real");
+        std::fs::create_dir_all(real.join("logs")).unwrap();
+        let evil = guard.dir.join("evil");
+        if std::os::windows::fs::symlink_dir(&real, &evil).is_err() {
+            return;
+        }
+        let live_path = evil.join("logs").join("log-Live.log");
+
+        assert!(open_live_log(&live_path, false).is_err());
+        assert!(
+            !real.join("logs").join("log-Live.log").exists(),
+            "no log file may be created through the junction"
+        );
     }
 
     #[test]
