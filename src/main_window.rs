@@ -290,14 +290,18 @@ struct SettingsLayoutKey {
     status: Option<ConfigStatus>,
 }
 
-/// A keyboard-focusable Settings-pane control. `cx`/`cy` is the window client
-/// coordinate at the control's center — the keyboard handler activates a control
-/// by posting a synthetic `WM_LBUTTONDOWN` there, so it reuses the existing mouse
-/// click path verbatim. The list order (top-to-bottom, left-to-right within a
-/// row) is what Tab/arrows walk.
+/// A keyboard-focusable Settings-pane control. `rect` is the exact interaction
+/// rectangle (client coordinates) of the control — the same geometry the mouse
+/// hit-test and the paint derive from `segment_rects`/`halve`/`position_parts`/
+/// `row_split`, so keyboard focus, the focus outline and the UIA bounds all
+/// agree with what is clickable. `cx`/`cy` is that rect's center; the keyboard
+/// handler activates a control by posting a synthetic `WM_LBUTTONDOWN` there,
+/// so it reuses the existing mouse click path verbatim. The list order
+/// (top-to-bottom, left-to-right within a row) is what Tab/arrows walk.
 struct SettingsFocus {
     row_index: usize,
     sub: SettingSub,
+    rect: RECT,
     cx: i32,
     cy: i32,
 }
@@ -3446,20 +3450,23 @@ impl MainWindowState {
                             );
                         }
                     }
-                    // The dedicated keyboard-focus outline: the row
-                    // the keyboard cursor is on gets a border whose color is
-                    // checked against the painted surface at 3:1, instead of
-                    // relying on the low-delta hover fill. The width follows
-                    // the user's focus-border metric, clamped to a sane 1-3
-                    // px so a huge metric cannot swallow a 34 px row.
-                    if settings_hover.is_some_and(|(r, _)| r == current_row) {
+                    // The dedicated keyboard-focus outline: the exact
+                    // interaction rectangle of the focused sub-control (the
+                    // same rect the UIA bounds and the click point derive
+                    // from) gets a border whose color is checked against the
+                    // painted surface at 3:1, instead of relying on the
+                    // low-delta hover fill. The width follows the user's
+                    // focus-border metric, clamped to a sane 1-3 px so a huge
+                    // metric cannot swallow a 34 px row.
+                    if let Some((_, sub)) = settings_hover.filter(|(r, _)| *r == current_row) {
+                        let focus_rect = setting_sub_rect(*id, sub, rect, scale).unwrap_or(*rect);
                         let width = crate::winutil::system_preferences().focus_border_px.clamp(1, 3) as i32;
                         for inset in 0..width {
                             let outline = RECT {
-                                left: rect.left + inset,
-                                top: rect.top + inset,
-                                right: rect.right - inset,
-                                bottom: rect.bottom - inset,
+                                left: focus_rect.left + inset,
+                                top: focus_rect.top + inset,
+                                right: focus_rect.right - inset,
+                                bottom: focus_rect.bottom - inset,
                             };
                             unsafe {
                                 let _ = FrameRect(hdc, &outline, self.settings_focus_brush);
@@ -3605,100 +3612,41 @@ impl MainWindowState {
 
     /// Enumerates every keyboard-focusable control in the Settings pane, in the
     /// same top-to-bottom, left-to-right order `settings_hover_at` would visit
-    /// them, each with the client coordinate a click on its center carries. The
-    /// keyboard handler reuses the mouse click path by posting `WM_LBUTTONDOWN`
-    /// at `(cx, cy)`, so this enumeration must stay in lockstep with the hover
-    /// geometry in `settings_hover_at`.
+    /// them, each carrying the EXACT interaction rectangle (and its center, the
+    /// client coordinate a click on the control carries). The keyboard handler
+    /// reuses the mouse click path by posting `WM_LBUTTONDOWN` at `(cx, cy)`, so
+    /// this enumeration must stay in lockstep with the hover geometry in
+    /// `settings_hover_at` — both now derive from the single `setting_sub_rect`.
     fn settings_focus_targets(&self, content_left: i32, client_w: i32, pad: i32, scale: f32) -> Vec<SettingsFocus> {
         let items = self
             .settings_items(content_left, client_w, pad, scale, self.settings_scroll_y)
             .items;
         let mut out = Vec::new();
-        let gap = (4.0 * scale) as i32;
         let mut row_index = 0usize;
         for item in &items {
             if let SettingsItem::Row { id, rect } = item {
-                let control_rect = row_split(rect, scale).control;
-                match *id {
-                    SettingId::Duration => {
-                        for (i, s) in segment_rects(&control_rect, 5, gap).iter().enumerate() {
-                            out.push(SettingsFocus {
-                                row_index,
-                                sub: SettingSub::Seg(i),
-                                cx: (s.left + s.right) / 2,
-                                cy: (s.top + s.bottom) / 2,
-                            });
-                        }
+                let subs: Vec<SettingSub> = match *id {
+                    SettingId::Duration | SettingId::Layout => {
+                        (0..setting_segment_count(*id)).map(SettingSub::Seg).collect()
                     }
-                    SettingId::Layout => {
-                        for (i, s) in segment_rects(&control_rect, 4, gap).iter().enumerate() {
-                            out.push(SettingsFocus {
-                                row_index,
-                                sub: SettingSub::Seg(i),
-                                cx: (s.left + s.right) / 2,
-                                cy: (s.top + s.bottom) / 2,
-                            });
-                        }
-                    }
-                    SettingId::CopyLogs => {
-                        let (open_rect, copy_rect) = halve(&control_rect, gap);
-                        out.push(SettingsFocus {
-                            row_index,
-                            sub: SettingSub::Open,
-                            cx: (open_rect.left + open_rect.right) / 2,
-                            cy: (open_rect.top + open_rect.bottom) / 2,
-                        });
-                        out.push(SettingsFocus {
-                            row_index,
-                            sub: SettingSub::Copy,
-                            cx: (copy_rect.left + copy_rect.right) / 2,
-                            cy: (copy_rect.top + copy_rect.bottom) / 2,
-                        });
-                    }
-                    SettingId::OpenConfig => {
-                        let (open_rect, reload_rect) = halve(&control_rect, gap);
-                        out.push(SettingsFocus {
-                            row_index,
-                            sub: SettingSub::OpenConfig,
-                            cx: (open_rect.left + open_rect.right) / 2,
-                            cy: (open_rect.top + open_rect.bottom) / 2,
-                        });
-                        out.push(SettingsFocus {
-                            row_index,
-                            sub: SettingSub::ReloadConfig,
-                            cx: (reload_rect.left + reload_rect.right) / 2,
-                            cy: (reload_rect.top + reload_rect.bottom) / 2,
-                        });
-                    }
+                    SettingId::CopyLogs => vec![SettingSub::Open, SettingSub::Copy],
+                    SettingId::OpenConfig => vec![SettingSub::OpenConfig, SettingSub::ReloadConfig],
                     SettingId::Position | SettingId::CompactPosition => {
-                        let parts = position_parts(rect, scale);
-                        for (i, a) in parts.anchors.iter().enumerate() {
-                            out.push(SettingsFocus {
-                                row_index,
-                                sub: SettingSub::Anchor(i),
-                                cx: (a.left + a.right) / 2,
-                                cy: (a.top + a.bottom) / 2,
-                            });
-                        }
-                        out.push(SettingsFocus {
-                            row_index,
-                            sub: SettingSub::Reset,
-                            cx: (parts.reset.left + parts.reset.right) / 2,
-                            cy: (parts.reset.top + parts.reset.bottom) / 2,
-                        });
-                        out.push(SettingsFocus {
-                            row_index,
-                            sub: SettingSub::Adjust,
-                            cx: (parts.adjust.left + parts.adjust.right) / 2,
-                            cy: (parts.adjust.top + parts.adjust.bottom) / 2,
-                        });
+                        let mut subs: Vec<SettingSub> = (0..6).map(SettingSub::Anchor).collect();
+                        subs.push(SettingSub::Reset);
+                        subs.push(SettingSub::Adjust);
+                        subs
                     }
-                    _ => {
+                    _ => vec![SettingSub::None],
+                };
+                for sub in subs {
+                    if let Some(control) = setting_sub_rect(*id, sub, rect, scale) {
                         out.push(SettingsFocus {
                             row_index,
-                            sub: SettingSub::None,
-                            cx: (control_rect.left + control_rect.right) / 2,
-                            cy: (control_rect.top + control_rect.bottom) / 2,
+                            sub,
+                            rect: control,
+                            cx: (control.left + control.right) / 2,
+                            cy: (control.top + control.bottom) / 2,
                         });
                     }
                 }
@@ -4894,31 +4842,35 @@ fn setting_segment_count(id: SettingId) -> usize {
     }
 }
 
-#[allow(unsafe_op_in_unsafe_fn)]
-/// The point inside a settings row's `rect` that activates `sub` — the same
-/// geometry the provider enumerates. `None` when the layout has no such
-/// sub-control (a stale or foreign encoded tag).
-fn setting_sub_click_point(id: SettingId, sub: SettingSub, rect: &RECT, scale: f32) -> Option<(i32, i32)> {
+/// The exact interaction rectangle (client coordinates) of a settings
+/// sub-control inside its row's `rect`, from the same geometry the paint and
+/// mouse hit-test use (`segment_rects`, `halve`, `position_parts`, or the
+/// control split). `None` when the layout has no such sub-control (a stale or
+/// foreign encoded tag). Single geometry source for keyboard focus, the focus
+/// outline, the click point, and the UIA bounds — the four must never drift
+/// apart.
+fn setting_sub_rect(id: SettingId, sub: SettingSub, rect: &RECT, scale: f32) -> Option<RECT> {
     let control = row_split(rect, scale).control;
-    let center = |r: &RECT| ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
     match sub {
-        SettingSub::None => Some(center(&control)),
-        SettingSub::Seg(i) => {
-            let count = setting_segment_count(id);
-            segment_rects(&control, count, (4.0 * scale) as i32).get(i).map(center)
-        }
-        SettingSub::Anchor(i) => position_parts(rect, scale).anchors.get(i).map(center),
-        SettingSub::Reset => Some(center(&position_parts(rect, scale).reset)),
-        SettingSub::Adjust => Some(center(&position_parts(rect, scale).adjust)),
-        SettingSub::Open | SettingSub::OpenConfig => {
-            let (open, _) = halve(&control, (4.0 * scale) as i32);
-            Some(center(&open))
-        }
-        SettingSub::Copy | SettingSub::ReloadConfig => {
-            let (_, copy) = halve(&control, (4.0 * scale) as i32);
-            Some(center(&copy))
-        }
+        SettingSub::None => Some(control),
+        SettingSub::Seg(i) => segment_rects(&control, setting_segment_count(id), (4.0 * scale) as i32)
+            .get(i)
+            .copied(),
+        SettingSub::Anchor(i) => position_parts(rect, scale).anchors.get(i).copied(),
+        SettingSub::Reset => Some(position_parts(rect, scale).reset),
+        SettingSub::Adjust => Some(position_parts(rect, scale).adjust),
+        SettingSub::Open | SettingSub::OpenConfig => Some(halve(&control, (4.0 * scale) as i32).0),
+        SettingSub::Copy | SettingSub::ReloadConfig => Some(halve(&control, (4.0 * scale) as i32).1),
     }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+/// The point inside a settings row's `rect` that activates `sub` — the center
+/// of the exact interaction rectangle (`setting_sub_rect`), so the UIA
+/// activation path clicks the same geometry the provider enumerates. `None`
+/// when the layout has no such sub-control (a stale or foreign encoded tag).
+fn setting_sub_click_point(id: SettingId, sub: SettingSub, rect: &RECT, scale: f32) -> Option<(i32, i32)> {
+    setting_sub_rect(id, sub, rect, scale).map(|r| ((r.left + r.right) / 2, (r.top + r.bottom) / 2))
 }
 
 /// Applies one settings row's action exactly as the mouse path does: `id` is
@@ -6394,16 +6346,15 @@ fn settings_children_from(state: &MainWindowState, hwnd: HWND) -> Vec<crate::acc
                 }
                 None => ("Setting".to_string(), UIA_ButtonControlTypeId, None),
             };
-            let rect = RECT {
-                left: t.cx - 40,
-                top: t.cy - 14,
-                right: t.cx + 40,
-                bottom: t.cy + 14,
-            };
+            // The bounds are the control's EXACT interaction rectangle from
+            // the shared layout model (never a fabricated box): UIA bounds
+            // equal the clickable visual target, so hit-testing and Narrator
+            // agree with the painted control and adjacent segments cannot
+            // overlap in UIA space.
             crate::accessibility::SettingChild {
                 row_index: t.row_index,
                 sub: t.sub,
-                rect,
+                rect: t.rect,
                 name,
                 control_type,
                 toggle,
@@ -7069,6 +7020,79 @@ mod tests {
                         on_screen >= 0 && on_screen < client_h,
                         "target at cy={} not reachable at scale {scale}, client_h {client_h} (extent {extent})",
                         t.cy
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn settings_focus_rects_are_exact_non_overlapping_and_lockstep_with_hit_testing() {
+        // The UIA bounds are built from the focus rects, so these are the
+        // acceptance for AF-004: at every DPI scale and narrow/wide client
+        // widths, every focus rect is the exact clickable target (its center
+        // hit-tests back to itself), no two rects overlap (UIA hit-testing
+        // can never resolve to the wrong control), and a point just outside a
+        // sub-control's edge never resolves to that control.
+        let state = MainWindowState::new(
+            Arc::new(RwLock::new(Config::default())),
+            EventQueue::default(),
+            HWND::default(),
+            HINSTANCE::default(),
+            {
+                let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+                tx
+            },
+        );
+        let overlap = |a: &RECT, b: &RECT| a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+        for scale in [1.0f32, 1.5, 2.0] {
+            for client_w in [800i32, 1600] {
+                let pad = (PAD * scale) as i32;
+                let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+                let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
+                assert!(!targets.is_empty(), "focus targets must exist at scale {scale}");
+                for t in &targets {
+                    assert!(
+                        t.rect.right > t.rect.left && t.rect.bottom > t.rect.top,
+                        "degenerate focus rect {:?} at scale {scale}, width {client_w}",
+                        t.rect
+                    );
+                    assert_eq!(
+                        (t.cx, t.cy),
+                        ((t.rect.left + t.rect.right) / 2, (t.rect.top + t.rect.bottom) / 2),
+                        "the click point must be the exact rect's center"
+                    );
+                    assert_eq!(
+                        state.settings_hover_at(t.cx, t.cy, sidebar_w, client_w, pad, scale),
+                        Some((t.row_index, t.sub)),
+                        "the rect's center must hit-test back to the same control"
+                    );
+                }
+                for (i, a) in targets.iter().enumerate() {
+                    for b in targets.iter().skip(i + 1) {
+                        assert!(
+                            !overlap(&a.rect, &b.rect),
+                            "overlapping focus rects at scale {scale}, width {client_w}: {:?} vs {:?}",
+                            a.rect,
+                            b.rect
+                        );
+                    }
+                }
+                // A point just outside a sub-control's right edge must never
+                // resolve back to that control (hit-testing uses x < right,
+                // so the rects are half-open — the painted edge belongs to
+                // the control, the next pixel does not). Whole-row controls
+                // are excluded: their rect is the row's control band, and a
+                // point outside it is still inside the row, which
+                // `settings_hover_at` reports as the same (row, None).
+                for t in targets.iter().filter(|t| t.sub != SettingSub::None) {
+                    let outside = (t.rect.right, (t.rect.top + t.rect.bottom) / 2);
+                    let hit = state.settings_hover_at(outside.0, outside.1, sidebar_w, client_w, pad, scale);
+                    assert_ne!(
+                        hit,
+                        Some((t.row_index, t.sub)),
+                        "a point just outside {:?} must not hit it",
+                        t.rect
                     );
                 }
             }
