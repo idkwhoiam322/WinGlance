@@ -80,13 +80,20 @@ fn hbitmap_to_bgra_premul(hdc: HDC, bitmap: HBITMAP, size: usize) -> Option<Vec<
     let mut pm = Vec::with_capacity(total_bytes);
     for px in buf.chunks_exact(4) {
         let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
-        let a = a as f32 / 255.0;
-        pm.push((b as f32 * a).round() as u8);
-        pm.push((g as f32 * a).round() as u8);
-        pm.push((r as f32 * a).round() as u8);
-        pm.push(px[3]);
+        pm.push(premultiply_channel(b, a));
+        pm.push(premultiply_channel(g, a));
+        pm.push(premultiply_channel(r, a));
+        pm.push(a);
     }
     Some(pm)
+}
+
+/// Premultiplies one color channel by the alpha, rounding half-up: the
+/// integer form of `round(channel * alpha / 255.0)`. The exhaustive
+/// equivalence test pins the two forms to the same output on every
+/// (channel, alpha) pair.
+fn premultiply_channel(channel: u8, alpha: u8) -> u8 {
+    ((channel as u32 * alpha as u32 + 127) / 255) as u8
 }
 
 fn extract_from_factory(factory: &IShellItemImageFactory, size: usize) -> Option<Vec<u8>> {
@@ -413,5 +420,29 @@ mod tests {
             let expected = (1..=128).contains(&len);
             assert_eq!(valid_aumid(&id), expected, "length bound mismatch at {len} for {id:?}");
         }
+    }
+
+    #[test]
+    fn premultiply_channel_matches_the_float_formula_exhaustively() {
+        // Every (channel, alpha) pair must round exactly like the former
+        // float path `(c * a / 255.0).round()`, so switching the icon
+        // pipeline to integer math cannot shift a single pixel. The two
+        // formulas agree because (c*a + 127)/255 and round(c*a/255) split
+        // at the same remainder: c*a mod 255 <= 127 rounds down in both,
+        // >= 128 rounds up in both.
+        for channel in 0..=255u8 {
+            for alpha in 0..=255u8 {
+                let expected = (channel as f32 * alpha as f32 / 255.0).round() as u8;
+                assert_eq!(
+                    premultiply_channel(channel, alpha),
+                    expected,
+                    "channel {channel} alpha {alpha}"
+                );
+            }
+        }
+        // Endpoint sanity: opaque is the identity, transparent is black.
+        assert_eq!(premultiply_channel(200, 255), 200);
+        assert_eq!(premultiply_channel(200, 0), 0);
+        assert_eq!(premultiply_channel(0, 128), 0);
     }
 }
