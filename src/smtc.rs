@@ -842,8 +842,13 @@ impl ListenerState {
     fn drain_control(&mut self) -> Result<()> {
         // Verify-take under the mailbox lock: the supervisor bumps the
         // generation under this same lock when it restarts the worker, so a
-        // superseded worker that reaches this turn cannot consume the
-        // commands — they stay in the mailbox for the successor.
+        // superseded worker cannot drain commands pushed for its successor —
+        // they stay in the mailbox. The lock covers the drain, not the apply
+        // that follows: a bump landing mid-apply only wastes that worker's
+        // own state. SetAllowedSources is recovered when the successor is
+        // seeded from the shared config, and the notifications re-show is
+        // restored by the overlay itself, so no command is ever lost
+        // functionally.
         let commands = {
             let mut mailbox = self
                 .control_mailbox
