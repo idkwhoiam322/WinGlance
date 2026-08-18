@@ -87,7 +87,7 @@ jobs:
               $m = [regex]::Match($latest, '^v(\d+)\.(\d+)\.(\d+)$')
               $tag = "v$($m.Groups[1].Value).$($m.Groups[2].Value).$([int]$m.Groups[3].Value + 1)"
             } else {
-              $tag = "v0.1.0"
+              $tag = "v1.0.0"
             }
           } elseif ($release -match '^v\d+\.\d+\.\d+$') {
             $tag = $release
