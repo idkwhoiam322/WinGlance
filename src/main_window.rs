@@ -173,9 +173,9 @@ enum Pane {
 /// Persistent settings-pane status about config persistence. Painted as a
 /// warning banner with the Open config / Restart app actions directly below
 /// it, every repaint, until the situation clears (a later successful save
-/// clears `Conflict`; `PersistenceDisabled` lasts the whole run — the startup
-/// file was invalid and is deliberately left untouched).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// clears every variant; `PersistenceDisabled` lasts the whole run — the
+/// startup file was invalid and is deliberately left untouched).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ConfigStatus {
     /// The on-disk file was edited outside the app after load: the session's
     /// settings changes are kept in memory only, nothing was written.
@@ -183,6 +183,44 @@ enum ConfigStatus {
     /// The startup file was invalid, unreadable, or oversized: nothing is
     /// ever persisted this run.
     PersistenceDisabled,
+    /// A generic save failure (disk full, access denied, …) after the change
+    /// was applied in memory: the disk still holds the previous value and the
+    /// UI must not look successful. The detailed OS error stays in the log;
+    /// the banner carries only the bounded category.
+    SaveFailed(SaveFailKind),
+}
+
+/// The bounded, user-facing category of a generic config-save failure. Kept
+/// tiny and `Copy` so the persistent status (and the layout key it feeds)
+/// never grows unbounded state; the exact OS error text is logged, not shown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SaveFailKind {
+    /// `ERROR_DISK_FULL` / `ERROR_HANDLE_DISK_FULL`: the volume ran out of space.
+    DiskFull,
+    /// `ERROR_ACCESS_DENIED` / sharing or lock violation: the file or its
+    /// parent rejects the write.
+    Permission,
+    /// Anything else (device errors, injected test failures, …).
+    Other,
+}
+
+impl SaveFailKind {
+    /// Classifies an `anyhow` save error into the bounded category. The
+    /// chain is searched for a `std::io::Error` (the error type
+    /// `write_temp_and_rename` propagates); anything else is `Other`. The
+    /// full chain remains visible in the log line the caller writes.
+    fn from_error(error: &anyhow::Error) -> Self {
+        const ERROR_DISK_FULL: i32 = 112;
+        const ERROR_HANDLE_DISK_FULL: i32 = 39;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        match error.downcast_ref::<std::io::Error>().and_then(|e| e.raw_os_error()) {
+            Some(ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL) => Self::DiskFull,
+            Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION) => Self::Permission,
+            _ => Self::Other,
+        }
+    }
 }
 
 /// Settings rows: section headers with label-left / control-right card rows.
@@ -373,9 +411,11 @@ fn settings_colors_for(prefs: &crate::winutil::SystemPreferences) -> SettingsCol
     }
 }
 
-/// Banner text for a `ConfigStatus`; both variants describe the current
-/// persistence state and point at the Open config / Restart app actions
-/// directly below the banner.
+/// Banner text for a `ConfigStatus`; every variant describes the current
+/// persistence state and points at the Open config / Restart app actions
+/// directly below the banner. A save failure names the bounded category so
+/// the user can act on it (free space, fix permissions) while the detailed
+/// OS error stays in the log.
 fn banner_text(status: ConfigStatus) -> &'static str {
     match status {
         ConfigStatus::Conflict => {
@@ -384,6 +424,17 @@ fn banner_text(status: ConfigStatus) -> &'static str {
         ConfigStatus::PersistenceDisabled => {
             "config.toml could not be saved; settings apply in memory only for this run"
         }
+        ConfigStatus::SaveFailed(kind) => match kind {
+            SaveFailKind::DiskFull => {
+                "config.toml could not be saved — the disk is full; changes apply in memory only — free space and change a setting to retry, or restart"
+            }
+            SaveFailKind::Permission => {
+                "config.toml could not be saved — access denied; changes apply in memory only — fix the file permissions and change a setting to retry, or restart"
+            }
+            SaveFailKind::Other => {
+                "config.toml could not be saved; changes apply in memory only — change a setting to retry, or restart"
+            }
+        },
     }
 }
 
@@ -1163,7 +1214,18 @@ impl MainWindowState {
                     self.invalidate();
                 }
             }
-            Err(error) => error!("saving config after a settings change failed: {error}"),
+            Err(error) => {
+                // The setting already changed in memory; without this banner
+                // the UI would look persisted until a restart silently
+                // discards the change. The detailed error chain goes to the
+                // log; the banner carries only the bounded category.
+                error!("saving config after a settings change failed: {error:#}");
+                let status = ConfigStatus::SaveFailed(SaveFailKind::from_error(&error));
+                if self.config_status != Some(status) {
+                    self.config_status = Some(status);
+                    self.invalidate();
+                }
+            }
         }
     }
 
@@ -6518,6 +6580,102 @@ fn focus_setting_at_body(hwnd: HWND, row_index: usize, sub: SettingSub) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A uniquely-named temporary directory removed on drop, so the
+    /// settings-save regression can run the full save path against a temp
+    /// config instead of touching live `%APPDATA%`.
+    struct TempDir {
+        dir: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!("winglance-mainwin-{tag}-{}-{stamp}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn failed_save_shows_a_persistent_banner_cleared_by_a_later_successful_save() {
+        use crate::config::test_hooks;
+        // The save path must run against a temp file, never live %APPDATA%.
+        let guard = TempDir::new("save-fail-banner");
+        let config_path = guard.dir.join("config.toml");
+        std::fs::write(&config_path, "overlay.duration_ms = 4000\n").unwrap();
+        let _ = test_hooks::CONFIG_PATH_OVERRIDE.set(config_path.clone());
+
+        let config = Config::load().expect("the temp config must load");
+        let mut state = MainWindowState::new(
+            Arc::new(RwLock::new(config)),
+            EventQueue::default(),
+            HWND::default(),
+            HINSTANCE::default(),
+            {
+                let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+                tx
+            },
+        );
+        let disk_before = std::fs::read(&config_path).unwrap();
+
+        // A failed save: the in-memory change applies, the disk does not move,
+        // and the persistent SaveFailed banner appears (category Other for the
+        // injected non-OS error).
+        test_hooks::set_fail_next_save();
+        state.mutate_config(|c| c.overlay.duration_ms = 5000);
+        assert_eq!(state.config_status, Some(ConfigStatus::SaveFailed(SaveFailKind::Other)));
+        assert_eq!(state.cfg().overlay.duration_ms, 5000, "the change applies in memory");
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            disk_before,
+            "disk bytes must be untouched after a failed save"
+        );
+
+        // The banner is part of the Settings layout whenever the pane is
+        // (re)shown, exactly like the Conflict banner — pane hide/show never
+        // clears the status (only persist_change writes it).
+        let with_banner = MainWindowState::build_settings_layout(
+            100,
+            800,
+            16,
+            1.0,
+            0,
+            Some(ConfigStatus::SaveFailed(SaveFailKind::Other)),
+        );
+        assert!(
+            with_banner
+                .items
+                .iter()
+                .any(|i| matches!(i, SettingsItem::Banner { .. })),
+            "the SaveFailed status must render a banner when the pane is shown"
+        );
+        assert!(with_banner.content_extent > 800, "the banner adds document height");
+
+        // The banner persists across further failed saves.
+        test_hooks::set_fail_next_save();
+        state.mutate_config(|c| c.overlay.duration_ms = 6000);
+        assert_eq!(
+            state.config_status,
+            Some(ConfigStatus::SaveFailed(SaveFailKind::Other)),
+            "a second failed save must not clear the banner"
+        );
+
+        // A later successful save writes the disk and clears the banner.
+        state.mutate_config(|c| c.overlay.duration_ms = 7000);
+        assert_eq!(state.config_status, None, "a successful save clears the banner");
+        let reloaded: Config = toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(reloaded.overlay.duration_ms, 7000, "the successful save persists");
+    }
 
     #[test]
     fn setting_row_name_pins_the_provider_name_format() {

@@ -5,6 +5,34 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Test-only seams for the config save path, compiled out of production
+/// builds. They let the settings-save regression drive the full save path
+/// against a temp file instead of live `%APPDATA%` and inject a write failure
+/// without real I/O faults. Nothing here is reachable from production code.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// When set, `Config::config_path()` resolves here instead of the real
+    /// `%APPDATA%` data dir. Set once per test process by the save-failure
+    /// regression; no other test resolves the real path.
+    pub(crate) static CONFIG_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+    /// When armed, the next `write_temp_and_rename` fails before touching the
+    /// filesystem, simulating a disk-full or permission-denied save failure.
+    static FAIL_NEXT_CONFIG_WRITE: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn set_fail_next_save() {
+        FAIL_NEXT_CONFIG_WRITE.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_fail_next_save() -> bool {
+        FAIL_NEXT_CONFIG_WRITE.swap(false, Ordering::SeqCst)
+    }
+}
+
 /// Upper bound on the config file size, in bytes. A file above this bound is
 /// treated as unreadable: defaults apply in memory, the file is left
 /// untouched, and persistence is disabled — so a hostile or corrupt
@@ -683,6 +711,14 @@ impl Config {
     /// flush makes the exchange durable. Any pre-commit failure deletes the
     /// temp and leaves the existing file byte-identical.
     fn write_temp_and_rename(config_path: &Path, content: &[u8]) -> anyhow::Result<()> {
+        #[cfg(test)]
+        {
+            if test_hooks::take_fail_next_save() {
+                return Err(anyhow::anyhow!(
+                    "injected save failure (simulated disk-full/permission error)"
+                ));
+            }
+        }
         crate::winutil::atomic_replace_file(config_path, content)?;
         Ok(())
     }
@@ -691,6 +727,12 @@ impl Config {
     /// writes it. Exposed so the Settings "Open config" button can hand the
     /// exact file to the shell without guessing the data dir itself.
     pub fn config_path() -> anyhow::Result<PathBuf> {
+        #[cfg(test)]
+        {
+            if let Some(override_path) = test_hooks::CONFIG_PATH_OVERRIDE.get() {
+                return Ok(override_path.clone());
+            }
+        }
         Ok(Self::data_dir()?.join("config.toml"))
     }
 
@@ -1106,6 +1148,35 @@ nested_appearance = [1, 2, 3]
             vec!["config.toml"],
             "no temp file may remain after the rename"
         );
+    }
+
+    #[test]
+    fn injected_save_failure_errors_and_leaves_the_file_byte_identical() {
+        // A generic I/O failure during the commit (disk full, permission
+        // denied) must surface as an Err from save_checked_to — the caller
+        // shows the persistent SaveFailed banner — and must leave the on-disk
+        // file byte-identical with no temp state behind.
+        let guard = TempDir::new("save-fail");
+        let config_path = guard.dir.join("config.toml");
+        let original = b"overlay.duration_ms = 4000\n";
+        std::fs::write(&config_path, original).unwrap();
+        let mut config = Config::load_from_path(&config_path).unwrap();
+        config.overlay.duration_ms = 5000;
+
+        test_hooks::set_fail_next_save();
+        let result = config.save_checked_to(&config_path);
+        assert!(result.is_err(), "the injected failure must surface as a save error");
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            original,
+            "the disk must still hold the previous value"
+        );
+        assert_eq!(sibling_names(&guard.dir), vec!["config.toml"], "no temp may remain");
+        // The armed flag is consumed in one shot; a second save succeeds.
+        assert!(matches!(
+            config.save_checked_to(&config_path).unwrap(),
+            SaveOutcome::Saved(_)
+        ));
     }
 
     #[test]
