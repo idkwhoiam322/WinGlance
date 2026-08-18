@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn crash_log_handle_is_retained_under_the_verified_discipline_at_install() {
-        // AF-001 regression for the exception-handler path: install must open
+        // Regression guard: install must open
         // crash.log under the verified-write discipline (pinned parent,
         // no-reparse-follow, identity-checked) and RETAIN the handle, so the
         // allocation-free handler can append without any open — a reparse

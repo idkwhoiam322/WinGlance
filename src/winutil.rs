@@ -15,6 +15,35 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::BOOL;
 use windows::core::{PCWSTR, PWSTR};
 
+/// Test-only seam for the synchronized swap scenario, compiled out of
+/// production builds. While armed, the next `open_verified_file` call on
+/// this thread runs the probe at the exact instant the attacker's swap
+/// would land — after the parent pin is taken, before anything is opened or
+/// truncated. The probe fires exactly once (it is taken), so it cannot leak
+/// into later opens, and it is thread-local, so it cannot fire inside
+/// another test's open. Nothing here is reachable from production code.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static OPEN_PROBE: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    /// Arms the probe for the next `open_verified_file` on this thread.
+    pub(crate) fn arm_open_probe(probe: impl FnMut() + 'static) {
+        OPEN_PROBE.with(|slot| *slot.borrow_mut() = Some(Box::new(probe)));
+    }
+
+    /// Runs and disarms the probe; a no-op when none is armed.
+    pub(crate) fn fire_open_probe() {
+        let probe = OPEN_PROBE.with(|slot| slot.borrow_mut().take());
+        if let Some(mut probe) = probe {
+            probe();
+        }
+    }
+}
+
 /// Registers a window class exactly once per window type (guarded by `guard`).
 /// The shared boilerplate lives here: arrow cursor, default style and extra
 /// bytes, the `RegisterClassExW` call, and the failure path. `background` is
@@ -946,6 +975,11 @@ pub(crate) fn open_verified_file(path: &Path, truncate: bool) -> io::Result<File
         Some(parent) => Some(open_pinned_parent(parent)?),
         None => None,
     };
+    // Race probe: the regression test runs its attacker's swap
+    // attempt at this exact point — pin taken, open not yet started — to
+    // prove the pin spans the whole validation-to-open window.
+    #[cfg(test)]
+    test_hooks::fire_open_probe();
     let wide = path
         .as_os_str()
         .encode_wide()
@@ -1643,6 +1677,45 @@ mod tests {
         drop(pinned_guard);
         std::fs::rename(&pinned, &renamed).unwrap();
         assert!(renamed.is_dir());
+    }
+
+    #[test]
+    fn open_verified_file_blocks_a_parent_swap_inside_the_open() {
+        // The synchronized scenario, end to end: the attacker attempts
+        // the parent rename at the exact instant inside `open_verified_file`
+        // — pin taken, open not yet started. The pin must refuse the swap,
+        // the open must complete against the original path, and the write
+        // must land in the verified location with nothing created anywhere
+        // else.
+        let guard = TestDir::new("open-swap");
+        let logs = guard.dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let swapped = guard.dir.join("logs-swapped");
+        let probe_logs = logs.clone();
+        let probe_swapped = swapped.clone();
+        super::test_hooks::arm_open_probe(move || {
+            assert!(
+                std::fs::rename(&probe_logs, &probe_swapped).is_err(),
+                "the pinned parent must refuse a swap while the open is in flight"
+            );
+        });
+
+        let target = logs.join("live.log");
+        use std::io::Write;
+        let mut file = open_verified_file(&target, true).expect("the open must complete against the original path");
+        file.write_all(b"swap-probe record\n").unwrap();
+        drop(file);
+
+        // The swap never landed: the only entry under the test root is the
+        // verified logs directory, the swapped name does not exist, and the
+        // bytes reached the expected file.
+        assert!(!swapped.exists(), "a swap must never be partially applied");
+        assert_eq!(
+            sibling_names(&guard.dir),
+            vec!["logs"],
+            "nothing may be created outside the verified parent"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"swap-probe record\n");
     }
 
     #[test]

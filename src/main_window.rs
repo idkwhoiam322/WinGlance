@@ -6663,7 +6663,7 @@ mod tests {
 
     #[test]
     fn retained_settings_provider_resolves_live_state_and_degrades_after_teardown() {
-        // AF-003 acceptance: one provider retained across a toggle, a
+        // Acceptance: one provider retained across a toggle, a
         // scroll/DPI rebuild, and teardown must answer the CURRENT name,
         // toggle state, focus, and bounds on every query — and unavailable
         // (empty) state after the snapshot is cleared, never stale window
@@ -7194,7 +7194,7 @@ mod tests {
     #[test]
     fn settings_focus_rects_are_exact_non_overlapping_and_lockstep_with_hit_testing() {
         // The UIA bounds are built from the focus rects, so these are the
-        // acceptance for AF-004: at every DPI scale and narrow/wide client
+        // Acceptance: at every DPI scale and narrow/wide client
         // widths, every focus rect is the exact clickable target (its center
         // hit-tests back to itself), no two rects overlap (UIA hit-testing
         // can never resolve to the wrong control), and a point just outside a
