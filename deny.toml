@@ -22,13 +22,13 @@ allow = [
 
 # Duplicate crate versions in this tree are two disjoint families that never
 # exchange types, so the duplicates are benign:
-#   - chrono -> iana-time-zone pulls windows-core 0.62 alongside our pinned
-#     windows 0.58.
-#   - dirs -> dirs-sys pulls windows-sys 0.48, a separate line from the
-#     windows 0.58 targets.
+#   - syn v2 (windows-implement / windows-interface) vs syn v3
+#     (serde_derive): proc-macro crates, build-time only.
+#   - dirs -> dirs-sys keeps windows-sys 0.48, an older windows-sys line
+#     distinct from our pinned windows 0.62; the skip-tree entry excludes its
+#     subtree from the duplicate check.
 [bans]
 skip-tree = [
-    { name = "iana-time-zone" },
     { name = "dirs-sys" },
 ]
 
