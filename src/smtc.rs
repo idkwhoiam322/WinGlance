@@ -21,12 +21,12 @@ use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
 use windows::core::Interface;
 use windows_future::AsyncStatus;
 
-/// Configuration commands the main window pushes to the worker over the
-/// shared signal+control channel. The worker applies them on the next
-/// event-loop turn (`handle_control`) instead of polling the shared config
-/// lock — the listener's per-turn config poll and its last-seen markers
-/// existed only to paper over the up-to-2s lag of that poll, and a pushed
-/// command is current the moment it is received.
+/// Configuration commands the main window pushes to the worker through the
+/// latest-value control mailbox (see `ControlMailbox`); the worker applies
+/// them on the next event-loop turn (`handle_control`) instead of polling
+/// the shared config lock — the listener's per-turn config poll and its
+/// last-seen markers existed only to paper over the up-to-2s lag of that
+/// poll, and a pushed command is current the moment it is applied.
 pub(crate) enum ControlCommand {
     /// The user toggled `behavior.notifications_enabled` in the settings
     /// pane or the tray menu. `true` also forces a one-shot re-show of the
@@ -40,6 +40,43 @@ pub(crate) enum ControlCommand {
     SetAllowedSources(Vec<String>),
 }
 
+/// Latest-value mailbox for worker control commands. The main window
+/// overwrites the newest command per kind (`push`); the worker drains it at
+/// every event-loop turn (`drain`). Nothing is ever dropped, unlike a
+/// bounded channel: a push made while the signal queue is saturated still
+/// reaches the worker at its next turn, and — because the mailbox lives in
+/// `main` and survives worker restarts — a command posted just before a
+/// restart is applied by the replacement worker. Every command carries an
+/// absolute value, so newest-wins coalescing is semantics-preserving.
+#[derive(Default)]
+pub(crate) struct ControlMailbox {
+    notifications: Option<bool>,
+    allowed_sources: Option<Vec<String>>,
+}
+
+impl ControlMailbox {
+    /// Stores the command, replacing any older command of the same kind.
+    pub(crate) fn push(&mut self, command: ControlCommand) {
+        match command {
+            ControlCommand::SetNotificationsEnabled(value) => self.notifications = Some(value),
+            ControlCommand::SetAllowedSources(sources) => self.allowed_sources = Some(sources),
+        }
+    }
+
+    /// Takes every pending command (at most one per kind) and clears the
+    /// mailbox, in a fixed kind order.
+    fn drain(&mut self) -> Vec<ControlCommand> {
+        let mut commands = Vec::with_capacity(2);
+        if let Some(value) = self.notifications.take() {
+            commands.push(ControlCommand::SetNotificationsEnabled(value));
+        }
+        if let Some(sources) = self.allowed_sources.take() {
+            commands.push(ControlCommand::SetAllowedSources(sources));
+        }
+        commands
+    }
+}
+
 pub(crate) enum Signal {
     /// Fired by SessionsChanged or CurrentSessionChanged: re-sync the
     /// subscription map at the next flush (one re-sync per burst).
@@ -47,11 +84,13 @@ pub(crate) enum Signal {
     MediaProperties(GlobalSystemMediaTransportControlsSession),
     PlaybackInfo(GlobalSystemMediaTransportControlsSession),
     Timeline(GlobalSystemMediaTransportControlsSession),
-    /// A typed command pushed by the main window (see `ControlCommand`).
-    /// Commands share the channel with the WinRT wake-ups, so the worker's
-    /// single receive loop applies them on the next turn without a second
-    /// receiver or a select.
-    Control(ControlCommand),
+    /// Best-effort wake-up posted by the main window after it wrote the
+    /// control mailbox: it makes a control push apply on the next turn
+    /// instead of waiting for the loop's scheduled wake. The wake shares
+    /// the bounded queue with the WinRT signals and may be dropped when the
+    /// queue is saturated — that only costs latency, never the command,
+    /// which the worker drains from the mailbox at its next turn anyway.
+    ControlWake,
 }
 
 struct SessionSubscription {
@@ -182,14 +221,16 @@ const SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// retires its pill ~4s after the last session goes.
 const TERMINAL_STOP_GRACE: Duration = Duration::from_secs(4);
 
-/// Capacity of the merged signal+control channel between the WinRT event
-/// handlers, the main window, and the listener loop. `try_send` drops a
-/// signal when the queue is full; that is safe because every dropped signal
-/// is a coalescible wake-up — the dirty-set membership it would have
-/// recorded is re-covered by the periodic safety-net poll within 2s, and a
-/// dropped control command is re-covered by the next settings click (the
-/// worker's startup seed rebuilds state on restarts). The bound keeps a
-/// session storm from accumulating unbounded queued COM session references.
+/// Capacity of the merged signal channel between the WinRT event handlers,
+/// the main window, and the listener loop. `try_send` drops a signal when
+/// the queue is full; that is safe because every dropped signal is a
+/// coalescible wake-up — the dirty-set membership it would have recorded is
+/// re-covered by the periodic safety-net poll within 2s. Control commands
+/// no longer share this queue: they live in the latest-value
+/// `ControlMailbox` and are delivered on the next turn no matter what, so
+/// only their optional wake-up hint (`Signal::ControlWake`) can be dropped.
+/// The bound keeps a session storm from accumulating unbounded queued COM
+/// session references.
 pub(crate) const SIGNAL_QUEUE_CAP: usize = 256;
 
 /// Hard admission caps defending the worker against a hostile process that
@@ -303,6 +344,12 @@ struct ListenerState {
     /// and the 2-second safety-net poll repairs state on top.
     pending_output: VecDeque<Arc<MediaEvent>>,
     signal_tx: SyncSender<Signal>,
+    /// Latest-value mailbox for main-window control commands. Drained at
+    /// the top of every event-loop turn (see `drain_control`), so a push is
+    /// applied even when its wake-up hint was dropped by a saturated signal
+    /// queue. Survives worker restarts: the mailbox is created in `main`
+    /// and every worker generation drains the same slot.
+    control_mailbox: Arc<Mutex<ControlMailbox>>,
     /// Every open session's event subscriptions, keyed by session pointer.
     subscriptions: HashMap<usize, SessionSubscription>,
     /// Last known displayed state per session key.
@@ -432,12 +479,12 @@ struct ListenerState {
 
 /// The worker's config values, sampled once by the supervisor at each spawn.
 /// The worker never reads the shared config lock again: live changes arrive
-/// as `ControlCommand`s on the merged channel, and the allow-list half of a
-/// command posted just before a restart is re-covered because the seed is
-/// taken from the same in-memory config the write landed on. The
-/// notifications toggle is not seed-recovered — suppression lives in the
-/// overlay, and the overlay's last-track restore covers the re-show if its
-/// `SetNotificationsEnabled(true)` command is lost to a restart.
+/// through the latest-value `ControlMailbox`, which survives worker
+/// restarts, so a command posted just before a restart — the allow list and
+/// the notifications toggle alike — is applied by the replacement worker at
+/// its first turn. The seed still exists because a brand-new worker must
+/// not wait for a push that may never come (the user may never touch the
+/// settings again): it carries the config state as of the restart.
 pub(crate) struct ListenerSeed {
     pub(crate) media_sources: Vec<String>,
     pub(crate) debounce_ms: u64,
@@ -453,12 +500,17 @@ pub struct SmtcListener {
     /// `ListenerState::budget_warned`).
     budget_warned: Arc<AtomicBool>,
     seed: ListenerSeed,
-    /// Sender half of the merged signal+control channel, cloned into the
-    /// WinRT event handlers and into `ListenerState` for its per-session
-    /// subscriptions. The channel itself is created in `main` and survives
-    /// worker restarts, so a control command posted by the main window is
-    /// never lost to a restart.
+    /// Sender half of the merged wake-up channel, cloned into the WinRT
+    /// event handlers and used by the main window for control wake-up
+    /// hints. The channel itself is created in `main` and survives worker
+    /// restarts, so a wake posted by the main window is never lost to a
+    /// restart.
     control_tx: SyncSender<Signal>,
+    /// Latest-value mailbox for control commands, created in `main` and
+    /// shared across worker restarts: the replacement worker drains what
+    /// its predecessor left behind, so a command is applied even when it
+    /// was posted between a stall and its successor's first turn.
+    control_mailbox: Arc<Mutex<ControlMailbox>>,
     /// Receiver half of the same channel. `main` wraps it in a mutex because
     /// a replacement worker must receive from the channel its predecessor
     /// left behind; the worker's event loop is the only receive site and
@@ -497,6 +549,7 @@ impl SmtcListener {
         now_showing: Arc<Mutex<Option<String>>>,
         control_tx: SyncSender<Signal>,
         control_rx: Arc<Mutex<mpsc::Receiver<Signal>>>,
+        control_mailbox: Arc<Mutex<ControlMailbox>>,
     ) -> Self {
         Self {
             output,
@@ -505,6 +558,7 @@ impl SmtcListener {
             seed,
             control_tx,
             control_rx,
+            control_mailbox,
             heartbeat,
             live_generation,
             my_generation,
@@ -543,6 +597,7 @@ impl SmtcListener {
             self.my_generation,
             self.shutdown,
             self.now_showing,
+            self.control_mailbox,
         );
 
         state.sync_subscriptions();
@@ -572,6 +627,7 @@ impl ListenerState {
         my_generation: u64,
         shutdown: Arc<AtomicBool>,
         now_showing: Arc<Mutex<Option<String>>>,
+        control_mailbox: Arc<Mutex<ControlMailbox>>,
     ) -> Self {
         Self {
             manager,
@@ -580,6 +636,7 @@ impl ListenerState {
             budget_warned,
             pending_output: VecDeque::new(),
             signal_tx,
+            control_mailbox,
             subscriptions: HashMap::new(),
             states: HashMap::new(),
             dirty: VecDeque::new(),
@@ -626,6 +683,11 @@ impl ListenerState {
             if self.shutdown.load(Ordering::SeqCst) {
                 break;
             }
+            // Control commands apply on this turn, before any receive, so a
+            // push whose wake-up hint was dropped by a saturated queue still
+            // lands within one loop iteration (the loop wakes at least every
+            // `SESSION_CHECK_INTERVAL`).
+            self.drain_control()?;
             // Only the current worker generation may keep the heartbeat
             // fresh: a stale worker that wakes after being replaced must not
             // mask a stall in its successor.
@@ -751,11 +813,30 @@ impl ListenerState {
                 }
                 self.schedule_flush();
             }
-            Signal::Control(command) => {
-                // Main-window commands run on this same turn; they are rare
-                // (settings clicks) and need no debounce.
-                self.handle_control(command)?;
+            Signal::ControlWake => {
+                // The mailbox itself is drained at the top of the next loop
+                // turn; this arm only consumes the wake-up hint, which exists
+                // so a control push is applied promptly while the loop is
+                // blocked in its receive.
             }
+        }
+        Ok(())
+    }
+
+    /// Applies every pending control command from the mailbox (newest value
+    /// per kind). Runs at the top of each event-loop turn, so a command
+    /// pushed while the signal queue was saturated — or whose wake-up hint
+    /// was dropped — still lands within one turn; the mailbox survives
+    /// worker restarts, so a push made just before a restart is applied by
+    /// the replacement worker.
+    fn drain_control(&mut self) -> Result<()> {
+        let commands = self
+            .control_mailbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain();
+        for command in commands {
+            self.handle_control(command)?;
         }
         Ok(())
     }
@@ -4613,6 +4694,7 @@ mod tests {
             0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(ControlMailbox::default())),
         )
     }
 
@@ -4639,6 +4721,7 @@ mod tests {
             0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(ControlMailbox::default())),
         );
         let (raw, normalized) = state.cached_allowed.as_ref().expect("seed cached");
         assert_eq!(raw, &["YouTube-Music".to_string()]);
@@ -4673,6 +4756,7 @@ mod tests {
             0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(ControlMailbox::default())),
         );
         state
             .handle_control(ControlCommand::SetAllowedSources(vec![
@@ -4683,6 +4767,80 @@ mod tests {
         let (raw, normalized) = state.cached_allowed.as_ref().expect("allow list stored");
         assert_eq!(raw, &[" Spotify ".to_string(), "youtube-music".to_string()]);
         assert_eq!(normalized, &["spotify".to_string(), "youtubemusic".to_string()]);
+        std::mem::forget(state);
+    }
+
+    #[test]
+    fn control_mailbox_coalesces_newest_wins_per_kind() {
+        // The mailbox keeps one slot per command kind: an older push of the
+        // same kind is superseded, so the drain yields at most the newest
+        // value of each. Kinds are independent (absolute values), so
+        // coalescing cannot skip a needed transition.
+        let mut mailbox = ControlMailbox::default();
+        mailbox.push(ControlCommand::SetAllowedSources(vec!["first-app".to_string()]));
+        mailbox.push(ControlCommand::SetNotificationsEnabled(true));
+        mailbox.push(ControlCommand::SetAllowedSources(vec!["newest-app".to_string()]));
+        mailbox.push(ControlCommand::SetNotificationsEnabled(false));
+
+        let commands = mailbox.drain();
+        assert_eq!(commands.len(), 2, "one command per kind, newest first");
+        assert!(
+            matches!(&commands[0], ControlCommand::SetNotificationsEnabled(false)),
+            "the newest notifications value wins"
+        );
+        assert!(
+            matches!(&commands[1], ControlCommand::SetAllowedSources(sources) if sources == &["newest-app"]),
+            "the newest allow list wins"
+        );
+        assert!(mailbox.drain().is_empty(), "drain clears the mailbox");
+    }
+
+    #[test]
+    fn control_mailbox_delivers_under_a_saturated_signal_channel() {
+        // Capacity-saturation proof of the control path: the old channel-borne
+        // commands were dropped when the 256-entry queue was full, leaving the
+        // worker with its stale allow list. Saturation must not affect the
+        // mailbox: the push lands, the wake-up hint is the only casualty, and
+        // the worker applies the newest list at its next turn.
+        let (output, _rx) = mpsc::sync_channel(1);
+        let (signal_tx, signal_rx) = mpsc::sync_channel::<Signal>(SIGNAL_QUEUE_CAP);
+        let mailbox = Arc::new(Mutex::new(ControlMailbox::default()));
+        let mut state = ListenerState::new(
+            unsafe { GlobalSystemMediaTransportControlsSessionManager::from_raw(std::ptr::null_mut()) },
+            ListenerSeed {
+                media_sources: vec!["old-app".to_string()],
+                debounce_ms: 200,
+            },
+            output,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            signal_tx.clone(),
+            Arc::new(Mutex::new(Instant::now())),
+            Arc::new(AtomicU64::new(0)),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            mailbox.clone(),
+        );
+        // Fill the queue exactly to capacity: the push that fails proves the
+        // queue is saturated, so the wake-up hint below is known-dropped.
+        while signal_tx.try_send(Signal::Sessions).is_ok() {}
+        // The control push succeeds regardless of saturation.
+        mailbox
+            .lock()
+            .unwrap()
+            .push(ControlCommand::SetAllowedSources(vec!["new-app".to_string()]));
+        assert!(
+            signal_tx.try_send(Signal::ControlWake).is_err(),
+            "with the queue saturated the wake-up hint is dropped"
+        );
+        // The worker's per-turn drain delivers the command even though the
+        // wake never arrived.
+        state.drain_control().unwrap();
+        let (raw, normalized) = state.cached_allowed.as_ref().expect("allow list stored");
+        assert_eq!(raw, &["new-app".to_string()]);
+        assert_eq!(normalized, &["newapp".to_string()]);
+        drop(signal_rx);
         std::mem::forget(state);
     }
 

@@ -12,7 +12,7 @@ use crate::overlay::{
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG, PINNED_SOURCE_RESULT_MSG};
-use crate::smtc::{ControlCommand, Signal};
+use crate::smtc::{ControlCommand, ControlMailbox, Signal};
 use crate::winapi::{
     create_dib_section, create_font, delete_object, global_free, invalidate_rect, is_window, kill_timer, post_message,
     select_object, send_message, set_clipboard_data, set_timer, set_window_pos, shell_execute, track_popup_menu,
@@ -1056,11 +1056,17 @@ struct MainWindowState {
     /// flight. The forwarder and this window only post when the flag was
     /// clear, so an event burst collapses into one wake message per drain.
     wake: Arc<AtomicBool>,
-    /// Sender half of the worker's merged signal+control channel. The worker
+    /// Sender half of the worker's merged signal channel, used to post
+    /// best-effort wake-up hints after a control-mailbox push. The worker
     /// never polls the shared config, so every settings/tray change that
     /// affects its behavior (notifications toggle, media-sources allow list)
-    /// is pushed as a `ControlCommand` here.
+    /// is pushed into `control_mailbox` here.
     control_tx: SyncSender<Signal>,
+    /// Latest-value mailbox carrying worker control commands (see
+    /// `smtc::ControlMailbox`). Pushes never drop and survive worker
+    /// restarts, unlike the channel-borne `Signal::Control` commands this
+    /// replaced.
+    control_mailbox: Arc<Mutex<ControlMailbox>>,
     /// Whether the position indicator in the Activity pane is hovered.
     position_hover: bool,
 }
@@ -1079,6 +1085,7 @@ pub fn create_window(
     overlay_hwnd: HWND,
     wake: Arc<AtomicBool>,
     control_tx: SyncSender<Signal>,
+    control_mailbox: Arc<Mutex<ControlMailbox>>,
 ) -> Result<HWND> {
     let module = unsafe { GetModuleHandleW(None) }.context("getting the process module")?;
     let instance: HINSTANCE = module.into();
@@ -1091,6 +1098,7 @@ pub fn create_window(
         overlay_hwnd,
         instance,
         control_tx,
+        control_mailbox,
     ));
     state.wake = wake;
     let state_ptr = Box::into_raw(state);
@@ -1239,6 +1247,7 @@ impl MainWindowState {
         overlay_hwnd: HWND,
         instance: HINSTANCE,
         control_tx: SyncSender<Signal>,
+        control_mailbox: Arc<Mutex<ControlMailbox>>,
     ) -> Self {
         Self {
             hwnd: HWND::default(),
@@ -1291,6 +1300,7 @@ impl MainWindowState {
             source_order: VecDeque::new(),
             wake: Arc::new(AtomicBool::new(false)),
             control_tx,
+            control_mailbox,
             position_hover: false,
         }
     }
@@ -4744,9 +4754,9 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     } else {
                         state.mutate_config(|cfg| cfg.behavior.notifications_enabled = new_value);
                         push_control(
+                            &state.control_mailbox,
                             &state.control_tx,
                             ControlCommand::SetNotificationsEnabled(new_value),
-                            "notifications toggle (tray menu)",
                         );
                     }
                 }
@@ -4908,9 +4918,9 @@ fn apply_settings_row_click(
             } else {
                 state.mutate_config(|cfg| cfg.behavior.notifications_enabled = new_value);
                 push_control(
+                    &state.control_mailbox,
                     &state.control_tx,
                     ControlCommand::SetNotificationsEnabled(new_value),
-                    "notifications toggle (settings)",
                 );
             }
             state.invalidate();
@@ -5790,7 +5800,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     apply_and_announce_settings_row(state, hwnd, SettingId::AllowedApps, |state| {
                         let command = ControlCommand::SetAllowedSources(patterns.clone());
                         state.mutate_config(|cfg| cfg.behavior.media_sources = patterns);
-                        push_control(&state.control_tx, command, "media sources (picker)");
+                        push_control(&state.control_mailbox, &state.control_tx, command);
                         state.invalidate();
                     });
                 }
@@ -6464,16 +6474,21 @@ fn apply_and_announce_settings_row(
     }
 }
 
-/// Pushes a worker control command onto the merged signal+control channel.
-/// The worker never polls the shared config anymore, so every behavior
-/// change made here must be pushed, or the worker would keep its stale
-/// snapshot until the next restart. The channel is bounded; a dropped push
-/// (overloaded worker) is logged, and the supervisor's restart reseeds from
-/// the same config, so the lost command cannot go unnoticed forever.
-fn push_control(control_tx: &SyncSender<Signal>, command: ControlCommand, who: &str) {
-    if control_tx.try_send(Signal::Control(command)).is_err() {
-        debug!("control command dropped | {who}");
-    }
+/// Pushes a worker control command into the latest-value control mailbox
+/// and posts a best-effort wake-up hint onto the merged signal channel. The
+/// worker never polls the shared config anymore, so every behavior change
+/// made here must be pushed, or the worker would keep its stale snapshot
+/// until the next restart. The mailbox never drops: it keeps the newest
+/// value per command kind until the worker drains it at its next
+/// event-loop turn — even when a saturated signal queue drops the wake-up
+/// (that only costs latency), and even across worker restarts (the mailbox
+/// is shared, and a replacement worker drains what its predecessor left).
+fn push_control(mailbox: &Arc<Mutex<ControlMailbox>>, wake_tx: &SyncSender<Signal>, command: ControlCommand) {
+    mailbox
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(command);
+    let _ = wake_tx.try_send(Signal::ControlWake);
 }
 
 /// Moves the keyboard focus to a control (used by the provider's SetFocus and
@@ -6576,6 +6591,7 @@ mod tests {
                 let (tx, _rx) = std::sync::mpsc::sync_channel(1);
                 tx
             },
+            Arc::new(Mutex::new(ControlMailbox::default())),
         );
         let disk_before = std::fs::read(&config_path).unwrap();
 
@@ -7103,6 +7119,7 @@ mod tests {
                 let (tx, _rx) = std::sync::mpsc::sync_channel(1);
                 tx
             },
+            Arc::new(Mutex::new(ControlMailbox::default())),
         );
         let scale = 1.0;
         let client_w = 1000;
@@ -7151,6 +7168,7 @@ mod tests {
                 let (tx, _rx) = std::sync::mpsc::sync_channel(1);
                 tx
             },
+            Arc::new(Mutex::new(ControlMailbox::default())),
         );
         let client_w = 1000;
         for scale in [1.0f32, 1.5, 2.0] {
@@ -7190,6 +7208,7 @@ mod tests {
                 let (tx, _rx) = std::sync::mpsc::sync_channel(1);
                 tx
             },
+            Arc::new(Mutex::new(ControlMailbox::default())),
         );
         let overlap = |a: &RECT, b: &RECT| a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
         for scale in [1.0f32, 1.5, 2.0] {

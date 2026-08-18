@@ -761,16 +761,27 @@ fn main() -> Result<()> {
     // supervisor sends at most one WorkerFailed ever (it gives up right
     // after), so the channel cannot grow.
     let (supervisor_tx, supervisor_rx) = mpsc::channel::<Arc<MediaEvent>>();
-    // Merged signal+control channel for the SMTC worker: WinRT wake-up
-    // signals and main-window control commands (settings pushes) share one
-    // bounded queue so the worker's single receive loop applies both. The
-    // channel is created here — not inside the worker — because it must
-    // survive worker restarts: the replacement worker receives from the same
-    // receiver, so a command posted by the main window is never lost to a
-    // restart.
+    // Merged wake-up channel for the SMTC worker: WinRT wake-up signals
+    // and the main window's best-effort control wake-up hints share one
+    // bounded queue so the worker's single receive loop stays responsive
+    // to both. Worker control commands themselves no longer travel over
+    // this queue — they live in `control_mailbox` below, which never
+    // drops. The channel is created here — not inside the worker — because
+    // it must survive worker restarts: the replacement worker receives
+    // from the same receiver, so a wake posted by the main window is never
+    // lost to a restart.
     let (control_tx, control_rx) = mpsc::sync_channel::<smtc::Signal>(smtc::SIGNAL_QUEUE_CAP);
+    // Latest-value mailbox for worker control commands (settings pushes).
+    // Unlike the channel, a mailbox push can never be dropped by a
+    // saturated queue, and the mailbox survives worker restarts: the
+    // replacement worker drains what its predecessor left behind, so a
+    // command posted just before a restart is still applied. The channel
+    // carries only the paired best-effort wake-up hints (`ControlWake`).
+    let control_mailbox: Arc<Mutex<smtc::ControlMailbox>> = Arc::new(Mutex::new(smtc::ControlMailbox::default()));
     let supervisor_control_tx = control_tx.clone();
     let main_window_control_tx = control_tx.clone();
+    let supervisor_control_mailbox = control_mailbox.clone();
+    let main_window_control_mailbox = control_mailbox.clone();
     let supervisor_control_rx: Arc<Mutex<mpsc::Receiver<smtc::Signal>>> = Arc::new(Mutex::new(control_rx));
     let shared_config: std::sync::Arc<std::sync::RwLock<Config>> =
         std::sync::Arc::new(std::sync::RwLock::new(config.clone()));
@@ -844,6 +855,7 @@ fn main() -> Result<()> {
                 let listener_config_worker = listener_config.clone();
                 let control_tx_worker = supervisor_control_tx.clone();
                 let control_rx_worker = supervisor_control_rx.clone();
+                let control_mailbox_worker = supervisor_control_mailbox.clone();
                 let now_showing_worker = now_showing_supervisor.clone();
                 let worker_started = Instant::now();
                 // A replacement worker starts with a fresh heartbeat:
@@ -860,10 +872,11 @@ fn main() -> Result<()> {
                 let (done_tx, done_rx) = mpsc::channel::<()>();
                 // The worker's config snapshot, sampled once per spawn. The
                 // worker never reads the shared config again: live changes
-                // are pushed as `Signal::Control` commands, and a command
-                // posted just before a restart is still covered because the
-                // seed is taken from the same in-memory config the write
-                // landed on.
+                // are pushed into the control mailbox, which survives
+                // restarts (the replacement worker drains what its
+                // predecessor left), and the seed keeps a brand-new worker
+                // current even when the user never touches the settings
+                // again.
                 let listener_seed = {
                     let cfg = listener_config_worker
                         .read()
@@ -889,6 +902,7 @@ fn main() -> Result<()> {
                             now_showing_worker,
                             control_tx_worker,
                             control_rx_worker,
+                            control_mailbox_worker,
                         )
                         .run();
                         let _ = done_tx.send(());
@@ -1011,6 +1025,7 @@ fn main() -> Result<()> {
         overlay_hwnd,
         main_wake.clone(),
         main_window_control_tx,
+        main_window_control_mailbox,
     ) {
         Ok(hwnd) => hwnd,
         Err(error) => {

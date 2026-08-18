@@ -79,17 +79,19 @@ with media playing — cannot be verified headless.
   its result back via `POSITION_MSG` — never reload config from disk in
   `positioner.rs`.
 - The SMTC worker never reads the shared config: `main` seeds it once per
-  spawn (`smtc::ListenerSeed`) and the main window pushes live changes as
-  `Signal::Control` commands over the merged channel (`main_window.rs`
-  `push_control`). Any new setting the worker must honor goes through that
-  channel, never a config read.
+  spawn (`smtc::ListenerSeed`) and the main window pushes live changes into
+  the latest-value control mailbox (`main_window.rs` `push_control`), which
+  the worker drains every event-loop turn. Any new setting the worker must
+  honor goes through that mailbox, never a config read.
 - Smoke test against the log after changing SMTC logic: one song change should
   produce one `track changed` line (with `artwork=` present), no repeated
   `track emit skipped` lines.
-- Control-channel smoke check (after touching `Signal::Control` /
+- Control-channel smoke check (after touching the control push /
   `push_control`): an Allowed-apps edit in the Settings pane logs one
   `media-sources allow list pushed by the settings UI` debug line, and a
-  Notifications toggle never logs `control command dropped`.
+  Notifications toggle never logs `control command dropped` (control
+  commands cannot be dropped: the mailbox holds the newest value per kind
+  until the worker drains it).
 - Churn-storm smoke check (after touching `smtc.rs` session handling): start
   an app that recreates its SMTC session rapidly (Riot Client was observed at
   ~20 sessions in 8.5s). Confirm the log shows one
