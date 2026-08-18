@@ -32,10 +32,17 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0,
-    WAIT_TIMEOUT, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HLOCAL, HWND, LPARAM, LocalFree, WAIT_ABANDONED,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_KERNEL_OBJECT, SetSecurityInfo,
 };
 use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
+use windows::Win32::Security::{
+    DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, IsValidSecurityDescriptor,
+    LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+};
 use windows::Win32::Storage::FileSystem::{FILE_BEGIN, GetFileSize, SetEndOfFile, SetFilePointer, WriteFile};
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
@@ -50,7 +57,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, DispatchMessageW, GetMessageW, TranslateMessage};
-use windows::core::PCWSTR;
+use windows::core::{BOOL, PCWSTR};
 
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, artwork_bytes};
 use crate::overlay::EventQueue;
@@ -391,6 +398,109 @@ fn report_suspected_squat() {
     );
 }
 
+/// Security descriptor string for the named singleton objects (the
+/// single-instance mutex and the restart-ready event). The DACL grants full
+/// control only to SYSTEM, Administrators, and the object owner (the current
+/// user); the mandatory label pins the objects at Medium integrity with
+/// no-write-up / no-execute-up, so a lower-integrity process in the same
+/// session cannot open these names for modify (release/signal) or wait
+/// (SYNCHRONIZE falls under the mandatory execute policy) — the named-object
+/// denial-of-service vectors for the singleton handshake. The objects are
+/// session-local (no `Global\` prefix), so other users cannot reach them by
+/// name at all; the DACL is the belt-and-braces for that boundary.
+const SINGLETON_OBJECT_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)S:(ML;;NWNX;;;ME)";
+
+/// Owns the `SECURITY_DESCRIPTOR` built from `SINGLETON_OBJECT_SDDL` and
+/// hands out the `SECURITY_ATTRIBUTES` pointing at it. The descriptor is a
+/// `LocalAlloc` allocation from the SDDL converter that must outlive the
+/// attributes, so both travel together; `Drop` frees it.
+struct SingletonSecurity(*mut std::ffi::c_void);
+
+impl SingletonSecurity {
+    /// Builds the descriptor from the constant SDDL. `None` only on a
+    /// converter failure (a can't-happen for a constant string); the caller
+    /// then proceeds with the default object security, and the crash.log
+    /// line keeps that degradation visible.
+    fn build() -> Option<SingletonSecurity> {
+        let sddl = wide(SINGLETON_OBJECT_SDDL);
+        let mut descriptor: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), 1, &mut descriptor, None)
+        }
+        .ok()?;
+        Some(SingletonSecurity(descriptor.0))
+    }
+
+    /// The attributes to pass to `CreateMutexW`/`CreateEventW`: a copy whose
+    /// descriptor pointer stays valid while this wrapper is alive.
+    fn attributes(&self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.0,
+            bInheritHandle: false.into(),
+        }
+    }
+
+    fn descriptor(&self) -> PSECURITY_DESCRIPTOR {
+        PSECURITY_DESCRIPTOR(self.0)
+    }
+}
+
+impl Drop for SingletonSecurity {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.0)));
+        }
+    }
+}
+
+/// Re-applies the singleton security descriptor to a freshly created named
+/// object. The DACL is applied at creation through the attributes; this
+/// re-apply is idempotent and additionally forces the mandatory label in,
+/// because a creation-time SACL can be silently dropped on some paths. A
+/// failure leaves the object with default security and records a crash.log
+/// line — the only channel available in `acquire_singleton` — so an
+/// unprotected launch is visible rather than silent.
+fn harden_named_object(handle: HANDLE, security: &SingletonSecurity) {
+    unsafe {
+        let descriptor = security.descriptor();
+        if !IsValidSecurityDescriptor(descriptor).as_bool() {
+            append_crash_log_line(
+                b"singleton hardening: the descriptor is invalid; the singleton objects run with default security\n",
+            );
+            return;
+        }
+        let mut dacl_present = BOOL(0);
+        let mut dacl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
+        let mut dacl_defaulted = BOOL(0);
+        let mut sacl_present = BOOL(0);
+        let mut sacl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
+        let mut sacl_defaulted = BOOL(0);
+        let dacl_ok = GetSecurityDescriptorDacl(descriptor, &mut dacl_present, &mut dacl, &mut dacl_defaulted);
+        let sacl_ok = GetSecurityDescriptorSacl(descriptor, &mut sacl_present, &mut sacl, &mut sacl_defaulted);
+        if dacl_ok.is_err() || sacl_ok.is_err() || !dacl_present.as_bool() || !sacl_present.as_bool() {
+            append_crash_log_line(b"singleton hardening: reading the descriptor's DACL/label failed; the singleton objects run with default security\n");
+            return;
+        }
+        let error = SetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            Some(sacl),
+        );
+        if !error.is_ok() {
+            let message = format!(
+                "singleton hardening: SetSecurityInfo failed (error {}); the singleton objects run with default security\n",
+                error.0
+            );
+            append_crash_log_line(message.as_bytes());
+        }
+    }
+}
+
 /// Acquires the single-instance mutex for the process lifetime. Returns the
 /// guard while the caller holds it, or `None` when another instance already
 /// owns the mutex. On the restart-handoff path (`restart_nonce` is `Some`),
@@ -403,12 +513,25 @@ fn acquire_singleton(restart_nonce: Option<&str>) -> anyhow::Result<Option<Singl
         // mutex. Opening can fail with ACCESS_DENIED when the name is held by
         // a process whose DACL denies us (a higher-integrity squatter):
         // annotate that instead of surfacing a bare OS error.
-        let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr())).map_err(|error| {
+        let security = SingletonSecurity::build();
+        let attributes = security.as_ref().map(|s| s.attributes());
+        let attributes_ptr = attributes.as_ref().map(|a| a as *const SECURITY_ATTRIBUTES);
+        let handle = CreateMutexW(attributes_ptr, true, PCWSTR(name.as_ptr())).map_err(|error| {
             anyhow::anyhow!(
                 "creating/opening the single-instance mutex failed: {error} (another process may already hold the name with restrictive permissions)"
             )
         })?;
-        if GetLastError() != ERROR_ALREADY_EXISTS {
+        // ERROR_ALREADY_EXISTS is only meaningful immediately after the
+        // create call; capture it before the hardening calls below can
+        // overwrite it.
+        let already_exists = GetLastError() == ERROR_ALREADY_EXISTS;
+        // Hardening is applied to the object whenever this process holds a
+        // handle, fresh or existing: an object created by an older, unhardened
+        // instance is retro-fitted (object security is not handle-scoped).
+        if let Some(security) = security.as_ref() {
+            harden_named_object(handle, security);
+        }
+        if !already_exists {
             return Ok(Some(SingletonGuard::new(handle)));
         }
         // The mutex already exists, so either a live instance owns it or the
@@ -581,7 +704,10 @@ pub fn relaunch_self() {
     // open it by name; auto-reset (bManualReset = false) so the single wait
     // consumes the signal.
     let event_name = wide(&format!("WinGlanceRestartReady-{nonce}"));
-    let ready = match unsafe { CreateEventW(None, false, false, PCWSTR(event_name.as_ptr())) } {
+    let security = SingletonSecurity::build();
+    let attributes = security.as_ref().map(|s| s.attributes());
+    let attributes_ptr = attributes.as_ref().map(|a| a as *const SECURITY_ATTRIBUTES);
+    let ready = match unsafe { CreateEventW(attributes_ptr, false, false, PCWSTR(event_name.as_ptr())) } {
         Ok(event) => {
             // A fresh 128-bit nonce must yield a fresh event. An already-
             // existing name means the object was pre-created by something
@@ -604,6 +730,9 @@ pub fn relaunch_self() {
             return;
         }
     };
+    if let Some(security) = security.as_ref() {
+        harden_named_object(ready, security);
+    }
     let spawned = process::Command::new(&exe)
         .arg("--reload-config")
         .arg("--winglance-restart-nonce")
@@ -1357,7 +1486,17 @@ fn message_loop() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only Win32 surface (production `main.rs` never touches these).
     use crate::events::{PlaybackState, media_event_into_owned};
+    use windows::Win32::Foundation::GENERIC_ALL;
+    use windows::Win32::Security::Authorization::GetSecurityInfo;
+    use windows::Win32::Security::GetAce;
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_ACCESS_RIGHTS};
+    // ACE type constants: winnt.h ACCESS_ALLOWED_ACE_TYPE (0) and
+    // SYSTEM_MANDATORY_LABEL_ACE_TYPE (0x11). The crate gates them behind a
+    // feature this crate does not enable; these values are stable ABI.
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
 
     #[test]
     fn crash_log_handle_is_retained_under_the_verified_discipline_at_install() {
@@ -1552,6 +1691,178 @@ mod tests {
                 "release hands the mutex back, so a later Drop is a no-op"
             );
             let _ = CloseHandle(second);
+        }
+    }
+
+    /// The mandatory-label SID of a Medium object: the
+    /// `SECURITY_MANDATORY_LABEL_AUTHORITY` identifier authority
+    /// ({0,0,0,0,0,16}) with the single subauthority
+    /// `SECURITY_MANDATORY_MEDIUM_RID` (0x2000) — S-1-16-0x2000.
+    const MEDIUM_LABEL_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 16];
+    const MEDIUM_LABEL_RID: u32 = 0x2000;
+
+    /// Reads the SID stored at an ACE's `SidStart` slot (offset 8 into an
+    /// `ACCESS_ALLOWED_ACE` / `SYSTEM_MANDATORY_LABEL_ACE`: 4-byte header, 4-byte
+    /// mask, then the SID). SIDs are variable-length and the crate's `SID`
+    /// struct only carries one subauthority slot, so the authority and
+    /// subauthorities are read at their byte offsets with unaligned reads.
+    unsafe fn read_ace_sid(ace: *const std::ffi::c_void) -> ([u8; 6], Vec<u32>) {
+        unsafe {
+            // The ACE prefix is 4-byte header plus 4-byte mask; the SID
+            // (revision, count, authority, subauthorities) starts at offset 8.
+            let sid = (ace as *const u8).add(8);
+            let count = *sid.add(1) as usize;
+            let mut authority = [0u8; 6];
+            authority.copy_from_slice(std::slice::from_raw_parts(sid.add(2), 6));
+            let subauthorities = (0..count)
+                .map(|index| std::ptr::read_unaligned(sid.add(8 + 4 * index) as *const u32))
+                .collect();
+            (authority, subauthorities)
+        }
+    }
+
+    /// Reads an ACE's type byte and access mask — the fixed
+    /// `ACE_HEADER`-plus-mask prefix shared by every ACE shape.
+    unsafe fn read_ace_type_and_mask(ace: *const std::ffi::c_void) -> (u8, u32) {
+        unsafe {
+            let base = ace as *const u8;
+            (*base, std::ptr::read_unaligned(base.add(4) as *const u32))
+        }
+    }
+
+    #[test]
+    fn singleton_security_descriptor_carries_the_intended_dacl_and_label() {
+        // The constant SDDL must parse into a descriptor whose DACL grants
+        // full control to exactly SYSTEM, Administrators, and the object
+        // owner (owner rights), and whose mandatory label pins Medium
+        // integrity. The kernel-applied counterpart is covered by the
+        // next test; this one pins the descriptor contents themselves.
+        let security = SingletonSecurity::build().expect("the constant SDDL must parse");
+        unsafe {
+            assert!(IsValidSecurityDescriptor(security.descriptor()).as_bool());
+            let mut dacl_present = BOOL(0);
+            let mut dacl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
+            let mut dacl_defaulted = BOOL(0);
+            assert!(
+                GetSecurityDescriptorDacl(security.descriptor(), &mut dacl_present, &mut dacl, &mut dacl_defaulted)
+                    .is_ok()
+            );
+            assert!(dacl_present.as_bool(), "the DACL must be present");
+            let mut aces = Vec::new();
+            for index in 0..8u32 {
+                let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+                if GetAce(dacl, index, &mut ace).is_err() {
+                    break;
+                }
+                aces.push(ace);
+            }
+            assert_eq!(aces.len(), 3, "exactly three DACL ACEs, got {}", aces.len());
+            for (index, ace) in aces.iter().enumerate() {
+                let (ace_type, mask) = read_ace_type_and_mask(*ace);
+                assert_eq!(ace_type, ACCESS_ALLOWED_ACE_TYPE, "ACE {index} must be an allow");
+                assert_eq!(mask, GENERIC_ALL.0, "ACE {index} must grant full control");
+                let (authority, subauthorities) = read_ace_sid(*ace);
+                let expected: ([u8; 6], Vec<u32>) = match index {
+                    0 => ([0, 0, 0, 0, 0, 5], vec![18]),      // SYSTEM (S-1-5-18)
+                    1 => ([0, 0, 0, 0, 0, 5], vec![32, 544]), // Administrators (S-1-5-32-544)
+                    _ => ([0, 0, 0, 0, 0, 3], vec![4]),       // Owner rights (S-1-3-4)
+                };
+                assert_eq!((authority, subauthorities), expected, "ACE {index} trustee");
+            }
+            let mut sacl_present = BOOL(0);
+            let mut sacl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
+            let mut sacl_defaulted = BOOL(0);
+            assert!(
+                GetSecurityDescriptorSacl(security.descriptor(), &mut sacl_present, &mut sacl, &mut sacl_defaulted)
+                    .is_ok()
+            );
+            assert!(sacl_present.as_bool(), "the mandatory label must be present");
+            let mut label_ace: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert!(GetAce(sacl, 0, &mut label_ace).is_ok(), "the label ACE must exist");
+            assert!(
+                GetAce(sacl, 1, &mut std::ptr::null_mut()).is_err(),
+                "exactly one label ACE"
+            );
+            let (ace_type, _) = read_ace_type_and_mask(label_ace);
+            assert_eq!(ace_type, SYSTEM_MANDATORY_LABEL_ACE_TYPE, "the label ACE type");
+            let (authority, subauthorities) = read_ace_sid(label_ace);
+            assert_eq!(
+                authority, MEDIUM_LABEL_AUTHORITY,
+                "the label uses the mandatory authority"
+            );
+            assert_eq!(subauthorities, vec![MEDIUM_LABEL_RID], "the label must be Medium");
+        }
+    }
+
+    #[test]
+    fn hardened_singleton_objects_reach_the_kernel_and_stay_open_to_the_user() {
+        // End-to-end: a named mutex created through the production attributes
+        // must carry the restrictive DACL and the Medium label as seen by the
+        // kernel (this also proves the label write via SetSecurityInfo works
+        // without elevation), and the same user must still be able to open the
+        // object — the successor process of a restart and the duplicate-launch
+        // probe both open these objects by name.
+        let security = SingletonSecurity::build().expect("the constant SDDL must parse");
+        let attributes = security.attributes();
+        let name = format!("WinGlanceTestHardened-{}", process::id());
+        let name_wide = wide(&name);
+        let mutex = unsafe { CreateMutexW(Some(&attributes), true, PCWSTR(name_wide.as_ptr())) }
+            .expect("creating the test mutex");
+        harden_named_object(mutex, &security);
+        unsafe {
+            // SYNCHRONIZE (0x0010_0000) is the standard right for waitable
+            // handles; the crate only ships it typed to FILE_ACCESS_RIGHTS.
+            let opened = OpenMutexW(
+                SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000),
+                false,
+                PCWSTR(name_wide.as_ptr()),
+            )
+            .expect("the owning user must still open the hardened mutex");
+            let _ = CloseHandle(opened);
+            let mut descriptor: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+            let error = GetSecurityInfo(
+                mutex,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut descriptor),
+            );
+            assert_eq!(error.0, 0, "GetSecurityInfo must succeed on our own object");
+            assert!(!descriptor.0.is_null());
+            let mut dacl_present = BOOL(0);
+            let mut dacl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
+            let mut dacl_defaulted = BOOL(0);
+            assert!(GetSecurityDescriptorDacl(descriptor, &mut dacl_present, &mut dacl, &mut dacl_defaulted).is_ok());
+            let mut ace_count = 0;
+            for index in 0..8u32 {
+                if GetAce(dacl, index, &mut std::ptr::null_mut()).is_ok() {
+                    ace_count += 1;
+                } else {
+                    break;
+                }
+            }
+            assert_eq!(
+                ace_count, 3,
+                "the kernel-applied DACL must carry the three ACEs, got {ace_count}"
+            );
+            let mut sacl_present = BOOL(0);
+            let mut sacl: *mut windows::Win32::Security::ACL = std::ptr::null_mut();
+            let mut sacl_defaulted = BOOL(0);
+            assert!(GetSecurityDescriptorSacl(descriptor, &mut sacl_present, &mut sacl, &mut sacl_defaulted).is_ok());
+            assert!(sacl_present.as_bool(), "the kernel-applied object must carry the label");
+            let mut label_ace: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert!(GetAce(sacl, 0, &mut label_ace).is_ok());
+            let (_, subauthorities) = read_ace_sid(label_ace);
+            assert_eq!(
+                subauthorities,
+                vec![MEDIUM_LABEL_RID],
+                "the object must be labeled Medium"
+            );
+            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+            let _ = CloseHandle(mutex);
         }
     }
 
