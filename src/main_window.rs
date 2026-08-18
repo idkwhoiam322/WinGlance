@@ -6628,6 +6628,153 @@ mod tests {
         assert_eq!(reloaded.overlay.duration_ms, 7000, "the successful save persists");
     }
 
+    /// Reads the BSTR payload of a VT_BSTR VARIANT. The layout is the
+    /// windows 0.62 generated `VARIANT` (VARIANT -> VARIANT_0 ->
+    /// VARIANT_0_0, whose `bstrVal` union field holds a `ManuallyDrop<BSTR>`)
+    /// — pinned here so the name assertions don't depend on the crate's
+    /// feature-gated `TryFrom<&VARIANT> for BSTR` conversion.
+    fn variant_bstr(variant: &windows::Win32::System::Variant::VARIANT) -> String {
+        use windows::Win32::System::Variant::VT_BSTR;
+        unsafe {
+            let v = &variant.Anonymous.Anonymous;
+            assert_eq!(v.vt, VT_BSTR, "expected a BSTR variant");
+            // `bstrVal` is a union field (VARIANT_0_0_0), so reading it is
+            // unsafe; it holds a ManuallyDrop<BSTR> for a VT_BSTR value.
+            let bstr: BSTR = (*v.Anonymous.bstrVal).clone();
+            bstr.to_string()
+        }
+    }
+
+    #[test]
+    fn retained_settings_provider_resolves_live_state_and_degrades_after_teardown() {
+        // AF-003 acceptance: one provider retained across a toggle, a
+        // scroll/DPI rebuild, and teardown must answer the CURRENT name,
+        // toggle state, focus, and bounds on every query — and unavailable
+        // (empty) state after the snapshot is cleared, never stale window
+        // data. The provider resolves by (row, sub) identity against the
+        // generation-tagged snapshot, so the same COM object tracks every
+        // change.
+        use std::convert::TryFrom;
+        use windows::Win32::UI::Accessibility::{
+            IRawElementProviderFragment, IToggleProvider, ToggleState_Off, ToggleState_On,
+            UIA_HasKeyboardFocusPropertyId, UIA_NamePropertyId, UIA_TogglePatternId,
+        };
+        use windows::core::Interface;
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::accessibility::clear_uia_provider_state(&SETTINGS_UI_SNAPSHOT);
+
+        let make_child = |toggle: bool, rect: RECT| crate::accessibility::SettingChild {
+            row_index: 3,
+            sub: SettingSub::None,
+            rect,
+            name: format!("Notifications: {}", if toggle { "On" } else { "Off" }),
+            control_type: UIA_CheckBoxControlTypeId,
+            toggle: Some(toggle),
+            runtime_id: setting_runtime_id(3, SettingSub::None),
+        };
+        // Snapshot 1: toggle ON, control at rect A.
+        let rect_a = RECT {
+            left: 100,
+            top: 200,
+            right: 300,
+            bottom: 234,
+        };
+        store_settings_ui_snapshot(Arc::new(SettingsUiSnapshot {
+            children: vec![make_child(true, rect_a)],
+            focus: None,
+        }));
+
+        // Retain ONE provider (UIA core holds it across every later change).
+        let provider = crate::accessibility::settings_child_provider(HWND::default(), 3, SettingSub::None)
+            .expect("the control must exist in snapshot 1");
+        let fragment: IRawElementProviderFragment = provider.cast().unwrap();
+        // The windows 0.62 COM interface methods are `unsafe fn`.
+        let toggle: IToggleProvider = unsafe { provider.GetPatternProvider(UIA_TogglePatternId) }
+            .unwrap()
+            .cast()
+            .unwrap();
+
+        // Snapshot 1 answers: ON, rect A, current name.
+        assert_eq!(unsafe { toggle.ToggleState() }.unwrap().0, ToggleState_On.0);
+        let bounds = unsafe { fragment.BoundingRectangle() }.unwrap();
+        assert_eq!(
+            (bounds.left, bounds.top, bounds.width, bounds.height),
+            (100.0, 200.0, 200.0, 34.0),
+            "bounds must be the exact rect from the snapshot"
+        );
+        assert_eq!(
+            variant_bstr(&unsafe { provider.GetPropertyValue(UIA_NamePropertyId) }.unwrap()),
+            "Notifications: On"
+        );
+
+        // The toggle flips and a scroll/DPI rebuild moves the control (rect
+        // B): the SAME retained provider must now answer OFF at rect B.
+        let rect_b = RECT {
+            left: 40,
+            top: 40,
+            right: 240,
+            bottom: 74,
+        };
+        store_settings_ui_snapshot(Arc::new(SettingsUiSnapshot {
+            children: vec![make_child(false, rect_b)],
+            focus: None,
+        }));
+        assert_eq!(
+            unsafe { toggle.ToggleState() }.unwrap().0,
+            ToggleState_Off.0,
+            "no stale toggle state"
+        );
+        let bounds = unsafe { fragment.BoundingRectangle() }.unwrap();
+        assert_eq!(
+            (bounds.left, bounds.top, bounds.width, bounds.height),
+            (40.0, 40.0, 200.0, 34.0),
+            "no stale bounds after the layout change"
+        );
+        assert_eq!(
+            variant_bstr(&unsafe { provider.GetPropertyValue(UIA_NamePropertyId) }.unwrap()),
+            "Notifications: Off",
+            "no stale name after the toggle"
+        );
+
+        // Keyboard focus tracks the live focus cell.
+        store_settings_ui_snapshot(Arc::new(SettingsUiSnapshot {
+            children: vec![make_child(false, rect_b)],
+            focus: Some((3, SettingSub::None)),
+        }));
+        let focused: bool =
+            bool::try_from(&unsafe { provider.GetPropertyValue(UIA_HasKeyboardFocusPropertyId) }.unwrap()).unwrap();
+        assert!(focused, "HasKeyboardFocus must follow the live focus cell");
+
+        // Teardown (WM_NCDESTROY clears the snapshot): the SAME retained
+        // provider must degrade to unavailable answers, never stale window
+        // data.
+        crate::accessibility::clear_uia_provider_state(&SETTINGS_UI_SNAPSHOT);
+        assert_eq!(
+            unsafe { toggle.ToggleState() }.unwrap().0,
+            ToggleState_Off.0,
+            "no stale toggle state after teardown"
+        );
+        assert_eq!(
+            unsafe { fragment.BoundingRectangle() }.unwrap().width,
+            0.0,
+            "no stale bounds after teardown"
+        );
+        assert_eq!(
+            variant_bstr(&unsafe { provider.GetPropertyValue(UIA_NamePropertyId) }.unwrap()),
+            "",
+            "no stale name after teardown"
+        );
+        let focused: bool =
+            bool::try_from(&unsafe { provider.GetPropertyValue(UIA_HasKeyboardFocusPropertyId) }.unwrap()).unwrap();
+        assert!(!focused, "no focus after teardown");
+        assert!(
+            unsafe { provider.GetPatternProvider(UIA_TogglePatternId) }.is_err(),
+            "no patterns after teardown"
+        );
+    }
+
     #[test]
     fn setting_row_name_pins_the_provider_name_format() {
         // The name-changed raise and the provider both build names through

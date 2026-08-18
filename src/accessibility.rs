@@ -61,19 +61,19 @@ pub struct SettingChild {
     pub runtime_id: i32,
 }
 
+/// Which element a `SettingsProvider` answers for: the fragment root, or one
+/// child identified by its STABLE (row, sub) identity. Identity — not an
+/// index into an owned snapshot — is what lets a provider retained by UIA
+/// core across a toggle, scroll, resize, or DPI change resolve the control's
+/// CURRENT name, toggle state, and bounds on every query, and answer
+/// unavailable after teardown.
 #[derive(Clone)]
 enum ProviderKind {
     Root,
-    Child(usize),
-}
-
-impl ProviderKind {
-    fn child_index(&self) -> Option<usize> {
-        match self {
-            ProviderKind::Root => None,
-            ProviderKind::Child(i) => Some(*i),
-        }
-    }
+    Child {
+        row_index: usize,
+        sub: crate::main_window::SettingSub,
+    },
 }
 
 #[implement(
@@ -86,20 +86,31 @@ impl ProviderKind {
 struct SettingsProvider {
     hwnd: HWND,
     kind: ProviderKind,
-    children: Vec<SettingChild>,
 }
 
 impl SettingsProvider {
-    fn make(&self, kind: ProviderKind) -> SettingsProvider {
-        SettingsProvider {
-            hwnd: self.hwnd,
-            kind,
-            children: self.children.clone(),
-        }
+    /// Resolves this provider's control against the CURRENT Settings
+    /// snapshot (generation-tagged, rebuilt by the UI thread on request), so
+    /// every query answers from the latest painted state — a retained
+    /// provider can never report a stale name, toggle state, focus, or
+    /// rectangle. After window teardown the snapshot is cleared (WM_NCDESTROY
+    /// empties it), resolution fails, and the provider degrades to
+    /// unavailable answers instead of stale window data.
+    fn resolve(&self) -> Option<SettingChild> {
+        let ProviderKind::Child { row_index, sub } = &self.kind else {
+            return None;
+        };
+        crate::main_window::settings_accessibility_children(self.hwnd)
+            .into_iter()
+            .find(|c| c.row_index == *row_index && c.sub == *sub)
     }
 
-    fn child_fragment(&self, index: usize) -> IRawElementProviderFragment {
-        self.make(ProviderKind::Child(index)).into()
+    fn make(&self, kind: ProviderKind) -> SettingsProvider {
+        SettingsProvider { hwnd: self.hwnd, kind }
+    }
+
+    fn child_fragment(&self, row_index: usize, sub: crate::main_window::SettingSub) -> IRawElementProviderFragment {
+        self.make(ProviderKind::Child { row_index, sub }).into()
     }
 
     fn root_fragment(&self) -> IRawElementProviderFragment {
@@ -137,26 +148,22 @@ impl SettingsProvider {
     fn control_type(&self) -> windows::Win32::UI::Accessibility::UIA_CONTROLTYPE_ID {
         match &self.kind {
             ProviderKind::Root => UIA_PaneControlTypeId,
-            ProviderKind::Child(index) => self
-                .children
-                .get(*index)
-                .map(|c| c.control_type)
-                .unwrap_or(UIA_GroupControlTypeId),
+            ProviderKind::Child { .. } => self.resolve().map(|c| c.control_type).unwrap_or(UIA_GroupControlTypeId),
         }
     }
 
     fn name(&self) -> String {
         match &self.kind {
             ProviderKind::Root => "Settings".to_string(),
-            ProviderKind::Child(index) => self.children.get(*index).map(|c| c.name.clone()).unwrap_or_default(),
+            ProviderKind::Child { .. } => self.resolve().map(|c| c.name).unwrap_or_default(),
         }
     }
 
     fn has_keyboard_focus(&self) -> bool {
-        let ProviderKind::Child(index) = &self.kind else {
+        let ProviderKind::Child { .. } = &self.kind else {
             return false;
         };
-        let Some(child) = self.children.get(*index) else {
+        let Some(child) = self.resolve() else {
             return false;
         };
         crate::main_window::settings_focus(self.hwnd).is_some_and(|(r, s)| child.row_index == r && child.sub == s)
@@ -164,14 +171,15 @@ impl SettingsProvider {
 
     /// Activates the control by posting its stable runtime id to the main
     /// window, which re-resolves it against the live layout and dispatches
-    /// through the same function as a real mouse click. A provider held across
-    /// a scroll or pane rebuild can never activate the control that now
-    /// occupies the old position: a stale id finds no row and is dropped.
+    /// through the same function as a real mouse click. The id is resolved
+    /// through the CURRENT snapshot, so a provider held past teardown or a
+    /// layout change cannot activate a control that no longer exists: a stale
+    /// id finds no row and is dropped.
     fn activate(&self) {
-        let ProviderKind::Child(index) = &self.kind else {
+        let ProviderKind::Child { .. } = &self.kind else {
             return;
         };
-        let Some(child) = self.children.get(*index) else {
+        let Some(child) = self.resolve() else {
             return;
         };
         if self.hwnd.0.is_null() {
@@ -195,18 +203,28 @@ impl IRawElementProviderSimple_Impl for SettingsProvider_Impl {
 
     fn GetPatternProvider(&self, patternid: UIA_PATTERN_ID) -> windows::core::Result<IUnknown> {
         let this = &self.this;
-        let Some(index) = this.kind.child_index() else {
+        let ProviderKind::Child { row_index, sub } = &this.kind else {
             return Err(Error::empty());
         };
-        let Some(child) = this.children.get(index) else {
+        let Some(child) = this.resolve() else {
             return Err(Error::empty());
         };
         if child.toggle.is_some() && patternid == UIA_TogglePatternId {
-            let p: IToggleProvider = this.make(ProviderKind::Child(index)).into();
+            let p: IToggleProvider = this
+                .make(ProviderKind::Child {
+                    row_index: *row_index,
+                    sub: *sub,
+                })
+                .into();
             return p.cast::<IUnknown>();
         }
         if child.toggle.is_none() && patternid == UIA_InvokePatternId {
-            let p: IInvokeProvider = this.make(ProviderKind::Child(index)).into();
+            let p: IInvokeProvider = this
+                .make(ProviderKind::Child {
+                    row_index: *row_index,
+                    sub: *sub,
+                })
+                .into();
             return p.cast::<IUnknown>();
         }
         Err(Error::empty())
@@ -224,7 +242,7 @@ impl IRawElementProviderSimple_Impl for SettingsProvider_Impl {
             return Ok(VARIANT::from(true));
         }
         if propertyid == UIA_IsKeyboardFocusablePropertyId {
-            return Ok(VARIANT::from(matches!(&this.kind, ProviderKind::Child(_))));
+            return Ok(VARIANT::from(matches!(&this.kind, ProviderKind::Child { .. })));
         }
         if propertyid == UIA_HasKeyboardFocusPropertyId {
             return Ok(VARIANT::from(this.has_keyboard_focus()));
@@ -251,22 +269,40 @@ impl IRawElementProviderFragment_Impl for SettingsProvider_Impl {
         let this = &self.this;
         match &this.kind {
             ProviderKind::Root => {
-                if direction == NavigateDirection_FirstChild && !this.children.is_empty() {
-                    return Ok(this.child_fragment(0));
+                let children = crate::main_window::settings_accessibility_children(this.hwnd);
+                if direction == NavigateDirection_FirstChild
+                    && let Some(first) = children.first()
+                {
+                    return Ok(this.child_fragment(first.row_index, first.sub));
                 }
-                if direction == NavigateDirection_LastChild && !this.children.is_empty() {
-                    return Ok(this.child_fragment(this.children.len() - 1));
+                if direction == NavigateDirection_LastChild
+                    && let Some(last) = children.last()
+                {
+                    return Ok(this.child_fragment(last.row_index, last.sub));
                 }
             }
-            ProviderKind::Child(index) => {
+            ProviderKind::Child { row_index, sub } => {
                 if direction == NavigateDirection_Parent {
                     return Ok(this.root_fragment());
                 }
-                if direction == NavigateDirection_NextSibling && *index + 1 < this.children.len() {
-                    return Ok(this.child_fragment(*index + 1));
+                // Sibling order is resolved against the CURRENT snapshot, so
+                // after a scroll or layout change a retained provider
+                // navigates the live tree, not the enumeration it was built
+                // from.
+                let children = crate::main_window::settings_accessibility_children(this.hwnd);
+                let index = children.iter().position(|c| c.row_index == *row_index && c.sub == *sub);
+                if direction == NavigateDirection_NextSibling
+                    && let Some(index) = index
+                    && let Some(next) = children.get(index + 1)
+                {
+                    return Ok(this.child_fragment(next.row_index, next.sub));
                 }
-                if direction == NavigateDirection_PreviousSibling && *index > 0 {
-                    return Ok(this.child_fragment(*index - 1));
+                if direction == NavigateDirection_PreviousSibling
+                    && let Some(index) = index
+                    && index > 0
+                    && let Some(prev) = children.get(index - 1)
+                {
+                    return Ok(this.child_fragment(prev.row_index, prev.sub));
                 }
             }
         }
@@ -278,10 +314,9 @@ impl IRawElementProviderFragment_Impl for SettingsProvider_Impl {
             // For the root, UIA derives the runtime id from the HWND; a null
             // array is the documented "no custom id" answer.
             ProviderKind::Root => Ok(std::ptr::null_mut()),
-            ProviderKind::Child(index) => match self.this.children.get(*index) {
-                Some(child) => runtime_id_array(child.runtime_id),
-                None => Ok(std::ptr::null_mut()),
-            },
+            ProviderKind::Child { row_index, sub } => {
+                runtime_id_array(crate::main_window::setting_runtime_id(*row_index, *sub))
+            }
         }
     }
 
@@ -289,7 +324,7 @@ impl IRawElementProviderFragment_Impl for SettingsProvider_Impl {
         let this = &self.this;
         let client = match &this.kind {
             ProviderKind::Root => Some(crate::main_window::settings_content_rect(this.hwnd)),
-            ProviderKind::Child(index) => this.children.get(*index).map(|c| c.rect),
+            ProviderKind::Child { .. } => this.resolve().map(|c| c.rect),
         };
         Ok(client.map_or(UiaRect::default(), |client| this.screen_rect(client)))
     }
@@ -300,10 +335,11 @@ impl IRawElementProviderFragment_Impl for SettingsProvider_Impl {
     }
 
     fn SetFocus(&self) -> windows::core::Result<()> {
-        if let ProviderKind::Child(index) = &self.this.kind
-            && let Some(c) = self.this.children.get(*index)
-        {
-            crate::main_window::focus_setting_at(self.this.hwnd, c.row_index, c.sub);
+        if let ProviderKind::Child { row_index, sub } = &self.this.kind {
+            // `focus_setting_at` validates the pair against the live layout
+            // before committing, so a stale provider cannot focus a control
+            // that no longer exists.
+            crate::main_window::focus_setting_at(self.this.hwnd, *row_index, *sub);
         }
         Ok(())
     }
@@ -319,8 +355,9 @@ impl IRawElementProviderFragmentRoot_Impl for SettingsProvider_Impl {
         if this.hwnd.0.is_null() {
             return Ok(this.root_fragment());
         }
-        // Hit-test against the live layout, not the enumeration snapshot:
-        // scrolling may have moved every control since enumeration.
+        // Hit-test against the live layout with the exact control rectangles:
+        // scrolling may have moved every control since enumeration, and the
+        // bounds now equal the clickable targets.
         let children = crate::main_window::settings_accessibility_children(this.hwnd);
         let mut p = POINT {
             x: x as i32,
@@ -329,12 +366,14 @@ impl IRawElementProviderFragmentRoot_Impl for SettingsProvider_Impl {
         if !unsafe { ScreenToClient(this.hwnd, &mut p) }.as_bool() {
             return Ok(this.root_fragment());
         }
-        for (index, child) in children.iter().enumerate() {
+        for child in &children {
             if p.x >= child.rect.left && p.x < child.rect.right && p.y >= child.rect.top && p.y < child.rect.bottom {
                 return Ok(SettingsProvider {
                     hwnd: this.hwnd,
-                    kind: ProviderKind::Child(index),
-                    children,
+                    kind: ProviderKind::Child {
+                        row_index: child.row_index,
+                        sub: child.sub,
+                    },
                 }
                 .into());
             }
@@ -347,14 +386,12 @@ impl IRawElementProviderFragmentRoot_Impl for SettingsProvider_Impl {
             return Err(Error::empty());
         };
         let children = crate::main_window::settings_accessibility_children(self.this.hwnd);
-        let index = children
-            .iter()
-            .position(|c| c.row_index == row && c.sub == sub)
-            .ok_or_else(Error::empty)?;
+        if !children.iter().any(|c| c.row_index == row && c.sub == sub) {
+            return Err(Error::empty());
+        }
         Ok(SettingsProvider {
             hwnd: self.this.hwnd,
-            kind: ProviderKind::Child(index),
-            children,
+            kind: ProviderKind::Child { row_index: row, sub },
         }
         .into())
     }
@@ -374,10 +411,10 @@ impl IToggleProvider_Impl for SettingsProvider_Impl {
     }
 
     fn ToggleState(&self) -> windows::core::Result<windows::Win32::UI::Accessibility::ToggleState> {
-        if let ProviderKind::Child(index) = &self.this.kind
-            && let Some(c) = self.this.children.get(*index)
-            && let Some(on) = c.toggle
-        {
+        // Resolved through the CURRENT snapshot: after the toggle flipped, a
+        // retained provider reports the new state; after teardown it reports
+        // the unavailable `Off` rather than a stale value.
+        if let Some(on) = self.this.resolve().and_then(|c| c.toggle) {
             return Ok(if on { ToggleState_On } else { ToggleState_Off });
         }
         Ok(ToggleState_Off)
@@ -504,15 +541,16 @@ pub(crate) fn raise_pill_name_changed(
 /// focusable controls (e.g. the pane is hidden or the window is gone). Used
 /// from `WM_GETOBJECT`.
 pub fn settings_provider(hwnd: HWND) -> Option<IRawElementProviderSimple> {
-    let children = crate::main_window::settings_accessibility_children(hwnd);
-    if children.is_empty() {
+    // The existence check gates provider attachment on the pane having
+    // controls; the provider itself answers every query against fresh
+    // snapshots, so it never serves a stale enumeration.
+    if crate::main_window::settings_accessibility_children(hwnd).is_empty() {
         return None;
     }
     Some(
         SettingsProvider {
             hwnd,
             kind: ProviderKind::Root,
-            children,
         }
         .into(),
     )
@@ -520,19 +558,24 @@ pub fn settings_provider(hwnd: HWND) -> Option<IRawElementProviderSimple> {
 
 /// Builds a provider for one Settings control identified by row and
 /// sub-control, from the live layout. Used to raise UIA events (focus changed,
-/// toggle state changed) on the element clients already know.
+/// toggle state changed) on the element clients already know. The control's
+/// existence is checked against the live layout (a vanished control gets no
+/// event), and the returned provider resolves its properties against fresh
+/// snapshots on every query, so an event raised on it always carries the
+/// current state.
 pub fn settings_child_provider(
     hwnd: HWND,
     row_index: usize,
     sub: crate::main_window::SettingSub,
 ) -> Option<IRawElementProviderSimple> {
     let children = crate::main_window::settings_accessibility_children(hwnd);
-    let index = children.iter().position(|c| c.row_index == row_index && c.sub == sub)?;
+    if !children.iter().any(|c| c.row_index == row_index && c.sub == sub) {
+        return None;
+    }
     Some(
         SettingsProvider {
             hwnd,
-            kind: ProviderKind::Child(index),
-            children,
+            kind: ProviderKind::Child { row_index, sub },
         }
         .into(),
     )
