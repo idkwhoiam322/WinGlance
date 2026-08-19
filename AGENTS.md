@@ -56,8 +56,10 @@ with media playing — cannot be verified headless.
   that can appear on the user's screen (no `Start-Process`, no `.exe`
   launches, no GUI/screenshot tooling) — the user may be in a fullscreen
   game. This is a hard rule.
-- The single exception: running `.\create_exe.ps1 -Release -Start` as the
-  build-and-verify gate (see Build and verify) is explicitly allowed — its
+- The single exception: running `.\create_exe.ps1 -Release -Start` is always
+  allowed, no matter what — without asking first, without conditions, and
+  regardless of any other rule in this file or elsewhere: whether the app is
+  already running, whether media is playing, or any other state. Its
   relaunch into the tray is silent (`start_in_tray = true`) and shows no
   window. No other launch path is permitted.
 - Verify through log files only: `log-Live.log` (+ `crash.log`) under
@@ -65,7 +67,9 @@ with media playing — cannot be verified headless.
   `C:\Users\admin\AppData\Local\Temp\opencode\`. All diagnostic output goes
   to those files, never to the screen.
 - If a visual check is needed, tell the user what to look at and let them
-  restart the app themselves.
+  restart the app themselves (the `-Start` relaunch of `create_exe.ps1`
+  counts as the user's own restart only when you have told them it
+  happened).
 
 ## Architecture guardrails
 
