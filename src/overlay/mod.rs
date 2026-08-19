@@ -288,6 +288,49 @@ const MARQUEE_FADE: f32 = 12.0;
 /// pack tightly without clipping.
 const ROW_HEIGHT: f32 = 1.35;
 
+/// Identity of the fully-composed static "background" layer (everything that
+/// does not move during a marquee scroll: aura, body, edge stroke, art tile,
+/// progress bar, and the non-scrolling text rows). The marquee tick copies this
+/// cached buffer and only re-composites the scrolling row(s), so any change to a
+/// background-affecting input must change at least one field here or the pill
+/// would render stale. Keep this exhaustive: every value `draw_pixels` /
+/// `draw_text_pixels` read that can alter the background must be reflected, or a
+/// config/art change will not invalidate the cache. Bumped separately from the
+/// structural `content` identity via `content_rev` (palette/art travel with the
+/// content, but a content swap also bumps `content_rev`, so both are covered).
+#[derive(Clone, Debug, PartialEq)]
+struct ChromeKey {
+    content_rev: u64,
+    compact: bool,
+    dpi: u32,
+    buf_w: usize,
+    buf_h: usize,
+    scale: f32,
+    bar_w: Option<usize>,
+    high_contrast: bool,
+    palette: Option<([u8; 4], [u8; 4])>,
+    background_color: [u8; 4],
+    text_color: [u8; 4],
+    accent_color: [u8; 4],
+    art_size: f32,
+    padding: f32,
+    font_size_title: f32,
+    font_size_artist: f32,
+    corner_radius: f32,
+    compact_corner_radius: f32,
+    morph: Option<(f32, f32)>,
+}
+
+/// The retained static-background raster produced by a `RenderLayer::Background`
+/// pass, reused by the marquee tick's `Foreground` pass. The pixels are tightly
+/// packed at stride `buf_w * 4` (the same layout `draw_pixels` / `draw_text_pixels`
+/// assume), so each marquee tick copies `pixels` over the scratch buffer and
+/// composites the scrolling rows on top — no chrome or GDI re-rasterization.
+struct ChromeCache {
+    key: ChromeKey,
+    pixels: Vec<u8>,
+}
+
 /// Scratch device context + DIB used to render pill text with Windows' own
 /// GDI text engine (ClearType, proper hinting), then composite the glyph
 /// coverage into the pill's premultiplied buffer. GDI writes alpha 0 for text
@@ -483,6 +526,19 @@ struct OverlayState {
     /// torn image, because the two strides only match when the pill is at
     /// its fully expanded size.
     frame_scratch: Vec<u8>,
+    /// Retained static-background raster (chrome + non-scrolling text) for the
+    /// current content, used to skip the expensive per-frame chrome re-render
+    /// while a marquee line scrolls. `None` until the first background pass;
+    /// invalidated by any `ChromeKey` change (see `chrome_cache_key`).
+    chrome_cache: Option<ChromeCache>,
+    /// Bumped whenever `content` is replaced or cleared, so the chrome cache is
+    /// invalidated across content swaps. Palette/art travel with the content, so
+    /// this also covers cover changes.
+    content_rev: u64,
+    /// The layer the current render pass should draw (set by `render_layered`
+    /// before the text draw). Read by the text-drawing helpers so the marquee
+    /// `Foreground` pass only re-composites the scrolling rows.
+    render_layer: render::RenderLayer,
     /// Timestamp of the previous animation tick, for time-based marquee
     /// scrolling.
     last_tick: Instant,
@@ -944,6 +1000,9 @@ impl OverlayState {
             last_bar_fraction: None,
             dib: None,
             frame_scratch: Vec::new(),
+            chrome_cache: None,
+            content_rev: 0,
+            render_layer: render::RenderLayer::Full,
             last_tick: Instant::now(),
             last_reassert: None,
             period_cache: None,
@@ -1006,6 +1065,51 @@ impl OverlayState {
         self.palette = self
             .content_palette
             .or_else(|| self.decoded_art.as_deref().and_then(crate::palette::palette_from_rgba));
+    }
+
+    /// The key identifying one static-background raster: every input that can
+    /// change the geometry or the non-scrolling text rows. A marquee tick whose
+    /// computed key matches the cached `ChromeCache` can skip the chrome and
+    /// the static-text GDI entirely and only re-composite the scrolling rows.
+    /// `content_rev` carries the structural content identity (title/artist/etc.
+    /// are not hashed here); palette and art travel with the content, so they
+    /// are covered by both `content_rev` and the `palette` tuple.
+    fn chrome_cache_key(
+        &self,
+        buf_w: usize,
+        buf_h: usize,
+        dpi: u32,
+        scale: f32,
+        compact: bool,
+        morph: Option<MorphProgress>,
+    ) -> ChromeKey {
+        let a = &self.config.appearance;
+        // The bar width must use the exact draw formula (`render::bar_pixel_w`,
+        // shared with `draw_pixels`): the key has to change on the pixel step
+        // the draw takes and not before, or the cache drifts silently either
+        // way.
+        let pill_w = buf_w.saturating_sub(self.aura_inset as usize * 2);
+        ChromeKey {
+            content_rev: self.content_rev,
+            compact,
+            dpi,
+            buf_w,
+            buf_h,
+            scale,
+            bar_w: render::bar_pixel_w(self.estimated_position_secs, self.progress_duration_secs, pill_w),
+            high_contrast: crate::winutil::system_preferences().high_contrast,
+            palette: self.palette.map(|p| (p.primary, p.secondary)),
+            background_color: a.background_color,
+            text_color: a.text_color,
+            accent_color: a.accent_color,
+            art_size: a.art_size as f32,
+            padding: a.padding,
+            font_size_title: a.font_size_title,
+            font_size_artist: a.font_size_artist,
+            corner_radius: a.corner_radius,
+            compact_corner_radius: a.compact_corner_radius,
+            morph: morph.map(|m| (m.width, m.height)),
+        }
     }
 
     fn ensure_anim_timer(&mut self) {
@@ -2026,6 +2130,7 @@ impl OverlayState {
         if self.persistent_collapse_on_dismiss {
             self.held_content = Some(event.clone());
         }
+        self.content_rev += 1;
         self.content = Some(event);
         self.publish_now_showing();
         self.content_palette = match &self.content {
@@ -2191,6 +2296,7 @@ impl OverlayState {
         if let MediaEvent::TrackChanged(ref track) = event {
             self.apply_track_progress(track);
         }
+        self.content_rev += 1;
         self.content = Some(event);
         self.publish_now_showing();
         self.content_palette = match &self.content {
@@ -3264,6 +3370,7 @@ impl OverlayState {
 
     fn hide(&mut self) {
         debug!("pill hidden");
+        self.content_rev += 1;
         self.content = None;
         self.dismiss_at = None;
         self.hover_dismiss_at = None;
@@ -3361,6 +3468,11 @@ impl OverlayState {
         self.text_scratch = None;
         self.dib = None;
         self.frame_scratch = Vec::new();
+        // The retained chrome raster too: a hidden pill would otherwise keep
+        // the last background cached for the rest of the session. The next
+        // show always rebuilds it (a hide bumps `content_rev`, so the key
+        // never matches), which is already the cost of showing anyway.
+        self.chrome_cache = None;
         debug!("released idle overlay buffers");
     }
 
@@ -3508,6 +3620,7 @@ impl OverlayState {
             },
             MediaEvent::TrackChanged,
         );
+        self.content_rev += 1;
         self.content = Some(content);
         self.resolve_pill_text();
         self.reset_scroll();
@@ -3912,11 +4025,12 @@ mod tests {
         morph_radius, morph_symbol_pos, morph_title_band, row_unveil_alpha, spring_expand,
     };
     use super::render::{
-        FILL_TINT_WEIGHT, blend_frames, blit_packed_rows, circle_coverage, clear_frame_scratch, clock_icon_coverage,
-        composite_marquee_strip, contrast_ratio, draw_aura, draw_clock_icon_pixels, draw_compact_pill,
-        draw_icon_scaled, draw_symbol_pixels, draw_text_line_pixels, draw_text_pixels, edge_fade_factor, muted_accent,
-        playback_state_for_track, round_rect_coverage, round_rect_coverage_fast, round_rect_coverage_supersampled,
-        rounded_triangle_coverage, scale_frame_about, shrink_frame_scratch, tinted_fill,
+        FILL_TINT_WEIGHT, RenderLayer, blend_frames, blit_packed_rows, circle_coverage, clear_frame_scratch,
+        clock_icon_coverage, composite_marquee_strip, contrast_ratio, draw_aura, draw_clock_icon_pixels,
+        draw_compact_pill, draw_icon_scaled, draw_pixels, draw_symbol_pixels, draw_text_line_pixels, draw_text_pixels,
+        edge_fade_factor, muted_accent, playback_state_for_track, round_rect_coverage, round_rect_coverage_fast,
+        round_rect_coverage_supersampled, rounded_triangle_coverage, scale_frame_about, shrink_frame_scratch,
+        tinted_fill,
     };
     use crate::events::{ARTWORK_DECODE, PlaybackType};
     use std::ptr::null_mut;
@@ -7385,6 +7499,7 @@ mod tests {
             [255, 255, 255, 255],
             1.0,
             None,
+            RenderLayer::Full,
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 100, "expected glyph pixels in the buffer, got {lit}");
@@ -7420,6 +7535,7 @@ mod tests {
             [0x80, 0x80, 0x80, 0xFF],
             1.0,
             None,
+            RenderLayer::Full,
         );
         // Find the highest alpha in the buffer: the interior of the glyphs.
         let max_alpha = pixels.chunks(4).map(|p| p[3]).max().unwrap_or(0);
@@ -7473,6 +7589,7 @@ mod tests {
                 scroll: &mut scroll,
                 strip: &mut strip,
             }),
+            RenderLayer::Full,
         );
         let lit = pixels.chunks(4).filter(|p| p[3] > 0).count();
         assert!(lit > 100, "expected glyph pixels with marquee state, got {lit}");
@@ -7509,6 +7626,7 @@ mod tests {
                 scroll: &mut scroll,
                 strip: &mut strip,
             }),
+            RenderLayer::Full,
         );
         assert!(
             scroll.scrolling,
@@ -7555,6 +7673,7 @@ mod tests {
                 scroll: &mut scroll,
                 strip: &mut strip,
             }),
+            RenderLayer::Full,
         );
         let built = strip.as_ref().expect("scrolling line must build a strip");
         assert!(built.text_w > 80, "strip must carry the full text width");
@@ -7577,6 +7696,7 @@ mod tests {
                 scroll: &mut scroll,
                 strip: &mut strip,
             }),
+            RenderLayer::Full,
         );
         assert_eq!(
             strip.as_ref().unwrap().pixels,
@@ -7621,6 +7741,7 @@ mod tests {
                 scroll: &mut scroll,
                 strip: &mut strip,
             }),
+            RenderLayer::Full,
         );
         assert_eq!(strip.as_ref().unwrap().value, first);
         draw_text_line_pixels(
@@ -7638,6 +7759,7 @@ mod tests {
                 scroll: &mut scroll,
                 strip: &mut strip,
             }),
+            RenderLayer::Full,
         );
         assert_eq!(
             strip.as_ref().unwrap().value,
@@ -7762,6 +7884,7 @@ mod tests {
             [255, 255, 255, 255],
             1.0,
             None,
+            RenderLayer::Full,
         );
         let mut marquee_pixels = vec![0u8; 200 * 40 * 4];
         let mut scroll = LineScroll::default();
@@ -7781,6 +7904,7 @@ mod tests {
                 scroll: &mut scroll,
                 strip: &mut strip,
             }),
+            RenderLayer::Full,
         );
         assert!(!scroll.scrolling, "fitting text must not be marked as scrolling");
         assert!(strip.is_none(), "fitting text must not build a strip");
@@ -7832,6 +7956,7 @@ mod tests {
                 scroll: &mut scroll,
                 strip: &mut strip,
             }),
+            RenderLayer::Full,
         );
         assert!(scroll.scrolling, "overflow must be detected during the hold");
         assert_eq!(scroll.offset, 0.0, "the hold must not advance the scroll offset");
@@ -7860,6 +7985,7 @@ mod tests {
                 scroll: &mut scroll,
                 strip: &mut strip,
             }),
+            RenderLayer::Full,
         );
         assert_eq!(
             strip.as_ref().unwrap().pixels,
@@ -7959,6 +8085,7 @@ mod tests {
                 scroll: &mut scroll,
                 strip: &mut strip,
             }),
+            RenderLayer::Full,
         );
         assert_eq!(
             strip.as_ref().unwrap().pixels,
@@ -8386,6 +8513,7 @@ mod tests {
             [255, 255, 255, 255],
             1.0,
             None,
+            RenderLayer::Full,
         );
         let upper = pixels
             .chunks(4)
@@ -10086,6 +10214,151 @@ mod tests {
         assert!(
             state.progress_playing,
             "a stateless TrackChanged pill keeps the historical playing behavior"
+        );
+    }
+
+    #[test]
+    fn chrome_cache_key_tracks_the_bar_by_visible_pixels() {
+        // The cached background is reused while a marquee scrolls, so the key
+        // must change exactly when the drawn bar changes: the draw quantizes
+        // the bar to integer pixels (`(pill_w * fraction).round()`), so a
+        // position that stays inside the same pixel step keeps the key (and
+        // the cache) and a step (or the bar appearing/disappearing) rebuilds.
+        // Keying on the raw position would invalidate every playing tick and
+        // never reuse the cache; keying on the paused scheduling fraction
+        // would hide paused seeks behind a stale cached bar.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.progress_duration_secs = Some(120);
+        state.estimated_position_secs = Some(60.0);
+        // 300 px pill at scale 1.0: one bar pixel = 0.4 s.
+        let at_half = state.chrome_cache_key(300, 100, 96, 1.0, false, None);
+        state.estimated_position_secs = Some(60.1);
+        assert_eq!(
+            state.chrome_cache_key(300, 100, 96, 1.0, false, None),
+            at_half,
+            "sub-pixel movement must keep the cached background"
+        );
+        state.estimated_position_secs = Some(62.5);
+        assert_ne!(
+            state.chrome_cache_key(300, 100, 96, 1.0, false, None),
+            at_half,
+            "a visible bar step must rebuild the background"
+        );
+        state.estimated_position_secs = None;
+        let barless = state.chrome_cache_key(300, 100, 96, 1.0, false, None);
+        assert_ne!(barless, at_half, "a disappearing bar must invalidate the cache");
+        state.progress_duration_secs = None;
+        assert_eq!(
+            state.chrome_cache_key(300, 100, 96, 1.0, false, None),
+            barless,
+            "no position and no duration both draw no bar"
+        );
+    }
+
+    #[test]
+    fn layered_background_plus_foreground_equals_full_render() {
+        // The marquee fast path composites a cached `Background` raster with a
+        // `Foreground` pass that draws only the scrolling rows. The union of
+        // the two passes must be pixel-identical to the single `Full` pass, or
+        // a scrolling pill would show a frozen, missing, or doubled row
+        // between cache rebuilds. This pins the layer gating of every element
+        // (scrolling rows, static rows, the play symbol, art tile, progress
+        // bar): anything added to a draw without a matching layer guard makes
+        // the buffers diverge here.
+        let config = Config::default();
+        let content = MediaEvent::TrackChanged(TrackInfo {
+            source_app: "spotify".into(),
+            title: "A deliberately very long title that cannot fit into the visible band".into(),
+            artist: "The Artist".into(),
+            album: "The Album".into(),
+            playback_state: Some(PlaybackState::Playing),
+            ..TrackInfo::default()
+        });
+        let inset = OverlayState::new(Config::default(), EventQueue::default()).aura_inset;
+        let (pill_w, pill_h) = content_size_of(&config, &content, false);
+        let buf_w = (pill_w.round() as i32 + inset * 2) as usize;
+        let buf_h = (pill_h.round() as i32 + inset * 2) as usize;
+        let body_bottom = inset + pill_h.round() as i32;
+        let needed = buf_w * buf_h * 4;
+
+        let mut full = OverlayState::new(Config::default(), EventQueue::default());
+        let mut split = OverlayState::new(Config::default(), EventQueue::default());
+        for state in [&mut full, &mut split] {
+            // A live bar: painted by the background pass and keyed separately,
+            // so the equivalence must hold with it drawn too.
+            state.progress_duration_secs = Some(120);
+            state.estimated_position_secs = Some(47.3);
+        }
+        let mut full_buf = vec![0u8; needed];
+        let mut split_buf = vec![0u8; needed];
+
+        // Single-pass reference render.
+        full.render_layer = RenderLayer::Full;
+        draw_pixels(
+            &mut full,
+            &mut full_buf,
+            &content,
+            buf_w,
+            buf_h,
+            1.0,
+            false,
+            None,
+            body_bottom,
+        )
+        .unwrap();
+        draw_text_pixels(
+            &mut full,
+            &mut full_buf,
+            &content,
+            buf_w as i32,
+            1.0,
+            false,
+            None,
+            body_bottom,
+            body_bottom,
+        );
+
+        // The production two-pass sequence: background, then foreground.
+        split.render_layer = RenderLayer::Background;
+        draw_pixels(
+            &mut split,
+            &mut split_buf,
+            &content,
+            buf_w,
+            buf_h,
+            1.0,
+            false,
+            None,
+            body_bottom,
+        )
+        .unwrap();
+        draw_text_pixels(
+            &mut split,
+            &mut split_buf,
+            &content,
+            buf_w as i32,
+            1.0,
+            false,
+            None,
+            body_bottom,
+            body_bottom,
+        );
+        split.render_layer = RenderLayer::Foreground;
+        draw_text_pixels(
+            &mut split,
+            &mut split_buf,
+            &content,
+            buf_w as i32,
+            1.0,
+            false,
+            None,
+            body_bottom,
+            body_bottom,
+        );
+
+        assert_eq!(
+            full_buf, split_buf,
+            "the Background + Foreground passes must composite exactly like a Full render"
         );
     }
 

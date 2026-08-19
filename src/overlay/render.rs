@@ -6,8 +6,8 @@ use super::morph::{
     morph_title_band, row_unveil_alpha,
 };
 use super::{
-    CONTENT_FADE_DURATION, ContentFade, DibCache, MARQUEE_FADE, MARQUEE_GAP, MARQUEE_HOLD, MarqueeCtx, MarqueeStrip,
-    OverlayState, PillText, ROW_HEIGHT, TextScratch,
+    CONTENT_FADE_DURATION, ChromeCache, ContentFade, DibCache, MARQUEE_FADE, MARQUEE_GAP, MARQUEE_HOLD, MarqueeCtx,
+    MarqueeStrip, OverlayState, PillText, ROW_HEIGHT, TextScratch,
 };
 use crate::config::{AppearanceConfig, Config};
 use crate::events::{MediaEvent, PlaybackState, PlaybackType, TrackInfo};
@@ -26,6 +26,22 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW, ULW_ALPHA};
 use windows::core::PCWSTR;
+
+/// Which parts of the pill a text-drawing pass should produce. This lets the
+/// marquee tick avoid re-rendering the whole pill every frame: the static
+/// chrome (aura, body, edge, art, progress bar) and the non-scrolling text
+/// rows are drawn once into a cached `background` (the `Background` pass, which
+/// skips only the scrolling rows' text), and each subsequent marquee tick
+/// copies that cache and runs a `Foreground` pass that draws only the scrolling
+/// rows' text from the already-rasterized `MarqueeStrip`. `Full` is the
+/// original behavior used for every non-cached frame (morph, hover, content
+/// swap, first paint).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RenderLayer {
+    Full,
+    Background,
+    Foreground,
+}
 
 /// The cross-fade's blend weight from the fade's elapsed time: a smoothstep
 /// (a symmetric ease reads best for a dissolve), pinned at 1.0 past the
@@ -111,28 +127,104 @@ pub(super) fn render_layered(
     let needed = content_buf_w as usize * content_buf_h as usize * 4;
     let mut scratch = std::mem::take(&mut state.frame_scratch);
     clear_frame_scratch(&mut scratch, needed);
-    draw_pixels(
-        state,
-        &mut scratch[..needed],
-        content,
+
+    // Marquee fast path: while a line scrolls, the geometry and the
+    // non-scrolling rows are static, so reuse the cached `Background` raster
+    // and run only the `Foreground` pass that composites the scrolling rows'
+    // strips. The cache is keyed on every input that can change the static
+    // background (see `chrome_cache_key`); a key mismatch rebuilds it.
+    let chrome_key = state.chrome_cache_key(
         content_buf_w as usize,
         content_buf_h as usize,
+        (scale * 96.0).round() as u32,
         scale,
         compact,
         morph,
-        body_bottom,
-    )?;
-    draw_text_pixels(
-        state,
-        &mut scratch[..needed],
-        content,
-        content_buf_w,
-        scale,
-        compact,
-        morph,
-        body_bottom,
-        rest_body_bottom,
     );
+    let any_scrolling = state.scroll.iter().any(|s| s.scrolling);
+    if any_scrolling
+        && state.content_fade.is_none()
+        && crate::winutil::animations_enabled()
+        && state.chrome_cache.as_ref().is_some_and(|c| c.key == chrome_key)
+    {
+        // Reuse the cached background: copy it, then composite only the
+        // scrolling rows' text (their strips are already rasterized in
+        // `state.marquee_strips`). Skips the geometry and the static-text GDI.
+        state.render_layer = RenderLayer::Foreground;
+        scratch[..needed].copy_from_slice(&state.chrome_cache.as_ref().unwrap().pixels[..needed]);
+        draw_text_pixels(
+            state,
+            &mut scratch[..needed],
+            content,
+            content_buf_w,
+            scale,
+            compact,
+            morph,
+            body_bottom,
+            rest_body_bottom,
+        );
+    } else {
+        // Full background build, or a single-pass full frame when nothing is
+        // scrolling. `Background` defers the scrolling rows' text so it can be
+        // cached and re-composited on later ticks; `Full` paints everything.
+        state.render_layer = if any_scrolling {
+            RenderLayer::Background
+        } else {
+            RenderLayer::Full
+        };
+        draw_pixels(
+            state,
+            &mut scratch[..needed],
+            content,
+            content_buf_w as usize,
+            content_buf_h as usize,
+            scale,
+            compact,
+            morph,
+            body_bottom,
+        )?;
+        draw_text_pixels(
+            state,
+            &mut scratch[..needed],
+            content,
+            content_buf_w,
+            scale,
+            compact,
+            morph,
+            body_bottom,
+            rest_body_bottom,
+        );
+        if any_scrolling {
+            // Retain the background (scrolling rows omitted) for the marquee
+            // fast path. The live `scratch` still needs the scrolling text, so
+            // the foreground pass runs next into a separate copy.
+            if let Some(cache) = state.chrome_cache.as_mut() {
+                if cache.pixels.len() != needed {
+                    cache.pixels.resize(needed, 0);
+                }
+                cache.pixels[..needed].copy_from_slice(&scratch[..needed]);
+                cache.key = chrome_key;
+            } else {
+                state.chrome_cache = Some(ChromeCache {
+                    key: chrome_key,
+                    pixels: scratch[..needed].to_vec(),
+                });
+            }
+            state.render_layer = RenderLayer::Foreground;
+            draw_text_pixels(
+                state,
+                &mut scratch[..needed],
+                content,
+                content_buf_w,
+                scale,
+                compact,
+                morph,
+                body_bottom,
+                rest_body_bottom,
+            );
+        }
+    }
+    state.render_layer = RenderLayer::Full;
     // Record the composed frame's dimensions, so the next in-place content
     // swap can snapshot it for its cross-fade (see `update_content`).
     state.last_frame_w = content_buf_w as usize;
@@ -441,6 +533,26 @@ pub(super) fn dib_for(state: &mut OverlayState, width: i32, height: i32) -> Resu
     Ok((hdc, bitmap, bits))
 }
 
+/// Integer width of the progress-bar fill in buffer pixels for a pill body
+/// `pill_w` px wide, or `None` when no bar draws (missing position or
+/// duration, or a zero duration). The bar quantizes to whole pixels, so the
+/// drawn step is exactly `pill_w * fraction` rounded. `chrome_cache_key`
+/// shares this one formula: the cached background must change exactly when
+/// the painted bar moves, and a drift between the two sites would silently
+/// either rebuild the cache every frame or freeze the cached bar at an old
+/// width — both invisible in the logs.
+pub(super) fn bar_pixel_w(position: Option<f64>, duration: Option<u64>, pill_w: usize) -> Option<usize> {
+    let (Some(position), Some(duration)) = (position, duration) else {
+        return None;
+    };
+    if duration == 0 {
+        return None;
+    }
+    let clamped = position.clamp(0.0, duration as f64);
+    let fraction = (clamped / duration as f64).clamp(0.0, 1.0) as f32;
+    Some((pill_w as f32 * fraction).round() as usize)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_pixels(
     state: &mut OverlayState,
@@ -553,15 +665,12 @@ pub(super) fn draw_pixels(
     // Progress bar: a thin accent fill at the pill's bottom edge, masked to
     // the rounded body so it never paints into the transparent aura ring at
     // the corners. Present only when the source reports both a position and a
-    // non-zero duration.
-    if let (Some(position), Some(duration)) = (state.estimated_position_secs, state.progress_duration_secs)
-        && duration > 0
-    {
-        let position = position.clamp(0.0, duration as f64);
-        let fraction = (position / duration as f64).clamp(0.0, 1.0) as f32;
+    // non-zero duration. The width comes from the shared `bar_pixel_w` — the
+    // cache key's bar formula — so the painted step and the cache
+    // invalidation step can never drift.
+    if let Some(bar_w) = bar_pixel_w(state.estimated_position_secs, state.progress_duration_secs, pill_w) {
         let bar_h = (2.0 * scale).round().max(1.0) as usize;
         let bar_y = inset + pill_h.saturating_sub(bar_h);
-        let bar_w = (pill_w as f32 * fraction).round() as usize;
         let bar_color = aura_palette.primary;
         let bar_alpha = (bar_color[3] as f32 * 0.8) as u32;
         for y in bar_y..(bar_y + bar_h).min(height) {
@@ -1468,6 +1577,7 @@ pub(super) fn draw_pill_text_rows(
 ) {
     let inset = state.aura_inset;
     let appearance = &state.config.appearance;
+    let layer = state.render_layer;
     // Accent color: the displayed artwork's primary palette color when
     // available (gives the pill per-track theming), falling back to the
     // configured accent. Every color is dimmed by the cross-fade's
@@ -1570,8 +1680,11 @@ pub(super) fn draw_pill_text_rows(
                     scroll: &mut state.scroll[0],
                     strip: &mut state.marquee_strips[0],
                 }),
+                layer,
             );
-            if let Some(playback) = playback {
+            if layer != RenderLayer::Foreground
+                && let Some(playback) = playback
+            {
                 draw_symbol_pixels(
                     pixels,
                     width as usize,
@@ -1605,6 +1718,7 @@ pub(super) fn draw_pill_text_rows(
                     scroll: &mut state.scroll[1],
                     strip: &mut state.marquee_strips[1],
                 }),
+                layer,
             );
         }
     }
@@ -1635,6 +1749,7 @@ pub(super) fn draw_pill_text_rows(
                     scroll: &mut state.scroll[2],
                     strip: &mut state.marquee_strips[2],
                 }),
+                layer,
             );
         }
     }
@@ -1659,6 +1774,7 @@ pub(super) fn draw_pill_text_rows(
                     scroll: &mut state.scroll[3],
                     strip: &mut state.marquee_strips[3],
                 }),
+                layer,
             );
         }
     }
@@ -1707,6 +1823,7 @@ pub(super) fn draw_text_pixels(
     body_bottom: i32,
     rest_body_bottom: i32,
 ) {
+    let layer = state.render_layer;
     if let Some(progress) = morph {
         draw_morph_content(
             state,
@@ -1731,6 +1848,7 @@ pub(super) fn draw_text_pixels(
             body_bottom,
             rest_body_bottom,
             false,
+            layer,
         );
     }
 }
@@ -1755,6 +1873,7 @@ pub(super) fn draw_expanded_pill_text(
     body_bottom: i32,
     rest_body_bottom: i32,
     skip_title: bool,
+    layer: RenderLayer,
 ) {
     match content {
         MediaEvent::TrackChanged(track) => {
@@ -1860,17 +1979,20 @@ pub(super) fn draw_expanded_pill_text(
                                 dim_color(text_color, unveil),
                                 scale,
                                 None,
+                                layer,
                             );
-                            draw_symbol_pixels(
-                                pixels,
-                                width as usize,
-                                title_rect.right,
-                                title_rect.top,
-                                symbol_size,
-                                *playback,
-                                PlaybackType::Unknown,
-                                dim_color(accent_color, unveil),
-                            );
+                            if layer != RenderLayer::Foreground {
+                                draw_symbol_pixels(
+                                    pixels,
+                                    width as usize,
+                                    title_rect.right,
+                                    title_rect.top,
+                                    symbol_size,
+                                    *playback,
+                                    PlaybackType::Unknown,
+                                    dim_color(accent_color, unveil),
+                                );
+                            }
                         }
                     }
                     let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
@@ -1888,6 +2010,7 @@ pub(super) fn draw_expanded_pill_text(
                             dim_color([0xCC, 0xCC, 0xCC, 0xFF], content_alpha * unveil),
                             scale,
                             None,
+                            layer,
                         );
                     }
                 }
@@ -1922,6 +2045,7 @@ pub(super) fn draw_compact_pill(
 ) {
     let inset = state.aura_inset;
     let appearance = &state.config.appearance;
+    let layer = state.render_layer;
     // The playback symbol's color, guarded exactly like the expanded layout
     // and the morph's traveling symbol (see `draw_pill_text_rows`): the raw
     // palette primary can be too dark against the fill, and the compact and
@@ -1951,19 +2075,23 @@ pub(super) fn draw_compact_pill(
     let art_size = (metrics.art * scale).round() as i32;
     let art_x = inset + padding;
     let art_y = inset + (pill_h - art_size) / 2;
-    draw_art_tile(
-        pixels,
-        width as usize,
-        state.palette,
-        appearance.accent_color,
-        art_x as usize,
-        art_y as usize,
-        art_size as usize,
-        art_size as f32 * 0.2,
-        state.decoded_art.as_deref(),
-        scale,
-        content_alpha,
-    );
+    // The art tile is static; the `Foreground` pass only re-composites the
+    // scrolling title, so skip it there (it is painted in the geometry pass).
+    if layer != RenderLayer::Foreground {
+        draw_art_tile(
+            pixels,
+            width as usize,
+            state.palette,
+            appearance.accent_color,
+            art_x as usize,
+            art_y as usize,
+            art_size as usize,
+            art_size as f32 * 0.2,
+            state.decoded_art.as_deref(),
+            scale,
+            content_alpha,
+        );
+    }
 
     // Title row band: the title font's own row height, vertically centered
     // in the pill.
@@ -2037,6 +2165,7 @@ pub(super) fn draw_compact_pill(
             scroll: &mut state.scroll[0],
             strip: &mut state.marquee_strips[0],
         }),
+        layer,
     );
 
     // Trailing elements, from the title viewport's right edge outward:
@@ -2050,7 +2179,11 @@ pub(super) fn draw_compact_pill(
     let viewport_right = inset + (title_vp_right * scale).round() as i32;
     let icon_x = viewport_right + gap;
     let icon_y = inset + (pill_h - icon_size) / 2;
-    if let Some(icon) = app_icon {
+    // The app icon is static; only the scrolling title belongs in the
+    // `Foreground` pass, so skip it when compositing scrolling rows.
+    if layer != RenderLayer::Foreground
+        && let Some(icon) = app_icon
+    {
         draw_icon_scaled(
             pixels,
             width as usize,
@@ -2064,16 +2197,20 @@ pub(super) fn draw_compact_pill(
     }
     let symbol_right = icon_x + icon_size + symbol_gap + symbol;
     let symbol_y = inset + (pill_h - symbol) / 2;
-    draw_symbol_pixels(
-        pixels,
-        width as usize,
-        symbol_right,
-        symbol_y,
-        symbol as f32,
-        playback,
-        playback_type,
-        accent,
-    );
+    // The playback symbol is static; only the scrolling title belongs in the
+    // `Foreground` pass.
+    if layer != RenderLayer::Foreground {
+        draw_symbol_pixels(
+            pixels,
+            width as usize,
+            symbol_right,
+            symbol_y,
+            symbol as f32,
+            playback,
+            playback_type,
+            accent,
+        );
+    }
 }
 
 /// Draws one morph frame's content: the shared elements — the title and the
@@ -2099,6 +2236,7 @@ pub(super) fn draw_morph_content(
     let shape = progress.width.min(progress.height);
     let inset = state.aura_inset;
     let appearance = &state.config.appearance;
+    let layer = state.render_layer;
     let compact_opacity = compact_alpha(shape);
     let expanded_opacity = expanded_alpha(shape);
 
@@ -2149,22 +2287,25 @@ pub(super) fn draw_morph_content(
 
     // App icon (compact-only): stays at its compact position and dissolves
     // out; it is gone by 0.20, before the expanded app row starts arriving
-    // at 0.25, so the two never coexist.
-    match app_icon {
-        Some(icon) if compact_opacity > 0.0 => {
-            let (icon_x, icon_y, icon_size) = morph_icon_pos(&state.config, inset, scale);
-            draw_icon_scaled(
-                pixels,
-                width as usize,
-                &icon,
-                24,
-                icon_x as usize,
-                icon_y as usize,
-                icon_size as usize,
-                compact_opacity,
-            );
+    // at 0.25, so the two never coexist. Static element: skip during the
+    // `Foreground` pass (only the scrolling title belongs there).
+    if layer != RenderLayer::Foreground {
+        match app_icon {
+            Some(icon) if compact_opacity > 0.0 => {
+                let (icon_x, icon_y, icon_size) = morph_icon_pos(&state.config, inset, scale);
+                draw_icon_scaled(
+                    pixels,
+                    width as usize,
+                    &icon,
+                    24,
+                    icon_x as usize,
+                    icon_y as usize,
+                    icon_size as usize,
+                    compact_opacity,
+                );
+            }
+            _ => {}
         }
-        _ => {}
     }
 
     // The traveling title: one instance, moving from the compact band to
@@ -2189,25 +2330,29 @@ pub(super) fn draw_morph_content(
                 scroll: &mut state.scroll[0],
                 strip: &mut state.marquee_strips[0],
             }),
+            layer,
         );
     }
 
     // The traveling playback symbol: from the compact trailing chain to the
     // expanded title row's right slot. Both layouts draw the same size; the
-    // color matches the expanded steady state (contrast-checked).
-    let accent_base = pill_accent_base(state, appearance);
-    let accent = ensure_contrast(accent_base, pill_fill_bg(state), TEXT_CONTRAST_AA);
-    let (symbol_right, symbol_y, symbol_size) = morph_symbol_pos(&state.config, inset, width, scale, progress);
-    draw_symbol_pixels(
-        pixels,
-        width as usize,
-        symbol_right,
-        symbol_y,
-        symbol_size,
-        playback,
-        playback_type,
-        accent,
-    );
+    // color matches the expanded steady state (contrast-checked). Static
+    // element: skip during the `Foreground` pass.
+    if layer != RenderLayer::Foreground {
+        let accent_base = pill_accent_base(state, appearance);
+        let accent = ensure_contrast(accent_base, pill_fill_bg(state), TEXT_CONTRAST_AA);
+        let (symbol_right, symbol_y, symbol_size) = morph_symbol_pos(&state.config, inset, width, scale, progress);
+        draw_symbol_pixels(
+            pixels,
+            width as usize,
+            symbol_right,
+            symbol_y,
+            symbol_size,
+            playback,
+            playback_type,
+            accent,
+        );
+    }
 
     // The expanded extra rows (artist, meta, app): fade in with the expanded
     // window and sweep in behind the body edge. The title band keeps its
@@ -2223,6 +2368,7 @@ pub(super) fn draw_morph_content(
         body_bottom,
         rest_body_bottom,
         true,
+        layer,
     );
 }
 
@@ -2249,6 +2395,7 @@ pub(super) fn draw_meta_line_pixels(
     accent: [u8; 4],
     scale: f32,
     marquee: Option<MarqueeCtx<'_>>,
+    layer: RenderLayer,
 ) {
     if !clock {
         draw_text_line_pixels(
@@ -2263,6 +2410,7 @@ pub(super) fn draw_meta_line_pixels(
             color,
             scale,
             marquee,
+            layer,
         );
         return;
     }
@@ -2270,7 +2418,11 @@ pub(super) fn draw_meta_line_pixels(
     let icon_h = icon_size.round() as i32;
     let gap = (4.0 * scale) as i32;
     let icon_top = rect.top + (rect.bottom - rect.top - icon_h) / 2;
-    draw_clock_icon_pixels(pixels, width as usize, rect.left, icon_top, icon_size, accent);
+    // The clock icon is static; only the scrolling text belongs in the
+    // `Foreground` pass, so skip the icon when compositing scrolling rows.
+    if layer != RenderLayer::Foreground {
+        draw_clock_icon_pixels(pixels, width as usize, rect.left, icon_top, icon_size, accent);
+    }
     let text_rect = RECT {
         left: rect.left + icon_h + gap,
         ..*rect
@@ -2287,6 +2439,7 @@ pub(super) fn draw_meta_line_pixels(
         color,
         scale,
         marquee,
+        layer,
     );
 }
 
@@ -2310,6 +2463,7 @@ pub(super) fn draw_text_line_pixels(
     color: [u8; 4],
     scale: f32,
     marquee: Option<MarqueeCtx<'_>>,
+    layer: RenderLayer,
 ) {
     if value.is_empty() || rect.right <= rect.left || rect.bottom <= rect.top {
         return;
@@ -2387,6 +2541,11 @@ pub(super) fn draw_text_line_pixels(
             let fade_w = MARQUEE_FADE * scale;
             if text_w <= rw || !motion {
                 // Text fits: render once statically (no scrolling needed).
+                // A `Foreground` pass only re-composites scrolling rows, so a
+                // non-scrolling row is already in the cached background — skip it.
+                if layer == RenderLayer::Foreground {
+                    return;
+                }
                 let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
             } else {
                 // Overflowing line, served from the cached strip.
@@ -2418,7 +2577,12 @@ pub(super) fn draw_text_line_pixels(
                     y,
                     text_w,
                 );
-                if let Some(strip) = ctx.strip.as_ref() {
+                // `Background` builds the strip (so it is cached for the
+                // scrolling pass) but must not paint it into the background —
+                // the scrolling row's band holds only the body fill there.
+                if layer != RenderLayer::Background
+                    && let Some(strip) = ctx.strip.as_ref()
+                {
                     let off = (ctx.scroll.offset % total as f32) as i32;
                     // Edge fade relative to the visible band: during the hold
                     // only the trailing edge fades — nothing exits the left
@@ -2436,6 +2600,11 @@ pub(super) fn draw_text_line_pixels(
                 return;
             }
         } else {
+            // No marquee context: static text only. A `Foreground` pass skips it
+            // (already in the cached background).
+            if layer == RenderLayer::Foreground {
+                return;
+            }
             let _ = DrawTextW(hdc, &mut *scratch_utf16, &mut local, flags);
         }
         // `font_guard` restores the previous selection here on the static
@@ -2943,6 +3112,7 @@ pub(super) fn draw_source_app_row(
     scale: f32,
     content_alpha: f32,
     marquee: Option<MarqueeCtx<'_>>,
+    layer: RenderLayer,
 ) {
     if let Some(icon) = app_icon {
         // The source bitmap is always 24x24; the destination size is the
@@ -2951,7 +3121,11 @@ pub(super) fn draw_source_app_row(
         let icon_size = ((16.0 * scale).round() as usize).min(band_h);
         let icon_x = rect.left as usize;
         let icon_y = rect.top as usize + (band_h - icon_size) / 2;
-        draw_icon_scaled(pixels, width, icon, 24, icon_x, icon_y, icon_size, content_alpha);
+        // The app icon is static; only the scrolling text belongs in the
+        // `Foreground` pass, so skip the icon when compositing scrolling rows.
+        if layer != RenderLayer::Foreground {
+            draw_icon_scaled(pixels, width, icon, 24, icon_x, icon_y, icon_size, content_alpha);
+        }
         let text_rect = RECT {
             left: rect.left + icon_size as i32 + 6,
             ..*rect
@@ -2968,6 +3142,7 @@ pub(super) fn draw_source_app_row(
             color,
             scale,
             marquee,
+            layer,
         );
     } else {
         draw_text_line_pixels(
@@ -2982,6 +3157,7 @@ pub(super) fn draw_source_app_row(
             color,
             scale,
             marquee,
+            layer,
         );
     }
 }
