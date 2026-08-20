@@ -1771,6 +1771,38 @@ nested_appearance = [1, 2, 3]
     }
 
     #[test]
+    fn config_example_values_equal_the_code_defaults() {
+        // The coverage test above proves the example mentions every key; this
+        // test proves it carries the same *values* as the code defaults, so a
+        // default changed in code (or a value edited in the example) fails the
+        // suite at the drifting key instead of passing silently. A commented-
+        // out key in the example means "the default value" (how max_tick_hz is
+        // documented), so unset Option fields are filled from the defaults
+        // before the pair-by-pair comparison.
+        let example = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml"))
+            .expect("config.example.toml must exist at the crate root");
+        let mut parsed: Config =
+            toml::from_str(&example).expect("config.example.toml must deserialize into the Config schema");
+        parsed.normalize();
+        let defaults = Config::default();
+        if parsed.overlay.max_tick_hz.is_none() {
+            parsed.overlay.max_tick_hz = defaults.overlay.max_tick_hz;
+        }
+        let parsed_text = toml::to_string_pretty(&parsed).expect("parsed config must serialize");
+        let defaults_text = toml::to_string_pretty(&defaults).expect("default config must serialize");
+        fn pairs(text: &str) -> Vec<(&str, &str)> {
+            text.lines()
+                .filter_map(|line| line.split_once('=').map(|(key, value)| (key.trim(), value.trim())))
+                .collect()
+        }
+        assert_eq!(
+            pairs(&parsed_text),
+            pairs(&defaults_text),
+            "config.example.toml values must equal the code defaults"
+        );
+    }
+
+    #[test]
     fn tray_menu_lists_in_readme_and_docs_cover_every_entry() {
         // The tray menu offers more than the preset durations and the three
         // classic layouts: a custom duration entry (Custom…), the Persistent
