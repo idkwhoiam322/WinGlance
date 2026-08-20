@@ -511,6 +511,13 @@ struct OverlayState {
     /// Bar fraction painted on the last frame, so a settled pill can skip a
     /// static-tick repaint when the bar did not move by at least a pixel.
     last_bar_fraction: Option<f32>,
+    /// Identity (source, title, artist) of the track the progress state was
+    /// seeded from by `apply_track_progress`. A re-show of the SAME track
+    /// (held-content resume, dedup re-emit) must not re-seed the bar from the
+    /// snapshot's stale position/rate — the live estimate, anchor and rate the
+    /// overlay maintains via `ProgressChanged` and the tick crawl stay
+    /// authoritative. A different identity re-seeds.
+    progress_track_key: Option<(String, String, String)>,
     /// Cached DIB (DC + bitmap) reused across frames of the same size.
     dib: Option<DibCache>,
     /// Tightly-packed per-frame scratch buffer (stride == the requested
@@ -1000,6 +1007,7 @@ impl OverlayState {
             progress_playing: false,
             last_progress_position_secs: None,
             last_bar_fraction: None,
+            progress_track_key: None,
             dib: None,
             frame_scratch: Vec::new(),
             chrome_cache: None,
@@ -1415,12 +1423,18 @@ impl OverlayState {
                     // every ~2s, so without this gate a different source's
                     // advancing position would drive the seekbar under this
                     // source's pill (e.g. a paused YouTube Music card while a
-                    // Brave playback runs in the background).
-                    let matches_shown = self.content.as_ref().is_some_and(|content| match content {
+                    // Brave playback runs in the background). While the pill is
+                    // auto-hidden with held content, the held content stands in
+                    // for the screen: its source's samples keep the estimate fresh
+                    // across the hold, so the resume re-shows a current position
+                    // instead of the pre-hide one.
+                    let matches_source = |event: &MediaEvent| match event {
                         MediaEvent::TrackChanged(shown) => shown.source_app == source_app,
                         MediaEvent::PlaybackStateChanged(_, source) => source == &source_app,
                         _ => false,
-                    });
+                    };
+                    let matches_held = self.content.is_none() && self.held_content.as_ref().is_some_and(matches_source);
+                    let matches_shown = self.content.as_ref().is_some_and(matches_source) || matches_held;
                     if matches_shown {
                         self.apply_progress(position_secs, duration_secs, playback_rate);
                         // The static tick that drives a settled pill does not repaint
@@ -1985,6 +1999,14 @@ impl OverlayState {
     /// `show_with_duration`), since the latter does not funnel through the
     /// former. A state pill never touches progress — freeze/resume is handled
     /// in `tick`.
+    /// Identity triple (source, title, artist) used to decide whether a
+    /// TrackChanged re-display is the same timeline the progress state already
+    /// tracks. Matches the worker's track dedup identity, so a session-
+    /// recreation re-emit and a held-content resume both compare equal.
+    fn track_progress_key(track: &TrackInfo) -> (String, String, String) {
+        (track.source_app.clone(), track.title.clone(), track.artist.clone())
+    }
+
     fn apply_track_progress(&mut self, track: &TrackInfo) {
         self.progress_duration_secs = track.duration_secs;
         self.progress_rate = track.playback_rate;
@@ -2000,6 +2022,7 @@ impl OverlayState {
             .position_secs
             .map(|pos| (track.position_updated_at.unwrap_or_else(Instant::now), pos));
         self.progress_playing = true;
+        self.progress_track_key = Some(Self::track_progress_key(track));
     }
 
     /// Re-bases the progress estimate from a live `ProgressChanged` update
@@ -2122,7 +2145,12 @@ impl OverlayState {
             self.content_fade = None;
         }
         if let MediaEvent::TrackChanged(ref track) = event {
-            self.apply_track_progress(track);
+            // Same guard as `show_with_duration`: an in-place refresh of the
+            // track the bar already tracks (artwork arrival, dedup re-emit)
+            // keeps the live progress state; only a new identity re-seeds.
+            if self.progress_track_key.as_ref() != Some(&Self::track_progress_key(track)) {
+                self.apply_track_progress(track);
+            }
         }
         // A pill currently shown over a fullscreen/listed foreground is flagged
         // for collapse-on-dismiss; keep held_content in sync so the resume (when
@@ -2296,7 +2324,15 @@ impl OverlayState {
             let _ = kill_timer(self.hwnd, IDLE_BUFFER_TIMER_ID);
         }
         if let MediaEvent::TrackChanged(ref track) = event {
-            self.apply_track_progress(track);
+            // Re-displaying the same track (held-content resume, dedup
+            // re-emit) must not re-seed the bar from the snapshot's stale
+            // position/rate: the progress state this overlay already keeps
+            // (live `ProgressChanged` re-bases + tick crawl) is authoritative
+            // once a track's timeline is seeded. Only a genuinely different
+            // track re-seeds.
+            if self.progress_track_key.as_ref() != Some(&Self::track_progress_key(track)) {
+                self.apply_track_progress(track);
+            }
         }
         self.content_rev += 1;
         self.content = Some(event);
@@ -11887,6 +11923,136 @@ mod tests {
         assert_eq!(state.estimated_position_secs, Some(10.0));
         assert_eq!(state.progress_duration_secs, Some(120));
         assert_eq!(state.pending.len(), 0, "no pill queued for a progress update");
+    }
+
+    #[test]
+    fn reshowing_the_same_track_keeps_the_live_bar_position() {
+        // Held-content resume (alt-tab out of fullscreen; both the fore-
+        // ground-flap re-shows) re-displays the SAME TrackChanged the bar
+        // already tracks. Re-seeding progress from the snapshot's stale
+        // position would revert the bar to the track-change time; the live
+        // state (event re-bases + tick crawl) must survive the re-show.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        let mut snapshot = track_for("spotify", "Song", "Artist");
+        snapshot.duration_secs = Some(120);
+        snapshot.position_secs = Some(10.0);
+        snapshot.playback_rate = Some(1.0);
+        state.apply_track_progress(&snapshot);
+        assert_eq!(state.estimated_position_secs, Some(10.0));
+
+        // Live playback advances the bar to 90s (a ProgressChanged re-base;
+        // the crawl interpolates the same way).
+        state.apply_progress(Some(90.0), Some(120), Some(1.0));
+        assert_eq!(state.estimated_position_secs, Some(90.0));
+
+        // The pill is re-shown from the held snapshot whose position is the
+        // stale 10s of the original read.
+        state.show(MediaEvent::TrackChanged(snapshot), true);
+
+        assert_eq!(
+            state.estimated_position_secs,
+            Some(90.0),
+            "the re-show must not revert the bar to the stale snapshot position"
+        );
+        assert_eq!(state.progress_rate, Some(1.0));
+        assert_eq!(state.progress_duration_secs, Some(120));
+    }
+
+    #[test]
+    fn reshowing_a_different_track_reseeds_the_bar_from_its_snapshot() {
+        // A genuinely new track re-seeds the bar from its own snapshot even
+        // when the previous pill came from the same source.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        let mut first = track_for("spotify", "Song", "Artist");
+        first.duration_secs = Some(120);
+        first.position_secs = Some(10.0);
+        first.playback_rate = Some(1.0);
+        state.apply_track_progress(&first);
+        assert_eq!(state.estimated_position_secs, Some(10.0));
+
+        let mut second = track_for("spotify", "Other Song", "Artist");
+        second.duration_secs = Some(200);
+        second.position_secs = Some(42.0);
+        second.playback_rate = Some(1.0);
+        state.show(MediaEvent::TrackChanged(second), true);
+
+        assert_eq!(state.estimated_position_secs, Some(42.0));
+        assert_eq!(state.progress_duration_secs, Some(200));
+    }
+
+    #[test]
+    fn progress_for_held_content_updates_the_bar_while_the_pill_is_hidden() {
+        // While auto-hidden with held content, the held source's position
+        // samples must keep re-basing the estimate: the resume then shows a
+        // current position instead of the pre-hide one.
+        let config = Config::default();
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut state = OverlayState::new(config, queue.clone());
+        let mut track = track_for("spotify", "Song", "Artist");
+        track.duration_secs = Some(120);
+        track.position_secs = Some(10.0);
+        track.playback_rate = Some(1.0);
+        state.apply_track_progress(&track);
+        state.held_content = Some(MediaEvent::TrackChanged(track));
+        state.content = None;
+        state.phase = Phase::Hidden;
+
+        queue.lock().unwrap().push_back(Arc::new(MediaEvent::ProgressChanged {
+            source_app: "spotify".into(),
+            position_secs: Some(70.0),
+            duration_secs: Some(120),
+            playback_rate: Some(1.0),
+        }));
+        state.receive_events();
+
+        assert_eq!(state.estimated_position_secs, Some(70.0));
+        assert_eq!(state.pending.len(), 0, "a progress update must not queue a pill");
+        assert!(state.content.is_none(), "a progress update must not surface content");
+        assert!(
+            state.held_content.is_some(),
+            "the hold must survive the progress update"
+        );
+    }
+
+    #[test]
+    fn progress_from_a_foreign_source_is_ignored_while_holding() {
+        // The source gate applies to the hold too: a Brave timeline refresh
+        // must not drive the held spotify track's bar while the pill is
+        // hidden.
+        let config = Config::default();
+        let queue: EventQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut state = OverlayState::new(config, queue.clone());
+        let mut track = track_for("spotify", "Song", "Artist");
+        track.duration_secs = Some(120);
+        track.position_secs = Some(10.0);
+        track.playback_rate = Some(1.0);
+        state.apply_track_progress(&track);
+        state.held_content = Some(MediaEvent::TrackChanged(track));
+        state.content = None;
+        state.phase = Phase::Hidden;
+
+        queue.lock().unwrap().push_back(Arc::new(MediaEvent::ProgressChanged {
+            source_app: "brave".into(),
+            position_secs: Some(90.0),
+            duration_secs: Some(300),
+            playback_rate: Some(1.0),
+        }));
+        state.receive_events();
+
+        assert_eq!(state.estimated_position_secs, Some(10.0));
+        assert_eq!(state.progress_duration_secs, Some(120));
     }
 
     #[test]
