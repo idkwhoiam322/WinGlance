@@ -641,8 +641,24 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(!dialog.0.is_null(), "the dialog window must appear");
-        let edit = unsafe { GetDlgItem(Some(dialog), 100) }.expect("the edit control must exist");
-        let error_label = unsafe { GetDlgItem(Some(dialog), 101) }.expect("the error label must exist");
+        // The window becomes findable the moment CreateWindowExW returns,
+        // while its child controls are still being created on the dialog
+        // thread — poll until both exist so the test never races the control
+        // creation.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut edit, mut error_label) = (HWND::default(), HWND::default());
+        while Instant::now() < deadline {
+            if let Ok(found_edit) = unsafe { GetDlgItem(Some(dialog), 100) }
+                && let Ok(found_label) = unsafe { GetDlgItem(Some(dialog), 101) }
+                && !found_edit.0.is_null()
+                && !found_label.0.is_null()
+            {
+                edit = found_edit;
+                error_label = found_label;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
         assert!(
             !edit.0.is_null() && !error_label.0.is_null(),
             "the edit and error label must exist"
