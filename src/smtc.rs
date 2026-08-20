@@ -6621,22 +6621,22 @@ mod tests {
             drop(guard);
             if let Some(delay) = self.fire_after {
                 let shared = self.shared.clone();
+                // Fires on a detached background thread: a panic here unwinds
+                // the thread and aborts the whole test process (an AV-shaped
+                // crash, not a caught test failure). If the op/handler clones
+                // are already gone, the test ended first — return quietly
+                // rather than expect-ing into an abort. `Invoke`'s result is
+                // likewise ignored: the mock delegate is fire-and-forget.
                 std::thread::spawn(move || {
                     std::thread::sleep(delay);
                     let (handler, op) = {
                         let mut guard = shared.lock().unwrap();
-                        (
-                            guard
-                                .handler
-                                .clone()
-                                .expect("the handler must be installed before it fires"),
-                            guard.op.take().expect("the operation handle must be wired"),
-                        )
+                        match (guard.handler.clone(), guard.op.take()) {
+                            (Some(handler), Some(op)) => (handler, op),
+                            _ => return,
+                        }
                     };
-                    handler
-                        .0
-                        .Invoke(&op, AsyncStatus::Completed)
-                        .expect("the delegate must invoke");
+                    let _ = handler.0.Invoke(&op, AsyncStatus::Completed);
                 });
             }
             Ok(())
@@ -6745,6 +6745,11 @@ mod tests {
             drop(guard);
             if let Some(delay) = self.fire_after {
                 let shared = self.shared.clone();
+                // Fires on a detached background thread: a panic here unwinds
+                // the thread and aborts the whole test process (an AV-shaped
+                // crash, not a caught test failure). Return quietly if the
+                // op/handler clones are already gone, and ignore every
+                // `Invoke` result — the mock delegates are fire-and-forget.
                 std::thread::spawn(move || {
                     // Report progress partway through the work, then
                     // complete: WinRT operations report progress as they
@@ -6755,27 +6760,20 @@ mod tests {
                     std::thread::sleep(third);
                     let (handler, op, progress) = {
                         let mut guard = shared.lock().unwrap();
-                        (
-                            guard
-                                .handler
-                                .clone()
-                                .expect("the handler must be installed before it fires"),
-                            guard.op.take().expect("the operation handle must be wired"),
-                            guard.progress.clone(),
-                        )
+                        match (guard.handler.clone(), guard.op.take(), guard.progress.clone()) {
+                            (Some(handler), Some(op), progress) => (handler, op, progress),
+                            _ => return,
+                        }
                     };
                     if let Some(progress) = progress.as_ref() {
-                        progress.0.Invoke(&op, 1).expect("the progress delegate must invoke");
+                        let _ = progress.0.Invoke(&op, 1);
                     }
                     std::thread::sleep(third);
                     if let Some(progress) = progress.as_ref() {
-                        progress.0.Invoke(&op, 2).expect("the progress delegate must invoke");
+                        let _ = progress.0.Invoke(&op, 2);
                     }
                     std::thread::sleep(third);
-                    handler
-                        .0
-                        .Invoke(&op, AsyncStatus::Completed)
-                        .expect("the delegate must invoke");
+                    let _ = handler.0.Invoke(&op, AsyncStatus::Completed);
                 });
             }
             Ok(())
@@ -6895,22 +6893,20 @@ mod tests {
             drop(guard);
             if let Some(delay) = self.fire_after {
                 let shared = self.shared.clone();
+                // See the completed-handler mock: a panic on this detached
+                // thread aborts the test process. Return quietly if the
+                // op/handler clones are already gone, and ignore `Invoke`'s
+                // result.
                 std::thread::spawn(move || {
                     std::thread::sleep(delay);
                     let (handler, op) = {
                         let mut guard = shared.lock().unwrap();
-                        (
-                            guard
-                                .handler
-                                .clone()
-                                .expect("the handler must be installed before it fires"),
-                            guard.op.take().expect("the operation handle must be wired"),
-                        )
+                        match (guard.handler.clone(), guard.op.take()) {
+                            (Some(handler), Some(op)) => (handler, op),
+                            _ => return,
+                        }
                     };
-                    handler
-                        .0
-                        .Invoke(&op, AsyncStatus::Completed)
-                        .expect("the delegate must invoke");
+                    let _ = handler.0.Invoke(&op, AsyncStatus::Completed);
                 });
             }
             Ok(())
