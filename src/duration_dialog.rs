@@ -12,6 +12,8 @@ use crate::winutil::{StateClaim, register_class_once, release_window_state, set_
 use log::warn;
 use std::ffi::c_void;
 use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, DEFAULT_GUI_FONT, FillRect, GetStockObject, GetSysColorBrush, HDC, SetBkMode, SetTextColor,
@@ -20,6 +22,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+/// Test seam constant: the creation parent that makes a window message-only
+/// (see TEST_MESSAGE_ONLY_DIALOG). Imported only for the test build, where
+/// the seam is compiled in.
+#[cfg(test)]
+use windows::Win32::UI::WindowsAndMessaging::HWND_MESSAGE;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, EN_CHANGE, ES_AUTOHSCROLL, GetClientRect, GetMessageW, GetWindowRect, HMENU, IDCANCEL, IDOK,
@@ -43,6 +50,22 @@ static CLASS_GUARD: OnceLock<()> = OnceLock::new();
 /// caller. Reset before each open. See `winutil::StateClaim` for the shared
 /// mechanics.
 static DIALOG_STATE_CLAIMED: StateClaim = StateClaim::new();
+
+/// Test seam for the duration-dialog gate tests: while armed,
+/// `show_duration_dialog` creates the dialog against `HWND_MESSAGE` instead
+/// of the real parent. A message-only window can never be displayed and is
+/// invisible to FindWindowW/EnumWindows, so the gate's test phase cannot
+/// flash the dialog no matter how it runs. Production never arms the flag;
+/// the real `parent` keeps driving `EnableWindow` and centering.
+#[cfg(test)]
+static TEST_MESSAGE_ONLY_DIALOG: AtomicBool = AtomicBool::new(false);
+
+/// Test seam: the handle of the message-only dialog, latched at WM_NCCREATE
+/// while TEST_MESSAGE_ONLY_DIALOG is armed. EnumThreadWindows does not
+/// enumerate message-only windows, so the gate tests cannot discover the
+/// dialog through the OS — they poll this latch instead.
+#[cfg(test)]
+static TEST_DIALOG_HWND: AtomicUsize = AtomicUsize::new(0);
 
 struct DialogData {
     chosen: Option<u64>,
@@ -120,6 +143,20 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
             error_label: HWND::default(),
         }));
         DIALOG_STATE_CLAIMED.reset();
+        // Test seam: the gate tests arm TEST_MESSAGE_ONLY_DIALOG so this
+        // window is created against HWND_MESSAGE — such a window can never
+        // be displayed and is invisible to FindWindowW/EnumWindows, so the
+        // gate's test phase cannot flash the dialog regardless of the
+        // window station or what else is running. Production never arms the
+        // flag; the real `parent` still drives EnableWindow and centering.
+        #[cfg(test)]
+        let creation_parent = if TEST_MESSAGE_ONLY_DIALOG.load(Ordering::SeqCst) {
+            HWND_MESSAGE
+        } else {
+            parent
+        };
+        #[cfg(not(test))]
+        let creation_parent = parent;
         let hwnd = match create_window(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             PCWSTR(wide(CLASS_NAME).as_ptr()),
@@ -129,7 +166,7 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
             y,
             outer_w,
             outer_h,
-            Some(parent),
+            Some(creation_parent),
             None,
             instance,
             Some(state_ptr.cast()),
@@ -278,6 +315,14 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if message == WM_NCCREATE {
+        // Test seam: latch the dialog handle the moment the window
+        // materializes. The gate tests poll this because their message-only
+        // dialog is invisible to FindWindowW/EnumWindows and to
+        // EnumThreadWindows (compiled into test builds only).
+        #[cfg(test)]
+        if TEST_MESSAGE_ONLY_DIALOG.load(Ordering::SeqCst) {
+            TEST_DIALOG_HWND.store(hwnd.0 as usize, Ordering::SeqCst);
+        }
         let create = lparam.0 as *const CREATESTRUCTW;
         if !create.is_null() {
             let state = (*create).lpCreateParams as *mut DialogData;
@@ -379,12 +424,13 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
 #[cfg(test)]
 mod tests {
     use super::{
-        CLASS_GUARD, CLASS_NAME, DIALOG_STATE_CLAIMED, DialogData, dialog_proc, parse_duration_seconds,
-        show_duration_dialog,
+        CLASS_GUARD, CLASS_NAME, DIALOG_STATE_CLAIMED, DialogData, TEST_DIALOG_HWND, TEST_MESSAGE_ONLY_DIALOG,
+        dialog_proc, parse_duration_seconds, show_duration_dialog,
     };
     use crate::winapi::{create_window, post_message, send_message};
     use crate::winutil::{register_class_once, wide, window_state};
     use std::ffi::c_void;
+    use std::sync::atomic::Ordering;
     use std::sync::{Mutex, OnceLock, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -392,9 +438,9 @@ mod tests {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, DestroyWindow, FindWindowW, GetDlgItem, IDOK, IsWindowVisible, WINDOW_EX_STYLE, WINDOW_STYLE,
-        WM_CLOSE, WM_COMMAND, WM_NCDESTROY, WM_SETTEXT, WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-        WS_SYSMENU,
+        DefWindowProcW, DestroyWindow, GWL_STYLE, GetDlgItem, GetWindowLongW, HWND_MESSAGE, IDOK, WINDOW_EX_STYLE,
+        WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_NCDESTROY, WM_SETTEXT, WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_POPUP, WS_SYSMENU, WS_VISIBLE,
     };
     use windows::core::PCWSTR;
 
@@ -406,11 +452,10 @@ mod tests {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 
-    // The two dialog tests below both create real windows of the dialog class
-    // and both touch DIALOG_STATE_CLAIMED, so they must not interleave — a
-    // concurrent FindWindowW (in the re-enable test) could otherwise latch
-    // onto the other test's same-class window. Serialize like the overlay
-    // wndproc harness does.
+    // The three dialog tests below all create windows of the dialog class
+    // and all touch DIALOG_STATE_CLAIMED, so they must not interleave — the
+    // dialog harness would otherwise race the class registration and the
+    // state claim. Serialize like the overlay wndproc harness does.
     static DIALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     // Test-only parent window class, shared by the tests that run the real
@@ -419,6 +464,39 @@ mod tests {
     // ERROR_CLASS_ALREADY_EXISTS on the runner-up).
     static PARENT_GUARD: OnceLock<()> = OnceLock::new();
     const PARENT_CLASS: &str = "WinGlanceDialogTestParent";
+
+    /// Polls the dialog handle latch until the message-only dialog appears.
+    /// WM_NCCREATE fills the latch while the test seam is armed; window
+    /// enumeration cannot find a message-only window (FindWindowW,
+    /// EnumWindows and EnumThreadWindows all skip it), so the latch is the
+    /// only observable the tests have.
+    fn find_dialog_on_thread(timeout: Duration) -> HWND {
+        let deadline = Instant::now() + timeout;
+        let mut dialog = HWND::default();
+        // Clear first: the latch may still name the previous test's (now
+        // destroyed) dialog; only a handle latched during this poll window
+        // is accepted.
+        TEST_DIALOG_HWND.store(0, Ordering::SeqCst);
+        while Instant::now() < deadline {
+            let found = TEST_DIALOG_HWND.load(Ordering::SeqCst);
+            if found != 0 {
+                dialog = HWND(found as *mut c_void);
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        dialog
+    }
+
+    /// Whether `hwnd` carries the WS_VISIBLE style bit. IsWindowVisible cannot
+    /// answer for the dialog's descendants: their ancestor walk ends at the
+    /// HWND_MESSAGE pseudo-parent, which has no style bits, so
+    /// IsWindowVisible reads false even while the window is shown. The
+    /// style bit is the visibility state the dialog's own ShowWindow calls
+    /// control, so that is what the tests assert.
+    fn style_visible(hwnd: HWND) -> bool {
+        unsafe { (GetWindowLongW(hwnd, GWL_STYLE) as u32) & WS_VISIBLE.0 != 0 }
+    }
 
     #[test]
     fn dialog_state_box_installs_through_nccreate_and_frees_through_ncdestroy() {
@@ -533,22 +611,28 @@ mod tests {
                 PCWSTR(wide(PARENT_CLASS).as_ptr()),
                 PCWSTR(wide("dialog-test parent").as_ptr()),
                 WINDOW_STYLE(0),
-                // Offscreen: the dialog centers over its parent via
-                // GetWindowRect, so a parent at the origin would flash the
-                // real dialog on the visible desktop during the gate's test
-                // phase. FindWindowW finds top-level windows anywhere.
-                -12000,
-                -12000,
+                0,
+                0,
                 200,
                 120,
-                None,
+                // Message-only, like the dialog: a window created against
+                // HWND_MESSAGE can never be displayed and is invisible to
+                // FindWindowW/EnumWindows, so the gate's test phase cannot
+                // flash the parent or the dialog no matter what else is
+                // running on the machine.
+                Some(HWND_MESSAGE),
                 None,
                 instance,
                 None,
             )
             .expect("the parent window must be created");
             let _ = parent_tx.send(parent.0 as usize);
+            // Armed only around the dialog's own open, so the flag never
+            // leaks into another call on this thread (and the tests are
+            // serialized by DIALOG_TEST_LOCK anyway).
+            TEST_MESSAGE_ONLY_DIALOG.store(true, Ordering::SeqCst);
             let chosen = show_duration_dialog(parent, 3000);
+            TEST_MESSAGE_ONLY_DIALOG.store(false, Ordering::SeqCst);
             // The parent is enabled/disabled on this thread, so observe its
             // state here while the handle is still valid.
             let parent_enabled = IsWindowEnabled(parent).as_bool();
@@ -556,22 +640,13 @@ mod tests {
             let _ = DestroyWindow(parent);
         });
         // Wait for the parent window to exist, then for the dialog window to
-        // appear, then close it. Both are top-level (WS_POPUP), so
-        // FindWindowW by class reaches them.
+        // appear, then close it. Both windows are message-only, so no window
+        // enumeration can reach them — the dialog announces itself through
+        // the WM_NCCREATE latch instead.
         let _parent = parent_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the parent window must be created on the dialog thread");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut dialog = HWND::default();
-        while Instant::now() < deadline {
-            if let Ok(found) = unsafe { FindWindowW(PCWSTR(wide(CLASS_NAME).as_ptr()), PCWSTR::null()) }
-                && !found.0.is_null()
-            {
-                dialog = found;
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        let dialog = find_dialog_on_thread(Duration::from_secs(5));
         assert!(!dialog.0.is_null(), "the dialog window must appear");
         let _ = unsafe { post_message(dialog, WM_CLOSE, WPARAM(0), LPARAM(0)) };
         let (chosen, parent_enabled) = result_rx
@@ -623,22 +698,23 @@ mod tests {
                 PCWSTR(wide(PARENT_CLASS).as_ptr()),
                 PCWSTR(wide("dialog-test parent").as_ptr()),
                 WINDOW_STYLE(0),
-                // Offscreen: the dialog centers over its parent via
-                // GetWindowRect, so a parent at the origin would flash the
-                // real dialog on the visible desktop during the gate's test
-                // phase. FindWindowW finds top-level windows anywhere.
-                -12000,
-                -12000,
+                0,
+                0,
                 200,
                 120,
-                None,
+                // Message-only, like the dialog: neither window can ever be
+                // displayed or found by FindWindowW/EnumWindows, so the
+                // gate's test phase cannot flash them.
+                Some(HWND_MESSAGE),
                 None,
                 instance,
                 None,
             )
             .expect("the parent window must be created");
             let _ = parent_tx.send(parent.0 as usize);
+            TEST_MESSAGE_ONLY_DIALOG.store(true, Ordering::SeqCst);
             let chosen = show_duration_dialog(parent, 3000);
+            TEST_MESSAGE_ONLY_DIALOG.store(false, Ordering::SeqCst);
             let parent_enabled = IsWindowEnabled(parent).as_bool();
             let _ = result_tx.send((chosen, parent_enabled));
             let _ = DestroyWindow(parent);
@@ -646,17 +722,7 @@ mod tests {
         let _parent = parent_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the parent window must be created on the dialog thread");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut dialog = HWND::default();
-        while Instant::now() < deadline {
-            if let Ok(found) = unsafe { FindWindowW(PCWSTR(wide(CLASS_NAME).as_ptr()), PCWSTR::null()) }
-                && !found.0.is_null()
-            {
-                dialog = found;
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        let dialog = find_dialog_on_thread(Duration::from_secs(5));
         assert!(!dialog.0.is_null(), "the dialog window must appear");
         // The window becomes findable the moment CreateWindowExW returns,
         // while its child controls are still being created on the dialog
@@ -687,21 +753,18 @@ mod tests {
         set_text("abc", edit);
         let _ = unsafe { crate::winapi::send_message(dialog, WM_COMMAND, WPARAM(IDOK.0 as usize), LPARAM(0)) };
         assert!(
-            unsafe { IsWindowVisible(error_label).as_bool() },
+            style_visible(error_label),
             "the inline error label must be shown for invalid input"
         );
         assert!(
-            !unsafe { FindWindowW(PCWSTR(wide(CLASS_NAME).as_ptr()), PCWSTR::null()) }
-                .expect("FindWindowW never fails")
-                .0
-                .is_null(),
+            unsafe { crate::winapi::is_window(dialog) },
             "the dialog must stay open after invalid input"
         );
         // Corrected input hides the error while typing, then commits and
         // closes the dialog like the old path.
         set_text("7", edit);
         assert!(
-            !unsafe { IsWindowVisible(error_label).as_bool() },
+            !style_visible(error_label),
             "the inline error label must hide when the text changes"
         );
         let _ = unsafe { crate::winapi::send_message(dialog, WM_COMMAND, WPARAM(IDOK.0 as usize), LPARAM(0)) };
