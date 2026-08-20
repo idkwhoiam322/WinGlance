@@ -43,7 +43,7 @@ use windows::Win32::Security::{
     DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, IsValidSecurityDescriptor,
     LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
-use windows::Win32::Storage::FileSystem::{FILE_BEGIN, GetFileSize, SetEndOfFile, SetFilePointer, WriteFile};
+use windows::Win32::Storage::FileSystem::{SetFilePointer, WriteFile};
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
 };
@@ -205,16 +205,13 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if raw != 0 {
         let handle = HANDLE(raw as *mut c_void);
         unsafe {
-            // Keep crash.log bounded even on the allocation-free handler path:
-            // a crash loop must not grow it without limit. The pointer is
-            // positioned at EOF first so the crash record is always APPENDED,
-            // never written over earlier records (the handle carries both
-            // FILE_APPEND_DATA and FILE_WRITE_DATA, so the OS does not force
-            // appends automatically).
-            if GetFileSize(handle, None) > CRASH_LOG_CAP as u32 {
-                let _ = SetFilePointer(handle, 0, None, FILE_BEGIN);
-                let _ = SetEndOfFile(handle);
-            }
+            // crash.log is preserved forever: every crash record is appended
+            // and no cap truncates the file — the whole history is the
+            // forensics trail for diagnosing the crash loop itself. The
+            // pointer is positioned at EOF first so the crash record is
+            // always APPENDED, never written over earlier records (the
+            // handle carries both FILE_APPEND_DATA and FILE_WRITE_DATA, so
+            // the OS does not force appends automatically).
             let _ = SetFilePointer(handle, 0, None, windows::Win32::Storage::FileSystem::FILE_END);
             let mut written: u32 = 0;
             let _ = WriteFile(handle, Some(&buf[..pos]), Some(&mut written as *mut _), None);
@@ -243,8 +240,8 @@ fn install_crash_handler(logs_dir: &Path) {
 /// Writes Rust panics to crash.log. A panic in a window-proc unwinds across
 /// the extern "C" boundary, which aborts the process silently (no access
 /// violation, so the vectored handler never fires) — without this hook a
-/// panic looks like the app "stopped running randomly". The file is capped so
-/// a crash loop cannot grow it without bound.
+/// panic looks like the app "stopped running randomly". The file is appended
+/// to without a cap: its history is preserved for diagnosing crash loops.
 fn install_panic_hook(logs_dir: &Path) {
     let dir = logs_dir.to_path_buf();
     std::panic::set_hook(Box::new(move |info| {
@@ -259,15 +256,11 @@ fn install_panic_hook(logs_dir: &Path) {
         let message = format!("PANIC {payload} at {location}\n");
         let path = dir.join("crash.log");
         // Verified append — the parent's identity is checked and the
-        // final component is opened without following a pre-created link. The
-        // cap truncates the file when a crash loop would otherwise grow it
-        // without bound.
-        let _ = crate::winutil::append_verified_bounded(&path, message.as_bytes(), CRASH_LOG_CAP);
+        // final component is opened without following a pre-created link.
+        // crash.log is preserved forever: no size cap truncates it.
+        let _ = crate::winutil::append_verified(&path, message.as_bytes());
     }));
 }
-
-/// Upper bound on `crash.log` before the next panic truncates it.
-const CRASH_LOG_CAP: u64 = 1024 * 1024;
 
 /// Bounded waits for the restart handoff protocol. The old process gives the
 /// successor at most `RESTART_READY_TIMEOUT` to signal ready, and the
@@ -380,11 +373,11 @@ fn winglance_instance_running_retried() -> bool {
 }
 
 /// Appends a diagnostic line to `crash.log` — the only log available before
-/// `logging::init_logging` runs. Bounded like the panic hook so a launch
-/// loop cannot grow the file without limit.
+/// `logging::init_logging` runs. Append-only like the panic hook: the file is
+/// never truncated.
 fn append_crash_log_line(message: &[u8]) {
     if let Some(dir) = config::Config::data_dir().ok().map(|d| d.join("logs")) {
-        let _ = crate::winutil::append_verified_bounded(&dir.join("crash.log"), message, CRASH_LOG_CAP);
+        let _ = crate::winutil::append_verified(&dir.join("crash.log"), message);
     }
 }
 
