@@ -594,7 +594,9 @@ struct OverlayState {
     /// When true (PersistentCompact + hide_for_auto_compact_sources, foreground
     /// is fullscreen/listed), the pill collapses to fully hidden on its normal
     /// dismiss instead of fading to idle opacity. Set in `show_with_duration`
-    /// and re-evaluated by `on_foreground_change` on every foreground switch.
+    /// and re-evaluated by `on_foreground_change` on every foreground switch;
+    /// a flip to fullscreen while the pill is still inside its display window
+    /// defers the collapse to that deadline instead of hiding instantly.
     persistent_collapse_on_dismiss: bool,
     /// Cached result of `is_cursor_over_pill()` from the last animation tick,
     /// so `held_expanded()` (called from `receive_events` between ticks) can
@@ -3318,7 +3320,15 @@ impl OverlayState {
                 // which is correct — the pending event's pill is the one that
                 // was shown and collapsed. If no pending event, the save survives.
                 self.held_content = self.content.clone();
-                self.hide();
+                // A pill still inside its display window finishes its duration
+                // before the auto-hide: the collapse-on-dismiss flag set above
+                // routes that dismiss deadline into a full hide instead of the
+                // idle fade, so deferring is just skipping the immediate hide.
+                // Only an idle pill (deadline already passed — e.g. a faded
+                // persistent pill) hides instantly, as before.
+                if !self.dismiss_at.is_some_and(|deadline| Instant::now() < deadline) {
+                    self.hide();
+                }
                 return;
             }
             if was_auto_hidden && !should_hide {
@@ -5556,11 +5566,14 @@ mod tests {
     }
 
     #[test]
-    fn same_window_fullscreen_toggle_hides_persistent_pill_on_tick() {
+    fn same_window_fullscreen_toggle_defers_persistent_pill_hide_to_deadline() {
         // A same-window fullscreen toggle (F11 in a browser, Alt+Enter in a
         // game) fires no EVENT_SYSTEM_FOREGROUND — the foreground HWND never
         // changes. The static tick re-check must detect the verdict flip and
-        // auto-hide the pill through on_foreground_change.
+        // route it through on_foreground_change; a pill still inside its
+        // display window must defer the auto-hide to its dismiss deadline
+        // (the duration finishes, then the pill hides) instead of vanishing
+        // the instant the game takes the foreground.
         let mut config = Config::default();
         config.overlay.layout = LayoutMode::PersistentCompact;
         let mut state = OverlayState::new(config, EventQueue::default());
@@ -5573,8 +5586,7 @@ mod tests {
         let track = track_for("spotify", "Song", "Artist");
         state.content = Some(MediaEvent::TrackChanged(track));
         state.phase = Phase::Shown;
-        // Keep the dismiss countdown in the future so the pill cannot fade or
-        // collapse independently of the fullscreen transition.
+        // A fresh pill: the dismiss countdown is still in the future.
         state.dismiss_at = Some(Instant::now() + Duration::from_secs(3600));
 
         // The window goes fullscreen without changing identity.
@@ -5585,19 +5597,46 @@ mod tests {
         state.tick();
 
         assert!(
-            matches!(state.phase, Phase::Hidden),
-            "the pill must auto-hide on the tick"
+            !matches!(state.phase, Phase::Hidden),
+            "a young pill must not auto-hide instantly on the tick"
         );
-        assert!(state.content.is_none(), "content is cleared on hide");
-        assert!(state.held_content.is_some(), "the content must be held for resume");
+        assert!(state.content.is_some(), "the deferred pill keeps its content");
         assert!(
-            state.hidden_watchdog,
-            "the hidden-hold state must arm the foreground watchdog"
+            state.held_content.is_some(),
+            "the content must be held so the deferred hide still resumes later"
         );
-        assert_eq!(
-            state.tick_period, 1000,
-            "the watchdog must keep its coarse 1 s cadence — the trailing \
-             sync_anim_timer must not recreate the timer at refresh rate"
+        assert!(
+            state.persistent_collapse_on_dismiss,
+            "the flag must route the dismiss deadline into a full hide instead of the idle fade"
+        );
+        assert!(!state.hidden_watchdog, "no hide ran, so the watchdog must not be armed");
+    }
+
+    #[test]
+    fn hide_for_auto_compact_hides_idle_pill_immediately() {
+        // An idle persistent pill (display deadline already passed, faded to
+        // idle opacity) has nothing left to show: the fullscreen flip hides it
+        // instantly, exactly as before the deferral.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: true,
+        });
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Song", "Artist")));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() - Duration::from_secs(60));
+
+        state.on_foreground_change();
+
+        assert!(
+            matches!(state.phase, Phase::Hidden),
+            "an idle pill must still hide instantly on the fullscreen flip"
+        );
+        assert!(
+            state.held_content.is_some(),
+            "the content must be held for the future resume"
         );
     }
 
