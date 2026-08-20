@@ -440,8 +440,9 @@ struct OverlayState {
     /// The aura comet sweep's current angle in radians (atan2 convention:
     /// 0 = right of the pill center, positive = clockwise on screen),
     /// advanced by the animation tick while `orbiting`. Frozen while the
-    /// content is paused/stopped, so the sweep rests with the music; reset
-    /// on hide so each show starts the sweep fresh at the right.
+    /// content is paused/stopped, so the sweep rests with the music; kept
+    /// across pause, idle-fade and full hide so the next live tick resumes
+    /// the comet in place. Only a fresh process start zeroes it (see `new`).
     orbit_angle: f32,
     position: OverlayPos,
     /// The compact pill's resolved placement (independent of `position` only
