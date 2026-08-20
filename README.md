@@ -46,8 +46,9 @@ interrupts and never needs interaction.
   (UI Automation), and the tracking window's Settings pane is
   keyboard-navigable and exposes a full UIA provider.
 - **Small footprint** — raw Win32 + GDI, no UI framework, no webview, no GPU
-  runtime. One SMTC worker thread (plus a supervisor watchdog and an icon
-  worker); the pill repaints only while animating or scrolling.
+  runtime. Five isolated threads: SMTC worker, supervisor watchdog, event
+  forwarder, icon worker, and the UI thread; the pill repaints only while
+  animating or scrolling.
 
 ## Getting started
 
