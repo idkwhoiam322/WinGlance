@@ -2459,9 +2459,14 @@ impl OverlayState {
     /// playing content. It is gated on the pill's life, not its shape or
     /// animation state: the angle advances through the entrance, the hover
     /// expand/collapse morphs and the exit, so the sweep never pauses for a
-    /// size change. Pausing, stopping or hiding freezes it.
+    /// size change. Pausing, stopping, the PersistentCompact idle fade
+    /// (a resting pill must not burn refresh-rate repaints at 25% opacity),
+    /// or hiding freezes it.
     fn orbiting(&self) -> bool {
-        crate::winutil::animations_enabled() && !matches!(self.phase, Phase::Hidden) && self.content_playing()
+        crate::winutil::animations_enabled()
+            && !matches!(self.phase, Phase::Hidden)
+            && !self.persistent_faded
+            && self.content_playing()
     }
 
     fn tick_layout_check(&mut self) -> (bool, bool) {
@@ -10391,6 +10396,31 @@ mod tests {
         state.tick();
         assert_eq!(state.orbit_angle, 0.0, "a paused track must not advance the sweep");
         assert_eq!(state.render_count, before, "a paused settled pill must not repaint");
+    }
+
+    #[test]
+    fn the_sweep_freezes_for_the_persistent_idle_fade() {
+        // The idle-faded persistent pill is deliberately at rest: the sweep
+        // must not keep the pill repainting at refresh rate at 25% opacity.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.overlay.fade_persistent_pill = true;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.phase = Phase::Shown;
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Idle Fade", "Artist")));
+        state.persistent_faded = true;
+        // Pin the cursor verdict: without the hook, `is_cursor_over_pill`
+        // samples the real cursor against a display-derived placeholder rect
+        // (the test hwnd is null), which flakes whenever the user's mouse
+        // happens to sit over it. The cursor left long ago (see the
+        // persistent leave branch), so the fade must not be restored.
+        state.test_cursor_over = Some(false);
+        state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+        assert!(!state.orbiting(), "the idle-faded pill must not keep the sweep alive");
+        let before = state.render_count;
+        state.tick();
+        assert_eq!(state.orbit_angle, 0.0, "the faded pill must not advance the sweep");
+        assert_eq!(state.render_count, before, "the faded pill must not repaint");
     }
 
     #[test]
