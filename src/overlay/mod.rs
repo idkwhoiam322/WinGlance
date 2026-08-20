@@ -10409,6 +10409,24 @@ mod tests {
         state.phase = Phase::Shown;
         state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Idle Fade", "Artist")));
         state.persistent_faded = true;
+        // Pin the foreground verdict and the effective layout: the first
+        // static tick re-resolves the layout (PersistentCompact resolves to
+        // Compact, `decide_layout`) and compares the fullscreen verdict
+        // against an unset baseline. With the placeholder `Expanded` layout
+        // and a live foreground sample the tick either repaints (layout
+        // flip) or auto-hides (fullscreen verdict) — real-desktop state
+        // decides pass or fail either way.
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: None,
+            fullscreen: false,
+        });
+        state.layout = LayoutMode::Compact;
+        // Pre-seed the foreground-change baseline: the first tick otherwise
+        // sees `last_fullscreen` unset, reports a spurious "verdict change",
+        // and routes through on_foreground_change — whose reposition path
+        // re-renders on a monitor-DPI font rebuild. Matching the pinned
+        // verdict keeps the tick on the pure fade-freeze path.
+        state.last_fullscreen = Some(false);
         // Pin the cursor verdict: without the hook, `is_cursor_over_pill`
         // samples the real cursor against a display-derived placeholder rect
         // (the test hwnd is null), which flakes whenever the user's mouse
