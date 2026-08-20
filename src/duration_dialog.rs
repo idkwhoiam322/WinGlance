@@ -533,8 +533,12 @@ mod tests {
                 PCWSTR(wide(PARENT_CLASS).as_ptr()),
                 PCWSTR(wide("dialog-test parent").as_ptr()),
                 WINDOW_STYLE(0),
-                0,
-                0,
+                // Offscreen: the dialog centers over its parent via
+                // GetWindowRect, so a parent at the origin would flash the
+                // real dialog on the visible desktop during the gate's test
+                // phase. FindWindowW finds top-level windows anywhere.
+                -12000,
+                -12000,
                 200,
                 120,
                 None,
@@ -619,8 +623,12 @@ mod tests {
                 PCWSTR(wide(PARENT_CLASS).as_ptr()),
                 PCWSTR(wide("dialog-test parent").as_ptr()),
                 WINDOW_STYLE(0),
-                0,
-                0,
+                // Offscreen: the dialog centers over its parent via
+                // GetWindowRect, so a parent at the origin would flash the
+                // real dialog on the visible desktop during the gate's test
+                // phase. FindWindowW finds top-level windows anywhere.
+                -12000,
+                -12000,
                 200,
                 120,
                 None,
