@@ -3464,7 +3464,10 @@ impl OverlayState {
         self.hover_expanded_once = false;
         self.hover_leave_at = None;
         self.content_fade = None;
-        self.orbit_angle = 0.0;
+        // Deliberately keep `orbit_angle`: the comet resumes from its last
+        // position when the sweep next comes alive (a fresh show, an un-fade,
+        // or a resume after pause), instead of snapping back to zero. Only a
+        // fresh process start zeroes it (see `new`).
         self.persistent_collapse_on_dismiss = false;
         self.phase = Phase::Hidden;
         // Release the per-show render state: the next show re-converts the
