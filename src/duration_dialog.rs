@@ -13,7 +13,7 @@ use log::warn;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, DEFAULT_GUI_FONT, FillRect, GetStockObject, GetSysColorBrush, HDC, SetBkMode, SetTextColor,
@@ -63,9 +63,32 @@ static TEST_MESSAGE_ONLY_DIALOG: AtomicBool = AtomicBool::new(false);
 /// Test seam: the handle of the message-only dialog, latched at WM_NCCREATE
 /// while TEST_MESSAGE_ONLY_DIALOG is armed. EnumThreadWindows does not
 /// enumerate message-only windows, so the gate tests cannot discover the
-/// dialog through the OS — they poll this latch instead.
+/// dialog through the OS — they poll this latch instead. The handle is only
+/// acceptable while `TEST_DIALOG_EPOCH` carries the polling test's
+/// generation (see `find_dialog_on_thread`), so a stale handle from a
+/// previous test can never be mistaken for this test's dialog.
 #[cfg(test)]
 static TEST_DIALOG_HWND: AtomicUsize = AtomicUsize::new(0);
+
+/// Test seam: handles of the dialog's two id-interesting children (the
+/// duration edit, id 100, and the hidden error label, id 101), latched
+/// when the dialog thread creates them. Together with TEST_DIALOG_HWND
+/// they let a gate test wait for the whole dialog — window and controls —
+/// in one poll instead of racing the dialog thread's control creation
+/// with a second deadline. Same generation rule as the window latch.
+#[cfg(test)]
+static TEST_DIALOG_EDIT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_DIALOG_LABEL: AtomicUsize = AtomicUsize::new(0);
+
+/// Test seam generation counter: bumped by each gate test before it opens
+/// its dialog. The poll accepts a handle only while the generation matches
+/// — the latched values carry no generation themselves, so the tests also
+/// clear them after the bump; the epoch alone cannot tell a stale value
+/// from a fresh one, and the clear alone would race the dialog's own
+/// WM_NCCREATE store.
+#[cfg(test)]
+static TEST_DIALOG_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 struct DialogData {
     chosen: Option<u64>,
@@ -201,6 +224,18 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
                 None,
             );
             if let Ok(child) = child {
+                // Test seam: latch the duration edit (id 100) and the error
+                // label (id 101) the moment they materialize, so a gate test
+                // can wait for the full dialog in one poll (see
+                // `find_dialog_on_thread`).
+                #[cfg(test)]
+                if TEST_MESSAGE_ONLY_DIALOG.load(Ordering::SeqCst) {
+                    match id {
+                        100 => TEST_DIALOG_EDIT.store(child.0 as usize, Ordering::SeqCst),
+                        101 => TEST_DIALOG_LABEL.store(child.0 as usize, Ordering::SeqCst),
+                        _ => {}
+                    }
+                }
                 let _ = send_message(child, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
                 child
             } else {
@@ -424,8 +459,9 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
 #[cfg(test)]
 mod tests {
     use super::{
-        CLASS_GUARD, CLASS_NAME, DIALOG_STATE_CLAIMED, DialogData, TEST_DIALOG_HWND, TEST_MESSAGE_ONLY_DIALOG,
-        dialog_proc, parse_duration_seconds, show_duration_dialog,
+        CLASS_GUARD, CLASS_NAME, DIALOG_STATE_CLAIMED, DialogData, TEST_DIALOG_EDIT, TEST_DIALOG_EPOCH,
+        TEST_DIALOG_HWND, TEST_DIALOG_LABEL, TEST_MESSAGE_ONLY_DIALOG, dialog_proc, parse_duration_seconds,
+        show_duration_dialog,
     };
     use crate::winapi::{create_window, post_message, send_message};
     use crate::winutil::{register_class_once, wide, window_state};
@@ -438,9 +474,9 @@ mod tests {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, DestroyWindow, GWL_STYLE, GetDlgItem, GetWindowLongW, HWND_MESSAGE, IDOK, WINDOW_EX_STYLE,
-        WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_NCDESTROY, WM_SETTEXT, WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+        DefWindowProcW, DestroyWindow, GWL_STYLE, GetWindowLongW, HWND_MESSAGE, IDOK, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WM_CLOSE, WM_COMMAND, WM_NCDESTROY, WM_SETTEXT, WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        WS_SYSMENU, WS_VISIBLE,
     };
     use windows::core::PCWSTR;
 
@@ -455,8 +491,65 @@ mod tests {
     // The three dialog tests below all create windows of the dialog class
     // and all touch DIALOG_STATE_CLAIMED, so they must not interleave — the
     // dialog harness would otherwise race the class registration and the
-    // state claim. Serialize like the overlay wndproc harness does.
+    // state claim. Serialize like the overlay wndproc harness does. The
+    // lock is taken poison-tolerant: a panicking test poisons the mutex,
+    // but its contents stay valid, so the next test must still run —
+    // otherwise one failure cascades into the whole family.
     static DIALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Bounded on-drop cleanup for a dialog-test worker thread. If a test
+    /// panics mid-flight, its worker is left blocked inside the modal loop
+    /// forever — nothing will ever close its dialog — holding the armed seam
+    /// flag and the DIALOG_STATE_CLAIMED slot the next dialog test needs.
+    /// The guard closes this generation's latched dialog (if one exists) and
+    /// waits up to 5s for the worker to unwind; on the normal path the test
+    /// already joined the worker, so the guard is a no-op.
+    struct DialogWorkerGuard {
+        worker: Option<std::thread::JoinHandle<()>>,
+        epoch: u64,
+    }
+
+    impl DialogWorkerGuard {
+        fn new(worker: std::thread::JoinHandle<()>, epoch: u64) -> Self {
+            Self {
+                worker: Some(worker),
+                epoch,
+            }
+        }
+
+        /// Normal-path completion: the test verified the result channel, so
+        /// join the worker now. Consumes the guard; its Drop impl then sees
+        /// a finished worker and is a no-op.
+        fn join(mut self) {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    impl Drop for DialogWorkerGuard {
+        fn drop(&mut self) {
+            let Some(worker) = self.worker.as_ref() else {
+                return;
+            };
+            if worker.is_finished() {
+                return;
+            }
+            if TEST_DIALOG_EPOCH.load(Ordering::SeqCst) == self.epoch {
+                let hwnd = HWND(TEST_DIALOG_HWND.load(Ordering::SeqCst) as *mut c_void);
+                if !hwnd.0.is_null() {
+                    let _ = unsafe { post_message(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            if worker.is_finished() {
+                let _ = self.worker.take().expect("the worker handle is present").join();
+            }
+        }
+    }
 
     // Test-only parent window class, shared by the tests that run the real
     // modal dialog: like the dialog class itself, it is registered once per
@@ -465,27 +558,37 @@ mod tests {
     static PARENT_GUARD: OnceLock<()> = OnceLock::new();
     const PARENT_CLASS: &str = "WinGlanceDialogTestParent";
 
-    /// Polls the dialog handle latch until the message-only dialog appears.
-    /// WM_NCCREATE fills the latch while the test seam is armed; window
-    /// enumeration cannot find a message-only window (FindWindowW,
+    /// Polls the dialog latch until the message-only dialog and its two
+    /// id-bearing children (duration edit, error label) have all appeared.
+    /// WM_NCCREATE fills the window latch while the test seam is armed, and
+    /// the child helper latches the edit/label handles when it creates them;
+    /// window enumeration cannot find a message-only window (FindWindowW,
     /// EnumWindows and EnumThreadWindows all skip it), so the latch is the
-    /// only observable the tests have.
-    fn find_dialog_on_thread(timeout: Duration) -> HWND {
+    /// only observable the tests have. `epoch` is this test's latch
+    /// generation (bumped before spawning its worker): the test clears the
+    /// latches after the bump, so under the matching generation every
+    /// non-zero value is this generation's handle — a stale handle from a
+    /// previous test's window can never satisfy the poll.
+    fn find_dialog_on_thread(epoch: u64, timeout: Duration) -> (HWND, HWND, HWND) {
         let deadline = Instant::now() + timeout;
         let mut dialog = HWND::default();
-        // Clear first: the latch may still name the previous test's (now
-        // destroyed) dialog; only a handle latched during this poll window
-        // is accepted.
-        TEST_DIALOG_HWND.store(0, Ordering::SeqCst);
+        let mut edit = HWND::default();
+        let mut label = HWND::default();
         while Instant::now() < deadline {
-            let found = TEST_DIALOG_HWND.load(Ordering::SeqCst);
-            if found != 0 {
-                dialog = HWND(found as *mut c_void);
-                break;
+            if TEST_DIALOG_EPOCH.load(Ordering::SeqCst) == epoch {
+                let window = TEST_DIALOG_HWND.load(Ordering::SeqCst);
+                let edit_hwnd = TEST_DIALOG_EDIT.load(Ordering::SeqCst);
+                let label_hwnd = TEST_DIALOG_LABEL.load(Ordering::SeqCst);
+                if window != 0 && edit_hwnd != 0 && label_hwnd != 0 {
+                    dialog = HWND(window as *mut c_void);
+                    edit = HWND(edit_hwnd as *mut c_void);
+                    label = HWND(label_hwnd as *mut c_void);
+                    break;
+                }
             }
             thread::sleep(Duration::from_millis(5));
         }
-        dialog
+        (dialog, edit, label)
     }
 
     /// Whether `hwnd` carries the WS_VISIBLE style bit. IsWindowVisible cannot
@@ -500,7 +603,7 @@ mod tests {
 
     #[test]
     fn dialog_state_box_installs_through_nccreate_and_frees_through_ncdestroy() {
-        let _serialize = DIALOG_TEST_LOCK.lock().unwrap();
+        let _serialize = DIALOG_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // The DialogData lifecycle runs through the shared state-slot guard:
         // WM_NCCREATE installs the heap box via set_window_state, WM_NCDESTROY
         // frees it and clears the slot via release_window_state. Driving the
@@ -576,7 +679,7 @@ mod tests {
         // asserts the parent — disabled when the dialog opened — is enabled
         // again. Without the restore line the settings window would stay
         // permanently disabled after the dialog closes.
-        let _serialize = DIALOG_TEST_LOCK.lock().unwrap();
+        let _serialize = DIALOG_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.expect("process module").into();
         register_class_once(
             &CLASS_GUARD,
@@ -604,6 +707,17 @@ mod tests {
         let (parent_tx, parent_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let instance_raw = instance.0 as usize;
+        // Reserve this test's latch generation before the dialog can open:
+        // the poll below accepts only a handle latched under this epoch, so
+        // a stale handle from a previous test can never satisfy it.
+        let epoch = TEST_DIALOG_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        // The latch values carry no generation of their own: a poll under
+        // this epoch would otherwise accept the previous test's dead window
+        // handles the moment the epoch counter matches. Clear them on the
+        // main thread before the worker can store this generation's handles.
+        TEST_DIALOG_HWND.store(0, Ordering::SeqCst);
+        TEST_DIALOG_EDIT.store(0, Ordering::SeqCst);
+        TEST_DIALOG_LABEL.store(0, Ordering::SeqCst);
         let worker = thread::spawn(move || unsafe {
             let instance = HINSTANCE(instance_raw as *mut c_void);
             let parent = create_window(
@@ -626,7 +740,7 @@ mod tests {
                 None,
             )
             .expect("the parent window must be created");
-            let _ = parent_tx.send(parent.0 as usize);
+            let _ = parent_tx.send((parent.0 as usize, epoch));
             // Armed only around the dialog's own open, so the flag never
             // leaks into another call on this thread (and the tests are
             // serialized by DIALOG_TEST_LOCK anyway).
@@ -639,20 +753,23 @@ mod tests {
             let _ = result_tx.send((chosen, parent_enabled));
             let _ = DestroyWindow(parent);
         });
+        // On a panic this guard closes the dialog and waits for the worker
+        // to unwind, instead of leaving it in the modal loop forever.
+        let _worker_guard = DialogWorkerGuard::new(worker, epoch);
         // Wait for the parent window to exist, then for the dialog window to
         // appear, then close it. Both windows are message-only, so no window
         // enumeration can reach them — the dialog announces itself through
         // the WM_NCCREATE latch instead.
-        let _parent = parent_rx
+        let (_parent, epoch) = parent_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the parent window must be created on the dialog thread");
-        let dialog = find_dialog_on_thread(Duration::from_secs(5));
+        let (dialog, _, _) = find_dialog_on_thread(epoch, Duration::from_secs(15));
         assert!(!dialog.0.is_null(), "the dialog window must appear");
         let _ = unsafe { post_message(dialog, WM_CLOSE, WPARAM(0), LPARAM(0)) };
         let (chosen, parent_enabled) = result_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the dialog thread must return after WM_CLOSE");
-        let _ = worker.join();
+        _worker_guard.join();
         assert!(chosen.is_none(), "WM_CLOSE cancels the dialog");
         assert!(
             parent_enabled,
@@ -668,7 +785,7 @@ mod tests {
         // commit normally. Driven end to end like the re-enable test above:
         // the dialog (and its parent) live on a worker thread so the modal
         // loop is genuinely pumping.
-        let _serialize = DIALOG_TEST_LOCK.lock().unwrap();
+        let _serialize = DIALOG_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.expect("process module").into();
         register_class_once(
             &CLASS_GUARD,
@@ -691,6 +808,13 @@ mod tests {
         let (parent_tx, parent_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let instance_raw = instance.0 as usize;
+        // Reserve this test's latch generation (see the re-enable test).
+        let epoch = TEST_DIALOG_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        // Clear the previous generation's latched handles (see the re-enable
+        // test): the poll must not accept the past test's dead windows.
+        TEST_DIALOG_HWND.store(0, Ordering::SeqCst);
+        TEST_DIALOG_EDIT.store(0, Ordering::SeqCst);
+        TEST_DIALOG_LABEL.store(0, Ordering::SeqCst);
         let worker = thread::spawn(move || unsafe {
             let instance = HINSTANCE(instance_raw as *mut c_void);
             let parent = create_window(
@@ -711,7 +835,7 @@ mod tests {
                 None,
             )
             .expect("the parent window must be created");
-            let _ = parent_tx.send(parent.0 as usize);
+            let _ = parent_tx.send((parent.0 as usize, epoch));
             TEST_MESSAGE_ONLY_DIALOG.store(true, Ordering::SeqCst);
             let chosen = show_duration_dialog(parent, 3000);
             TEST_MESSAGE_ONLY_DIALOG.store(false, Ordering::SeqCst);
@@ -719,32 +843,20 @@ mod tests {
             let _ = result_tx.send((chosen, parent_enabled));
             let _ = DestroyWindow(parent);
         });
-        let _parent = parent_rx
+        // On a panic this guard closes the dialog and waits for the worker
+        // to unwind (see the re-enable test).
+        let _worker_guard = DialogWorkerGuard::new(worker, epoch);
+        let (_parent, epoch) = parent_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the parent window must be created on the dialog thread");
-        let dialog = find_dialog_on_thread(Duration::from_secs(5));
-        assert!(!dialog.0.is_null(), "the dialog window must appear");
-        // The window becomes findable the moment CreateWindowExW returns,
-        // while its child controls are still being created on the dialog
-        // thread — poll until both exist so the test never races the control
-        // creation.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let (mut edit, mut error_label) = (HWND::default(), HWND::default());
-        while Instant::now() < deadline {
-            if let Ok(found_edit) = unsafe { GetDlgItem(Some(dialog), 100) }
-                && let Ok(found_label) = unsafe { GetDlgItem(Some(dialog), 101) }
-                && !found_edit.0.is_null()
-                && !found_label.0.is_null()
-            {
-                edit = found_edit;
-                error_label = found_label;
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        // One wait for the whole dialog: the seam latches the window at
+        // WM_NCCREATE and the edit/label handles when the dialog thread
+        // creates the children, so a single generation-tagged poll covers
+        // both — no second deadline racing the control creation.
+        let (dialog, edit, error_label) = find_dialog_on_thread(epoch, Duration::from_secs(15));
         assert!(
-            !edit.0.is_null() && !error_label.0.is_null(),
-            "the edit and error label must exist"
+            !dialog.0.is_null() && !edit.0.is_null() && !error_label.0.is_null(),
+            "the dialog, edit and error label must appear"
         );
         let set_text = |text: &str, label: HWND| unsafe {
             let _ = crate::winapi::send_message(label, WM_SETTEXT, WPARAM(0), LPARAM(wide(text).as_ptr() as isize));
@@ -772,7 +884,7 @@ mod tests {
         let (chosen, parent_enabled) = result_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the dialog thread must return after the corrected entry");
-        let _ = worker.join();
+        _worker_guard.join();
         assert_eq!(chosen, Some(7000), "the corrected duration must commit");
         assert!(
             parent_enabled,
