@@ -3277,8 +3277,10 @@ pub(super) const AURA_DECAY: f32 = 3.0;
 
 /// One full lap of the aura comet sweep (see `draw_comet`), in seconds. The
 /// overlay drives the sweep from this period so a lap reads the same at any
-/// frame rate or pill shape.
-pub(super) const ORBIT_PERIOD_SECS: f32 = 24.0;
+/// frame rate or pill shape. Fast enough (one lap per 8 s, ≈45°/s) that the
+/// whole arc is clearly visible in motion — a 24 s lap read as a rare
+/// event instead of a live orbit.
+pub(super) const ORBIT_PERIOD_SECS: f32 = 8.0;
 /// Angular half-span of the comet, in degrees (the full comet is 2 × this).
 /// Wide enough to stay smooth across a small pill's rounded corners, narrow
 /// enough that the boosted arc still reads as a moving sweep.
