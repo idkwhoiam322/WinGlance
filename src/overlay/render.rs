@@ -73,6 +73,7 @@ pub(super) fn render_layered(
     compact: bool,
     morph: Option<MorphProgress>,
     scale_factor: f32,
+    orbit_angle: Option<f32>,
 ) -> Result<()> {
     let inset = state.aura_inset;
     let buf_w = (width + inset * 2).max(1);
@@ -239,6 +240,34 @@ pub(super) fn render_layered(
             state.content_fade = None;
         } else {
             blend_frames(&mut scratch[..needed], &fade.from, progress);
+        }
+    }
+    // The aura comet sweep is painted here, after both frame paths (the
+    // cached-marquee copy and a full rebuild) and after the content
+    // cross-fade: it never bakes into the chrome cache, so the cache stays
+    // valid while the sweep advances, and a dissolving content swap cannot
+    // smear a stale comet. The shadow and every layer beneath ride below it.
+    if let Some(angle) = orbit_angle {
+        let cw = content_buf_w as usize;
+        let ch = content_buf_h as usize;
+        let inset_c = inset as usize;
+        if cw > inset_c * 2 && ch > inset_c * 2 {
+            let comet_palette = state.palette.unwrap_or(Palette {
+                primary: state.config.appearance.accent_color,
+                secondary: state.config.appearance.accent_color,
+            });
+            draw_comet(
+                &mut scratch[..needed],
+                cw,
+                ch,
+                comet_palette,
+                inset_c,
+                cw - inset_c * 2,
+                ch - inset_c * 2,
+                frame_radius(&state.config, scale, compact, morph),
+                scale,
+                angle,
+            );
         }
     }
     // A single oversized metadata string (huge title/album) can inflate the
@@ -553,6 +582,28 @@ pub(super) fn bar_pixel_w(position: Option<f64>, duration: Option<u64>, pill_w: 
     Some((pill_w as f32 * fraction).round() as usize)
 }
 
+/// The frame's effective corner radius in pixels. A morph lerps the radius
+/// continuously between the compact and the expanded radius (see
+/// `morph_radius`), so the corner curvature follows the silhouette while the
+/// pill changes shape; every other frame uses the radius of the effective
+/// layout (`compact` is the already-resolved layout: Auto has been decided
+/// into Expanded or Compact before rendering). The same value feeds the aura,
+/// the pill body, the edge stroke and the aura comet, keeping every shape
+/// clipped to one silhouette. Oversized values are safe: every rounded-rect
+/// primitive clamps the radius to half the smaller pill dimension.
+fn frame_radius(config: &Config, scale: f32, compact: bool, morph: Option<MorphProgress>) -> f32 {
+    match morph {
+        Some(progress) => {
+            morph_radius(
+                config.appearance.effective_corner_radius(true),
+                config.appearance.effective_corner_radius(false),
+                progress,
+            ) * scale
+        }
+        None => config.appearance.effective_corner_radius(compact) * scale,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_pixels(
     state: &mut OverlayState,
@@ -565,26 +616,7 @@ pub(super) fn draw_pixels(
     morph: Option<MorphProgress>,
     body_bottom: i32,
 ) -> Result<()> {
-    // One radius per frame. A morph lerps the radius continuously between
-    // the compact and the expanded radius (see `morph_radius`), so the
-    // corner curvature follows the silhouette while the pill changes shape;
-    // every other frame uses the radius of the effective layout (`compact`
-    // is the already-resolved layout: Auto has been decided into Expanded or
-    // Compact before rendering, so Auto automatically follows whatever is
-    // drawn). The same value feeds the aura, the pill body and the edge
-    // stroke, keeping the shadow, fill, border and clipped shape aligned.
-    // Oversized values are safe: every rounded-rect primitive clamps the
-    // radius to half the smaller pill dimension.
-    let radius = match morph {
-        Some(progress) => {
-            morph_radius(
-                state.config.appearance.effective_corner_radius(true),
-                state.config.appearance.effective_corner_radius(false),
-                progress,
-            ) * scale
-        }
-        None => state.config.appearance.effective_corner_radius(compact) * scale,
-    };
+    let radius = frame_radius(&state.config, scale, compact, morph);
     // Resolve the artwork that will be displayed and convert it (once per
     // unique cover) up front, so the aura palette below is ready and the
     // cover is never shown stale. Track pills carry the worker's decode
@@ -3243,6 +3275,19 @@ pub(super) const AURA_PEAK_ALPHA: f32 = 140.0;
 /// extent shrinks.
 pub(super) const AURA_DECAY: f32 = 3.0;
 
+/// One full lap of the aura comet sweep (see `draw_comet`), in seconds. The
+/// overlay drives the sweep from this period so a lap reads the same at any
+/// frame rate or pill shape.
+pub(super) const ORBIT_PERIOD_SECS: f32 = 24.0;
+/// Angular half-span of the comet, in degrees (the full comet is 2 × this).
+/// Wide enough to stay smooth across a small pill's rounded corners, narrow
+/// enough that the boosted arc still reads as a moving sweep.
+pub(super) const ORBIT_COMET_HALF_SPAN_DEG: f32 = 55.0;
+/// Glow boost at the comet's center, composited on top of the static aura
+/// ring (which peaks at `AURA_PEAK_ALPHA` ≈ 140). The composite caps at 255,
+/// so the sweep is clearly brighter without burning out.
+pub(super) const ORBIT_COMET_PEAK_ALPHA: f32 = 210.0;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_aura(
     pixels: &mut [u8],
@@ -3323,6 +3368,99 @@ pub(super) fn draw_aura(
                 .round()
                 .min(AURA_PEAK_ALPHA) as u32;
 
+            if alpha > 0 {
+                composite(pixels, buf_w, x, y, rgb, alpha);
+            }
+        }
+    }
+}
+
+/// The aura comet sweep: an arc of boosted glow riding the static aura ring
+/// (drawn on top of the cached ring each animation tick, so it never bakes
+/// into the chrome cache). `angle` is the sweep's current position in
+/// standard atan2 convention (0 = right of the pill center, positive =
+/// clockwise on screen). The comet reuses the ring's radial falloff, edge
+/// ramp and inner anti-aliased fade, so it reads as a concentrated piece of
+/// the ring rather than a spot painted over it.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_comet(
+    pixels: &mut [u8],
+    buf_w: usize,
+    buf_h: usize,
+    palette: Palette,
+    inset: usize,
+    pill_w: usize,
+    pill_h: usize,
+    radius: f32,
+    scale: f32,
+    angle: f32,
+) {
+    let c1 = palette.primary;
+    let c2 = palette.secondary;
+    let margin = (AURA_HALO_LOGICAL * scale).round().max(1.0) as usize;
+    let center_x = inset as f32 + pill_w as f32 * 0.5;
+    let center_y = inset as f32 + pill_h as f32 * 0.5;
+    let half_span = ORBIT_COMET_HALF_SPAN_DEG.to_radians();
+    for y in 0..buf_h {
+        for x in 0..buf_w {
+            // Same halo-band reject as the ring: pixels farther than the
+            // margin from the pill's bounding box can never be in the glow.
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let box_left = inset as f32;
+            let box_right = box_left + pill_w as f32;
+            let box_top = inset as f32;
+            let box_bottom = box_top + pill_h as f32;
+            let margin_f = margin as f32;
+            if px < box_left - margin_f
+                || px > box_right + margin_f
+                || py < box_top - margin_f
+                || py > box_bottom + margin_f
+            {
+                continue;
+            }
+            let d = round_rect_signed_dist(
+                (x as f32) - inset as f32,
+                (y as f32) - inset as f32,
+                pill_w as f32,
+                pill_h as f32,
+                radius,
+            );
+            // Same inner anti-aliased fade as the ring: the comet hides
+            // beneath the pill's supersampled edge instead of painting over it.
+            let inner_aa = if d < 0.0 {
+                let t = ((d + 1.5) / 1.5).clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            } else {
+                1.0
+            };
+            if inner_aa <= 0.0 || d > margin as f32 {
+                continue;
+            }
+            // Cyclic angular distance from the sweep's position.
+            let a = (py - center_y).atan2(px - center_x) - angle;
+            let mut diff = a.abs();
+            diff = diff.min(std::f32::consts::TAU - diff);
+            let t = (diff / half_span).clamp(0.0, 1.0);
+            // Smooth top-hat: full boost at the sweep center, fading to the
+            // plain ring at the comet's angular edge.
+            let s = 1.0 - t;
+            let bump = s * s * (3.0 - 2.0 * s);
+            // Same horizontal primary→secondary gradient as the ring, so the
+            // comet keeps the ring's hue at each point it rides.
+            let tc = (px - inset as f32) / pill_w as f32;
+            let tc = tc.clamp(0.0, 1.0);
+            let rgb = [
+                (c1[0] as f32 * (1.0 - tc) + c2[0] as f32 * tc).round() as u8,
+                (c1[1] as f32 * (1.0 - tc) + c2[1] as f32 * tc).round() as u8,
+                (c1[2] as f32 * (1.0 - tc) + c2[2] as f32 * tc).round() as u8,
+            ];
+            // Radial shape identical to the ring's: same exponential falloff
+            // and linear edge ramp, so the comet's silhouette matches the
+            // glow it rides.
+            let falloff = (-d * AURA_DECAY / AURA_MARGIN_LOGICAL / scale).exp();
+            let edge = (margin as f32 - d).clamp(0.0, 1.0);
+            let alpha = (ORBIT_COMET_PEAK_ALPHA * inner_aa * bump * falloff * edge).round() as u32;
             if alpha > 0 {
                 composite(pixels, buf_w, x, y, rgb, alpha);
             }

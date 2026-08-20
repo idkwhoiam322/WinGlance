@@ -56,7 +56,7 @@ use morph::{
     collapse_duration, content_size_of, ease_out_quint, hover_engaged, hover_progress, hover_step, lagged_collapse,
     lagged_expand, morph_duration, morph_size, normalized_elapsed, reversal_seed, spring_collapse,
 };
-use render::{AURA_HALO_LOGICAL, pill_text_from_track, render_layered};
+use render::{AURA_HALO_LOGICAL, ORBIT_PERIOD_SECS, pill_text_from_track, render_layered};
 
 /// How long an in-place content swap dissolves the previous frame into the
 /// new one (see `ContentFade`).
@@ -134,6 +134,9 @@ const COLLAPSE_TROUGH: f32 = -0.094780;
 /// rate; the refresh-rate timer is restored the moment the pill animates or
 /// a line scrolls.
 const STATIC_TICK_MS: u32 = 250;
+/// Angular speed of the aura comet sweep in rad/s: one circuit per
+/// `render::ORBIT_PERIOD_SECS`, so the sweep reads the same at any cadence.
+const ORBIT_ANGULAR_SPEED: f32 = std::f32::consts::TAU / ORBIT_PERIOD_SECS;
 /// During steady playback the OS reports position with latency (the value was
 /// read a tick or two ago), so a live sample a little behind the displayed
 /// position is jitter and must not snap the bar backward. A backward jump far
@@ -434,6 +437,12 @@ struct OverlayState {
     /// frame buffer at exactly this size.
     last_frame_w: usize,
     last_frame_h: usize,
+    /// The aura comet sweep's current angle in radians (atan2 convention:
+    /// 0 = right of the pill center, positive = clockwise on screen),
+    /// advanced by the animation tick while `orbiting`. Frozen while the
+    /// content is paused/stopped, so the sweep rests with the music; reset
+    /// on hide so each show starts the sweep fresh at the right.
+    orbit_angle: f32,
     position: OverlayPos,
     /// The compact pill's resolved placement (independent of `position` only
     /// while `compact_position_separate` is on; see `active_pos`).
@@ -981,6 +990,7 @@ impl OverlayState {
             content_fade: None,
             last_frame_w: 0,
             last_frame_h: 0,
+            orbit_angle: 0.0,
             position,
             compact_position,
             // Every show path re-resolves the layout before the first frame
@@ -1164,7 +1174,8 @@ impl OverlayState {
         let animating = !matches!(self.phase, Phase::Shown)
             || self.hover_expand.is_some()
             || self.content_fade.is_some()
-            || self.persistent_fade_active();
+            || self.persistent_fade_active()
+            || self.orbiting();
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
         let now = Instant::now();
         let raw = if animating || marquee_active {
@@ -2433,6 +2444,26 @@ impl OverlayState {
     /// flipped, whether the fullscreen verdict changed), so the caller can
     /// force a re-render (Auto) or re-run the auto-hide decision
     /// (PersistentCompact).
+    /// Whether the shown content represents actively playing media. A None
+    /// state (pre-carriage sessions, spurious-recreation snapshots) counts as
+    /// playing — the same rule the progress estimate uses.
+    fn content_playing(&self) -> bool {
+        match &self.content {
+            Some(MediaEvent::TrackChanged(track)) => track.playback_state.is_none_or(|s| s == PlaybackState::Playing),
+            Some(MediaEvent::PlaybackStateChanged(s, _)) => *s == PlaybackState::Playing,
+            _ => false,
+        }
+    }
+
+    /// The aura comet sweep is active while the pill is on screen with
+    /// playing content. It is gated on the pill's life, not its shape or
+    /// animation state: the angle advances through the entrance, the hover
+    /// expand/collapse morphs and the exit, so the sweep never pauses for a
+    /// size change. Pausing, stopping or hiding freezes it.
+    fn orbiting(&self) -> bool {
+        crate::winutil::animations_enabled() && !matches!(self.phase, Phase::Hidden) && self.content_playing()
+    }
+
     fn tick_layout_check(&mut self) -> (bool, bool) {
         let now = Instant::now();
         let foreground = unsafe { GetForegroundWindow() };
@@ -2501,16 +2532,7 @@ impl OverlayState {
         // Progress estimate: advance the live position from the anchor while
         // playing; freeze it while paused/stopped and re-anchor on resume so
         // the bar never crawls or jumps forward.
-        let playing = match &self.content {
-            // The TrackChanged snapshot carries the authoritative playback
-            // state (see `TrackInfo.playback_state`): a paused/stopped pill
-            // must not crawl its bar. A None state (pre-carriage sessions,
-            // spurious-recreation snapshots) keeps the historical behavior
-            // of treating a track pill as playing.
-            Some(MediaEvent::TrackChanged(track)) => track.playback_state.is_none_or(|s| s == PlaybackState::Playing),
-            Some(MediaEvent::PlaybackStateChanged(s, _)) => *s == PlaybackState::Playing,
-            _ => false,
-        };
+        let playing = self.content_playing();
         // A Stopped-state pill is a tombstone: the source behind it is done,
         // so persistent-compact must not let it linger at idle opacity — it
         // collapses and hides at its dismiss deadline (see below).
@@ -2918,6 +2940,12 @@ impl OverlayState {
                 }
             }
         }
+        // The aura comet sweep, driven by this same tick: time-based so the
+        // speed is constant at any cadence. It advances while the pill is
+        // mid-morph too — the sweep never pauses for an expand/collapse.
+        if self.orbiting() {
+            self.orbit_angle = (self.orbit_angle + dt * ORBIT_ANGULAR_SPEED) % std::f32::consts::TAU;
+        }
         // Foreground re-check: a foreground change flips the Auto pill between
         // layouts within one static tick even when no media event arrives
         // (an alt-tab into a fullscreen game mid-pill). Persistent-compact
@@ -2966,6 +2994,7 @@ impl OverlayState {
             || marquee_active
             || bar_moved
             || self.persistent_fade_active()
+            || self.orbiting()
         {
             self.render();
         }
@@ -2980,6 +3009,11 @@ impl OverlayState {
         {
             self.render_count += 1;
         }
+        // The comet sweep is painted at its current angle only while it is
+        // live; a render arriving outside the sweep (paused, stopped or
+        // hidden) draws no comet. Read before the take below: `orbiting`
+        // inspects the content that this render is about to consume.
+        let orbit_angle = self.orbiting().then_some(self.orbit_angle);
         let Some(content) = self.content.take() else {
             return;
         };
@@ -3080,6 +3114,7 @@ impl OverlayState {
             compact && morph.is_none(),
             morph,
             scale_factor,
+            orbit_angle,
         );
         self.content = Some(content);
         if let Err(error) = result {
@@ -3424,6 +3459,7 @@ impl OverlayState {
         self.hover_expanded_once = false;
         self.hover_leave_at = None;
         self.content_fade = None;
+        self.orbit_angle = 0.0;
         self.persistent_collapse_on_dismiss = false;
         self.phase = Phase::Hidden;
         // Release the per-show render state: the next show re-converts the
@@ -4072,7 +4108,7 @@ mod tests {
     };
     use super::render::{
         FILL_TINT_WEIGHT, RenderLayer, blend_frames, blit_packed_rows, circle_coverage, clear_frame_scratch,
-        clock_icon_coverage, composite_marquee_strip, contrast_ratio, draw_aura, draw_clock_icon_pixels,
+        clock_icon_coverage, composite_marquee_strip, contrast_ratio, draw_aura, draw_clock_icon_pixels, draw_comet,
         draw_compact_pill, draw_icon_scaled, draw_pixels, draw_symbol_pixels, draw_text_line_pixels, draw_text_pixels,
         edge_fade_factor, muted_accent, playback_state_for_track, round_rect_coverage, round_rect_coverage_fast,
         round_rect_coverage_supersampled, rounded_triangle_coverage, scale_frame_about, shrink_frame_scratch,
@@ -7478,6 +7514,54 @@ mod tests {
     }
 
     #[test]
+    fn comet_glow_stays_outside_the_pill_and_follows_its_angle() {
+        // The comet is the moving part of the aura: it must live in the halo
+        // band (never inside the pill), sit where its angle points, and not
+        // wrap around to the far side.
+        let buf = 60;
+        let mut pixels = vec![0u8; buf * buf * 4];
+        let palette = Palette {
+            primary: [255, 0, 0, 255],
+            secondary: [0, 0, 255, 255],
+        };
+        let inset = 10usize;
+        let pill_w = buf - inset * 2;
+        let pill_h = buf - inset * 2;
+        // Angle 0 is the +x direction: the comet sits on the pill's right
+        // side, riding the halo band.
+        draw_comet(&mut pixels, buf, buf, palette, inset, pill_w, pill_h, 8.0, 1.0, 0.0);
+        let alpha_at = |pixels: &[u8], x: usize, y: usize| pixels[(y * buf + x) * 4 + 3];
+        let near_right = alpha_at(&pixels, inset + pill_w + 2, inset + pill_h / 2);
+        assert!(near_right > 0, "the comet must glow on its sweep side");
+        // Inside the pill body: never (the body covers the glow).
+        let inside = alpha_at(&pixels, inset + 2, inset + pill_h / 2);
+        assert_eq!(inside, 0, "the comet must not reach inside the pill");
+        // Far side (left, 180° away) and beyond the halo extent: nothing.
+        let far = alpha_at(&pixels, inset - 2, inset + pill_h / 2);
+        assert_eq!(far, 0, "the comet must not wrap to the far side");
+        let beyond = alpha_at(&pixels, inset + pill_w + 7, inset + pill_h / 2);
+        assert_eq!(beyond, 0, "no comet beyond the halo extent");
+        // The same sweep at π must light the left side instead.
+        let mut moved = vec![0u8; buf * buf * 4];
+        draw_comet(
+            &mut moved,
+            buf,
+            buf,
+            palette,
+            inset,
+            pill_w,
+            pill_h,
+            8.0,
+            1.0,
+            std::f32::consts::PI,
+        );
+        let near_left = alpha_at(&moved, inset - 2, inset + pill_h / 2);
+        assert!(near_left > 0, "the comet must follow its angle around the pill");
+        let right_after_move = alpha_at(&moved, inset + pill_w + 2, inset + pill_h / 2);
+        assert_eq!(right_after_move, 0, "the comet must leave its previous side");
+    }
+
+    #[test]
     fn fill_tint_mixes_toward_the_accent_and_keeps_alpha() {
         let base = [160, 160, 180, 38];
         let accent = [255, 0, 0, 255];
@@ -10248,6 +10332,82 @@ mod tests {
             before + 1,
             "the tick that starts the morph must render its first frame"
         );
+    }
+
+    #[test]
+    fn the_aura_sweep_advances_and_repaints_a_shown_playing_pill() {
+        // A settled expanded pill with playing content keeps the sweep alive:
+        // the static tick must advance the angle AND repaint, so the comet
+        // actually moves on screen while the track plays.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::Expanded;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.phase = Phase::Shown;
+        state.layout = LayoutMode::Expanded;
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Orbit Song", "Artist")));
+        // Backdate the tick anchor so this tick carries a non-zero dt.
+        state.last_tick = Instant::now() - Duration::from_millis(16);
+        let before = state.render_count;
+        state.tick();
+        assert!(
+            state.orbit_angle > 0.0,
+            "the sweep must advance on a tick while the track plays"
+        );
+        assert_eq!(
+            state.render_count,
+            before + 1,
+            "an orbiting tick must repaint so the comet moves"
+        );
+    }
+
+    #[test]
+    fn the_compact_pill_sweeps_too() {
+        // The sweep is gated on the pill's life, not its shape: the compact
+        // pill must keep the comet orbiting as well.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::Compact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.phase = Phase::Shown;
+        state.layout = LayoutMode::Compact;
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Small Orbit", "Artist")));
+        state.last_tick = Instant::now() - Duration::from_millis(16);
+        let before = state.render_count;
+        state.tick();
+        assert!(state.orbit_angle > 0.0, "the compact pill must keep the sweep alive");
+        assert_eq!(state.render_count, before + 1, "the compact sweep must repaint");
+    }
+
+    #[test]
+    fn the_sweep_freezes_for_a_paused_track() {
+        // Paused content freezes the sweep: the angle must not advance and
+        // the settled pill must not repaint.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Shown;
+        state.layout = LayoutMode::Expanded;
+        let mut paused_track = track_for("spotify", "Frozen", "Artist");
+        paused_track.playback_state = Some(PlaybackState::Paused);
+        state.content = Some(MediaEvent::TrackChanged(paused_track));
+        let before = state.render_count;
+        state.tick();
+        assert_eq!(state.orbit_angle, 0.0, "a paused track must not advance the sweep");
+        assert_eq!(state.render_count, before, "a paused settled pill must not repaint");
+    }
+
+    #[test]
+    fn the_sweep_outlives_a_hover_morph() {
+        // The expand/compact morph must not stop the sweep: with a hover
+        // morph in flight, a playing pill keeps orbiting.
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Shown;
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Morph Song", "Artist")));
+        state.hover_expand = Some(HoverExpand {
+            start: Instant::now(),
+            direction: MorphDirection::Expand,
+            from: 0.5,
+            velocity: 0.0,
+            done: false,
+        });
+        assert!(state.orbiting(), "a mid-morph playing pill must keep the sweep alive");
     }
 
     #[test]
