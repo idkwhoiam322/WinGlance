@@ -3,9 +3,9 @@
 //! A tiny raw-Win32 popup (label, edit control, OK/Cancel) matching the
 //! repo's no-framework approach. The dialog is modal: the parent window is
 //! disabled while a nested message loop runs on the UI thread, and the
-//! selected value is returned when the loop exits. Invalid input keeps the
-//! dialog open with an inline error label; valid input is clamped to the config
-//! range [0.5, 60] seconds before it is converted to milliseconds.
+//! selected value is returned when the loop exits. Input that does not parse
+//! or falls outside the config range [0.5, 60] seconds keeps the dialog open
+//! with an inline error label; valid input is converted to milliseconds.
 
 use crate::winapi::{create_window, send_message, set_focus};
 use crate::winutil::{StateClaim, register_class_once, release_window_state, set_window_state, wide, window_state};
@@ -22,8 +22,8 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, ES_AUTOHSCROLL, GetClientRect, GetMessageW, GetWindowRect, HMENU, IDCANCEL, IDOK,
-    IsDialogMessageW, MSG, PostQuitMessage, SW_SHOW, SetForegroundWindow, ShowWindow, TranslateMessage,
+    DispatchMessageW, EN_CHANGE, ES_AUTOHSCROLL, GetClientRect, GetMessageW, GetWindowRect, HMENU, IDCANCEL, IDOK,
+    IsDialogMessageW, MSG, PostQuitMessage, SW_HIDE, SW_SHOW, SetForegroundWindow, ShowWindow, TranslateMessage,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC,
     WM_ERASEBKGND, WM_GETTEXT, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SETTEXT, WS_BORDER, WS_CAPTION, WS_CHILD,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
@@ -48,19 +48,21 @@ struct DialogData {
     chosen: Option<u64>,
     done: bool,
     edit: HWND,
-    /// Hidden error label, shown while the entered text does not parse.
+    /// Hidden error label, shown while the entered text does not parse or
+    /// falls outside the range.
     error_label: HWND,
 }
 
-/// Parses an entered duration (seconds) into milliseconds, clamped to
-/// [0.5, 60] seconds. `None` on unparseable input (empty, non-numeric,
-/// NaN/Infinity).
+/// Parses an entered duration (seconds) into milliseconds. `None` when the
+/// input does not parse (empty, non-numeric, NaN/Infinity) or falls outside
+/// the hardcoded [0.5, 60] seconds range — the dialog reports those instead
+/// of silently clamping, so the committed value always equals what was typed.
 fn parse_duration_seconds(text: &str) -> Option<u64> {
     let value = text.trim().parse::<f64>().ok()?;
-    if !value.is_finite() {
+    if !value.is_finite() || !(MIN_SECONDS..=MAX_SECONDS).contains(&value) {
         return None;
     }
-    Some((value.clamp(MIN_SECONDS, MAX_SECONDS) * 1000.0).round() as u64)
+    Some((value * 1000.0).round() as u64)
 }
 
 /// Shows the modal duration dialog centered over `parent`, pre-filled with
@@ -190,7 +192,8 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
         );
         (*state_ptr).edit = edit;
         let error_label = child(
-            "STATIC", "", 12, 60, 260, 18, 101, // Hidden until the entered text fails to parse.
+            "STATIC", "", 12, 60, 260, 18,
+            101, // Hidden until the entered text fails to parse or is out of range.
             WS_CHILD,
         );
         (*state_ptr).error_label = error_label;
@@ -296,9 +299,15 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 return LRESULT(0);
             }
             let id = (wparam.0 & 0xFFFF) as u32;
+            let notification = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            if id == 100 && notification == EN_CHANGE {
+                // Editing hides the error again: the label describes the last
+                // OK click, not the text currently being typed.
+                let _ = ShowWindow((*data_ptr).error_label, SW_HIDE);
+            }
             if id == IDOK.0 as u32 {
                 // OK: read the edit text, parse it, and either commit or
-                // keep the dialog open with an error box.
+                // keep the dialog open with the inline error label.
                 let edit = (*data_ptr).edit;
                 let mut buffer = [0u16; 64];
                 let copied = send_message(
@@ -680,8 +689,13 @@ mod tests {
                 .is_null(),
             "the dialog must stay open after invalid input"
         );
-        // Corrected input commits and closes the dialog like the old path.
+        // Corrected input hides the error while typing, then commits and
+        // closes the dialog like the old path.
         set_text("7", edit);
+        assert!(
+            !unsafe { IsWindowVisible(error_label).as_bool() },
+            "the inline error label must hide when the text changes"
+        );
         let _ = unsafe { crate::winapi::send_message(dialog, WM_COMMAND, WPARAM(IDOK.0 as usize), LPARAM(0)) };
         thread::sleep(Duration::from_millis(50));
         let (chosen, parent_enabled) = result_rx
@@ -706,10 +720,15 @@ mod tests {
     }
 
     #[test]
-    fn clamps_out_of_range_input_to_the_hardcoded_range() {
-        assert_eq!(parse_duration_seconds("0.1"), Some(500));
-        assert_eq!(parse_duration_seconds("120"), Some(60_000));
-        assert_eq!(parse_duration_seconds("-2"), Some(500));
+    fn rejects_out_of_range_input() {
+        assert_eq!(parse_duration_seconds("0.25"), None);
+        assert_eq!(parse_duration_seconds("0.1"), None);
+        assert_eq!(parse_duration_seconds("-2"), None);
+        assert_eq!(parse_duration_seconds("70"), None);
+        assert_eq!(parse_duration_seconds("120"), None);
+        // Inclusive bounds still commit.
+        assert_eq!(parse_duration_seconds("0.5"), Some(500));
+        assert_eq!(parse_duration_seconds("60"), Some(60_000));
     }
 
     #[test]
