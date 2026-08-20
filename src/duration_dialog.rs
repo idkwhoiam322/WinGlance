@@ -4,17 +4,18 @@
 //! repo's no-framework approach. The dialog is modal: the parent window is
 //! disabled while a nested message loop runs on the UI thread, and the
 //! selected value is returned when the loop exits. Invalid input keeps the
-//! dialog open with a message box; valid input is clamped to the config
+//! dialog open with an inline error label; valid input is clamped to the config
 //! range [0.5, 60] seconds before it is converted to milliseconds.
 
-use crate::winapi::{create_window, message_box, send_message, set_focus};
+use crate::winapi::{create_window, send_message, set_focus};
 use crate::winutil::{StateClaim, register_class_once, release_window_state, set_window_state, wide, window_state};
 use log::warn;
 use std::ffi::c_void;
 use std::sync::OnceLock;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, DEFAULT_GUI_FONT, FillRect, GetStockObject, GetSysColorBrush, HDC, SetBkMode, TRANSPARENT,
+    COLOR_BTNFACE, DEFAULT_GUI_FONT, FillRect, GetStockObject, GetSysColorBrush, HDC, SetBkMode, SetTextColor,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -22,10 +23,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, ES_AUTOHSCROLL, GetClientRect, GetMessageW, GetWindowRect, HMENU, IDCANCEL, IDOK,
-    IsDialogMessageW, MB_ICONWARNING, MB_OK, MSG, PostQuitMessage, SW_SHOW, SetForegroundWindow, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG,
-    WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_GETTEXT, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WS_BORDER, WS_CAPTION,
-    WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    IsDialogMessageW, MSG, PostQuitMessage, SW_SHOW, SetForegroundWindow, ShowWindow, TranslateMessage,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC,
+    WM_ERASEBKGND, WM_GETTEXT, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SETTEXT, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
@@ -47,6 +48,8 @@ struct DialogData {
     chosen: Option<u64>,
     done: bool,
     edit: HWND,
+    /// Hidden error label, shown while the entered text does not parse.
+    error_label: HWND,
 }
 
 /// Parses an entered duration (seconds) into milliseconds, clamped to
@@ -112,6 +115,7 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
             chosen: None,
             done: false,
             edit: HWND::default(),
+            error_label: HWND::default(),
         }));
         DIALOG_STATE_CLAIMED.reset();
         let hwnd = match create_window(
@@ -185,6 +189,11 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
         );
         (*state_ptr).edit = edit;
+        let error_label = child(
+            "STATIC", "", 12, 60, 260, 18, 101, // Hidden until the entered text fails to parse.
+            WS_CHILD,
+        );
+        (*state_ptr).error_label = error_label;
         let _ = child(
             "BUTTON",
             "OK",
@@ -304,12 +313,14 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     (*data_ptr).chosen = Some(ms);
                     (*data_ptr).done = true;
                 } else {
-                    let _ = message_box(
-                        hwnd,
-                        PCWSTR(wide("Enter a duration between 0.5 and 60 seconds.").as_ptr()),
-                        PCWSTR(wide("Custom duration").as_ptr()),
-                        MB_OK | MB_ICONWARNING,
+                    let error_text = wide("Enter a duration between 0.5 and 60 seconds.");
+                    let _ = send_message(
+                        (*data_ptr).error_label,
+                        WM_SETTEXT,
+                        WPARAM(0),
+                        LPARAM(error_text.as_ptr() as isize),
                     );
+                    let _ = ShowWindow((*data_ptr).error_label, SW_SHOW);
                     let _ = set_focus(edit);
                 }
             } else if id == IDCANCEL.0 as u32 {
@@ -341,7 +352,14 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLORDLG => {
             if message == WM_CTLCOLORSTATIC {
-                let _ = SetBkMode(HDC(wparam.0 as *mut c_void), TRANSPARENT);
+                let hdc = HDC(wparam.0 as *mut c_void);
+                let _ = SetBkMode(hdc, TRANSPARENT);
+                // The error label renders in red (COLORREF is 0x00BBGGRR, so
+                // 0x000000FF is pure red) so invalid input reads as an error,
+                // not as a caption.
+                if !data_ptr.is_null() && HWND(lparam.0 as *mut c_void) == (*data_ptr).error_label {
+                    let _ = SetTextColor(hdc, COLORREF(0x000000FF));
+                }
             }
             LRESULT(GetSysColorBrush(COLOR_BTNFACE).0 as isize)
         }
@@ -365,8 +383,9 @@ mod tests {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
     use windows::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, DestroyWindow, FindWindowW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_NCDESTROY, WS_CAPTION,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU,
+        DefWindowProcW, DestroyWindow, FindWindowW, GetDlgItem, IDOK, IsWindowVisible, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WM_CLOSE, WM_COMMAND, WM_NCDESTROY, WM_SETTEXT, WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        WS_SYSMENU,
     };
     use windows::core::PCWSTR;
 
@@ -384,6 +403,13 @@ mod tests {
     // onto the other test's same-class window. Serialize like the overlay
     // wndproc harness does.
     static DIALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // Test-only parent window class, shared by the tests that run the real
+    // modal dialog: like the dialog class itself, it is registered once per
+    // process and reused (a per-test registration would hit
+    // ERROR_CLASS_ALREADY_EXISTS on the runner-up).
+    static PARENT_GUARD: OnceLock<()> = OnceLock::new();
+    const PARENT_CLASS: &str = "WinGlanceDialogTestParent";
 
     #[test]
     fn dialog_state_box_installs_through_nccreate_and_frees_through_ncdestroy() {
@@ -411,6 +437,7 @@ mod tests {
             chosen: None,
             done: false,
             edit: HWND::default(),
+            error_label: HWND::default(),
         }));
         let hwnd = unsafe {
             create_window(
@@ -473,8 +500,6 @@ mod tests {
             "the duration dialog",
         )
         .expect("the dialog class registers");
-        static PARENT_GUARD: OnceLock<()> = OnceLock::new();
-        const PARENT_CLASS: &str = "WinGlanceDialogTestParent";
         register_class_once(
             &PARENT_GUARD,
             instance,
@@ -541,6 +566,113 @@ mod tests {
             .expect("the dialog thread must return after WM_CLOSE");
         let _ = worker.join();
         assert!(chosen.is_none(), "WM_CLOSE cancels the dialog");
+        assert!(
+            parent_enabled,
+            "the parent window must be re-enabled after the dialog closes"
+        );
+    }
+
+    #[test]
+    fn invalid_input_shows_the_inline_error_and_keeps_the_dialog_open() {
+        // Regression pin for the inline-error replacement of the old modal
+        // message box: an unparseable entry must show the dialog's own error
+        // label and keep the dialog open, and a corrected entry must then
+        // commit normally. Driven end to end like the re-enable test above:
+        // the dialog (and its parent) live on a worker thread so the modal
+        // loop is genuinely pumping.
+        let _serialize = DIALOG_TEST_LOCK.lock().unwrap();
+        let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.expect("process module").into();
+        register_class_once(
+            &CLASS_GUARD,
+            instance,
+            &wide(CLASS_NAME),
+            Some(dialog_proc),
+            || None,
+            "the duration dialog",
+        )
+        .expect("the dialog class registers");
+        register_class_once(
+            &PARENT_GUARD,
+            instance,
+            &wide(PARENT_CLASS),
+            Some(parent_proc),
+            || None,
+            "the dialog-test parent",
+        )
+        .expect("the parent class registers");
+        let (parent_tx, parent_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let instance_raw = instance.0 as usize;
+        let worker = thread::spawn(move || unsafe {
+            let instance = HINSTANCE(instance_raw as *mut c_void);
+            let parent = create_window(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(wide(PARENT_CLASS).as_ptr()),
+                PCWSTR(wide("dialog-test parent").as_ptr()),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                200,
+                120,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .expect("the parent window must be created");
+            let _ = parent_tx.send(parent.0 as usize);
+            let chosen = show_duration_dialog(parent, 3000);
+            let parent_enabled = IsWindowEnabled(parent).as_bool();
+            let _ = result_tx.send((chosen, parent_enabled));
+            let _ = DestroyWindow(parent);
+        });
+        let _parent = parent_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the parent window must be created on the dialog thread");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut dialog = HWND::default();
+        while Instant::now() < deadline {
+            if let Ok(found) = unsafe { FindWindowW(PCWSTR(wide(CLASS_NAME).as_ptr()), PCWSTR::null()) }
+                && !found.0.is_null()
+            {
+                dialog = found;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!dialog.0.is_null(), "the dialog window must appear");
+        let edit = unsafe { GetDlgItem(Some(dialog), 100) }.expect("the edit control must exist");
+        let error_label = unsafe { GetDlgItem(Some(dialog), 101) }.expect("the error label must exist");
+        assert!(
+            !edit.0.is_null() && !error_label.0.is_null(),
+            "the edit and error label must exist"
+        );
+        let set_text = |text: &str, label: HWND| unsafe {
+            let _ = crate::winapi::send_message(label, WM_SETTEXT, WPARAM(0), LPARAM(wide(text).as_ptr() as isize));
+        };
+        // Invalid input: the label appears and the dialog stays open.
+        set_text("abc", edit);
+        let _ = unsafe { crate::winapi::send_message(dialog, WM_COMMAND, WPARAM(IDOK.0 as usize), LPARAM(0)) };
+        assert!(
+            unsafe { IsWindowVisible(error_label).as_bool() },
+            "the inline error label must be shown for invalid input"
+        );
+        assert!(
+            !unsafe { FindWindowW(PCWSTR(wide(CLASS_NAME).as_ptr()), PCWSTR::null()) }
+                .expect("FindWindowW never fails")
+                .0
+                .is_null(),
+            "the dialog must stay open after invalid input"
+        );
+        // Corrected input commits and closes the dialog like the old path.
+        set_text("7", edit);
+        let _ = unsafe { crate::winapi::send_message(dialog, WM_COMMAND, WPARAM(IDOK.0 as usize), LPARAM(0)) };
+        thread::sleep(Duration::from_millis(50));
+        let (chosen, parent_enabled) = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the dialog thread must return after the corrected entry");
+        let _ = worker.join();
+        assert_eq!(chosen, Some(7000), "the corrected duration must commit");
         assert!(
             parent_enabled,
             "the parent window must be re-enabled after the dialog closes"

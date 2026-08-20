@@ -139,8 +139,8 @@ its bindings publicly). Commit 3 therefore flips the helper's four type paths
 
 ### Commits 2a–2c — the facade, one consumer area at a time (green on 0.58)
 
-Add `src/winapi.rs` with the ~26 thin wrappers (messaging/timers: `post_message`,
-`send_message`, `peek_message`, `message_box`, `set_focus`, `set_cursor`,
+Add `src/winapi.rs` with the ~25 thin wrappers (messaging/timers: `post_message`,
+`send_message`, `peek_message`, `set_focus`, `set_cursor`,
 `set_timer`, `kill_timer`, `set_window_pos`, `invalidate_rect`,
 `validate_rect`, `is_window`, `track_popup_menu`, `update_layered_window`,
 `shell_execute`, `set_clipboard_data`, `set_win_event_hook`,

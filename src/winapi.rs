@@ -29,10 +29,10 @@ use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, WINEVENT
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, HCURSOR, HMENU, IsWindow, KillTimer, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MSG, MessageBoxW,
-    PEEK_MESSAGE_REMOVE_TYPE, PeekMessageW, PostMessageW, SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD, SendMessageW,
-    SetCursor, SetTimer, SetWindowPos, TIMERPROC, TRACK_POPUP_MENU_FLAGS, TrackPopupMenu, UPDATE_LAYERED_WINDOW_FLAGS,
-    UpdateLayeredWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+    CreateWindowExW, HCURSOR, HMENU, IsWindow, KillTimer, MSG, PEEK_MESSAGE_REMOVE_TYPE, PeekMessageW, PostMessageW,
+    SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD, SendMessageW, SetCursor, SetTimer, SetWindowPos, TIMERPROC,
+    TRACK_POPUP_MENU_FLAGS, TrackPopupMenu, UPDATE_LAYERED_WINDOW_FLAGS, UpdateLayeredWindow, WINDOW_EX_STYLE,
+    WINDOW_STYLE,
 };
 use windows::core::{PCWSTR, Result};
 
@@ -97,11 +97,6 @@ pub unsafe fn validate_rect(hwnd: HWND, rect: Option<*const RECT>) -> bool {
 /// `IsWindow`.
 pub unsafe fn is_window(hwnd: HWND) -> bool {
     unsafe { IsWindow(Some(hwnd)).as_bool() }
-}
-
-/// `MessageBoxW`; returns the button the user chose.
-pub unsafe fn message_box(hwnd: HWND, text: PCWSTR, caption: PCWSTR, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
-    unsafe { MessageBoxW(Some(hwnd), text, caption, style) }
 }
 
 /// `TrackPopupMenu`; with `TPM_RETURNCMD` this is the selected command id.
