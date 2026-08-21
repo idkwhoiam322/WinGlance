@@ -124,6 +124,13 @@ pub struct Config {
     /// it and refuses to write on a mismatch. Never serialized.
     #[serde(skip)]
     pub revision: Option<ConfigRevision>,
+    /// True only for the launch that created `config.toml` (the file did not
+    /// exist). The window layer shows the tracking window once on this run so
+    /// a first manual launch is discoverable, while `start_in_tray` keeps
+    /// every later launch — autostart at logon included — silent. Never
+    /// serialized.
+    #[serde(skip)]
+    pub first_run: bool,
 }
 
 impl Default for Config {
@@ -135,6 +142,7 @@ impl Default for Config {
             unknown: toml::Table::new(),
             persistable: true,
             revision: None,
+            first_run: false,
         }
     }
 }
@@ -613,7 +621,10 @@ impl Config {
             let bytes = config.serialized()?;
             Self::write_temp_and_rename(config_path, &bytes)?;
             config.revision = Some(ConfigRevision::captured(bytes));
-            info!("no config at {config_path:?}; wrote defaults");
+            // The creating launch is the first run: the window layer shows
+            // the tracking window once (see `first_run`).
+            config.first_run = true;
+            info!("no config at {config_path:?}; wrote defaults (first run)");
             return Ok(config);
         }
         if Self::exceeds_size_bound(config_path) {
@@ -1143,6 +1154,20 @@ nested_appearance = [1, 2, 3]
             SaveOutcome::PersistenceDisabled
         );
         assert_eq!(std::fs::read(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn first_run_is_true_only_for_the_creating_launch() {
+        let guard = TempDir::new("first-run");
+        let config_path = guard.dir.join("config.toml");
+
+        let config = Config::load_from_path(&config_path).unwrap();
+        assert!(config.first_run, "the launch that creates the config is the first run");
+        // The flag is never serialized, so it cannot leak into the file.
+        assert!(!std::fs::read_to_string(&config_path).unwrap().contains("first_run"));
+
+        let reload = Config::load_from_path(&config_path).unwrap();
+        assert!(!reload.first_run, "every later launch is a normal launch");
     }
 
     #[test]

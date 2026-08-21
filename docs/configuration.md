@@ -135,7 +135,7 @@ Expanded rules, in the compact layout the Compact rules):
 | `enable_playback_state_change`  | `true`  | bool   | Show a small state pill on play/pause   |
 | `notifications_enabled`         | `true`  | bool   | Master switch for pill notifications; mirrors the tray "Toggle notifications" item and is persisted so the toggle survives a restart |
 | `debounce_ms`                   | `200`   | 150–250 | Coalescing window for bursty SMTC events |
-| `start_in_tray`                 | `true`  | bool   | Start silently: no window, only the tray icon + pill |
+| `start_in_tray`                 | `true`  | bool   | Start silently: no window, only the tray icon + pill. The very first run (the launch that creates config.toml) shows the tracking window once, regardless of this setting |
 | `start_on_login`                | `false` | bool   | Register a Windows startup entry to launch WinGlance at logon |
 | `close_to_tray`                 | `true`  | bool   | Hide (instead of close) the window when its X is pressed |
 | `media_sources`                 | `[]`    | list   | Media source apps (case-insensitive substrings) to allow; empty = all apps |

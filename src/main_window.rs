@@ -1215,15 +1215,16 @@ pub fn create_window(
         }
     };
 
+    // Hide-on-start unless this is the very first run (the launch that just
+    // created config.toml): a first manual launch shows the tracking window
+    // once so the app is discoverable, while `start_in_tray` keeps every
+    // later launch — autostart at logon included — silent.
+    let show_window_once = {
+        let cfg = config.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cfg.first_run || !cfg.behavior.start_in_tray
+    };
     unsafe {
-        if config
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .behavior
-            .start_in_tray
-        {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        } else {
+        if show_window_once {
             let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
             // The tooltip timer is normally started by show_window(); this
             // visible-at-start path bypasses it, so start it and sync once
@@ -1231,6 +1232,8 @@ pub fn create_window(
             let _ = set_timer(hwnd, TIMER_TOOLTIPS_ID, 1000, None);
             let state_ref = &mut *state_ptr;
             state_ref.sync_tooltips();
+        } else {
+            let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
     if let Err(error) = install_tray_icon(hwnd) {
