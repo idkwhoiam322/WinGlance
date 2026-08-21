@@ -1131,20 +1131,16 @@ pub(crate) fn open_verified_file(path: &Path, truncate: bool) -> io::Result<File
     Ok(unsafe { File::from_raw_handle(handle.0) })
 }
 
-/// Appends `data` to `path` through `open_verified_file`: the parent is
-/// pinned through the open, the final component is opened without following a
-/// reparse point and rejected if it IS one, and the identity check lands
-/// before any mutation. Used by the crash.log writers, which run where a full
-/// temp+rename transaction is not warranted.
-pub(crate) fn append_verified(path: &Path, data: &[u8]) -> io::Result<()> {
-    append_verified_bounded(path, data, u64::MAX)
-}
-
-/// `append_verified` with a size cap: when the file already exceeds `cap`,
-/// it is truncated to zero before the append, so a crash loop cannot grow it
-/// without bound (matches the cap applied on the allocation-free handler
-/// path). The truncation happens through the already-verified handle, never
-/// through a re-resolved path.
+/// Appends `data` to `path` through `open_verified_file` under a size cap:
+/// the parent is pinned through the open, the final component is opened
+/// without following a reparse point and rejected if it IS one, and the
+/// identity check lands before any mutation. Used by the crash.log writers,
+/// which run where a full temp+rename transaction is not warranted. When the
+/// file already exceeds `cap`, it is truncated to zero before the append, so
+/// a crash loop cannot grow it without bound (the allocation-free vectored
+/// handler enforces the same budget with its own byte counter). The
+/// truncation happens through the already-verified handle, never through a
+/// re-resolved path.
 pub(crate) fn append_verified_bounded(path: &Path, data: &[u8], cap: u64) -> io::Result<()> {
     let mut file = open_verified_file(path, false)?;
     if cap != u64::MAX && file.metadata()?.len() > cap {
@@ -1668,7 +1664,7 @@ mod tests {
             return;
         }
 
-        assert!(append_verified(&link.join("crash.log"), b"x").is_err());
+        assert!(append_verified_bounded(&link.join("crash.log"), b"x", u64::MAX).is_err());
         assert!(!real.join("target").join("crash.log").exists());
     }
 

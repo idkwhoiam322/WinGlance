@@ -76,6 +76,21 @@ use crate::winutil::wide;
 /// allocation- and teardown-free).
 static CRASH_LOG_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
+/// Upper bound on crash.log growth. The file is diagnostic forensics, not
+/// user data: past this size a crash loop stops appending, so a broken
+/// install that crashes at startup cannot fill the disk. The earliest
+/// records survive, which is where a loop's signature lives. The panic-hook
+/// and singleton-failure writers enforce the cap through
+/// `append_verified_bounded`; the allocation-free vectored handler counts
+/// its own appended bytes against the same budget.
+const CRASH_LOG_CAP: u64 = 8 * 1024 * 1024;
+
+/// Bytes already in crash.log as accounted by this process: seeded from the
+/// file's length when the verified handle is installed, advanced by the
+/// vectored handler per append. Only touched before/during a crash path, so
+/// plain loads and stores are sufficient.
+static CRASH_LOG_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// Writes literal bytes into the stack buffer, truncating if the buffer is full.
 /// Returns the new write position.
 fn crash_write_str(buf: &mut [u8], pos: usize, s: &[u8]) -> usize {
@@ -200,15 +215,15 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // Append through the verified handle retained at install time: the object
     // was opened under the pinned parent and identity-validated before the
     // open returned, so no path component can be swapped out from under the
-    // crash write. No open, no close and no allocation happen here.
+    // crash write. No open, no close and no allocation happen here. Appends
+    // stop once the file reaches `CRASH_LOG_CAP`, so a crash loop cannot
+    // fill the disk.
     let raw = CRASH_LOG_HANDLE.load(Ordering::SeqCst);
-    if raw != 0 {
+    let written_so_far = CRASH_LOG_BYTES.load(Ordering::SeqCst);
+    if raw != 0 && written_so_far < CRASH_LOG_CAP {
         let handle = HANDLE(raw as *mut c_void);
         unsafe {
-            // crash.log is preserved forever: every crash record is appended
-            // and no cap truncates the file — the whole history is the
-            // forensics trail for diagnosing the crash loop itself. The
-            // pointer is positioned at EOF first so the crash record is
+            // The pointer is positioned at EOF first so the crash record is
             // always APPENDED, never written over earlier records (the
             // handle carries both FILE_APPEND_DATA and FILE_WRITE_DATA, so
             // the OS does not force appends automatically).
@@ -216,6 +231,7 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
             let mut written: u32 = 0;
             let _ = WriteFile(handle, Some(&buf[..pos]), Some(&mut written as *mut _), None);
         }
+        CRASH_LOG_BYTES.store((written_so_far + pos as u64).min(CRASH_LOG_CAP), Ordering::SeqCst);
     }
     0 // EXCEPTION_CONTINUE_SEARCH
 }
@@ -230,6 +246,10 @@ fn install_crash_handler(logs_dir: &Path) {
     // the open fails the handler degrades to skipping the crash log, exactly
     // as it did when the per-crash open failed.
     if let Ok(file) = crate::winutil::open_verified_file(&logs_dir.join("crash.log"), false) {
+        // Seed the byte counter with the file's existing length, so the cap
+        // bounds the whole file and not just this run's additions.
+        let existing = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        CRASH_LOG_BYTES.store(existing.min(CRASH_LOG_CAP), Ordering::SeqCst);
         CRASH_LOG_HANDLE.store(file.into_raw_handle() as usize, Ordering::SeqCst);
     }
     unsafe {
@@ -241,7 +261,8 @@ fn install_crash_handler(logs_dir: &Path) {
 /// the extern "C" boundary, which aborts the process silently (no access
 /// violation, so the vectored handler never fires) — without this hook a
 /// panic looks like the app "stopped running randomly". The file is appended
-/// to without a cap: its history is preserved for diagnosing crash loops.
+/// to under the shared `CRASH_LOG_CAP`, so a panic loop cannot grow it
+/// without bound.
 fn install_panic_hook(logs_dir: &Path) {
     let dir = logs_dir.to_path_buf();
     std::panic::set_hook(Box::new(move |info| {
@@ -257,8 +278,9 @@ fn install_panic_hook(logs_dir: &Path) {
         let path = dir.join("crash.log");
         // Verified append — the parent's identity is checked and the
         // final component is opened without following a pre-created link.
-        // crash.log is preserved forever: no size cap truncates it.
-        let _ = crate::winutil::append_verified(&path, message.as_bytes());
+        // Capped like the vectored handler, so a panic loop cannot fill
+        // the disk (past the cap the file truncates to zero and starts over).
+        let _ = crate::winutil::append_verified_bounded(&path, message.as_bytes(), CRASH_LOG_CAP);
     }));
 }
 
@@ -377,7 +399,7 @@ fn winglance_instance_running_retried() -> bool {
 /// never truncated.
 fn append_crash_log_line(message: &[u8]) {
     if let Some(dir) = config::Config::data_dir().ok().map(|d| d.join("logs")) {
-        let _ = crate::winutil::append_verified(&dir.join("crash.log"), message);
+        let _ = crate::winutil::append_verified_bounded(&dir.join("crash.log"), message, CRASH_LOG_CAP);
     }
 }
 
@@ -819,9 +841,10 @@ fn main() -> Result<()> {
             // failure in crash.log and exit. Verified append (parent
             // identity checked, no reparse follow).
             if let Some(dir) = config::Config::data_dir().ok().map(|d| d.join("logs")) {
-                let _ = crate::winutil::append_verified(
+                let _ = crate::winutil::append_verified_bounded(
                     &dir.join("crash.log"),
                     format!("could not acquire the single-instance mutex: {error:#}\n").as_bytes(),
+                    CRASH_LOG_CAP,
                 );
             }
             return Err(error);
