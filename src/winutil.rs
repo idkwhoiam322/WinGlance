@@ -643,7 +643,7 @@ fn to_io(error: windows::core::Error) -> io::Error {
 /// True when the Win32 error carries the given Win32 code.
 fn is_win32_code(error: &windows::core::Error, code: u32) -> bool {
     let raw = error.code().0 as u32;
-    raw & 0xFFFF_0000 == 0x8007_0000 && raw & 0xFFFF == code
+    (raw & 0xFFFF_0000) == 0x8007_0000 && (raw & 0xFFFF) == code
 }
 
 /// ASCII-insensitive comparison of two paths on their UTF-16 forms, so a
