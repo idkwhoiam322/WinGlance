@@ -119,7 +119,9 @@ prefix), so separate sessions get independent namespaces.
 
 The in-app "Restart app" handoff (`relaunch_self`) spawns
 `WinGlance.exe --reload-config --winglance-restart-nonce {nonce}`, where the
-nonce (`{pid}-{nanos}`) names an auto-reset ready event the child can open.
+nonce is a fresh 128-bit random hex value (`BCryptGenRandom`) naming an
+auto-reset ready event the child can open; a handoff whose event name already
+exists is refused, since only the spawned successor could know it.
 The child signals ready *before* waiting on the mutex; on the signal the old
 process releases the mutex and exits (10 s ready timeout), and the child
 takes ownership (15 s wait, `WAIT_ABANDONED` accepted — covering the old
@@ -324,7 +326,9 @@ Animation runs through three phases — expanding (grow + fade in), light (a
 short 120 ms fade for playback-state changes), collapsing (shrink + fade out)
 — on the spring model described in "Morph springs" below, driven by a
 high-resolution timer matched to the monitor's refresh rate while the pill
-animates or a text line scrolls (the period is capped by `max_tick_hz`,
+animates, a text line scrolls, or the aura comet sweep orbits — playing
+content keeps the sweep alive, so a playing pill stays at the refresh-rate
+cap for its whole duration (the period is capped by `max_tick_hz`,
 default 60 Hz). A fully static pill drops to a coarse 250 ms tick — the
 dismiss countdown and hover polling do not need frame rate — and the pill
 repaints only while animating or marquee-scrolling; a static pill does no
@@ -514,8 +518,10 @@ switching between two panes:
 
 - **Now Playing** — the current activity (art, state, title/artist/album,
   meta) and the per-session history listbox (newest first, capped at 400
-  rows, auto-pinned to the newest entry via `LB_SETTOPINDEX` on every insert —
-  intended). A native `TOOLTIPS_CLASSW` control shows full row details on hover,
+  rows; an insert follows the reader's scroll position — pinned while the
+  top rows are visible, shifted by one row otherwise, so a mid-history
+  position is not yanked back to the newest entry). A native
+  `TOOLTIPS_CLASSW` control shows full row details on hover,
   synced to the visible row band on a 1 Hz timer while the window is visible.
 - **Settings** — cards mirroring the tray menu and `[behavior]`/`[overlay]`
   config: notifications toggle, duration presets and the respect-system-
