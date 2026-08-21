@@ -125,6 +125,13 @@ const TIMER_LOGS_ID: usize = 101;
 /// Timer used to clear the "Opened" feedback on the Open logs/Open config buttons.
 const TIMER_OPENED_ID: usize = 104;
 /// Timer used to keep the native history tooltip's item rects in sync (scroll).
+/// Timer that retries a failed initial tray add: Explorer may not have built
+/// the notification area yet at logon, which makes the first `NIM_ADD` fail.
+const TRAY_RETRY_TIMER_ID: usize = 105;
+/// Retry cadence and budget for the tray add: five attempts two seconds
+/// apart (~10 s), then one bounded error instead of failing startup.
+const TRAY_RETRY_INTERVAL_MS: u32 = 2000;
+const TRAY_RETRY_MAX_ATTEMPTS: u32 = 5;
 const TIMER_TOOLTIPS_ID: usize = 102;
 /// One-shot timer that frees the cached artwork blit after the window has
 /// been tray-hidden for `IDLE_ART_RELEASE_MS` (see `on_close`). The blit
@@ -1137,6 +1144,10 @@ struct MainWindowState {
     control_mailbox: Arc<Mutex<ControlMailbox>>,
     /// Whether the position indicator in the Activity pane is hovered.
     position_hover: bool,
+    /// Attempts consumed by the initial tray-add retry timer (see
+    /// `TRAY_RETRY_TIMER_ID`). Zero while the icon is up or the budget is
+    /// spent.
+    tray_add_attempts: u32,
 }
 
 /// Set when this window's WM_NCCREATE claims the state box handed over in
@@ -1223,12 +1234,18 @@ pub fn create_window(
         }
     }
     if let Err(error) = install_tray_icon(hwnd) {
+        // A failed initial add (Explorer not up yet at logon, a transient
+        // shell state) must not abort startup silently: retry on a window
+        // timer for ~10 s, then give up with one bounded error. A later
+        // Explorer restart still recovers the icon via TaskbarCreated.
+        warn!("initial tray add failed ({error}); retrying every {TRAY_RETRY_INTERVAL_MS} ms");
         unsafe {
-            let _ = DestroyWindow(hwnd);
+            (*state_ptr).tray_add_attempts = 1;
+            let _ = set_timer(hwnd, TRAY_RETRY_TIMER_ID, TRAY_RETRY_INTERVAL_MS, None);
         }
-        return Err(error);
+    } else {
+        debug!("tray icon installed");
     }
-    debug!("tray icon installed");
     Ok(hwnd)
 }
 
@@ -1370,6 +1387,7 @@ impl MainWindowState {
             control_tx,
             control_mailbox,
             position_hover: false,
+            tray_add_attempts: 0,
         }
     }
 
@@ -3926,6 +3944,7 @@ impl MainWindowState {
         }
         unsafe {
             let _ = kill_timer(self.hwnd, TIMER_TOOLTIPS_ID);
+            let _ = kill_timer(self.hwnd, TRAY_RETRY_TIMER_ID);
             if !self.tooltip_ctrl.0.is_null() {
                 let _ = DestroyWindow(self.tooltip_ctrl);
                 self.tooltip_ctrl = HWND::default();
@@ -5276,6 +5295,29 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         WM_DPICHANGED => {
             if !state_ptr.is_null() {
                 (*state_ptr).on_dpi_changed((wparam.0 >> 16) as u32);
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TRAY_RETRY_TIMER_ID => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                if install_tray_icon(hwnd).is_ok() {
+                    info!("tray icon installed on retry {}", state.tray_add_attempts);
+                    state.tray_add_attempts = 0;
+                    let _ = kill_timer(hwnd, TRAY_RETRY_TIMER_ID);
+                } else {
+                    state.tray_add_attempts += 1;
+                    if state.tray_add_attempts >= TRAY_RETRY_MAX_ATTEMPTS {
+                        error!(
+                            "the tray icon could not be added after {} attempts over {} ms; \
+                             pills are unaffected and an Explorer restart will re-add it",
+                            state.tray_add_attempts,
+                            TRAY_RETRY_MAX_ATTEMPTS * TRAY_RETRY_INTERVAL_MS
+                        );
+                        state.tray_add_attempts = 0;
+                        let _ = kill_timer(hwnd, TRAY_RETRY_TIMER_ID);
+                    }
+                }
             }
             LRESULT(0)
         }
