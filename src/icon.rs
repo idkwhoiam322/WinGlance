@@ -267,7 +267,10 @@ pub(crate) fn extract_app_icon(aumid: &str, target_size: usize) -> Option<Vec<u8
         reply: reply_tx,
     };
     if sender.try_send(job).is_err() {
-        warn!("icon-extraction queue is full; skipping the icon for {aumid}");
+        warn!(
+            "icon-extraction queue is full; skipping the icon for {}",
+            log_preview(aumid)
+        );
         return None;
     }
     match reply_rx.recv_timeout(ICON_EXTRACT_TIMEOUT) {
@@ -278,7 +281,8 @@ pub(crate) fn extract_app_icon(aumid: &str, target_size: usize) -> Option<Vec<u8
                 .is_ok()
             {
                 warn!(
-                    "app-icon extraction timed out for {aumid}; the worker may be hung — no further icons will be requested this session"
+                    "app-icon extraction timed out for {}; the worker may be hung — no further icons will be requested this session",
+                    log_preview(aumid)
                 );
             }
             None
