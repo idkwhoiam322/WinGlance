@@ -249,6 +249,12 @@ struct LineScroll {
     /// its band). The animation tick only repaints a fully-shown pill while at
     /// least one line is scrolling; static text needs no per-frame redraw.
     scrolling: bool,
+    /// Cached natural (DT_CALCRECT) width of this row's current text, valid
+    /// only while `measured_font` is the font the row draws with — the same
+    /// keying discipline as the marquee strip. Spares every animation tick a
+    /// GDI measure pass for unchanged text; reset with the content.
+    measured_w: i32,
+    measured_font: HFONT,
 }
 
 /// Bundles the scroll state of one line with the cached raster of that line,

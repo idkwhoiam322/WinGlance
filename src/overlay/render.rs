@@ -2546,14 +2546,25 @@ pub(super) fn draw_text_line_pixels(
             bottom: rh,
         };
         if let Some(ctx) = marquee {
-            let mut measured = RECT::default();
-            let _ = DrawTextW(
-                hdc,
-                &mut *scratch_utf16,
-                &mut measured,
-                DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT,
-            );
-            let text_w = measured.right - measured.left;
+            // The overflow decision needs the text's natural width. It is
+            // cached per row (keyed by the selected font, like the marquee
+            // strip's key), so an animation tick never re-runs the DT_CALCRECT
+            // measure for unchanged text.
+            let text_w = if ctx.scroll.measured_font.0 == font.0 {
+                ctx.scroll.measured_w
+            } else {
+                let mut measured = RECT::default();
+                let _ = DrawTextW(
+                    hdc,
+                    &mut *scratch_utf16,
+                    &mut measured,
+                    DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT,
+                );
+                let width = measured.right - measured.left;
+                ctx.scroll.measured_w = width;
+                ctx.scroll.measured_font = font;
+                width
+            };
             // Whether this line overflows its visible band: while a
             // fully-shown pill has no overflowing line, the animation tick
             // skips repainting. The threshold is the draw rect itself (the
