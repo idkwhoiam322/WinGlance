@@ -437,7 +437,13 @@ pub(super) fn compact_title_viewport(config: &Config) -> (f32, f32) {
     let (pill_w, _) = compact_size(config);
     let left = appearance.padding + metrics.art + 12.0;
     let right = pill_w - appearance.padding - metrics.symbol - 16.0 - metrics.icon - 6.0;
-    (left, right)
+    // Extreme-but-valid configs (max padding + title font at the minimum
+    // max_width) can squeeze the band past inversion; keep a minimal
+    // positive viewport so the row renders — and marquees — instead of
+    // handing the rasterizer an inverted rect that reads as permanently
+    // overflowing.
+    const MIN_VIEWPORT: f32 = 8.0;
+    (left, right.max(left + MIN_VIEWPORT))
 }
 
 /// f32 lerp on an i32 edge, rounded to the pixel: `a + (b - a) * t`.

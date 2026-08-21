@@ -5664,6 +5664,27 @@ mod tests {
     }
 
     #[test]
+    fn compact_title_viewport_never_inverts_at_extreme_configs() {
+        let mut config = Config::default();
+        // Every value inside its documented clamp range, combined to squeeze
+        // the band past inversion (padding 4-32, title font 8-32,
+        // max_width 180-800).
+        config.appearance.padding = 32.0;
+        config.appearance.font_size_title = 32.0;
+        config.overlay.max_width = 180;
+        let (left, right) = compact_title_viewport(&config);
+        assert!(
+            right > left,
+            "the band must stay positive at extreme-but-valid configs (got {left}..{right})"
+        );
+        assert!(
+            right - left >= 8.0,
+            "a squeezed band keeps a minimal viewport (got {})",
+            right - left
+        );
+    }
+
+    #[test]
     fn decide_layout_applies_the_configured_mode_directly() {
         let config = Config::default();
         let verdict = ForegroundVerdict {
