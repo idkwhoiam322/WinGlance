@@ -47,7 +47,7 @@ pub(crate) use render::{TEXT_CONTRAST_AA, ensure_contrast, pm_bgra_to_rgba};
 pub(crate) use render::contrast_ratio;
 
 use fullscreen::{
-    ForegroundVerdict, TargetMonitor, anchor_unchanged, decide_layout, effective_position_rect,
+    DisplayInfo, ForegroundVerdict, TargetMonitor, anchor_unchanged, decide_layout, effective_position_rect,
     foreground_fullscreens_target, foreground_monitor_index, log_target_once, monitor_dpi, placement,
     refresh_period_ms, resolve_target, window_is_fullscreen,
 };
@@ -3276,14 +3276,22 @@ impl OverlayState {
         }
     }
 
-    /// Re-resolves the target display for the configured monitor mode. Fresh
-    /// on every call — the system monitor enumeration is cheap, and handles
-    /// are never cached, so a hot-plugged or reordered display takes effect
-    /// on the very next frame.
+    /// Re-resolves the target display for the monitor mode of the *active*
+    /// position — a compact pill with its own separated position targets the
+    /// compact monitor, every other pill the expanded one. Fresh on every
+    /// call — the system monitor enumeration is cheap, and handles are never
+    /// cached, so a hot-plugged or reordered display takes effect on the very
+    /// next frame.
     fn target(&self) -> Option<TargetMonitor> {
         let displays = enumerate_displays_cached();
         let foreground_nearest = foreground_monitor_index(&displays);
-        let index = resolve_target(self.position.monitor, &displays, foreground_nearest)?;
+        self.target_on(&displays, foreground_nearest)
+    }
+
+    /// `target` against an explicit display snapshot (pure core, so the
+    /// compact-monitor selection is testable without live displays).
+    fn target_on(&self, displays: &[DisplayInfo], foreground_nearest: Option<usize>) -> Option<TargetMonitor> {
+        let index = resolve_target(self.active_pos().monitor, displays, foreground_nearest)?;
         let display = &displays[index];
         let target = TargetMonitor {
             handle: display.handle,
@@ -11513,6 +11521,41 @@ mod tests {
         assert_eq!(resolve_target(MonitorMode::ActiveWindow, &[], None), None);
         assert_eq!(resolve_target(MonitorMode::Primary, &[], None), None);
         assert_eq!(resolve_target(MonitorMode::Index(0), &[], None), None);
+    }
+
+    #[test]
+    fn target_resolves_the_compact_monitor_while_separated() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.layout = LayoutMode::Compact;
+        state.config.overlay.compact_position_separate = true;
+        state.position.monitor = MonitorMode::Primary;
+        state.compact_position = OverlayPos {
+            vertical: VerticalPosition::Top,
+            horizontal: HorizontalPosition::Center,
+            margin: 8,
+            x: None,
+            y: None,
+            monitor: MonitorMode::Index(1),
+        };
+        let displays = vec![fake_display(1, true), fake_display(2, false)];
+
+        let target = state.target_on(&displays, None).expect("target resolves");
+        assert_eq!(
+            target.index, 1,
+            "a separated compact pill must target its own monitor, not the expanded one"
+        );
+
+        // Without separation the shared position governs: the expanded
+        // monitor is targeted even though the compact monitor differs.
+        state.config.overlay.compact_position_separate = false;
+        let target = state.target_on(&displays, None).expect("target resolves");
+        assert_eq!(target.index, 0, "a shared position must target the expanded monitor");
+
+        // The expanded layout ignores the compact position entirely.
+        state.layout = LayoutMode::Expanded;
+        state.config.overlay.compact_position_separate = true;
+        let target = state.target_on(&displays, None).expect("target resolves");
+        assert_eq!(target.index, 0, "the expanded pill always targets the expanded monitor");
     }
 
     fn anchor_pos(x: Option<i32>, y: Option<i32>) -> OverlayPos {
