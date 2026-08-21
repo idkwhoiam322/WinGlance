@@ -1,3 +1,4 @@
+use crate::smtc::normalize_for_match;
 use log::{debug, info, warn};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::Read;
@@ -783,6 +784,19 @@ impl Config {
         if let Some(pinned) = &self.behavior.pinned_source {
             let trimmed = pinned.trim().to_string();
             self.behavior.pinned_source = (!trimmed.is_empty()).then_some(trimmed);
+        }
+        // A pattern that normalizes to nothing is inert under the matchers'
+        // empty guard; warn so a hand-edited entry is visibly doing nothing
+        // instead of silently meaning "allow every app".
+        for pattern in self
+            .behavior
+            .media_sources
+            .iter()
+            .chain(self.behavior.auto_compact_sources.iter())
+        {
+            if normalize_for_match(pattern).is_empty() {
+                warn!("config behavior pattern {pattern:?} normalizes to nothing and will never match");
+            }
         }
         // f32 appearance fields go through `finite_clamp`: a non-finite value
         // declared in config.toml (TOML accepts nan/inf spellings) must fall

@@ -528,7 +528,7 @@ pub(super) fn auto_source_matches(config: &Config, exe_name: Option<&str>) -> bo
     let n_exe = crate::smtc::normalize_for_match(exe);
     patterns
         .iter()
-        .any(|pattern| n_exe.contains(&crate::smtc::normalize_for_match(pattern)))
+        .any(|pattern| crate::smtc::pattern_matches(&n_exe, pattern))
 }
 
 /// Decides the effective pill layout from the configured mode and the

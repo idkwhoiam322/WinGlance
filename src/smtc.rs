@@ -2118,7 +2118,11 @@ impl ListenerState {
         }
         let naumid = normalize_for_match(&aumid);
         let nlabel = normalize_for_match(&label);
-        normalized.iter().any(|np| naumid.contains(np) || nlabel.contains(np))
+        // Empty normalized patterns are skipped so a hand-edited "" cannot
+        // match via the empty-substring rule (see `pattern_matches`).
+        normalized
+            .iter()
+            .any(|np| !np.is_empty() && (naumid.contains(np) || nlabel.contains(np)))
     }
 
     /// True while a source app is excluded from tracking (churn cool-down or
@@ -3906,6 +3910,18 @@ pub(crate) fn normalize_for_match(s: &str) -> String {
     s.to_lowercase().replace(['-', '_', '.', ' '], "")
 }
 
+/// Whether one allow-list / auto-compact pattern matches a normalized source
+/// identity. A pattern that normalizes to nothing (empty, whitespace or
+/// separator characters only) never matches — the same rule the overlay's
+/// pin matcher applies — so a hand-edited empty entry cannot silently mean
+/// "allow every app" or "compact everywhere" via the empty-substring rule.
+/// The hot allow-list path inlines the same guard over its precomputed
+/// patterns; keep the two in lockstep.
+pub(crate) fn pattern_matches(normalized_identity: &str, pattern: &str) -> bool {
+    let normalized_pattern = normalize_for_match(pattern);
+    !normalized_pattern.is_empty() && normalized_identity.contains(&normalized_pattern)
+}
+
 /// The flush-scheduling debounce window. The worker's value comes from the
 /// supervisor's seed, not from a live config, so it is clamped here to the
 /// coalescing range (150–250 ms): a mis-set config value can starve (too
@@ -4074,6 +4090,18 @@ mod tests {
         assert_eq!(source_app_label(""), "Media");
         assert_eq!(source_app_label("com.github.th-ch.youtube-music"), "youtube-music");
         assert_eq!(source_app_label("com.riotgames.RiotGames.RiotClient"), "RiotClient");
+    }
+
+    #[test]
+    fn pattern_matches_rejects_empty_normalized_patterns() {
+        // An entry that normalizes to nothing must never match: the empty
+        // substring is contained in every identity, so allowing it would
+        // make media_sources = [""] mean "allow every app".
+        assert!(pattern_matches("youtubemusic", "youtube"));
+        assert!(!pattern_matches("youtubemusic", ""));
+        assert!(!pattern_matches("youtubemusic", "   "));
+        assert!(!pattern_matches("youtubemusic", "-_. "));
+        assert!(!pattern_matches("", "youtube"));
     }
 
     #[test]
