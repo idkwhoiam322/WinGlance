@@ -931,8 +931,11 @@ pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<(
             .chain(std::iter::once(0))
             .collect::<Vec<u16>>();
         // Backoff between attempts: rides out a residual transient holder on
-        // either path without delaying the normal path.
-        const BACKOFF_MS: [u64; 6] = [2, 16, 64, 250, 1000, 2000];
+        // either path. The schedule is deliberately short (~82 ms total):
+        // saves run on the UI thread, and the interference that used to need
+        // seconds was the filter race on the held handle, which the
+        // close-before-commit design removed.
+        const BACKOFF_MS: [u64; 3] = [2, 16, 64];
         let mut move_err: Option<io::Error> = None;
         for attempt in 0..BACKOFF_MS.len() + 1 {
             if attempt > 0 {
