@@ -645,6 +645,17 @@ fn compact_position_label(config: &Config) -> String {
     }
 }
 
+/// Formats a pill duration for user-facing text: whole seconds render
+/// without a fraction ("5s"), anything else keeps its exact sub-second value
+/// ("1.5s"), so a custom 500 ms or 1500 ms duration never reads as "0s"/"1s".
+fn format_duration_label(duration_ms: u64) -> String {
+    if duration_ms.is_multiple_of(1000) {
+        format!("{}s", duration_ms / 1000)
+    } else {
+        format!("{}s", duration_ms as f64 / 1000.0)
+    }
+}
+
 /// The overlay's target display as a display string, e.g. "Active window",
 /// "Primary", "Display 2". An index beyond the currently attached displays
 /// still shows the configured intent, flagged as unavailable — the config is
@@ -2918,9 +2929,13 @@ impl MainWindowState {
                         ),
                         SettingId::Duration => {
                             let value = if duration_effective_ms > duration_ms {
-                                format!("{}s (system {}s)", duration_ms / 1000, duration_effective_ms / 1000)
+                                format!(
+                                    "{} (system {})",
+                                    format_duration_label(duration_ms),
+                                    format_duration_label(duration_effective_ms)
+                                )
                             } else {
-                                format!("{}s", duration_ms / 1000)
+                                format_duration_label(duration_ms)
                             };
                             ("Duration", value, colors.muted)
                         }
@@ -4624,16 +4639,18 @@ fn show_tray_menu(state: &mut MainWindowState) {
             let _ = DestroyMenu(menu);
             return;
         };
-        let current_secs = state.cfg().overlay.duration_ms / 1000;
+        let current_ms = state.cfg().overlay.duration_ms;
         let presets: [(u64, usize, &str); 4] = [
             (2, MENU_DURATION_2S, "2 seconds"),
             (3, MENU_DURATION_3S, "3 seconds"),
             (5, MENU_DURATION_5S, "5 seconds"),
             (10, MENU_DURATION_10S, "10 seconds"),
         ];
-        let is_preset = presets.iter().any(|(s, _, _)| *s == current_secs);
+        // Preset membership compares milliseconds exactly: a 2999 ms custom
+        // value must not light up the "2 seconds" checkmark.
+        let is_preset = presets.iter().any(|(s, _, _)| current_ms == s * 1000);
         for (secs, id, label) in presets {
-            let flags = if current_secs == secs {
+            let flags = if current_ms == secs * 1000 {
                 MF_STRING | MF_CHECKED
             } else {
                 MF_STRING
@@ -4646,7 +4663,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
         let custom_label = if is_preset {
             "Custom".to_string()
         } else {
-            format!("Custom ({current_secs}s)")
+            format!("Custom ({})", format_duration_label(current_ms))
         };
         let _ = AppendMenuW(
             duration_menu,
@@ -4669,7 +4686,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
                     true,
                 );
                 if effective > cfg.overlay.duration_ms {
-                    let label = format!("Currently applied: {}s (system)", effective / 1000);
+                    let label = format!("Currently applied: {} (system)", format_duration_label(effective));
                     let _ = AppendMenuW(
                         duration_menu,
                         MF_STRING | MF_DISABLED | MF_GRAYED,
@@ -6026,7 +6043,7 @@ fn setting_value(id: SettingId, cfg: &Config) -> String {
         // name never reads a bare "Pinned source:".
         SettingId::PinnedSource => cfg.behavior.pinned_source.clone().unwrap_or_else(|| "None".into()),
         SettingId::ShowSample => "Show a sample notification".into(),
-        SettingId::Duration => format!("{}s", cfg.overlay.duration_ms / 1000),
+        SettingId::Duration => format_duration_label(cfg.overlay.duration_ms),
         SettingId::Layout => format!("{:?}", cfg.overlay.layout),
         SettingId::Monitor => format!("{:?}", cfg.overlay.monitor),
         SettingId::Position => position_label(cfg),
