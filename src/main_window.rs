@@ -951,6 +951,63 @@ impl Drop for ArtBlit {
     }
 }
 
+/// An owned GDI brush handle deleted exactly once on drop. Wraps the main
+/// window's long-lived brushes so ownership cannot drift between creation and
+/// teardown — a brush field added without extending WM_DESTROY previously
+/// leaked its handle.
+struct OwnedBrush(HBRUSH);
+
+impl OwnedBrush {
+    fn null() -> Self {
+        Self(HBRUSH::default())
+    }
+
+    fn new(brush: HBRUSH) -> Self {
+        Self(brush)
+    }
+
+    fn get(&self) -> HBRUSH {
+        self.0
+    }
+}
+
+impl Drop for OwnedBrush {
+    fn drop(&mut self) {
+        if !self.0.0.is_null() {
+            unsafe {
+                let _ = delete_object(self.0);
+            }
+        }
+    }
+}
+
+/// `OwnedBrush` for the history listbox font (same ownership contract).
+struct OwnedFont(HFONT);
+
+impl OwnedFont {
+    fn null() -> Self {
+        Self(HFONT::default())
+    }
+
+    fn new(font: HFONT) -> Self {
+        Self(font)
+    }
+
+    fn get(&self) -> HFONT {
+        self.0
+    }
+}
+
+impl Drop for OwnedFont {
+    fn drop(&mut self) {
+        if !self.0.0.is_null() {
+            unsafe {
+                let _ = delete_object(self.0);
+            }
+        }
+    }
+}
+
 struct MainWindowState {
     hwnd: HWND,
     instance: HINSTANCE,
@@ -960,30 +1017,30 @@ struct MainWindowState {
     listbox: HWND,
     current: Option<CurrentActivity>,
     history: History,
-    listbox_font: HFONT,
+    listbox_font: OwnedFont,
     fonts: FontProvider,
-    gray_brush: HBRUSH,
-    accent_brush: HBRUSH,
-    black_brush: HBRUSH,
-    sidebar_bg_brush: HBRUSH,
-    sidebar_highlight_brush: HBRUSH,
-    settings_border_brush: HBRUSH,
-    settings_surface_brush: HBRUSH,
-    settings_hover_brush: HBRUSH,
+    gray_brush: OwnedBrush,
+    accent_brush: OwnedBrush,
+    black_brush: OwnedBrush,
+    sidebar_bg_brush: OwnedBrush,
+    sidebar_highlight_brush: OwnedBrush,
+    settings_border_brush: OwnedBrush,
+    settings_surface_brush: OwnedBrush,
+    settings_hover_brush: OwnedBrush,
     /// The Settings pane's effective colors (see `settings_colors_for`),
     /// snapshotted whenever the brushes are (re)built so the paint reads one
     /// consistent set per frame.
     settings_colors: SettingsColors,
     /// Brush for the dedicated keyboard-focus outline.
-    settings_focus_brush: HBRUSH,
-    settings_accent_soft_brush: HBRUSH,
-    settings_adjust_hover_brush: HBRUSH,
-    settings_small_fill_brush: HBRUSH,
-    settings_small_hover_brush: HBRUSH,
-    history_header_brush: HBRUSH,
-    history_selected_brush: HBRUSH,
-    history_row_even_brush: HBRUSH,
-    history_row_odd_brush: HBRUSH,
+    settings_focus_brush: OwnedBrush,
+    settings_accent_soft_brush: OwnedBrush,
+    settings_adjust_hover_brush: OwnedBrush,
+    settings_small_fill_brush: OwnedBrush,
+    settings_small_hover_brush: OwnedBrush,
+    history_header_brush: OwnedBrush,
+    history_selected_brush: OwnedBrush,
+    history_row_even_brush: OwnedBrush,
+    history_row_odd_brush: OwnedBrush,
     /// Effective accent: the playing song's album palette primary (guarded
     /// against the settings surface so accent text stays readable), falling
     /// back to the configured accent. Rebuilt when the artwork changes.
@@ -1258,26 +1315,26 @@ impl MainWindowState {
             listbox: HWND::default(),
             current: None,
             history: History::new(HISTORY_CAP),
-            listbox_font: HFONT::default(),
+            listbox_font: OwnedFont::null(),
             fonts: FontProvider::new(96),
-            gray_brush: HBRUSH::default(),
-            accent_brush: HBRUSH::default(),
-            black_brush: HBRUSH::default(),
-            sidebar_bg_brush: HBRUSH::default(),
-            sidebar_highlight_brush: HBRUSH::default(),
-            settings_border_brush: HBRUSH::default(),
-            settings_surface_brush: HBRUSH::default(),
-            settings_hover_brush: HBRUSH::default(),
+            gray_brush: OwnedBrush::null(),
+            accent_brush: OwnedBrush::null(),
+            black_brush: OwnedBrush::null(),
+            sidebar_bg_brush: OwnedBrush::null(),
+            sidebar_highlight_brush: OwnedBrush::null(),
+            settings_border_brush: OwnedBrush::null(),
+            settings_surface_brush: OwnedBrush::null(),
+            settings_hover_brush: OwnedBrush::null(),
             settings_colors: settings_colors_for(&crate::winutil::SystemPreferences::DEFAULT),
-            settings_focus_brush: HBRUSH::default(),
-            settings_accent_soft_brush: HBRUSH::default(),
-            settings_adjust_hover_brush: HBRUSH::default(),
-            settings_small_fill_brush: HBRUSH::default(),
-            settings_small_hover_brush: HBRUSH::default(),
-            history_header_brush: HBRUSH::default(),
-            history_selected_brush: HBRUSH::default(),
-            history_row_even_brush: HBRUSH::default(),
-            history_row_odd_brush: HBRUSH::default(),
+            settings_focus_brush: OwnedBrush::null(),
+            settings_accent_soft_brush: OwnedBrush::null(),
+            settings_adjust_hover_brush: OwnedBrush::null(),
+            settings_small_fill_brush: OwnedBrush::null(),
+            settings_small_hover_brush: OwnedBrush::null(),
+            history_header_brush: OwnedBrush::null(),
+            history_selected_brush: OwnedBrush::null(),
+            history_row_even_brush: OwnedBrush::null(),
+            history_row_odd_brush: OwnedBrush::null(),
             accent_color: [0, 0, 0, 255],
             accent_secondary: [0, 0, 0, 255],
             accent_art_source: None,
@@ -1335,13 +1392,9 @@ impl MainWindowState {
     /// a cross-DPI move.
     fn on_dpi_changed(&mut self, dpi: u32) {
         debug!("DPI changed to {dpi}");
-        unsafe {
-            if !self.listbox_font.0.is_null() {
-                let _ = delete_object(HGDIOBJ(self.listbox_font.0));
-            }
-        }
         let scale = dpi.max(96) as f32 / 96.0;
-        self.listbox_font = Self::make_listbox_font(scale);
+        // Assigning over the field drops the previous font exactly once.
+        self.listbox_font = OwnedFont::new(Self::make_listbox_font(scale));
         self.fonts = FontProvider::new(dpi);
         if !self.listbox.0.is_null() {
             unsafe {
@@ -1350,7 +1403,7 @@ impl MainWindowState {
                 let _ = send_message(
                     self.listbox,
                     WM_SETFONT,
-                    WPARAM(self.listbox_font.0 as usize),
+                    WPARAM(self.listbox_font.get().0 as usize),
                     LPARAM(1),
                 );
             }
@@ -1362,21 +1415,21 @@ impl MainWindowState {
 
     fn create_children(&mut self) {
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
-        self.listbox_font = Self::make_listbox_font(scale);
-        self.gray_brush = unsafe { CreateSolidBrush(colorref(0x1E, 0x1E, 0x1E)) };
+        self.listbox_font = OwnedFont::new(Self::make_listbox_font(scale));
+        self.gray_brush = OwnedBrush::new(unsafe { CreateSolidBrush(colorref(0x1E, 0x1E, 0x1E)) });
         // Fixed-color brushes for the panes, created once instead of per paint
         // (a settings repaint previously created ~40 brushes).
-        self.black_brush = unsafe { CreateSolidBrush(COLORREF(0)) };
-        self.sidebar_bg_brush = unsafe { CreateSolidBrush(COLORREF(0x0A0A0A)) };
+        self.black_brush = OwnedBrush::new(unsafe { CreateSolidBrush(COLORREF(0)) });
+        self.sidebar_bg_brush = OwnedBrush::new(unsafe { CreateSolidBrush(COLORREF(0x0A0A0A)) });
         // The settings brushes (surface/border/hover/focus) come from the
         // effective color set — see `rebuild_settings_appearance`.
         self.rebuild_settings_appearance();
-        self.settings_small_fill_brush = unsafe { CreateSolidBrush(COLORREF(0x00121212)) };
+        self.settings_small_fill_brush = OwnedBrush::new(unsafe { CreateSolidBrush(COLORREF(0x00121212)) });
         // History-row brushes: a fixed four-color set, created once instead of
         // per owner-draw row (every scroll tick repaints every visible row).
-        self.history_header_brush = unsafe { CreateSolidBrush(COLORREF(0x00141414)) };
-        self.history_row_even_brush = unsafe { CreateSolidBrush(COLORREF(0)) };
-        self.history_row_odd_brush = unsafe { CreateSolidBrush(COLORREF(0x000E0E0E)) };
+        self.history_header_brush = OwnedBrush::new(unsafe { CreateSolidBrush(COLORREF(0x00141414)) });
+        self.history_row_even_brush = OwnedBrush::new(unsafe { CreateSolidBrush(COLORREF(0)) });
+        self.history_row_odd_brush = OwnedBrush::new(unsafe { CreateSolidBrush(COLORREF(0x000E0E0E)) });
         // The accent-derived brushes start from the configured accent (the
         // default pink theme) and are rebuilt when the playing song's artwork
         // changes (see `update_accent`). The highlight surfaces (sidebar
@@ -1414,7 +1467,7 @@ impl MainWindowState {
                 let _ = send_message(
                     self.listbox,
                     WM_SETFONT,
-                    WPARAM(self.listbox_font.0 as usize),
+                    WPARAM(self.listbox_font.get().0 as usize),
                     LPARAM(1),
                 );
                 let header = wide("TIME     EVENT");
@@ -1631,23 +1684,14 @@ impl MainWindowState {
     fn rebuild_settings_appearance(&mut self) {
         let colors = settings_colors_for(&crate::winutil::system_preferences());
         self.settings_colors = colors;
-        unsafe {
-            for brush in [
-                &mut self.settings_border_brush,
-                &mut self.settings_surface_brush,
-                &mut self.settings_hover_brush,
-                &mut self.settings_focus_brush,
-            ] {
-                if !brush.0.is_null() {
-                    let _ = delete_object(HGDIOBJ(brush.0));
-                }
-            }
-            let solid = |c: [u8; 4]| -> HBRUSH { CreateSolidBrush(colorref(c[0], c[1], c[2])) };
-            self.settings_border_brush = solid(colors.border);
-            self.settings_surface_brush = solid(colors.surface);
-            self.settings_hover_brush = solid(colors.hover);
-            self.settings_focus_brush = solid(colors.focus);
-        }
+        // Assigning over a field drops the previous brush exactly once (see
+        // `OwnedBrush`), so a theme change cannot leak the old handles.
+        let solid =
+            |c: [u8; 4]| -> OwnedBrush { OwnedBrush::new(unsafe { CreateSolidBrush(colorref(c[0], c[1], c[2])) }) };
+        self.settings_border_brush = solid(colors.border);
+        self.settings_surface_brush = solid(colors.surface);
+        self.settings_hover_brush = solid(colors.hover);
+        self.settings_focus_brush = solid(colors.focus);
     }
 
     /// Pushes the effective pill duration to the overlay: the
@@ -1671,9 +1715,9 @@ impl MainWindowState {
     /// colors: the accent brush + the four soft fills derive from
     /// `accent_color`, and the two highlight surfaces (sidebar active pane,
     /// history selection) derive from `accent_secondary`. Called once at
-    /// window creation and whenever the playing song's palette changes; the
-    /// old brushes are deleted first, so every paint site picks up the new
-    /// accent without per-paint brush allocation.
+    /// window creation and whenever the playing song's palette changes;
+    /// replacing a brush drops the old one, so every paint site picks up the
+    /// new accent without per-paint brush allocation.
     fn rebuild_accent_brushes(&mut self) {
         // Under a high-contrast theme the accent family derives from the
         // system highlight (paired with COLOR_HIGHLIGHTTEXT labels), not the
@@ -1686,34 +1730,22 @@ impl MainWindowState {
         let blend_surface = if hc { colors.surface } else { SETTINGS_SURFACE };
         let highlight_base = if hc { colors.accent_fill } else { self.accent_secondary };
         let highlight_surface = if hc { colors.surface } else { [0x0A, 0x0A, 0x0A, 0xFF] };
-        unsafe {
-            for brush in [
-                &mut self.accent_brush,
-                &mut self.settings_accent_soft_brush,
-                &mut self.settings_adjust_hover_brush,
-                &mut self.settings_small_hover_brush,
-                &mut self.sidebar_highlight_brush,
-                &mut self.history_selected_brush,
-            ] {
-                if !brush.0.is_null() {
-                    let _ = delete_object(HGDIOBJ(brush.0));
-                }
-            }
-            self.accent_brush = CreateSolidBrush(colorref(accent[0], accent[1], accent[2]));
-            let soft = |weight: f32| -> HBRUSH {
-                let c = mix(accent, blend_surface, weight);
-                CreateSolidBrush(colorref(c[0], c[1], c[2]))
-            };
-            self.settings_accent_soft_brush = soft(SETTINGS_ACCENT_SOFT_WEIGHT);
-            self.settings_adjust_hover_brush = soft(SETTINGS_ADJUST_HOVER_WEIGHT);
-            self.settings_small_hover_brush = soft(0.35);
-            let highlight = |weight: f32| -> HBRUSH {
-                let c = mix(highlight_base, highlight_surface, weight);
-                CreateSolidBrush(colorref(c[0], c[1], c[2]))
-            };
-            self.sidebar_highlight_brush = highlight(0.15);
-            self.history_selected_brush = highlight(0.20);
-        }
+        // Assigning over a field drops the previous brush exactly once (see
+        // `OwnedBrush`), so an accent change cannot leak the old set.
+        self.accent_brush = OwnedBrush::new(unsafe { CreateSolidBrush(colorref(accent[0], accent[1], accent[2])) });
+        let soft = |weight: f32| -> OwnedBrush {
+            let c = mix(accent, blend_surface, weight);
+            OwnedBrush::new(unsafe { CreateSolidBrush(colorref(c[0], c[1], c[2])) })
+        };
+        self.settings_accent_soft_brush = soft(SETTINGS_ACCENT_SOFT_WEIGHT);
+        self.settings_adjust_hover_brush = soft(SETTINGS_ADJUST_HOVER_WEIGHT);
+        self.settings_small_hover_brush = soft(0.35);
+        let highlight = |weight: f32| -> OwnedBrush {
+            let c = mix(highlight_base, highlight_surface, weight);
+            OwnedBrush::new(unsafe { CreateSolidBrush(colorref(c[0], c[1], c[2])) })
+        };
+        self.sidebar_highlight_brush = highlight(0.15);
+        self.history_selected_brush = highlight(0.20);
     }
 
     /// Colors the window title bar to match the effective accent — the system
@@ -2078,7 +2110,7 @@ impl MainWindowState {
 
         // Fill background
         unsafe {
-            let _ = FillRect(hdc, &whole, self.black_brush);
+            let _ = FillRect(hdc, &whole, self.black_brush.get());
         }
 
         // Draw sidebar
@@ -2089,7 +2121,7 @@ impl MainWindowState {
             bottom: client_h,
         };
         unsafe {
-            let _ = FillRect(hdc, &sidebar_rect, self.sidebar_bg_brush);
+            let _ = FillRect(hdc, &sidebar_rect, self.sidebar_bg_brush.get());
         }
 
         // Sidebar items
@@ -2106,7 +2138,7 @@ impl MainWindowState {
             };
             if *pane == self.active_pane {
                 unsafe {
-                    let _ = FillRect(hdc, &item_rect, self.sidebar_highlight_brush);
+                    let _ = FillRect(hdc, &item_rect, self.sidebar_highlight_brush.get());
                 }
             }
             let mut text_rect = item_rect;
@@ -2213,7 +2245,7 @@ impl MainWindowState {
                     bottom: art_y + art,
                 };
                 unsafe {
-                    let _ = FillRect(hdc, &art_rect, self.accent_brush);
+                    let _ = FillRect(hdc, &art_rect, self.accent_brush.get());
                 }
             }
             let state_label = match current.state {
@@ -2376,7 +2408,7 @@ impl MainWindowState {
             bottom: sep_y + 1,
         };
         unsafe {
-            let _ = FillRect(hdc, &separator, self.gray_brush);
+            let _ = FillRect(hdc, &separator, self.gray_brush.get());
         }
 
         let mut history_rect = RECT {
@@ -2796,14 +2828,14 @@ impl MainWindowState {
             .settings_items(content_left, client_w, pad, scale, self.settings_scroll_y)
             .items;
         let brushes = SettingsBrushes {
-            border: self.settings_border_brush,
-            surface: self.settings_surface_brush,
-            hover: self.settings_hover_brush,
-            accent: self.accent_brush,
-            accent_soft: self.settings_accent_soft_brush,
-            adjust_hover: self.settings_adjust_hover_brush,
-            small_fill: self.settings_small_fill_brush,
-            small_hover: self.settings_small_hover_brush,
+            border: self.settings_border_brush.get(),
+            surface: self.settings_surface_brush.get(),
+            hover: self.settings_hover_brush.get(),
+            accent: self.accent_brush.get(),
+            accent_soft: self.settings_accent_soft_brush.get(),
+            adjust_hover: self.settings_adjust_hover_brush.get(),
+            small_fill: self.settings_small_fill_brush.get(),
+            small_hover: self.settings_small_hover_brush.get(),
         };
         let mut row_index = 0usize;
         for item in &items {
@@ -2839,7 +2871,7 @@ impl MainWindowState {
 
                     // Card: border + surface fill (+ hover tint)
                     unsafe {
-                        let _ = FillRect(hdc, rect, self.settings_border_brush);
+                        let _ = FillRect(hdc, rect, self.settings_border_brush.get());
                     }
                     let inner = RECT {
                         left: rect.left + 1,
@@ -2849,9 +2881,9 @@ impl MainWindowState {
                     };
                     unsafe {
                         let bg = if hovered_row {
-                            self.settings_hover_brush
+                            self.settings_hover_brush.get()
                         } else {
-                            self.settings_surface_brush
+                            self.settings_surface_brush.get()
                         };
                         let _ = FillRect(hdc, &inner, bg);
                     }
@@ -3479,7 +3511,7 @@ impl MainWindowState {
                                 bottom: focus_rect.bottom - inset,
                             };
                             unsafe {
-                                let _ = FrameRect(hdc, &outline, self.settings_focus_brush);
+                                let _ = FrameRect(hdc, &outline, self.settings_focus_brush.get());
                             }
                         }
                     }
@@ -3787,13 +3819,13 @@ impl MainWindowState {
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
 
         let brush = if index == 0 {
-            self.history_header_brush
+            self.history_header_brush.get()
         } else if selected {
-            self.history_selected_brush
+            self.history_selected_brush.get()
         } else if index.is_multiple_of(2) {
-            self.history_row_even_brush
+            self.history_row_even_brush.get()
         } else {
-            self.history_row_odd_brush
+            self.history_row_odd_brush.get()
         };
         unsafe {
             let _ = FillRect(hdc, &item.rcItem, brush);
@@ -3883,37 +3915,10 @@ impl MainWindowState {
                 let _ = DestroyWindow(self.tooltip_ctrl);
                 self.tooltip_ctrl = HWND::default();
             }
-            if !self.listbox_font.0.is_null() {
-                let _ = delete_object(HGDIOBJ(self.listbox_font.0));
-            }
-            if !self.gray_brush.0.is_null() {
-                let _ = delete_object(HGDIOBJ(self.gray_brush.0));
-            }
-            if !self.accent_brush.0.is_null() {
-                let _ = delete_object(HGDIOBJ(self.accent_brush.0));
-            }
-            for brush in [
-                &self.black_brush,
-                &self.sidebar_bg_brush,
-                &self.sidebar_highlight_brush,
-                &self.settings_border_brush,
-                &self.settings_surface_brush,
-                &self.settings_hover_brush,
-                &self.settings_focus_brush,
-                &self.history_header_brush,
-                &self.history_selected_brush,
-                &self.history_row_even_brush,
-                &self.history_row_odd_brush,
-                &self.settings_accent_soft_brush,
-                &self.settings_adjust_hover_brush,
-                &self.settings_small_fill_brush,
-                &self.settings_small_hover_brush,
-            ] {
-                if !brush.0.is_null() {
-                    let _ = delete_object(HGDIOBJ(brush.0));
-                }
-            }
         }
+        // The listbox font and every brush are `Owned*` handles: they drop
+        // with the state box at WM_NCDESTROY and delete themselves exactly
+        // once — there is no manual free list to keep in sync here.
     }
 
     /// Marks the whole window for repaint on the next WM_PAINT. Deliberately
