@@ -603,6 +603,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
+use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
@@ -788,11 +789,12 @@ pub(crate) fn open_pinned_parent(dir: &Path) -> io::Result<DirGuard> {
 /// anyway).
 fn temp_name() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed) % 0x100_0000;
-    // 8.3-safe name (base <= 8 chars, ext <= 3): identical long-name prefixes
-    // created rapidly force NTFS to derive and de-collide short-name aliases,
-    // which transiently breaks name operations in the directory.
-    format!("wg{:06x}.tmp", seq)
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("wg-{:x}-{:x}-{:x}.tmp", std::process::id(), seq, nanos)
 }
 
 /// Deletes the temp through its own handle (disposition-delete) and closes
