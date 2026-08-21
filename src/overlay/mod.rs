@@ -7542,9 +7542,13 @@ mod tests {
         let alpha_at = |pixels: &[u8], x: usize, y: usize| pixels[(y * buf + x) * 4 + 3];
         let near_right = alpha_at(&pixels, inset + pill_w + 2, inset + pill_h / 2);
         assert!(near_right > 0, "the comet must glow on its sweep side");
-        // Inside the pill body: never (the body covers the glow).
-        let inside = alpha_at(&pixels, inset + 2, inset + pill_h / 2);
-        assert_eq!(inside, 0, "the comet must not reach inside the pill");
+        // Inside the pill body on the sweep side: only the anti-aliased rim
+        // (~1.5 px) may pick up the glow; the body itself stays clean.
+        let inside_sweep_side = alpha_at(&pixels, inset + pill_w - 4, inset + pill_h / 2);
+        assert_eq!(
+            inside_sweep_side, 0,
+            "the comet must not reach into the pill body past its rim"
+        );
         // Far side (left, 180° away) and beyond the halo extent: nothing.
         let far = alpha_at(&pixels, inset - 2, inset + pill_h / 2);
         assert_eq!(far, 0, "the comet must not wrap to the far side");
