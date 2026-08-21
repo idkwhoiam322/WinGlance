@@ -71,10 +71,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLBAR_COMMAND, SCROLLINFO, SIF_PAGE, SIF_POS,
     SIF_RANGE, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SetForegroundWindow, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_GETOBJECT, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL,
-    WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_ENDSESSION,
+    WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
+    WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{BSTR, PCWSTR, PWSTR};
 
@@ -5245,6 +5245,14 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             error!("re-adding the tray icon after an Explorer restart failed: {error}");
         }
         return LRESULT(0);
+    }
+    // Session end (logoff/shutdown): consent through DefWindowProcW, but
+    // remove the tray icon first so no ghost icon lingers in a session that
+    // is about to disappear. Best-effort; config saves are atomic renames,
+    // so there is nothing else to flush here.
+    if message == WM_ENDSESSION {
+        remove_tray_icon(hwnd);
+        return DefWindowProcW(hwnd, message, wparam, lparam);
     }
     if message == WM_NCCREATE {
         let create = lparam.0 as *const CREATESTRUCTW;
