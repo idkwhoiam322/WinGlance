@@ -1084,6 +1084,26 @@ impl OverlayState {
             line.started_at = Some(now);
             // The overflow flag is recomputed on the next render.
             line.scrolling = false;
+            // The cached width belongs to the previous content: without this
+            // reset, a long title after a short one inherits the short
+            // measurement and never scrolls, and a short one after a long
+            // scrolls an over-wide empty strip.
+            line.measured_w = 0;
+            line.measured_font = HFONT(std::ptr::null_mut());
+        }
+    }
+
+    /// Rebuilds the DPI-scoped font provider when the target display's DPI
+    /// changed. Every marquee cache keyed on the old fonts — the per-row
+    /// overflow measurement and the rasterized strips — is invalidated with
+    /// the swap: GDI may recycle the deleted handles' values for the new
+    /// fonts, so the caches must never outlive the provider they measured
+    /// with.
+    fn refresh_fonts(&mut self, raw_dpi: u32) {
+        if needs_font_rebuild(self.fonts.dpi(), raw_dpi) {
+            self.fonts = FontProvider::new(raw_dpi);
+            self.reset_scroll();
+            self.marquee_strips = [None, None, None, None];
         }
     }
 
@@ -3090,9 +3110,7 @@ impl OverlayState {
         };
         let frame = self.frame();
         let raw_dpi = monitor_dpi(target.handle);
-        if needs_font_rebuild(self.fonts.dpi(), raw_dpi) {
-            self.fonts = FontProvider::new(raw_dpi);
-        }
+        self.refresh_fonts(raw_dpi);
         let dpi = raw_dpi as f32 / 96.0;
         let compact = self.layout == LayoutMode::Compact;
         // One morph per frame, resolved by construction: the hover leg and
@@ -11521,6 +11539,63 @@ mod tests {
         assert_eq!(resolve_target(MonitorMode::ActiveWindow, &[], None), None);
         assert_eq!(resolve_target(MonitorMode::Primary, &[], None), None);
         assert_eq!(resolve_target(MonitorMode::Index(0), &[], None), None);
+    }
+
+    #[test]
+    fn reset_scroll_clears_the_cached_overflow_measurement() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.scroll[0].measured_w = 4242;
+        state.scroll[0].measured_font = HFONT(0x8 as *mut c_void);
+        state.scroll[0].scrolling = true;
+        state.scroll[0].offset = 12.0;
+        state.reset_scroll();
+        assert_eq!(state.scroll[0].offset, 0.0);
+        assert!(!state.scroll[0].scrolling);
+        assert_eq!(
+            state.scroll[0].measured_w, 0,
+            "the cached width belongs to the previous content and must not survive the reset"
+        );
+        assert!(
+            state.scroll[0].measured_font.0.is_null(),
+            "the measurement key must be cleared so the next render re-measures"
+        );
+    }
+
+    #[test]
+    fn a_font_provider_swap_invalidates_the_marquee_caches() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.scroll[0].measured_w = 4242;
+        state.scroll[0].measured_font = HFONT(0x8 as *mut c_void);
+        state.scroll[0].scrolling = true;
+        state.marquee_strips[1] = Some(MarqueeStrip {
+            value: "stale".into(),
+            rw: 100,
+            rh: 20,
+            font: HFONT(0x8 as *mut c_void),
+            font_height: 16,
+            color: [255, 255, 255, 255],
+            text_w: 90,
+            pixels: vec![0; 100 * 20 * 4],
+        });
+
+        // Fonts start at dpi 0, so any real dpi forces the rebuild — and the
+        // rebuild must drop every cache keyed on the previous fonts (GDI can
+        // even recycle the old handle values for the new fonts).
+        state.refresh_fonts(144);
+        assert_eq!(state.fonts.dpi(), 144);
+        assert_eq!(state.scroll[0].measured_w, 0);
+        assert!(state.scroll[0].measured_font.0.is_null());
+        assert!(!state.scroll[0].scrolling);
+        assert!(
+            state.marquee_strips[1].is_none(),
+            "strip rasters must not outlive their font provider"
+        );
+
+        // A matching dpi is a no-op: caches built under the live provider
+        // survive unchanged.
+        state.scroll[0].measured_w = 77;
+        state.refresh_fonts(144);
+        assert_eq!(state.scroll[0].measured_w, 77);
     }
 
     #[test]
