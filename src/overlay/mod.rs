@@ -10176,7 +10176,9 @@ mod tests {
         // ...then the hold drops and leaving runs the collapse leg while the
         // countdown resets to the full duration.
         state.hover_leave_at = Some(Instant::now() - Duration::from_millis(100));
+        let tick_started = Instant::now();
         state.tick();
+        let tick_finished = Instant::now();
         assert!(
             matches!(&state.hover_expand, Some(m) if m.direction == MorphDirection::Collapse),
             "leaving a pinned pill must run the collapse leg"
@@ -10186,10 +10188,10 @@ mod tests {
             "the dismissal must wait for the in-flight collapse leg"
         );
         let full = Duration::from_millis(state.config.overlay.duration_ms.max(500));
-        let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
+        let deadline = state.dismiss_at.unwrap();
         assert!(
-            remaining >= full - Duration::from_millis(100) && remaining <= full + Duration::from_millis(100),
-            "leaving the interaction must reset the countdown to the full duration, got {remaining:?} (full {full:?})"
+            deadline >= tick_started + full && deadline <= tick_finished + full,
+            "leaving the interaction must reset the countdown from an instant inside its tick"
         );
         // Fast-forward the collapse leg: the fresh deadline means the pill
         // stays shown as compact instead of dismissing on the old deadline.
