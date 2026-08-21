@@ -3428,8 +3428,9 @@ pub(super) fn draw_comet(
                 pill_h as f32,
                 radius,
             );
-            // Same inner anti-aliased fade as the ring: the comet hides
-            // beneath the pill's supersampled edge instead of painting over it.
+            // Same inner anti-aliased fade as the ring: the comet's glow
+            // ramps down across the pill's supersampled rim and never
+            // reaches the body.
             let inner_aa = if d < 0.0 {
                 let t = ((d + 1.5) / 1.5).clamp(0.0, 1.0);
                 t * t * (3.0 - 2.0 * t)
