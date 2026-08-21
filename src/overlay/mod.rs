@@ -56,7 +56,7 @@ use morph::{
     collapse_duration, content_size_of, ease_out_quint, hover_engaged, hover_progress, hover_step, lagged_collapse,
     lagged_expand, morph_duration, morph_size, normalized_elapsed, reversal_seed, spring_collapse,
 };
-use render::{AURA_HALO_LOGICAL, ORBIT_PERIOD_SECS, pill_text_from_track, render_layered};
+use render::{AURA_HALO_LOGICAL, ORBIT_PERIOD_SECS, pill_text_from_track, playback_state_for_track, render_layered};
 
 /// How long an in-place content swap dissolves the previous frame into the
 /// new one (see `ContentFade`).
@@ -1549,6 +1549,14 @@ impl OverlayState {
                         self.content.as_ref(),
                         Some(MediaEvent::TrackChanged(t)) if t.source_app == source_app
                     );
+                    // What the track pill currently displays. A track pill
+                    // carries its snapshot's playback state, so it can
+                    // legitimately show ⏸ (skip-while-paused): "track pill"
+                    // does not imply "playing".
+                    let track_displayed = self.content.as_ref().and_then(|content| match content {
+                        MediaEvent::TrackChanged(t) if t.source_app == source_app => Some(playback_state_for_track(t)),
+                        _ => None,
+                    });
                     if track_wins {
                         // A TrackChanged for this source is in this batch or
                         // already queued behind the current pill: the upcoming
@@ -1560,10 +1568,19 @@ impl OverlayState {
                         );
                         continue;
                     }
-                    if track_pill_shown && matches!(state, PlaybackState::Playing) {
-                        // The track pill already carries the music-note "now playing"
-                        // symbol, so a Playing re-announcement for the same source
-                        // adds nothing the pill does not already show.
+                    if track_pill_shown
+                        && matches!(state, PlaybackState::Playing)
+                        && matches!(
+                            track_displayed,
+                            None | Some(PlaybackState::Playing) | Some(PlaybackState::NowPlaying)
+                        )
+                    {
+                        // The track pill already displays a playing state (▶,
+                        // or the ♪ fallback for a transitional snapshot), so a
+                        // Playing re-announcement adds nothing the pill does
+                        // not already show. A track pill displaying ⏸/■ is a
+                        // real flip target and falls through to the in-place
+                        // refresh below.
                         debug!(
                             "playback state pill suppressed | reason=now-playing re-announced | source={source_app}"
                         );
@@ -4291,6 +4308,65 @@ mod tests {
         let (b, g, r) = (color[2], color[1], color[0]);
         let px = [b, g, r, 255];
         Arc::from(px.repeat(ARTWORK_DECODE as usize * ARTWORK_DECODE as usize))
+    }
+
+    #[test]
+    fn playing_over_a_paused_track_pill_flips_it_in_place() {
+        // Skip-while-paused leaves a brand-new track pill displaying ⏸ (the
+        // snapshot's state rides the TrackChanged). The user's play is a real
+        // flip and must refresh the pill, not be swallowed as a redundant
+        // "now playing" re-announcement; a bare Playing over a *playing*
+        // track pill stays suppressed.
+        let config = Config::default();
+        let queue: EventQueue = EventQueue::default();
+        let mut state = OverlayState::new(config, queue.clone());
+        state.enabled = true;
+
+        let mut paused_track = TrackInfo {
+            source_app: "ytm".into(),
+            title: "Our Way".into(),
+            ..TrackInfo::default()
+        };
+        paused_track.playback_state = Some(PlaybackState::Paused);
+        state.content = Some(MediaEvent::TrackChanged(paused_track));
+        state.current_source = Some("ytm".into());
+
+        queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Playing,
+                "ytm".into(),
+            )));
+        state.receive_events();
+        assert!(
+            matches!(
+                state.content.as_ref(),
+                Some(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, _))
+            ),
+            "play must replace a paused track pill's content in place"
+        );
+
+        let mut playing_track = TrackInfo {
+            source_app: "ytm".into(),
+            title: "Our Way".into(),
+            ..TrackInfo::default()
+        };
+        playing_track.playback_state = Some(PlaybackState::Playing);
+        state.content = Some(MediaEvent::TrackChanged(playing_track));
+        state.pending.clear();
+        queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Playing,
+                "ytm".into(),
+            )));
+        state.receive_events();
+        assert!(
+            matches!(state.content.as_ref(), Some(MediaEvent::TrackChanged(_))),
+            "a Playing re-report over a playing track pill stays suppressed"
+        );
     }
 
     #[test]
