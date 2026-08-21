@@ -610,8 +610,9 @@ use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_DISPOSITION_FLAG_DELETE, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FlushFileBuffers,
-    GetFileInformationByHandle, GetFinalPathNameByHandleW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, SetEndOfFile, SetFileInformationByHandle, SetFilePointer, WriteFile,
+    GetFileInformationByHandle, GetFinalPathNameByHandleW, GetLongPathNameW, MOVEFILE_REPLACE_EXISTING,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, SetEndOfFile, SetFileInformationByHandle,
+    SetFilePointer, WriteFile,
 };
 
 /// The Win32 DELETE access right (0x0001_0000); `windows` 0.58 does not export
@@ -675,6 +676,35 @@ pub(crate) fn extended_path(path: &Path) -> PathBuf {
         prefixed.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
         prefixed.extend_from_slice(&raw);
         PathBuf::from(OsString::from_wide(&prefixed))
+    }
+}
+
+/// Expands DOS 8.3 aliases while preserving the path's directory entries.
+/// Unlike a canonicalizing open, `GetLongPathNameW` does not replace a
+/// junction with its target, so comparing this spelling with a final handle
+/// path still rejects reparse points in intermediate components.
+fn long_extended_path(path: &Path) -> io::Result<PathBuf> {
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let needed = unsafe { GetLongPathNameW(windows::core::PCWSTR(wide.as_ptr()), None) };
+    if needed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buf = vec![0u16; needed as usize];
+    loop {
+        let written = unsafe { GetLongPathNameW(windows::core::PCWSTR(wide.as_ptr()), Some(buf.as_mut_slice())) };
+        if written == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if written as usize >= buf.len() {
+            buf.resize(written as usize + 1, 0);
+            continue;
+        }
+        let long = PathBuf::from(OsString::from_wide(&buf[..written as usize]));
+        return Ok(extended_path(&long));
     }
 }
 
@@ -775,7 +805,16 @@ pub(crate) fn open_pinned_parent(dir: &Path) -> io::Result<DirGuard> {
         return reject("write root is not a directory");
     }
     let final_path = final_path_of_raw(handle)?;
-    if !paths_equal(&final_path, &extended_path(dir)) {
+    let expected_path = match long_extended_path(dir) {
+        Ok(path) => path,
+        Err(error) => {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err(error);
+        }
+    };
+    if !paths_equal(&final_path, &expected_path) {
         return reject(&format!(
             "write root final path does not match the expected path (resolved to {})",
             final_path.display()
@@ -872,7 +911,13 @@ pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<(
         // cannot move and CREATE_NEW cannot follow a link), kept as a hard
         // invariant. The expected path is the temp's own entry inside the
         // pinned parent, not the final target name.
-        let temp_expected = extended_path(&tmp_path);
+        let temp_expected = match long_extended_path(&tmp_path) {
+            Ok(path) => path,
+            Err(error) => {
+                delete_temp(temp_handle);
+                return Err(error);
+            }
+        };
         let fail = move |message: &str, handle: HANDLE| {
             delete_temp(handle);
             Err(io::Error::other(message))
@@ -1059,7 +1104,16 @@ pub(crate) fn open_verified_file(path: &Path, truncate: bool) -> io::Result<File
             return Err(error);
         }
     };
-    if !paths_equal(&final_path, &extended_path(path)) {
+    let expected_path = match long_extended_path(path) {
+        Ok(path) => path,
+        Err(error) => {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err(error);
+        }
+    };
+    if !paths_equal(&final_path, &expected_path) {
         return reject(&format!(
             "open target final path does not match the expected path (resolved to {})",
             final_path.display()
@@ -1494,6 +1548,19 @@ mod tests {
         atomic_replace_file(&target, b"new content").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new content");
         assert_eq!(sibling_names(&guard.dir), vec!["config.toml"], "no temp may remain");
+    }
+
+    #[test]
+    fn verified_writes_accept_a_dos_short_path_alias() {
+        let temp = std::env::temp_dir();
+        if paths_equal(&extended_path(&temp), &long_extended_path(&temp).unwrap()) {
+            return;
+        }
+
+        let guard = TestDir::new("short-path");
+        let target = guard.dir.join("config.toml");
+        atomic_replace_file(&target, b"content").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"content");
     }
 
     #[test]
