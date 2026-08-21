@@ -1,6 +1,7 @@
 use crate::winapi::{create_font, delete_object, select_object};
 use crate::winutil::wide;
 use log::warn;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use windows::Win32::Foundation::{COLORREF, RECT};
@@ -143,23 +144,34 @@ pub(crate) fn draw_string(
     if value.is_empty() {
         return;
     }
-    let mut text = value.encode_utf16().collect::<Vec<_>>();
     // ClearType subpixel rendering is incorrect on layered windows; grayscale
     // antialiasing keeps the pill text crisp.
     let (font, _) = fonts.font_for(height, bold);
     if font.0.is_null() {
         return;
     }
-    let old_font = unsafe { select_object(hdc, font) };
-    let color = COLORREF(color[0] as u32 | (color[1] as u32) << 8 | (color[2] as u32) << 16);
-    unsafe {
-        SetTextColor(hdc, color);
-        SetBkMode(hdc, TRANSPARENT);
-        let mut flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
-        if centered {
-            flags |= DT_CENTER;
-        }
-        let _ = DrawTextW(hdc, &mut text, rect, flags);
-        select_object(hdc, old_font);
+    // Reused UTF-16 scratch: every settings/history paint row funnels through
+    // this one function on the UI thread, so a fresh Vec per call is pure
+    // allocation churn. The thread-local is race-free because only the UI
+    // thread paints.
+    thread_local! {
+        static TEXT_UTF16: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
     }
+    TEXT_UTF16.with(|cell| {
+        let mut text = cell.borrow_mut();
+        text.clear();
+        text.extend(value.encode_utf16());
+        let old_font = unsafe { select_object(hdc, font) };
+        let color = COLORREF(color[0] as u32 | (color[1] as u32) << 8 | (color[2] as u32) << 16);
+        unsafe {
+            SetTextColor(hdc, color);
+            SetBkMode(hdc, TRANSPARENT);
+            let mut flags = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
+            if centered {
+                flags |= DT_CENTER;
+            }
+            let _ = DrawTextW(hdc, &mut text, rect, flags);
+            select_object(hdc, old_font);
+        }
+    });
 }
