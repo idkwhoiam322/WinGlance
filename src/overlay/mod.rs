@@ -134,6 +134,11 @@ const COLLAPSE_TROUGH: f32 = -0.094780;
 /// rate; the refresh-rate timer is restored the moment the pill animates or
 /// a line scrolls.
 const STATIC_TICK_MS: u32 = 250;
+/// Tick period while the only live element is the aura comet sweep: at
+/// 45°/s a 15 Hz sample advances ~3° per step, which reads as continuous
+/// motion for a soft glow while costing about a quarter of the refresh-rate
+/// renders the sweep previously demanded for as long as media played.
+const COMET_TICK_MS: u32 = 66;
 /// Angular speed of the aura comet sweep in rad/s: one circuit per
 /// `render::ORBIT_PERIOD_SECS`, so the sweep reads the same at any cadence.
 const ORBIT_ANGULAR_SPEED: f32 = std::f32::consts::TAU / ORBIT_PERIOD_SECS;
@@ -443,13 +448,24 @@ struct OverlayState {
     /// frame buffer at exactly this size.
     last_frame_w: usize,
     last_frame_h: usize,
-    /// The aura comet sweep's current angle in radians (atan2 convention:
+    /// The aura comet sweep's displayed angle in radians (atan2 convention:
     /// 0 = right of the pill center, positive = clockwise on screen),
-    /// advanced by the animation tick while `orbiting`. Frozen while the
-    /// content is paused/stopped, so the sweep rests with the music; kept
-    /// across pause, idle-fade and full hide so the next live tick resumes
-    /// the comet in place. Only a fresh process start zeroes it (see `new`).
+    /// derived from the wall-clock anchor below while `orbiting`. Frozen
+    /// while the content is paused/stopped, so the sweep rests with the
+    /// music; kept across pause, idle-fade and full hide so the next live
+    /// tick resumes the comet in place. Only a fresh process start zeroes
+    /// it (see `new`).
     orbit_angle: f32,
+    /// The angle the running sweep started from: the displayed angle is
+    /// `orbit_base + orbit_started_at.elapsed() * ORBIT_ANGULAR_SPEED`, so
+    /// the position stays true to wall clock even when ticks are delayed or
+    /// coalesced instead of accumulating clamped deltas.
+    orbit_base: f32,
+    /// When the running sweep anchored to `orbit_base`.
+    orbit_started_at: Instant,
+    /// Whether the previous tick saw the sweep live; a false→true edge
+    /// re-anchors the base at the last displayed angle.
+    orbit_was_on: bool,
     position: OverlayPos,
     /// The compact pill's resolved placement (independent of `position` only
     /// while `compact_position_separate` is on; see `active_pos`).
@@ -998,6 +1014,9 @@ impl OverlayState {
             last_frame_w: 0,
             last_frame_h: 0,
             orbit_angle: 0.0,
+            orbit_base: 0.0,
+            orbit_started_at: Instant::now(),
+            orbit_was_on: false,
             position,
             compact_position,
             // Every show path re-resolves the layout before the first frame
@@ -1181,8 +1200,11 @@ impl OverlayState {
         let animating = !matches!(self.phase, Phase::Shown)
             || self.hover_expand.is_some()
             || self.content_fade.is_some()
-            || self.persistent_fade_active()
-            || self.orbiting();
+            || self.persistent_fade_active();
+        // The comet alone no longer buys refresh-rate frames: a slow glow
+        // reads just as smoothly at ~15 Hz, which cuts a playing pill's
+        // steady-state render load to about a quarter.
+        let comet_only = !animating && self.orbiting();
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
         let now = Instant::now();
         let raw = if animating || marquee_active {
@@ -1199,6 +1221,8 @@ impl OverlayState {
                     fresh
                 }
             }
+        } else if comet_only {
+            COMET_TICK_MS
         } else {
             STATIC_TICK_MS
         };
@@ -1219,6 +1243,8 @@ impl OverlayState {
                 1000 / period.max(1),
                 if animating || marquee_active {
                     "refresh-rate matched"
+                } else if comet_only {
+                    "comet"
                 } else {
                     "static"
                 }
@@ -2952,11 +2978,20 @@ impl OverlayState {
                 }
             }
         }
-        // The aura comet sweep, driven by this same tick: time-based so the
-        // speed is constant at any cadence. It advances while the pill is
+        // The aura comet sweep, driven by this same tick: anchored to wall
+        // clock rather than accumulating per-tick deltas, so delayed or
+        // coalesced ticks move the comet to where it belongs instead of
+        // leaving it permanently behind. It advances while the pill is
         // mid-morph too — the sweep never pauses for an expand/collapse.
-        if self.orbiting() {
-            self.orbit_angle = (self.orbit_angle + dt * ORBIT_ANGULAR_SPEED) % std::f32::consts::TAU;
+        let orbiting_now = self.orbiting();
+        if orbiting_now && !self.orbit_was_on {
+            self.orbit_base = self.orbit_angle;
+            self.orbit_started_at = now;
+        }
+        self.orbit_was_on = orbiting_now;
+        if orbiting_now {
+            let elapsed = self.orbit_started_at.elapsed().as_secs_f32();
+            self.orbit_angle = (self.orbit_base + elapsed * ORBIT_ANGULAR_SPEED) % std::f32::consts::TAU;
         }
         // Foreground re-check: a foreground change flips the Auto pill between
         // layouts within one static tick even when no media event arrives
