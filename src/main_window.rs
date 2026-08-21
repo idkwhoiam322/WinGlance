@@ -1866,8 +1866,15 @@ impl MainWindowState {
                     if let Some(current) = &mut self.current
                         && current.track.source_app == source_app
                     {
+                        // Redundancy is decided against what the activity
+                        // already displays — the same predicate the overlay
+                        // applies when it suppresses the pill update — so a
+                        // row is highlighted exactly when its state reached
+                        // the pill. Every reported transition is recorded;
+                        // redundant ones just record grey.
+                        let redundant = redundant_state_row(current.state, state);
                         current.state = state;
-                        self.add_state_change(state);
+                        self.add_state_change(state, redundant);
                         dirty = true;
                     }
                 }
@@ -1966,24 +1973,19 @@ impl MainWindowState {
         self.tooltips_dirty = true;
     }
 
-    fn add_state_change(&mut self, state: PlaybackState) {
+    /// Records one playback transition of the current activity. Every
+    /// reported transition lands in the history — spam included — but only
+    /// the ones that changed what the pill displays are highlighted: a
+    /// `redundant` row records grey, mirroring the overlay's suppression.
+    fn add_state_change(&mut self, state: PlaybackState, redundant: bool) {
         let Some(current) = &self.current else {
             return;
         };
-        // Skip a state row that duplicates the newest one for the same source
-        // (same track, same state). Session recreation re-reports "Playing"
-        // for the same song, which would otherwise flood the history with
-        // identical rows while the user never changed anything. Rejected
-        // sessions from other sources can interleave on top; the newest
-        // same-source row is the one to compare against, not just the front.
-        if duplicate_state_row(&self.history.entries, current, state) {
-            return;
-        }
         // Convert to the history's text-only form before the clone so the
         // image buffers (Arc-pinned covers, app icon, palette) are never copied
         // just to be discarded.
         let track = current.track.clone().into_history_text();
-        self.push_history(track, state, true);
+        self.push_history(track, state, !redundant);
     }
 
     /// Records a session that was seen but not tracked (filtered by
@@ -3918,9 +3920,10 @@ impl MainWindowState {
             } else {
                 &entry.track.artist
             };
-            // Accepted sessions are highlighted in pink (the accent color)
-            // with bold text; rejected sessions render muted so every media
-            // source is visible without stealing attention from tracked ones.
+            // Rows whose state reached the pill are highlighted in pink (the
+            // accent color) with bold text; redundant re-reports and rejected
+            // sessions render muted, so the bright rows are exactly what the
+            // pill showed.
             let (row_color, bold) = if entry.accepted {
                 (accent_color, true)
             } else {
@@ -4271,17 +4274,12 @@ impl MainWindowState {
     }
 }
 
-/// Whether a state row for `current` would duplicate the newest history row
-/// of the same source (same track, same state). Rejected sessions from other
-/// sources can sit on top of the row in question, so the comparison skips
-/// interleaved foreign rows instead of only checking the front.
-fn duplicate_state_row(entries: &VecDeque<HistoryEntry>, current: &CurrentActivity, state: PlaybackState) -> bool {
-    entries
-        .iter()
-        .find(|e| e.track.source_app == current.track.source_app)
-        .is_some_and(|last| {
-            last.state == state && last.track.title == current.track.title && last.track.artist == current.track.artist
-        })
+/// Whether an incoming playback state repeats what the current activity
+/// already displays. This mirrors the overlay's suppression predicate: such
+/// a re-report never changes the pill, so its history row records grey
+/// instead of highlighting.
+fn redundant_state_row(displayed: PlaybackState, incoming: PlaybackState) -> bool {
+    displayed == incoming
 }
 
 fn history_row(track: &TrackInfo, at: DateTime<Local>, state: PlaybackState) -> String {
@@ -7545,60 +7543,19 @@ mod tests {
         assert!(entries[1].accepted);
     }
 
-    fn current_activity(track: TrackInfo, state: PlaybackState) -> CurrentActivity {
-        CurrentActivity {
-            track,
-            state,
-            art_blit: None,
-            art_fingerprint: None,
-            art_decode_failed: false,
-            icon_blit: None,
-        }
-    }
-
-    fn history_entry(track: TrackInfo, state: PlaybackState) -> HistoryEntry {
-        HistoryEntry {
-            at: Local::now(),
-            at_label: String::new(),
-            track,
-            state,
-            accepted: true,
-        }
-    }
-
     #[test]
-    fn state_row_dedup_skips_interleaved_foreign_rows() {
-        let current = current_activity(track("Song"), PlaybackState::Playing);
-
-        // Empty history: not a duplicate.
-        let history = History::new(10);
-        assert!(!duplicate_state_row(&history.entries, &current, PlaybackState::Playing));
-
-        // Same source, same track, same state on top: duplicate.
-        let mut history = History::new(10);
-        history.push(history_entry(track("Song"), PlaybackState::Playing));
-        assert!(duplicate_state_row(&history.entries, &current, PlaybackState::Playing));
-        // Same source, same track, different state: a real change, new row.
-        assert!(!duplicate_state_row(&history.entries, &current, PlaybackState::Paused));
-
-        // A rejected row from another source interleaves on top: the newest
-        // same-source row below it still dedups.
-        let mut other = track("Song");
-        other.source_app = "other-app".into();
-        history.push(history_entry(other.clone(), PlaybackState::Playing));
-        assert!(
-            duplicate_state_row(&history.entries, &current, PlaybackState::Playing),
-            "interleaved foreign rows must not defeat the dedup"
-        );
-
-        // Only a foreign row exists: nothing to dedup against.
-        let mut foreign_only = History::new(10);
-        foreign_only.push(history_entry(other, PlaybackState::Playing));
-        assert!(!duplicate_state_row(
-            &foreign_only.entries,
-            &current,
-            PlaybackState::Playing
-        ));
+    fn redundant_state_rows_mirror_the_overlay_suppression() {
+        // The predicate decides row highlighting: a state that repeats what
+        // the activity already displays is exactly what the overlay
+        // suppresses, so it records grey; any real flip reaches the pill and
+        // highlights.
+        let (playing, paused, stopped) = (PlaybackState::Playing, PlaybackState::Paused, PlaybackState::Stopped);
+        assert!(redundant_state_row(playing, playing));
+        assert!(redundant_state_row(paused, paused));
+        assert!(redundant_state_row(stopped, stopped));
+        assert!(!redundant_state_row(paused, playing));
+        assert!(!redundant_state_row(playing, paused));
+        assert!(!redundant_state_row(stopped, playing));
     }
 
     #[test]

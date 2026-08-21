@@ -520,8 +520,12 @@ switching between two panes:
   meta) and the per-session history listbox (newest first, capped at 400
   rows; an insert follows the reader's scroll position — pinned while the
   top rows are visible, shifted by one row otherwise, so a mid-history
-  position is not yanked back to the newest entry). A native
-  `TOOLTIPS_CLASSW` control shows full row details on hover,
+  position is not yanked back to the newest entry). Every reported
+  transition is recorded, and highlighting marks the rows that reached the
+  pill: a tracked source's redundant re-report (the state the activity
+  already displays — exactly what the overlay suppresses) records grey like
+  a rejected session. A native `TOOLTIPS_CLASSW` control shows full row
+  details on hover,
   synced to the visible row band on a 1 Hz timer while the window is visible.
 - **Settings** — cards mirroring the tray menu and `[behavior]`/`[overlay]`
   config: notifications toggle, duration presets and the respect-system-
