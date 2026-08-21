@@ -3442,8 +3442,7 @@ pub(super) fn draw_comet(
             }
             // Cyclic angular distance from the sweep's position.
             let a = (py - center_y).atan2(px - center_x) - angle;
-            let mut diff = a.abs();
-            diff = diff.min(std::f32::consts::TAU - diff);
+            let diff = ((a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI).abs();
             let t = (diff / half_span).clamp(0.0, 1.0);
             // Smooth top-hat: full boost at the sweep center, fading to the
             // plain ring at the comet's angular edge.

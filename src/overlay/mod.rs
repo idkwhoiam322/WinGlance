@@ -7572,6 +7572,26 @@ mod tests {
         assert!(near_left > 0, "the comet must follow its angle around the pill");
         let right_after_move = alpha_at(&moved, inset + pill_w + 2, inset + pill_h / 2);
         assert_eq!(right_after_move, 0, "the comet must leave its previous side");
+
+        // Angles past π cross atan2's -π/π boundary. The wrapped distance
+        // must light the top without leaving a false trail toward the left.
+        let mut wrapped = vec![0u8; buf * buf * 4];
+        draw_comet(
+            &mut wrapped,
+            buf,
+            buf,
+            palette,
+            inset,
+            pill_w,
+            pill_h,
+            8.0,
+            1.0,
+            std::f32::consts::PI * 1.5,
+        );
+        let near_top = alpha_at(&wrapped, inset + pill_w / 2, inset - 2);
+        assert!(near_top > 0, "the comet must cross the angular boundary");
+        let stale_upper_left = alpha_at(&wrapped, inset - 2, inset + pill_h / 2 - 4);
+        assert_eq!(stale_upper_left, 0, "the wrapped sweep must not leave a trail");
     }
 
     #[test]
