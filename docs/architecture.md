@@ -524,8 +524,9 @@ switching between two panes:
   transition is recorded, and highlighting marks the rows that reached the
   pill: a tracked source's redundant re-report (the state the activity
   already displays — exactly what the overlay suppresses) records grey like
-  a rejected session. A native `TOOLTIPS_CLASSW` control shows full row
-  details on hover,
+  a rejected session, and while notifications are off nothing reaches the
+  pill, so every row records grey. A native `TOOLTIPS_CLASSW` control shows
+  full row details on hover,
   synced to the visible row band on a 1 Hz timer while the window is visible.
 - **Settings** — cards mirroring the tray menu and `[behavior]`/`[overlay]`
   config: notifications toggle, duration presets and the respect-system-

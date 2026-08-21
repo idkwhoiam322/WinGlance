@@ -1984,11 +1984,15 @@ impl MainWindowState {
         let Some(current) = &self.current else {
             return;
         };
+        // Bright means the state reached the pill: a redundant re-report is
+        // exactly what the overlay suppresses, and with notifications off
+        // nothing reaches the pill at all.
+        let reached = !redundant && self.cfg().behavior.notifications_enabled;
         // Convert to the history's text-only form before the clone so the
         // image buffers (Arc-pinned covers, app icon, palette) are never copied
         // just to be discarded.
         let track = current.track.clone().into_history_text();
-        self.push_history(track, state, !redundant);
+        self.push_history(track, state, reached);
     }
 
     /// Records a session that was seen but not tracked (filtered by
@@ -2109,8 +2113,11 @@ impl MainWindowState {
         // last remembered state, then Playing.
         let state = Self::resolve_track_state(&track, &self.source_states);
         // History row is text-only: drop the image buffers (consume a clone).
+        // Bright means the state reached the pill; with notifications off
+        // nothing does.
+        let reached = self.cfg().behavior.notifications_enabled;
         let history_track = track.clone().into_history_text();
-        self.push_history(history_track, state, true);
+        self.push_history(history_track, state, reached);
         self.current = Some(CurrentActivity {
             track,
             state,
