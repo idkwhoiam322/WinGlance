@@ -5253,8 +5253,35 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
     // tray icon, which Explorer's restart wiped.
     if message == taskbar_created_msg() {
         debug!("Explorer restarted the notification area; re-adding the tray icon");
-        if let Err(error) = install_tray_icon(hwnd) {
-            error!("re-adding the tray icon after an Explorer restart failed: {error}");
+        match install_tray_icon(hwnd) {
+            Ok(()) => {
+                // A success while the startup retry budget is still armed
+                // (e.g. the timer fired between Explorer's restart and this
+                // broadcast): clear it, or the timer's next NIM_ADD would
+                // target an already-installed (hwnd, uID) and march the
+                // budget to its give-up error line for nothing.
+                let state_ptr = window_state::<MainWindowState>(hwnd);
+                if !state_ptr.is_null() {
+                    let state = &mut *state_ptr;
+                    if state.tray_add_attempts != 0 {
+                        state.tray_add_attempts = 0;
+                        let _ = kill_timer(hwnd, TRAY_RETRY_TIMER_ID);
+                        info!("tray icon re-added after an Explorer restart; retry budget cleared");
+                    }
+                }
+            }
+            Err(error) => {
+                error!("re-adding the tray icon after an Explorer restart failed: {error}");
+                // Explorer will not broadcast again until its next restart,
+                // so a failed re-add must re-arm the retry budget rather
+                // than leave the app icon-less until then.
+                let state_ptr = window_state::<MainWindowState>(hwnd);
+                if !state_ptr.is_null() {
+                    let state = &mut *state_ptr;
+                    state.tray_add_attempts = 1;
+                    let _ = set_timer(hwnd, TRAY_RETRY_TIMER_ID, TRAY_RETRY_INTERVAL_MS, None);
+                }
+            }
         }
         return LRESULT(0);
     }
