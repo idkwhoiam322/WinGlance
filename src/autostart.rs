@@ -5,12 +5,18 @@ use log::{info, warn};
 use std::path::Path;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, WIN32_ERROR};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyW, RegDeleteValueW, RegQueryValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, REG_BINARY, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyW,
+    RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
 };
 use windows::core::PCWSTR;
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const VALUE_NAME: &str = "WinGlance";
+
+/// The Task-Manager-managed companion key: its `WinGlance` value overrides
+/// the Run entry's presence (a disabled bit here means Windows never launches
+/// the app at logon even though the Run value exists).
+const STARTUP_APPROVED_RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
 
 /// The ownership marker written into this app's Run command:
 /// `"<exact exe>" --winglance-autostart`. The token is accepted and ignored
@@ -108,10 +114,78 @@ pub fn apply(enabled: bool) -> Result<()> {
         // delete; nothing to remove.
         if error.is_ok() || (!enabled && error == ERROR_FILE_NOT_FOUND) {
             info!("start-on-login state applied: enabled={enabled}");
+            log_startup_approved_drift(enabled);
             Ok(())
         } else {
             anyhow::bail!("updating the start-on-login registry entry failed: {error:?}")
         }
+    }
+}
+
+/// Reads the Task-Manager-managed enablement for this app's Run value:
+/// `Some(true)` = explicitly enabled there, `Some(false)` = the user
+/// disabled it there, `None` = unreadable or never written (no drift to
+/// report). The value's byte layout is undocumented but stable: the first
+/// byte's low bit set means "disabled", a clear low bit (0x02) means
+/// "enabled". Read-only — this sync never writes to StartupApproved.
+fn startup_approved_enabled() -> Option<bool> {
+    unsafe {
+        let key_name = wide(STARTUP_APPROVED_RUN_KEY);
+        let value = wide(VALUE_NAME);
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(key_name.as_ptr()),
+            None,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let mut ty = REG_VALUE_TYPE(0);
+        let mut len: u32 = 0;
+        let rc = RegQueryValueExW(key, PCWSTR(value.as_ptr()), None, Some(&mut ty), None, Some(&mut len));
+        let state = if rc == WIN32_ERROR(0) && ty == REG_BINARY && len as usize >= std::mem::size_of::<u8>() {
+            let mut first = 0u8;
+            let mut got = 1u32;
+            let rc = RegQueryValueExW(
+                key,
+                PCWSTR(value.as_ptr()),
+                None,
+                None,
+                Some(&mut first),
+                Some(&mut got),
+            );
+            if rc == WIN32_ERROR(0) {
+                // Low bit clear = enabled, set = user-disabled.
+                Some(first & 0x01 == 0)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let _ = RegCloseKey(key);
+        state
+    }
+}
+
+/// Logs the StartupApproved drift: Task Manager's Startup toggle lives in
+/// `StartupApproved`, which this app does not write — so after every sync,
+/// a mismatch between that toggle and our configured state is called out
+/// instead of leaving the Settings row silently lying.
+fn log_startup_approved_drift(enabled: bool) {
+    if let Some(approved) = startup_approved_enabled()
+        && approved != enabled
+    {
+        warn!(
+            "start-on-login drift: StartupApproved marks WinGlance as {} while start_on_login is {} \
+             — Windows follows StartupApproved, so re-toggle it in Task Manager's Startup list",
+            if approved { "enabled" } else { "disabled" },
+            if enabled { "on" } else { "off" },
+        );
     }
 }
 
