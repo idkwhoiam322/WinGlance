@@ -1109,6 +1109,9 @@ fn main() -> Result<()> {
             // hung thread plus its COM registrations, so the leak rate needs
             // a bound. A worker that runs for two minutes resets the counter.
             let mut consecutive_restarts: u32 = 0;
+        // Timestamps of leaked (stalled) workers inside the rolling window
+        // used by `leak_budget_exhausted`.
+        let mut leaked_at: Vec<Instant> = Vec::new();
             loop {
                 if supervisor_shutdown.load(Ordering::SeqCst) {
                     break;
@@ -1243,6 +1246,28 @@ fn main() -> Result<()> {
                     WorkerExit::Stalled => {
                         // Do not join: the worker may be blocked inside COM forever.
                         consecutive_restarts += 1;
+                        // Every stall leaks the hung thread (stack + COM
+                        // registrations). The consecutive-failure cap resets
+                        // after a healthy stretch, so a pathological
+                        // environment could leak one thread per cycle forever
+                        //: track leaks on a rolling window and stop
+                        // restarting once the window budget is gone.
+                        leaked_at.push(Instant::now());
+                        if leak_budget_exhausted(
+                            &mut leaked_at,
+                            LEAK_WINDOW,
+                            MAX_LEAKED_WORKERS,
+                            Instant::now(),
+                        ) {
+                            let reason = format!(
+                                "SMTC workers have hung {MAX_LEAKED_WORKERS} times within {} minutes; \
+                                 stopping to bound leaked threads",
+                                LEAK_WINDOW.as_secs() / 60
+                            );
+                            error!("{reason}");
+                            let _ = supervisor_tx.send(Arc::new(MediaEvent::WorkerFailed { reason }));
+                            break;
+                        }
                         // A hard-stalled worker is leaked mid-call, so its `Drop`
                         // never runs and the mailbox-clear latch reset (see
                         // `clear_pending_output`) cannot fire: an undelivered
@@ -1380,6 +1405,25 @@ fn main() -> Result<()> {
 /// SMTC stack cannot leak one hung thread (plus its COM registrations) every
 /// 90 seconds forever.
 const MAX_WORKER_RESTARTS: u32 = 5;
+
+/// Rolling window for the leaked-worker budget : leaks older
+/// than this fall off and stop counting.
+const LEAK_WINDOW: Duration = Duration::from_secs(60);
+
+/// How many hung-thread leaks inside `LEAK_WINDOW` the supervisor tolerates
+/// before stopping restarts. Bounds the one resource the consecutive-failure
+/// cap cannot bound by itself — a pathological environment that wedges at
+/// least once per healthy stretch.
+const MAX_LEAKED_WORKERS: usize = 4;
+
+/// Whether the leaked-worker window budget is exhausted: prunes
+/// samples older than `window`, then reports whether `max` leaks sit inside
+/// it. Pure over its inputs so the policy is unit-testable without real
+/// workers.
+fn leak_budget_exhausted(leaks: &mut Vec<Instant>, window: Duration, max: usize, now: Instant) -> bool {
+    leaks.retain(|t| now.duration_since(*t) <= window);
+    leaks.len() >= max
+}
 
 /// Cap of the SMTC worker → forwarder event channel. The forwarder drains it
 /// every 200ms, so in practice it never fills; the cap only matters when the
@@ -1725,6 +1769,25 @@ mod tests {
             "writes through the retained handle must land in the verified crash.log"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leak_budget_prunes_the_window_and_stops_at_max() {
+        // Old leaks fall off and stop counting; the budget trips only
+        // when MAX_LEAKED_WORKERS samples sit inside the window.
+        let now = Instant::now();
+        let mut leaks = vec![now - Duration::from_secs(120), now - Duration::from_secs(90)];
+        assert!(
+            !leak_budget_exhausted(&mut leaks, LEAK_WINDOW, MAX_LEAKED_WORKERS, now),
+            "stale leaks must not count"
+        );
+        assert!(leaks.is_empty(), "pruning must drop out-of-window samples");
+        for i in 0..MAX_LEAKED_WORKERS - 1 {
+            leaks.push(now - Duration::from_secs(i as u64 + 1));
+        }
+        assert!(!leak_budget_exhausted(&mut leaks, LEAK_WINDOW, MAX_LEAKED_WORKERS, now));
+        leaks.push(now);
+        assert!(leak_budget_exhausted(&mut leaks, LEAK_WINDOW, MAX_LEAKED_WORKERS, now));
     }
 
     #[test]
