@@ -2284,10 +2284,13 @@ impl OverlayState {
         }
         // A pill currently shown over a fullscreen/listed foreground is flagged
         // for collapse-on-dismiss; keep held_content in sync so the resume (when
-        // the foreground clears) restores the latest track, not a stale one. The
-        // auto-hidden case is handled above — it shows briefly instead of
-        // swapping in place while the pill stays hidden.
-        if self.persistent_collapse_on_dismiss {
+        // the foreground clears) restores the latest track, not a stale one
+        //. Save when the collapse flag is up, or when an in-place update
+        // lands on a visible pill; a show entering FROM Hidden is the resume of
+        // this very hold (flag down), which must stay consumed.
+        if self.config.overlay.layout == LayoutMode::PersistentCompact
+            && (self.persistent_collapse_on_dismiss || !matches!(self.phase, Phase::Hidden))
+        {
             self.held_content = Some(event.clone());
         }
         self.content_rev += 1;
@@ -2441,12 +2444,16 @@ impl OverlayState {
             let verdict = self.sample_foreground();
             self.persistent_collapse_on_dismiss =
                 verdict.fullscreen || fullscreen::auto_source_matches(&self.config, verdict.exe.as_deref());
-            // Save the content so on_foreground_change can resume it when the
-            // user returns from the fullscreen/listed app — the pill will
-            // collapse on its own via the tick, not from this call site.
-            if self.persistent_collapse_on_dismiss {
-                self.held_content = Some(event.clone());
-            }
+        }
+        // Keep the resume hold pointed at the newest shown content in
+        // persistent mode: save when the collapse flag is up (surfacing
+        // or showing over a fullscreen/listed foreground) or for visible
+        // in-place entries; a show entering FROM Hidden with the flag down is
+        // the resume of this very hold and must stay consumed.
+        if self.config.overlay.layout == LayoutMode::PersistentCompact
+            && (self.persistent_collapse_on_dismiss || !matches!(self.phase, Phase::Hidden))
+        {
+            self.held_content = Some(event.clone());
         }
         // A fresh pill invalidates the idle-release deadline: the frame
         // buffers are about to be reused.
@@ -3850,6 +3857,18 @@ impl OverlayState {
             },
             MediaEvent::TrackChanged,
         );
+        // PersistentCompact auto-hide: re-evaluate exactly like a real show
+        // does. hide() cleared the collapse flag before preview_if_hidden
+        // got here, so a sample surfaced while auto-hidden for a
+        // fullscreen/listed foreground would otherwise fade to idle opacity
+        // and linger over the app with the watchdog disarmed.
+        if self.config.overlay.layout == LayoutMode::PersistentCompact
+            && self.config.behavior.hide_for_auto_compact_sources
+        {
+            let verdict = self.sample_foreground();
+            self.persistent_collapse_on_dismiss =
+                verdict.fullscreen || fullscreen::auto_source_matches(&self.config, verdict.exe.as_deref());
+        }
         self.content_rev += 1;
         self.content = Some(content);
         self.resolve_pill_text();
