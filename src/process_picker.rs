@@ -27,16 +27,17 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_SPACE};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GetClientRect, GetParent,
     GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, LB_ADDSTRING,
-    LB_GETCOUNT, LB_GETITEMDATA, LB_GETITEMRECT, LB_GETTOPINDEX, LB_SETCURSEL, LB_SETITEMDATA, LB_SETITEMHEIGHT,
-    LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
-    WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WS_BORDER,
-    WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    LB_GETCOUNT, LB_GETCURSEL, LB_GETITEMDATA, LB_GETITEMRECT, LB_GETTOPINDEX, LB_SETCURSEL, LB_SETITEMDATA,
+    LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SETFONT, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use windows::core::BOOL;
 use windows::core::{PCWSTR, PWSTR};
@@ -589,6 +590,22 @@ pub(crate) fn open(
                 }
             })
             .collect();
+        // Single-select invariant at open time: a short stored pin can
+        // substring-match several offered rows, which would open the pinned
+        // picker with multiple checked rows even though the click path only
+        // ever allows one. Prefer an exact normalized identity match (the
+        // true stored pin), else keep the first contains-match.
+        let mut checked = checked;
+        if single {
+            let exact = list.iter().position(|e| {
+                let ne = normalize_pattern(&e.pattern);
+                norm_current.contains(&ne)
+            });
+            let chosen = exact.or_else(|| checked.iter().position(|&c| c));
+            for (i, slot) in checked.iter_mut().enumerate() {
+                *slot = Some(i) == chosen;
+            }
+        }
 
         let state = Box::new(PickerState {
             list,
@@ -861,14 +878,66 @@ fn hit_test_close(hwnd: HWND, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
 
+/// Toggles one row's checkbox through the exact semantics of a mouse click:
+/// flip the stored state, keep the auto-picker's pinned status row fixed,
+/// enforce single-select exclusivity on the pinned-source picker, and
+/// repaint the affected rows. Shared by WM_LBUTTONDOWN and the keyboard
+/// Space handler so both input paths behave identically.
+fn toggle_picker_row(lb: HWND, state: &mut PickerState, i: usize) {
+    // The Auto-compact picker's first row is the pinned "Full screen apps"
+    // status row: fullscreen coverage is unconditional, so its check is
+    // fixed — selecting the row never toggles it.
+    let pinned_row = state.list.first().is_some_and(|e| e.pattern.is_empty()) && i == 0;
+    if pinned_row {
+        return;
+    }
+    let data = unsafe { send_message(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
+    let toggled = if data.0 as usize == BST_CHECKED {
+        BST_UNCHECKED
+    } else {
+        BST_CHECKED
+    };
+    let _ = unsafe { send_message(lb, LB_SETCURSEL, WPARAM(i), LPARAM(0)) };
+    let _ = unsafe { send_message(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
+    if state.single {
+        // Single-select (pinned-source picker): checking one row clears
+        // every other, so at most one pattern is ever confirmed — toggling
+        // the checked row unchecks it (clearing the pin), toggling any
+        // other row moves the pin. The whole list repaints because another
+        // checked row just flipped too.
+        let count = unsafe { send_message(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as usize;
+        for j in 0..count {
+            if j != i && unsafe { send_message(lb, LB_GETITEMDATA, WPARAM(j), LPARAM(0)) }.0 as usize == BST_CHECKED {
+                let _ = unsafe { send_message(lb, LB_SETITEMDATA, WPARAM(j), LPARAM(BST_UNCHECKED as isize)) };
+            }
+        }
+        unsafe {
+            let _ = invalidate_rect(lb, None, false);
+        }
+    } else {
+        let mut item_rect = RECT::default();
+        let _ = unsafe {
+            send_message(
+                lb,
+                LB_GETITEMRECT,
+                WPARAM(i),
+                LPARAM(&mut item_rect as *mut RECT as isize),
+            )
+        };
+        unsafe {
+            let _ = invalidate_rect(lb, Some(&item_rect), false);
+        }
+    }
+}
+
 /// Comctl32 subclass proc for the picker's listbox. Mouse and keyboard
 /// messages are delivered to the listbox child rather than the picker window,
-/// so click-to-toggle and double-click-to-confirm are handled here. The parent
-/// (picker) HWND is carried in `ref_data`; PickerState is read from that
-/// window's GWLP_USERDATA. Every message we do not consume is forwarded via
-/// DefSubclassProc, which dispatches to the original listbox proc that Comctl32
-/// tracks internally — no GWLP_WNDPROC swap or stored original proc is needed.
-/// The subclass is unhooked on WM_NCDESTROY.
+/// so click-to-toggle, Space-to-toggle and double-click-to-confirm are
+/// handled here. The parent (picker) HWND is carried in `ref_data`; PickerState
+/// is read from that window's GWLP_USERDATA. Every message we do not consume
+/// is forwarded via DefSubclassProc, which dispatches to the original listbox
+/// proc that Comctl32 tracks internally — no GWLP_WNDPROC swap or stored
+/// original proc is needed. The subclass is unhooked on WM_NCDESTROY.
 unsafe extern "system" fn listbox_proc(
     lb: HWND,
     message: u32,
@@ -931,58 +1000,8 @@ unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPAR
                         return LRESULT(0);
                     }
 
-                    // Single click: toggle the checkbox and repaint the row.
-                    let data = unsafe { send_message(lb, LB_GETITEMDATA, WPARAM(i), LPARAM(0)) };
-                    let toggled = if data.0 as usize == BST_CHECKED {
-                        BST_UNCHECKED
-                    } else {
-                        BST_CHECKED
-                    };
-                    let _ = unsafe { send_message(lb, LB_SETCURSEL, WPARAM(i), LPARAM(0)) };
-                    // The Auto-compact picker's first row is the pinned
-                    // "Full screen apps" status row: fullscreen coverage is
-                    // unconditional, so its check is fixed — clicks select
-                    // the row but never toggle it.
-                    let pinned_row = state.list.first().is_some_and(|e| e.pattern.is_empty()) && i == 0;
-                    if pinned_row {
-                        return LRESULT(0);
-                    }
-                    let _ = unsafe { send_message(lb, LB_SETITEMDATA, WPARAM(i), LPARAM(toggled as isize)) };
-                    if state.single {
-                        // Single-select (pinned-source picker): checking one
-                        // row clears every other, so at most one pattern is
-                        // ever confirmed — clicking the checked row unchecks
-                        // it (clearing the pin), clicking any other row moves
-                        // the selection. The whole list repaints because any
-                        // other checked row just flipped too.
-                        let count = unsafe { send_message(lb, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as usize;
-                        for j in 0..count {
-                            if j != i
-                                && unsafe { send_message(lb, LB_GETITEMDATA, WPARAM(j), LPARAM(0)) }.0 as usize
-                                    == BST_CHECKED
-                            {
-                                let _ = unsafe {
-                                    send_message(lb, LB_SETITEMDATA, WPARAM(j), LPARAM(BST_UNCHECKED as isize))
-                                };
-                            }
-                        }
-                        unsafe {
-                            let _ = invalidate_rect(lb, None, false);
-                        }
-                    } else {
-                        let mut item_rect = RECT::default();
-                        let _ = unsafe {
-                            send_message(
-                                lb,
-                                LB_GETITEMRECT,
-                                WPARAM(i),
-                                LPARAM(&mut item_rect as *mut RECT as isize),
-                            )
-                        };
-                        unsafe {
-                            let _ = invalidate_rect(lb, Some(&item_rect), false);
-                        }
-                    }
+                    // Single click: toggle through the shared row path.
+                    toggle_picker_row(lb, state, i);
                     return LRESULT(0);
                 }
             }
@@ -990,7 +1009,10 @@ unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPAR
         }
         WM_KEYDOWN => {
             // The listbox takes keyboard focus when clicked, so Enter/Esc must
-            // work here as well as on the picker window itself.
+            // work here as well as on the picker window itself. Space toggles
+            // the selected row: without it a keyboard user could
+            // navigate and confirm but never change a check — the check state
+            // lived only in WM_LBUTTONDOWN.
             let key = wparam.0 as u16;
             if key == VK_ESCAPE.0 {
                 post_result(parent, true);
@@ -1000,6 +1022,17 @@ unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPAR
             if key == 0x0D {
                 post_result(parent, false);
                 let _ = unsafe { DestroyWindow(parent) };
+                return LRESULT(0);
+            }
+            if key == VK_SPACE.0 {
+                let sel = unsafe { send_message(lb, LB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0;
+                if sel >= 0 {
+                    let state_ptr = window_state::<PickerState>(parent);
+                    if !state_ptr.is_null() {
+                        let state = unsafe { &mut *state_ptr };
+                        toggle_picker_row(lb, state, sel as usize);
+                    }
+                }
                 return LRESULT(0);
             }
             unsafe { DefSubclassProc(lb, message, wparam, lparam) }
@@ -1372,6 +1405,22 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             if wparam.0 as u16 == 0x0D {
                 post_result(hwnd, false);
                 let _ = unsafe { DestroyWindow(hwnd) };
+                return LRESULT(0);
+            }
+            if wparam.0 as u16 == VK_SPACE.0 {
+                // Focus has not entered the listbox yet: route Space to the
+                // selected row anyway so keyboard-only use never depends on
+                // a prior mouse click. No selection = no-op.
+                let state_ptr = window_state::<PickerState>(hwnd);
+                if !state_ptr.is_null() {
+                    let state = unsafe { &mut *state_ptr };
+                    if !state.listbox.0.is_null() {
+                        let sel = unsafe { send_message(state.listbox, LB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0;
+                        if sel >= 0 {
+                            toggle_picker_row(state.listbox, state, sel as usize);
+                        }
+                    }
+                }
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
