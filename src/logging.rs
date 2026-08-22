@@ -71,7 +71,6 @@ pub fn init_logging(logs_dir: &Path, preserve: bool) {
     let logger = FileLogger {
         files: Mutex::new(files),
     };
-    static LOGGER: OnceLock<FileLogger> = OnceLock::new();
     if LOGGER.set(logger).is_ok() && log::set_logger(LOGGER.get().expect("logger initialized")).is_ok() {
         // Debug level: session churn, dedup skips and suppressed states are all
         // logged, which is what makes "why did/didn't a notification fire"
@@ -79,6 +78,27 @@ pub fn init_logging(logs_dir: &Path, preserve: bool) {
         log::set_max_level(LevelFilter::Debug);
     }
     log::info!("logging initialized | live log: {live_path:?}");
+}
+
+/// The process-wide logger instance. Held at module level so the restart
+/// handoff can reseat the live-log cursor without going through the `log`
+/// facade.
+static LOGGER: OnceLock<FileLogger> = OnceLock::new();
+
+/// Moves the live log's write cursor to EOF: called by the restart
+/// handoff right before the old process releases the singleton. The
+/// successor has already appended its boundary line to the preserved file;
+/// any late write from this process's remaining threads must append after
+/// it — this handle's cursor predates those bytes and would otherwise
+/// overwrite them. Best-effort: a failed seek leaves the pre-restart
+/// behavior (a microsecond-window overlap that is diagnostics-only).
+pub fn reseat_live_log_to_eof() {
+    if let Some(logger) = LOGGER.get()
+        && let Ok(mut files) = logger.files.lock()
+        && let Some(files) = files.as_mut()
+    {
+        let _ = files.live.seek(SeekFrom::End(0));
+    }
 }
 
 struct LogFiles {
@@ -112,18 +132,28 @@ impl Log for FileLogger {
         if let Ok(mut files) = self.files.lock()
             && let Some(files) = files.as_mut()
         {
-            let _ = files.live.write_all(line.as_bytes());
-            // No per-line flush: the OS page cache keeps the write durable
-            // across a process crash, which is what the log is for. Flushing
-            // every Debug line would stall the SMTC worker under churn; only
-            // a power loss can lose the last few lines.
-            files.written += line.len() as u64;
+            // The cap counter advances only on a successful write:
+            // phantom bytes from failed writes would trip the reset while
+            // the disk still holds the old body. No per-line flush: the OS
+            // page cache keeps the write durable across a process crash,
+            // which is what the log is for. Flushing every Debug line would
+            // stall the SMTC worker under churn; only a power loss can lose
+            // the last few lines.
+            match files.live.write_all(line.as_bytes()) {
+                Ok(()) => files.written += line.len() as u64,
+                Err(_) => return,
+            }
             if files.written >= LIVE_LOG_CAP {
                 // Start the log fresh instead of growing without bound; the
-                // file is diagnostic scratch, not user data.
-                let _ = files.live.set_len(0);
-                let _ = files.live.seek(SeekFrom::Start(0));
-                files.written = 0;
+                // file is diagnostic scratch, not user data. If the truncate
+                // itself fails (a full disk again), keep appending past the
+                // stale cursor rather than resetting it: overwriting live
+                // bytes with a wrong offset would garble what is still
+                // readable.
+                if files.live.set_len(0).is_ok() {
+                    let _ = files.live.seek(SeekFrom::Start(0));
+                    files.written = 0;
+                }
             }
         }
         // Echo to the console in debug builds only: the packaged exe is

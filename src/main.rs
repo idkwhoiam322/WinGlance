@@ -897,6 +897,11 @@ pub fn relaunch_self() {
     // Handoff accepted: the successor stayed alive across both samples.
     // Release the mutex and exit; the child's bounded wait acquires
     // ownership. The child keeps running, so it must not be waited on.
+    // First reseat this process's live-log cursor to EOF: the
+    // successor appends its boundary line to the preserved file before we
+    // exit, and any late write from our remaining threads must land after
+    // it, not overwrite it from a stale offset.
+    crate::logging::reseat_live_log_to_eof();
     guard.release();
     unsafe {
         let _ = CloseHandle(ready);
@@ -1322,18 +1327,21 @@ fn main() -> Result<()> {
         }
     };
 
+    // Clones of the queues stay behind for the shutdown-stranded count
+    //: how many buffered events die with the process is part of the
+    // post-mortem.
     let forwarder_handle = spawn_event_forwarder(
         main_hwnd,
         overlay_hwnd,
-        main_queue,
-        overlay_queue,
+        main_queue.clone(),
+        overlay_queue.clone(),
         main_wake,
         overlay_wake,
         event_rx,
         supervisor_rx,
         forwarder_shutdown,
         forwarder_art,
-    );
+    )?;
 
     let message_result = message_loop();
     debug!("message loop exited; shutting down");
@@ -1345,6 +1353,14 @@ fn main() -> Result<()> {
     shutdown.store(true, Ordering::SeqCst);
     let _ = forwarder_handle.join();
     let _ = supervisor_handle.join();
+
+    // Account for events that die with the process: a post-mortem
+    // asking "what happened to the last events" needs to know they were
+    // dropped at shutdown rather than silently lost mid-run.
+    let stranded = main_queue.lock().map(|q| q.len()).unwrap_or(0) + overlay_queue.lock().map(|q| q.len()).unwrap_or(0);
+    if stranded > 0 {
+        debug!("{stranded} buffered event(s) dropped at shutdown (queues were not fully drained)");
+    }
 
     unsafe {
         let _ = DestroyWindow(overlay_hwnd);
@@ -1477,7 +1493,7 @@ fn spawn_event_forwarder(
     supervisor_rx: mpsc::Receiver<Arc<MediaEvent>>,
     shutdown: Arc<AtomicBool>,
     in_flight_art: Arc<AtomicU64>,
-) -> std::thread::JoinHandle<()> {
+) -> anyhow::Result<std::thread::JoinHandle<()>> {
     // HWND is not Send; the raw handle value is all the forwarder needs to
     // post with.
     let main_raw = main_hwnd.0 as isize;
@@ -1537,15 +1553,39 @@ fn spawn_event_forwarder(
                 }
             }
         })
-        .expect("event forwarder thread should start")
+        .map_err(anyhow::Error::from)
+}
+
+/// Whether an event must survive queue overflow: one-shot signals whose
+/// loss is permanent for the whole run (the budget warning fires once per
+/// app run; a lost `SourceGone` lets the overlay's standby restore a dead
+/// source's track on re-enable; `WorkerFailed` is the terminal report).
+/// These travel the ordinary capped queues, so the overload that triggers
+/// them would otherwise evict exactly them.
+fn is_one_shot_signal(event: &MediaEvent) -> bool {
+    matches!(
+        event,
+        MediaEvent::WorkerFailed { .. } | MediaEvent::ArtworkBudgetExceeded | MediaEvent::SourceGone { .. }
+    )
 }
 
 /// Applies the window-queue cap after a push: when the queue holds more than
-/// `EVENT_QUEUE_CAP` events, the oldest is dropped in favor of the newest.
+/// `EVENT_QUEUE_CAP` events, the oldest droppable event is dropped in favor
+/// of the newest. One-shot signals are skipped as victims: dropping them
+/// loses information that can never be re-emitted, while any other event is
+/// superseded by newer state anyway. If every queued event is protected, the
+/// queue may temporarily exceed the cap — bounded by the one-shot emission
+/// rate, which is tiny by construction.
 fn enforce_queue_cap(queue: &mut VecDeque<Arc<MediaEvent>>, name: &str) {
-    if queue.len() > EVENT_QUEUE_CAP {
-        warn!("the {name} event queue exceeded its cap of {EVENT_QUEUE_CAP}; dropping the oldest buffered event");
-        queue.pop_front();
+    while queue.len() > EVENT_QUEUE_CAP {
+        let victim = queue.iter().position(|event| !is_one_shot_signal(event));
+        match victim {
+            Some(index) => {
+                queue.remove(index);
+                warn!("the {name} event queue exceeded its cap of {EVENT_QUEUE_CAP}; dropping a buffered event");
+            }
+            None => break,
+        }
     }
 }
 
@@ -2069,6 +2109,46 @@ mod tests {
             Some(MediaEvent::PlaybackStateChanged(_, source)) => assert_eq!(source, "src-0"),
             _ => panic!("expected the first event at the front"),
         }
+    }
+
+    #[test]
+    fn one_shot_signals_survive_queue_overflow() {
+        // When the cap is exceeded, ordinary events are evicted but
+        // the never-re-emitted signals (budget warning, source settle,
+        // worker failure) survive — they cannot be re-emitted, and losing
+        // them loses exactly the information the overload produced.
+        let mut queue = VecDeque::new();
+        for i in 0..EVENT_QUEUE_CAP {
+            queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Playing,
+                format!("src-{i}"),
+            )));
+        }
+        queue.push_back(Arc::new(MediaEvent::ArtworkBudgetExceeded));
+        queue.push_back(Arc::new(MediaEvent::SourceGone {
+            source_app: "gone".into(),
+        }));
+        enforce_queue_cap(&mut queue, "test");
+        assert_eq!(queue.len(), EVENT_QUEUE_CAP);
+        assert!(
+            queue
+                .iter()
+                .any(|e| matches!(e.as_ref(), MediaEvent::ArtworkBudgetExceeded)),
+            "the budget warning must survive overflow"
+        );
+        assert!(
+            queue
+                .iter()
+                .any(|e| matches!(e.as_ref(), MediaEvent::SourceGone { .. })),
+            "the settle signal must survive overflow"
+        );
+        // An all-protected queue may exceed the cap rather than lose them.
+        let mut protected = VecDeque::new();
+        for _ in 0..EVENT_QUEUE_CAP + 5 {
+            protected.push_back(Arc::new(MediaEvent::ArtworkBudgetExceeded));
+            enforce_queue_cap(&mut protected, "test");
+        }
+        assert_eq!(protected.len(), EVENT_QUEUE_CAP + 5);
     }
 
     #[test]
