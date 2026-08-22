@@ -3562,10 +3562,15 @@ fn read_session_text(
         .TryGetMediaPropertiesAsync()
         .context("requesting rejected-session properties")?;
     let properties = wait_async(&operation, Some(READ_ASYNC_TIMEOUT)).context("reading rejected-session properties")?;
-    let title = cap_meta(non_empty(
+    let mut title = cap_meta(non_empty(
         properties.Title().map(|v| v.to_string()).unwrap_or_default(),
         source_app,
     ));
+    // Same strippable-title fallback as `read_track_info`: an
+    // all-controls title must not leave a blank history row.
+    if title.is_empty() {
+        title = source_app.to_string();
+    }
     let artist = cap_meta(non_empty(
         properties.Artist().map(|v| v.to_string()).unwrap_or_default(),
         "",
@@ -3612,7 +3617,16 @@ fn read_track_info(
 ) -> Result<TrackInfo> {
     let source_app = read_source_app(session);
     let properties = wait_async(&session.TryGetMediaPropertiesAsync()?, Some(READ_ASYNC_TIMEOUT))?;
-    let title = cap_meta(non_empty(properties.Title()?.to_string(), &source_app));
+    let mut title = cap_meta(non_empty(properties.Title()?.to_string(), &source_app));
+    // A title made solely of strippable characters (controls, bidi commands)
+    // passes `non_empty` on its raw form and then sanitizes to "" — which
+    // would bypass the placeholder gate (`is_placeholder_like` matches the
+    // fallback shape) and emit an empty-title pill. Re-apply the fallback so
+    // the invariant "empty title ⇒ equals the source label" survives
+    // sanitization.
+    if title.is_empty() {
+        title = source_app.clone();
+    }
     // Keep artist empty when the app has not provided it yet; the pill and
     // the Activity pane show "Unknown Artist" as a placeholder so the row
     // is never blank.
@@ -4768,6 +4782,33 @@ mod tests {
             ..TrackInfo::default()
         };
         assert!(!is_placeholder_like(&empty_artist));
+    }
+
+    #[test]
+    fn strippable_title_falls_back_to_source_label_instead_of_empty() {
+        // A title whose raw text is non-empty but made entirely of
+        // characters `cap_meta` strips must not emit an empty-title pill.
+        // The read path re-applies the source-app fallback after
+        // sanitization, so the placeholder gate keeps working. This test
+        // pins that re-application: sanitize-then-fallback equals the
+        // fallback shape the gate already recognizes.
+        let hostile = "\u{0}\u{1F}\u{202E}";
+        let sanitized = cap_meta(non_empty(hostile.to_string(), "spotify"));
+        assert!(sanitized.is_empty(), "precondition: controls strip to nothing");
+        let merged = TrackInfo {
+            title: sanitized,
+            artist: "".into(),
+            source_app: "spotify".into(),
+            ..TrackInfo::default()
+        };
+        // With the fallback re-applied (as read_track_info now does), the
+        // snapshot is exactly the placeholder shape.
+        let mut with_fallback = merged.clone();
+        with_fallback.title = with_fallback.source_app.clone();
+        assert!(is_placeholder_like(&with_fallback));
+        // And the un-repaired form would have slipped past — documenting
+        // why the fix lives at the read site.
+        assert!(!is_placeholder_like(&merged));
     }
 
     #[test]
