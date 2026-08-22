@@ -1520,7 +1520,10 @@ impl MainWindowState {
                     LPARAM(1),
                 );
                 let header = wide("TIME     EVENT");
-                let _ = send_message(self.listbox, LB_ADDSTRING, WPARAM(0), LPARAM(header.as_ptr() as isize));
+                log_lb_result(
+                    send_message(self.listbox, LB_ADDSTRING, WPARAM(0), LPARAM(header.as_ptr() as isize)),
+                    "add header",
+                );
             }
             self.layout();
             self.install_tooltip();
@@ -1973,7 +1976,10 @@ impl MainWindowState {
             // the listbox (newest-first rendering, header at index 0).
             let count = unsafe { send_message(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as usize;
             if count > 0 {
-                let _ = unsafe { send_message(self.listbox, LB_DELETESTRING, WPARAM(count - 1), LPARAM(0)) };
+                log_lb_result(
+                    unsafe { send_message(self.listbox, LB_DELETESTRING, WPARAM(count - 1), LPARAM(0)) },
+                    "delete overflowed row",
+                );
             }
         }
         if !self.listbox.0.is_null() {
@@ -1983,7 +1989,8 @@ impl MainWindowState {
                 // new row would be visible anyway (top rows), otherwise shift
                 // the view down by one so the row under the cursor stays put.
                 let old_top = send_message(self.listbox, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)).0 as usize;
-                let _ = send_message(self.listbox, LB_INSERTSTRING, WPARAM(1), LPARAM(row.as_ptr() as isize));
+                let inserted = send_message(self.listbox, LB_INSERTSTRING, WPARAM(1), LPARAM(row.as_ptr() as isize));
+                log_lb_result(inserted, "insert row");
                 let new_top = Self::history_top_after_insert(old_top, count);
                 let _ = send_message(self.listbox, LB_SETTOPINDEX, WPARAM(new_top), LPARAM(0));
             }
@@ -2109,12 +2116,18 @@ impl MainWindowState {
                         // The header occupies row 0; data rows mirror the
                         // entries order (newest first).
                         let lb_row = index + 1;
-                        let _ = send_message(self.listbox, LB_DELETESTRING, WPARAM(lb_row), LPARAM(0));
-                        let _ = send_message(
-                            self.listbox,
-                            LB_INSERTSTRING,
-                            WPARAM(lb_row),
-                            LPARAM(row.as_ptr() as isize),
+                        log_lb_result(
+                            send_message(self.listbox, LB_DELETESTRING, WPARAM(lb_row), LPARAM(0)),
+                            "delete replaced row",
+                        );
+                        log_lb_result(
+                            send_message(
+                                self.listbox,
+                                LB_INSERTSTRING,
+                                WPARAM(lb_row),
+                                LPARAM(row.as_ptr() as isize),
+                            ),
+                            "reinsert replaced row",
                         );
                     }
                 }
@@ -4338,6 +4351,19 @@ fn log_art_blit_failure() {
     if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
         *last = Some(Instant::now());
         error!("artwork blit failed");
+    }
+}
+
+/// Logs a refused listbox mutation: `LB_ERRSPACE` (−2) means the
+/// insert/delete was rejected under memory pressure, silently desyncing the
+/// listbox from the history mirror. The mirror degrades gracefully — its
+/// reads re-query `LB_GETCOUNT` rather than trusting a stored count — so
+/// this is a diagnostics line, not an error path.
+fn log_lb_result(result: LRESULT, operation: &str) {
+    if result.0 == -2 {
+        debug!(
+            "history listbox {operation} refused with LB_ERRSPACE (memory pressure); the list may diverge from the history mirror"
+        );
     }
 }
 
