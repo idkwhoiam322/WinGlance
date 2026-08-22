@@ -269,6 +269,13 @@ pub(super) fn lagged_collapse(t: f32, lag: f32, from: f32, velocity: f32) -> f32
 pub(super) fn reversal_seed(morph: &HoverExpand, config: &Config, now: Instant) -> (f32, f32) {
     let expand_leg = morph_duration(config, MorphDirection::Expand).as_secs_f32();
     let collapse_leg = morph_duration(config, MorphDirection::Collapse).as_secs_f32();
+    // A zero-length expand leg (animations disabled) would divide by zero
+    // and store NaN velocity downstream. The mathematically honest seed for
+    // "the leg never moved" is the endpoint at rest: fully compact, no
+    // velocity.
+    if expand_leg <= 0.0 {
+        return (0.0, 0.0);
+    }
     let t = (now.duration_since(morph.start).as_secs_f32() / expand_leg).clamp(0.0, 1.0);
     let from = spring_expand(t);
     let velocity = EXPAND_SPRING.velocity_at(t, 0.0, 0.0) * collapse_leg / expand_leg;

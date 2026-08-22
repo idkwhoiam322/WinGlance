@@ -2851,10 +2851,14 @@ impl OverlayState {
             } else if cursor_over && self.hover_dismiss_at.is_none() && self.config.overlay.dismiss_on_hover {
                 // Hover during the entrance/collapse animation: only an
                 // Expanded-layout pill arms (Compact pills only ever expand
-                // on hover, which the Shown path handles).
+                // on hover, which the Shown path handles). The arm caps the
+                // remaining time at 500ms with `min`, never extends an
+                // already-sooner deadline — same shape as the
+                // Shown-path arm above.
                 if self.layout == LayoutMode::Expanded {
                     self.hover_dismiss_at = Some(now);
-                    self.dismiss_at = Some(now + Duration::from_millis(EARLY_EXIT_MS));
+                    let early = now + Duration::from_millis(EARLY_EXIT_MS);
+                    self.dismiss_at = Some(self.dismiss_at.map_or(early, |d| d.min(early)));
                     debug!("pill hover-dismiss armed");
                 }
             }
