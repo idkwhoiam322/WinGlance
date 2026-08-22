@@ -13,7 +13,8 @@ use log::warn;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, DEFAULT_GUI_FONT, FillRect, GetStockObject, GetSysColorBrush, HDC, SetBkMode, SetTextColor,
