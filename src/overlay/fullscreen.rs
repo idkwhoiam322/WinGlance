@@ -280,20 +280,20 @@ pub(super) fn resolve_target_sticky(
     let mut remembered = INDEXED_DISPLAY_NAMES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(name) = remembered.get(&index) {
-        if let Some(pos) = displays.iter().position(|display| &display.name == name) {
-            return Some(pos);
-        }
+    if let Some(name) = remembered.get(&index)
+        && let Some(pos) = displays.iter().position(|display| &display.name == name)
+    {
+        return Some(pos);
     }
     let picked = resolve_target(mode, displays, foreground_nearest)?;
     // Record only genuine index hits — never a primary fallback, so the
     // memory cannot glue an unplugged index to the primary and the setting
     // still reapplies when the display returns. Never overwritten: the
     // remembered device is the identity of the pick, by design.
-    if index as usize == picked {
-        if let Some(display) = displays.get(picked) {
-            remembered.entry(index).or_insert_with(|| display.name.clone());
-        }
+    if index as usize == picked
+        && let Some(display) = displays.get(picked)
+    {
+        remembered.entry(index).or_insert_with(|| display.name.clone());
     }
     Some(picked)
 }

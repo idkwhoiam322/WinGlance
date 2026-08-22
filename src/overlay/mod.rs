@@ -49,7 +49,7 @@ pub(crate) use render::contrast_ratio;
 use fullscreen::{
     DisplayInfo, ForegroundVerdict, TargetMonitor, anchor_unchanged, decide_layout, effective_position_rect,
     foreground_fullscreens_target, foreground_monitor_index, log_target_once, monitor_dpi, placement,
-    refresh_period_ms, resolve_target, resolve_target_sticky, window_is_fullscreen,
+    refresh_period_ms, resolve_target_sticky, window_is_fullscreen,
 };
 use morph::{
     ENTRANCE_GROW, HoverExpand, HoverStep, HoverTick, MorphDirection, MorphProgress, animation_duration, bounce_scale,
@@ -4219,7 +4219,7 @@ mod tests {
     use super::*;
     // Test-only imports: the bin compilation must not see these (the moved
     // modules and the windows APIs below are used only by the tests).
-    use super::fullscreen::{DisplayInfo, auto_source_matches, rect_covers_monitor};
+    use super::fullscreen::{DisplayInfo, auto_source_matches, rect_covers_monitor, resolve_target};
     use super::morph::{
         EXPAND_SPRING, animation_duration_with, art_edge_gate, compact_alpha, compact_metrics, compact_size,
         compact_title_viewport, content_size, dim_color, expanded_alpha, lag_progress, morph_art_tile, morph_icon_pos,
