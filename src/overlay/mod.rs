@@ -343,6 +343,11 @@ struct ChromeKey {
 struct ChromeCache {
     key: ChromeKey,
     pixels: Vec<u8>,
+    /// Whether the raster includes EVERY row (stored from a `Full` pass).
+    /// A cache stored while a line scrolled omits that row's static text;
+    /// the marquee fast path may reuse it, but a comet-only frame — which
+    /// draws no text at all — must not.
+    complete: bool,
 }
 
 /// Scratch device context + DIB used to render pill text with Windows' own

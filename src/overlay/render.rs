@@ -143,7 +143,14 @@ pub(super) fn render_layered(
         morph,
     );
     let any_scrolling = state.scroll.iter().any(|s| s.scrolling);
-    if any_scrolling
+    // Comet-only frames (playing, nothing scrolling) change no chrome pixel:
+    // the comet is drawn after the cache precisely so it never bakes in
+    //. Reuse a COMPLETE cached background for them — one built by a
+    // `Background` pass while a line scrolled omits that row's text and must
+    // not serve here.
+    let comet_reuse =
+        orbit_angle.is_some() && !any_scrolling && state.chrome_cache.as_ref().is_some_and(|c| c.complete);
+    if (any_scrolling || comet_reuse)
         && state.content_fade.is_none()
         && crate::winutil::animations_enabled()
         && state.chrome_cache.as_ref().is_some_and(|c| c.key == chrome_key)
@@ -151,19 +158,23 @@ pub(super) fn render_layered(
         // Reuse the cached background: copy it, then composite only the
         // scrolling rows' text (their strips are already rasterized in
         // `state.marquee_strips`). Skips the geometry and the static-text GDI.
+        // A comet-only reuse skips that text pass entirely — every row is
+        // already in the complete raster.
         state.render_layer = RenderLayer::Foreground;
         scratch[..needed].copy_from_slice(&state.chrome_cache.as_ref().unwrap().pixels[..needed]);
-        draw_text_pixels(
-            state,
-            &mut scratch[..needed],
-            content,
-            content_buf_w,
-            scale,
-            compact,
-            morph,
-            body_bottom,
-            rest_body_bottom,
-        );
+        if any_scrolling {
+            draw_text_pixels(
+                state,
+                &mut scratch[..needed],
+                content,
+                content_buf_w,
+                scale,
+                compact,
+                morph,
+                body_bottom,
+                rest_body_bottom,
+            );
+        }
     } else {
         // Full background build, or a single-pass full frame when nothing is
         // scrolling. `Background` defers the scrolling rows' text so it can be
@@ -195,22 +206,30 @@ pub(super) fn render_layered(
             body_bottom,
             rest_body_bottom,
         );
-        if any_scrolling {
-            // Retain the background (scrolling rows omitted) for the marquee
-            // fast path. The live `scratch` still needs the scrolling text, so
-            // the foreground pass runs next into a separate copy.
+        if any_scrolling || orbit_angle.is_some() {
+            // Retain the background for the fast paths: the marquee
+            // path reuses it with scrolling rows omitted (`complete=false`);
+            // a comet-only frame's full raster is stored `complete=true` so
+            // later comet frames skip this whole build. The live `scratch`
+            // still needs the scrolling text when scrolling, so the
+            // foreground pass runs next into a separate copy.
+            let complete = !any_scrolling;
             if let Some(cache) = state.chrome_cache.as_mut() {
                 if cache.pixels.len() != needed {
                     cache.pixels.resize(needed, 0);
                 }
                 cache.pixels[..needed].copy_from_slice(&scratch[..needed]);
                 cache.key = chrome_key;
+                cache.complete = complete;
             } else {
                 state.chrome_cache = Some(ChromeCache {
                     key: chrome_key,
                     pixels: scratch[..needed].to_vec(),
+                    complete,
                 });
             }
+        }
+        if any_scrolling {
             state.render_layer = RenderLayer::Foreground;
             draw_text_pixels(
                 state,
