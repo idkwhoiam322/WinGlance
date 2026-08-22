@@ -966,6 +966,12 @@ fn main() -> Result<()> {
     // exactly what is failing).
     install_crash_handler(&config::Config::default().logs_dir());
     install_panic_hook(&config::Config::default().logs_dir());
+    // Remove orphaned config-save temps left by a previous hard
+    // crash, before anything recreates them. Data-dir only; app-pattern
+    // only; best-effort.
+    if let Ok(dir) = config::Config::data_dir() {
+        crate::winutil::sweep_orphan_temps(&dir);
+    }
     let config = match config::Config::load() {
         Ok(config) => config,
         Err(error) => {

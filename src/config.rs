@@ -777,7 +777,16 @@ impl Config {
     }
 
     pub fn logs_dir(&self) -> PathBuf {
-        Self::data_dir().unwrap_or_else(|_| PathBuf::from("data")).join("logs")
+        // Fall back next to the executable when %APPDATA% cannot be
+        // resolved: the process CWD can be anywhere, and a stray
+        // `data\logs` there is easy to miss. The exe's own directory is at
+        // least discoverable.
+        let base = Self::data_dir().ok().or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        });
+        base.unwrap_or_else(|| PathBuf::from("data")).join("logs")
     }
 
     /// The pill-duration clamp range, in milliseconds. The single source of

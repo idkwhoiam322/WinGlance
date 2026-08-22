@@ -865,6 +865,33 @@ fn temp_name() -> String {
 }
 
 /// Deletes the temp through its own handle (disposition-delete) and closes
+/// The pattern `sweep_orphan_temps` matches: only files the save path
+/// itself creates (`wg-<pid>-<seq>-<nanos>.tmp`) are ever removed, so a
+/// directory shared with anything else is untouched.
+pub(crate) const ORPHAN_TEMP_PATTERN: (&str, &str) = ("wg-", ".tmp");
+
+/// Best-effort removal of orphaned config-save temps: a hard crash
+/// between temp creation and the rename commit leaves one randomized file
+/// next to config.toml forever. Called once at startup from `main`, against
+/// the data dir; matches ONLY this app's own temp naming. Failures are
+/// silently ignored — a leftover temp is cosmetic, and deleting files on a
+/// best-effort sweep must never risk user data.
+pub(crate) fn sweep_orphan_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(ORPHAN_TEMP_PATTERN.0) && name.ends_with(ORPHAN_TEMP_PATTERN.1) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Deletes the temp through its own handle (disposition-delete) and closes
 /// it. Only called on failure paths; best-effort.
 fn delete_temp(handle: HANDLE) {
     let info = FileDispositionInfoEx {
@@ -1186,6 +1213,28 @@ pub(crate) fn append_verified_bounded(path: &Path, data: &[u8], cap: u64) -> io:
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn orphan_temp_sweep_removes_only_matching_names() {
+        // The sweep must delete exactly this app's `wg-*.tmp` files
+        // and nothing else — a foreign temp-looking file or an unrelated
+        // document stays put.
+        let dir = std::env::temp_dir().join(format!("wg-sweep-{}-{}", std::process::id(), std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let keep = ["config.toml", "not-wg.tmp", "wg-preserved.tmp.bak", "random.tmp"];
+        let remove = ["wg-1234-0-5678.tmp", "wg-abcd-ef-1234.tmp"];
+        for name in keep.iter().chain(remove.iter()) {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        sweep_orphan_temps(&dir);
+        for name in &keep {
+            assert!(dir.join(name).is_file(), "{name} must survive the sweep");
+        }
+        for name in &remove {
+            assert!(!dir.join(name).exists(), "{name} must be swept");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn callback_panics_are_contained_and_propagate_the_payload() {
