@@ -4164,13 +4164,15 @@ impl MainWindowState {
     /// text editor), mirroring `copy_logs`, which reads the same path. The OS
     /// picks the handler; `ShellExecuteW` returns a value <= 32 on failure,
     /// which is surfaced to the debug log rather than the screen.
-    fn open_logs(&self) {
+    fn open_logs(&self) -> bool {
         let path = self.cfg().logs_dir().join("log-Live.log");
         let code = self.shell_open(&path);
         if code <= 32 {
             debug!("open logs: ShellExecuteW failed (code {code}) for {path:?}");
+            false
         } else {
             info!("opened the live log in the default editor");
+            true
         }
     }
 
@@ -4180,19 +4182,21 @@ impl MainWindowState {
     /// path `save()` writes. The OS picks the handler; `ShellExecuteW` returns
     /// a value <= 32 on failure, which is surfaced to the debug log rather
     /// than the screen. Hand-edits apply on the next launch (no live reload).
-    fn open_config(&self) {
+    fn open_config(&self) -> bool {
         let path = match Config::config_path() {
             Ok(path) => path,
             Err(error) => {
                 debug!("open config: resolving the config path failed: {error:#}");
-                return;
+                return false;
             }
         };
         let code = self.shell_open(&path);
         if code <= 32 {
             debug!("open config: ShellExecuteW failed (code {code}) for {path:?}");
+            false
         } else {
             info!("opened config.toml in the default editor");
+            true
         }
     }
 
@@ -5248,6 +5252,15 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
                 AUTO_SOURCES_RESULT_MSG,
             ) {
                 debug!("auto-compact sources picker failed to open");
+                // The debug line alone leaves a click that visibly did
+                // nothing; the tray note is the one feedback surface
+                // that does not depend on the picker itself opening.
+                show_tray_note(
+                    hwnd,
+                    "WinGlance",
+                    "Could not list apps for the auto-compact picker.",
+                    NIIF_ERROR,
+                );
             }
         }
         SettingId::PinnedSource => {
@@ -5269,6 +5282,12 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
                 PINNED_SOURCE_RESULT_MSG,
             ) {
                 debug!("pinned-source picker failed to open");
+                show_tray_note(
+                    hwnd,
+                    "WinGlance",
+                    "Could not list apps for the pinned-source picker.",
+                    NIIF_ERROR,
+                );
             }
         }
         SettingId::Position => {
@@ -5322,10 +5341,13 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
             let gap = (4.0 * scale) as i32;
             let (open_rect, _copy_rect) = halve(&control_rect, gap);
             if x >= open_rect.left && x < open_rect.right {
-                state.open_logs();
-                state.logs_opened_at = Some(Instant::now());
-                unsafe { set_timer(hwnd, TIMER_OPENED_ID, 2000, None) };
-                state.invalidate();
+                // Feedback only on a real open: a failed
+                // ShellExecuteW must not paint "Opened ✓".
+                if state.open_logs() {
+                    state.logs_opened_at = Some(Instant::now());
+                    unsafe { set_timer(hwnd, TIMER_OPENED_ID, 2000, None) };
+                    state.invalidate();
+                }
             } else {
                 state.copy_logs();
             }
@@ -5334,10 +5356,11 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
             let gap = (4.0 * scale) as i32;
             let (open_rect, _reload_rect) = halve(&control_rect, gap);
             if x >= open_rect.left && x < open_rect.right {
-                state.open_config();
-                state.config_opened_at = Some(Instant::now());
-                unsafe { set_timer(hwnd, TIMER_OPENED_ID, 2000, None) };
-                state.invalidate();
+                if state.open_config() {
+                    state.config_opened_at = Some(Instant::now());
+                    unsafe { set_timer(hwnd, TIMER_OPENED_ID, 2000, None) };
+                    state.invalidate();
+                }
             } else {
                 state.reload_config();
             }
@@ -5352,6 +5375,12 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
                 PICKER_RESULT_MSG,
             ) {
                 debug!("process picker failed to open");
+                show_tray_note(
+                    hwnd,
+                    "WinGlance",
+                    "Could not list apps for the allowed-apps picker.",
+                    NIIF_ERROR,
+                );
             }
         }
     }

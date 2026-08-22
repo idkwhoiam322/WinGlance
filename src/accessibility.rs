@@ -239,10 +239,19 @@ impl IRawElementProviderSimple_Impl for SettingsProvider_Impl {
             return Ok(VARIANT::from(this.control_type().0));
         }
         if propertyid == UIA_IsEnabledPropertyId {
-            return Ok(VARIANT::from(true));
+            // A child that no longer resolves against the live snapshot is
+            // gone: reporting it enabled would let a client activate or
+            // target a control that no longer exists. The root stays
+            // enabled — it is the pane surface itself.
+            let enabled = match &this.kind {
+                ProviderKind::Root => true,
+                ProviderKind::Child { .. } => this.resolve().is_some(),
+            };
+            return Ok(VARIANT::from(enabled));
         }
         if propertyid == UIA_IsKeyboardFocusablePropertyId {
-            return Ok(VARIANT::from(matches!(&this.kind, ProviderKind::Child { .. })));
+            let focusable = matches!(&this.kind, ProviderKind::Child { .. }) && this.resolve().is_some();
+            return Ok(VARIANT::from(focusable));
         }
         if propertyid == UIA_HasKeyboardFocusPropertyId {
             return Ok(VARIANT::from(this.has_keyboard_focus()));
