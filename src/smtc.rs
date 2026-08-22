@@ -1613,11 +1613,10 @@ impl ListenerState {
                 // on every 2-second re-sync.
                 if note_appearance(&mut self.rejected_seen, *key) {
                     debug!("SMTC session rejected | key={key} | source={source}");
-                    let source_app = read_source_app(session);
-                    let (title, artist) = read_session_text(session, &source_app);
+                    let (title, artist) = self.rejected_row_text(session, source);
                     let state = read_session_state(session);
                     self.emit(MediaEvent::SessionRejected {
-                        source_app,
+                        source_app: source.clone(),
                         title,
                         artist,
                         state,
@@ -2108,6 +2107,35 @@ impl ListenerState {
         warn!(
             "source {source} did not answer an SMTC read within {READ_ASYNC_TIMEOUT:?}; excluding it from tracking for {CHURN_COOLDOWN_MS}ms"
         );
+    }
+
+    /// Title/artist for a rejected session's history row. Never pays a
+    /// metadata read for an already-excluded source (churn cool-down or a
+    /// previous wedged read), and routes a timed-out read through the
+    /// wedged-read exclusion exactly like the tracked paths: this was the
+    /// one read path that swallowed its `AsyncReadTimeout` marker, so a
+    /// hostile source minting fresh session keys could cost one 10 s wedge
+    /// per key and burn the global restart budget into a permanent
+    /// `WorkerFailed`.
+    fn rejected_row_text(
+        &mut self,
+        session: &GlobalSystemMediaTransportControlsSession,
+        source: &str,
+    ) -> (String, String) {
+        if self.source_on_cooldown(source) {
+            return (source.to_string(), String::new());
+        }
+        match read_session_text(session, source) {
+            Ok(pair) => pair,
+            Err(error) => {
+                if is_wait_timeout(&error) {
+                    self.exclude_wedged_source(session);
+                } else {
+                    debug!("rejected-session metadata unreadable | source={source} | error={error:#}");
+                }
+                (source.to_string(), String::new())
+            }
+        }
     }
 
     /// The source the overlay's pill is currently displaying, if any. Read
@@ -3497,17 +3525,20 @@ const MAX_PREVIEW_CHARS: usize = 128;
 /// Best-effort title/artist for a session's history row. Reads can fail or
 /// return empty for freshly-created sessions; the title falls back to the
 /// source label so the row always names the app.
-fn read_session_text(session: &GlobalSystemMediaTransportControlsSession, source_app: &str) -> (String, String) {
+fn read_session_text(
+    session: &GlobalSystemMediaTransportControlsSession,
+    source_app: &str,
+) -> Result<(String, String), anyhow::Error> {
     // Bounded: this runs for *rejected* sessions (the history row), and a
     // rejected session's own operation must not be able to hang the worker
     // forever — the supervisor would stall and burn the global restart
-    // budget. A timeout degrades the row to the source label, nothing more.
-    let Ok(operation) = session.TryGetMediaPropertiesAsync() else {
-        return (source_app.to_string(), String::new());
-    };
-    let Ok(properties) = wait_async(&operation, Some(READ_ASYNC_TIMEOUT)) else {
-        return (source_app.to_string(), String::new());
-    };
+    // budget. The timeout is surfaced as an `is_wait_timeout` error rather
+    // than swallowed, so the caller routes the source through the
+    // wedged-read exclusion exactly like the tracked read paths.
+    let operation = session
+        .TryGetMediaPropertiesAsync()
+        .context("requesting rejected-session properties")?;
+    let properties = wait_async(&operation, Some(READ_ASYNC_TIMEOUT)).context("reading rejected-session properties")?;
     let title = cap_meta(non_empty(
         properties.Title().map(|v| v.to_string()).unwrap_or_default(),
         source_app,
@@ -3516,7 +3547,7 @@ fn read_session_text(session: &GlobalSystemMediaTransportControlsSession, source
         properties.Artist().map(|v| v.to_string()).unwrap_or_default(),
         "",
     ));
-    (title, artist)
+    Ok((title, artist))
 }
 
 /// Best-effort playback status for a session's history row. Unknown statuses
@@ -5059,6 +5090,31 @@ mod tests {
             1,
             "one exclusion per source"
         );
+        std::mem::forget(state);
+    }
+
+    #[test]
+    fn an_excluded_source_never_pays_a_rejected_row_read() {
+        // The rejected-row read gate: a source already on the churn/wedged
+        // cool-down must never issue another metadata read — the early
+        // return happens before any session call, so a hostile source
+        // minting fresh session keys cannot cost a fresh 10 s wedge per key
+        //. The null session proves the point: had the read started,
+        // the null dereference would crash the test.
+        let mut state = listener_state_for_exclusion_tests();
+        state
+            .excluded_sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                "spotify".to_string(),
+                Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
+            );
+        let session = unsafe { GlobalSystemMediaTransportControlsSession::from_raw(std::ptr::null_mut()) };
+        let (title, artist) = state.rejected_row_text(&session, "spotify");
+        assert_eq!(title, "spotify", "the row falls back to the source label");
+        assert_eq!(artist, "");
+        std::mem::forget(session);
         std::mem::forget(state);
     }
 
