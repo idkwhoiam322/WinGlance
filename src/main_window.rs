@@ -157,6 +157,11 @@ const IDLE_ART_RELEASE_MS: u32 = 30_000;
 /// Win32 LPSTR_TEXTCALLBACK sentinel: fetch tooltip text on demand.
 const LPSTR_TEXTCALLBACK: isize = -1;
 
+/// Tooltip tool id for the Now Playing block (the parent window's own
+/// client area, not a listbox row). Far outside the listbox row-id space so
+/// `(hwnd, u_id)` stays unambiguous within the one shared tooltip control.
+const NOW_PLAYING_TOOL_ID: usize = usize::MAX;
+
 /// Native TOOLINFOW layout (64-bit), for TTM_ADDTOOLW via SendMessageW.
 #[repr(C)]
 struct ToolInfo {
@@ -1676,7 +1681,53 @@ impl MainWindowState {
                 );
             }
             self.tooltip_range = Some((top, end));
+            self.sync_now_playing_tool();
         }
+    }
+
+    /// Adds or updates the one tool covering the Now Playing block in the
+    /// main window's client area. The block's geometry derives from the
+    /// same layout constants `paint_activity` uses, so a resize or DPI
+    /// change lands here on the next 1 Hz tick without extra invalidation.
+    /// Registered only while the Activity pane is showing; `apply_pane`
+    /// hides the whole tooltip control on pane switches, which covers the
+    /// rest of the pane lifecycle.
+    fn sync_now_playing_tool(&mut self) {
+        // Mirrors paint_activity's block extent: from the header top down to
+        // the source-app row bottom (art_y + art height).
+        let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
+        let (client_w, _) = client_size(self.hwnd);
+        let pad = (PAD * scale) as i32;
+        let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+        let art = (ART_SIZE * scale).round() as i32;
+        let art_y = (ART_Y * scale) as i32;
+        let np_rect = RECT {
+            left: sidebar_w + pad,
+            top: art_y,
+            right: client_w - pad,
+            bottom: art_y + art,
+        };
+        let mut tool = ToolInfo {
+            cb_size: std::mem::size_of::<ToolInfo>() as u32,
+            u_flags: TTF_SUBCLASS.0,
+            hwnd: self.hwnd,
+            u_id: NOW_PLAYING_TOOL_ID,
+            rect: np_rect,
+            hinst: HINSTANCE::default(),
+            lpsz_text: LPSTR_TEXTCALLBACK as *mut u16,
+            l_param: 0,
+            lp_reserved: std::ptr::null_mut(),
+        };
+        // TTM_ADDTOOLW replaces an existing tool with the same (hwnd, id),
+        // so this updates the rect in place after a resize/DPI change.
+        let _ = unsafe {
+            send_message(
+                self.tooltip_ctrl,
+                TTM_ADDTOOLW,
+                WPARAM(0),
+                LPARAM(&mut tool as *mut _ as isize),
+            )
+        };
     }
 
     /// Where the listbox should rest after a history row has been inserted at
@@ -4695,30 +4746,53 @@ fn entry_detail(entry: &HistoryEntry) -> String {
     if !entry.accepted {
         parts.push("(filtered by allowed apps)".to_string());
     }
-    if !entry.track.artist.trim().is_empty() {
-        parts.push(entry.track.artist.clone());
+    push_track_detail_lines(&mut parts, &entry.track);
+    parts.join("\n")
+}
+
+/// Details of the track in the Now Playing block, shown in that block's
+/// hover tooltip. Same fields as `entry_detail` minus the timestamp and
+/// filtered markers: the block is "now" and only accepted sources reach it.
+fn now_playing_detail(track: &TrackInfo, state: PlaybackState) -> String {
+    let mut parts = vec![
+        match state {
+            PlaybackState::Playing | PlaybackState::NowPlaying => "Playing",
+            PlaybackState::Paused => "Paused",
+            PlaybackState::Stopped => "Stopped",
+        }
+        .to_string(),
+        track.title.clone(),
+    ];
+    push_track_detail_lines(&mut parts, track);
+    parts.join("\n")
+}
+
+/// Appends the artist / album / context / meta / source lines shared by the
+/// history-row and Now Playing tooltip builders.
+fn push_track_detail_lines(parts: &mut Vec<String>, track: &TrackInfo) {
+    if !track.artist.trim().is_empty() {
+        parts.push(track.artist.clone());
     }
-    if !entry.track.album.trim().is_empty() {
-        parts.push(entry.track.album.clone());
+    if !track.album.trim().is_empty() {
+        parts.push(track.album.clone());
     }
     // Subtitle and album artist carry useful context when the album title is
     // empty (some apps populate one but not the other).
-    if entry.track.album.trim().is_empty() {
-        if !entry.track.subtitle.trim().is_empty() {
-            parts.push(entry.track.subtitle.clone());
+    if track.album.trim().is_empty() {
+        if !track.subtitle.trim().is_empty() {
+            parts.push(track.subtitle.clone());
         }
-        if !entry.track.album_artist.trim().is_empty() {
-            parts.push(entry.track.album_artist.clone());
+        if !track.album_artist.trim().is_empty() {
+            parts.push(track.album_artist.clone());
         }
     }
-    let meta = entry.track.meta_line(entry.track.album.trim().is_empty());
+    let meta = track.meta_line(track.album.trim().is_empty());
     if !meta.is_empty() {
         parts.push(meta);
     }
-    if !entry.track.source_app.trim().is_empty() {
-        parts.push(entry.track.source_app.clone());
+    if !track.source_app.trim().is_empty() {
+        parts.push(track.source_app.clone());
     }
-    parts.join("\n")
 }
 
 fn register_main_class(instance: HINSTANCE, class_name: &[u16]) -> Result<()> {
@@ -5832,16 +5906,31 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 let header = unsafe { &*(lparam.0 as *const NMHDR) };
                 if header.code == TTN_GETDISPINFOW {
                     let state = &mut *state_ptr;
-                    // Map the cursor into the listbox's client coordinates so
-                    // the per-cell hit-test sees the same basis the paint
-                    // does (the paint works in listbox client space too).
-                    let cursor_x = unsafe {
-                        let mut point = POINT::default();
-                        GetCursorPos(&mut point)
-                            .ok()
-                            .and_then(|_| ScreenToClient(state.listbox, &mut point).as_bool().then_some(point.x))
+                    // The Now Playing tool answers before any listbox cursor
+                    // math; its sentinel id cannot collide with row ids.
+                    let text = if header.idFrom == NOW_PLAYING_TOOL_ID {
+                        // The block has no timestamp (it is "now"), so the
+                        // tooltip carries the same details minus the time line.
+                        Some(
+                            state
+                                .current
+                                .as_ref()
+                                .map(|current| now_playing_detail(&current.track, current.state))
+                                .unwrap_or_else(|| "No media playing".to_string()),
+                        )
+                    } else {
+                        // Map the cursor into the listbox's client coordinates so
+                        // the per-cell hit-test sees the same basis the paint
+                        // does (the paint works in listbox client space too).
+                        let cursor_x = unsafe {
+                            let mut point = POINT::default();
+                            GetCursorPos(&mut point)
+                                .ok()
+                                .and_then(|_| ScreenToClient(state.listbox, &mut point).as_bool().then_some(point.x))
+                        };
+                        state.tooltip_text_for(header.idFrom, cursor_x)
                     };
-                    if let Some(text) = state.tooltip_text_for(header.idFrom, cursor_x) {
+                    if let Some(text) = text {
                         let info = unsafe { &mut *(lparam.0 as *mut NMTTDISPINFOW) };
                         // Point lpszText at a window-owned buffer instead of
                         // copying into the built-in szText (bounded at 80 u16):
