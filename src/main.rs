@@ -56,7 +56,9 @@ use windows::Win32::System::Threading::{
     WaitForSingleObject,
 };
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
-use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, DispatchMessageW, GetMessageW, TranslateMessage};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, RegisterWindowMessageW, TranslateMessage,
+};
 use windows::core::{BOOL, PCWSTR};
 
 use crate::events::{MEDIA_EVENT_MSG, MediaEvent, artwork_bytes};
@@ -381,6 +383,25 @@ fn winglance_instance_running() -> bool {
     }
 }
 
+/// Second tier of the tray-stranding recovery: a duplicate launch asks the
+/// running instance to show its tracking window before the duplicate exits,
+/// so a user whose tray icon is gone still has a way in (and, from the
+/// window, a way to quit). Registered message + PostMessage, fire and
+/// forget — a hung instance must not block the duplicate's exit.
+fn ping_running_instance_to_show() {
+    unsafe {
+        let class = wide(crate::main_window::MAIN_WINDOW_CLASS);
+        let Ok(hwnd) = FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) else {
+            return;
+        };
+        let name = wide(crate::main_window::SHOW_YOURSELF_MSG);
+        let message = RegisterWindowMessageW(PCWSTR(name.as_ptr()));
+        if message != 0 {
+            let _ = crate::winapi::post_message(hwnd, message, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
 /// Re-samples `winglance_instance_running` a few times so a just-started
 /// legitimate instance — already past mutex creation but not yet visible in a
 /// snapshot — is not mistaken for a squatter. Returns the last sample.
@@ -627,7 +648,14 @@ fn acquire_singleton(restart_nonce: Option<&str>) -> anyhow::Result<Option<Singl
                 // of service). The probe tells the two apart well enough to
                 // report the second — without it, a squatted name makes the
                 // app fail to start with no diagnostic anywhere.
-                if !winglance_instance_running_retried() {
+                if winglance_instance_running_retried() {
+                    // A genuine running instance: the most likely reader of
+                    // a duplicate launch is a user whose tray icon is
+                    // missing (failed add, lost Explorer restart) trying to
+                    // get the app back — ping it to show its window before
+                    // this duplicate exits.
+                    ping_running_instance_to_show();
+                } else {
                     report_suspected_squat();
                 }
                 Ok(None)
