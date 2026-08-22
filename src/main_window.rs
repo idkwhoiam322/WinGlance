@@ -106,8 +106,12 @@ const MENU_DURATION_10S: usize = 1020;
 const MENU_MONITOR_ACTIVE: usize = 1021;
 const MENU_MONITOR_PRIMARY: usize = 1022;
 /// Display entries in the Monitor submenu use sequential ids starting here;
-/// display `i` gets `MENU_MONITOR_DISPLAY_BASE + i`.
-const MENU_MONITOR_DISPLAY_BASE: usize = 1023;
+/// display `i` gets `MENU_MONITOR_DISPLAY_BASE + i`. The base sits in its
+/// own id namespace (every fixed command id stays below it), so a display
+/// entry can never collide with — and be mis-dispatched as — a fixed
+/// command, no matter how many displays are attached. The collision test
+/// below pins this.
+const MENU_MONITOR_DISPLAY_BASE: usize = 1100;
 /// Layout-mode entries of the tray "Layout" submenu.
 const MENU_LAYOUT_EXPANDED: usize = 1024;
 const MENU_LAYOUT_COMPACT: usize = 1025;
@@ -6626,6 +6630,40 @@ fn focus_setting_at_body(hwnd: HWND, row_index: usize, sub: SettingSub) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_menu_fixed_ids_never_intrude_into_the_display_range() {
+        // Display entries own the id namespace from MENU_MONITOR_DISPLAY_BASE
+        // upward; a fixed command id landing inside that range would be
+        // mis-dispatched as a display switch (or vice versa) once enough
+        // displays are attached — exactly the Display 5 → Custom-Duration /
+        // Display 7 → Preview collisions the old 1023 base produced.
+        let fixed = [
+            MENU_OPEN_ID,
+            MENU_NOTIFY_ID,
+            MENU_AUTOSTART_ID,
+            MENU_CLOSE_TRAY_ID,
+            MENU_QUIT_ID,
+            MENU_DURATION_2S,
+            MENU_DURATION_3S,
+            MENU_DURATION_5S,
+            MENU_DURATION_10S,
+            MENU_MONITOR_ACTIVE,
+            MENU_MONITOR_PRIMARY,
+            MENU_LAYOUT_EXPANDED,
+            MENU_LAYOUT_COMPACT,
+            MENU_LAYOUT_AUTO,
+            MENU_LAYOUT_PERSISTENT_COMPACT,
+            MENU_DURATION_CUSTOM,
+            MENU_PREVIEW_NOTIFY_ID,
+        ];
+        for id in fixed {
+            assert!(
+                id < MENU_MONITOR_DISPLAY_BASE,
+                "fixed tray id {id} intrudes into the display-entry range starting at {MENU_MONITOR_DISPLAY_BASE}"
+            );
+        }
+    }
 
     /// A uniquely-named temporary directory removed on drop, so the
     /// settings-save regression can run the full save path against a temp
