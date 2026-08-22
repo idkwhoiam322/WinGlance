@@ -676,20 +676,19 @@ fn is_win32_code(error: &windows::core::Error, code: u32) -> bool {
     (raw & 0xFFFF_0000) == 0x8007_0000 && (raw & 0xFFFF) == code
 }
 
-/// ASCII-insensitive comparison of two paths on their UTF-16 forms, so a
+/// Case-insensitive comparison of two paths on their UTF-16 forms, so a
 /// `\\?\C:\...` final handle path compares equal to the caller's expected
-/// path regardless of casing.
+/// path regardless of casing. The fold uses Unicode default lowercasing
+///: the previous ASCII-only fold rejected a legitimate match when a
+/// localized path component differed by non-ASCII casing, which made the
+/// app run without logs. `to_lowercase` handles the common non-ASCII cases
+/// without pulling in the `Win32_Globalization` feature for
+/// `LCMapStringEx`; Turkic special-casing is out of scope here because both
+/// sides come from the same machine's APIs.
 pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
-    let wa = a.as_os_str().encode_wide().collect::<Vec<_>>();
-    let wb = b.as_os_str().encode_wide().collect::<Vec<_>>();
-    fn fold(unit: u16) -> u16 {
-        if (0x41..=0x5A).contains(&unit) {
-            unit + 0x20
-        } else {
-            unit
-        }
-    }
-    wa.len() == wb.len() && wa.iter().zip(wb.iter()).all(|(x, y)| fold(*x) == fold(*y))
+    let fa = a.as_os_str().to_string_lossy().to_lowercase();
+    let fb = b.as_os_str().to_string_lossy().to_lowercase();
+    fa == fb
 }
 
 /// The `\\?\` extended-length form of `path`, the form
@@ -1065,9 +1064,19 @@ pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<(
         }
 
         // Durability of the directory-entry change (the rename's write-through
-        // intent): flush the parent directory handle.
+        // intent): flush the parent directory handle. Best-effort: the
+        // rename has already committed — the target holds the new content on
+        // disk — so a flush failure must NOT be reported as a save failure.
+        // The caller would then treat an applied change as unsaved (banner +
+        // in-memory-only messaging) while the next launch reads the new
+        // config. Log it and succeed; durability here is a power-loss
+        // guarantee, not a correctness one, and the data dir sits on the same
+        // volume the OS just performed a metadata-only rename on.
         if let Err(error) = unsafe { FlushFileBuffers(guard.handle) } {
-            return Err(io::Error::other(format!("parent flush failed: {}", to_io(error))));
+            log::warn!(
+                "config save: post-commit directory flush failed (data is written): {}",
+                to_io(error)
+            );
         }
         return Ok(());
     }
