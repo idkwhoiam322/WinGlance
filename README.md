@@ -56,8 +56,8 @@ interrupts and never needs interaction.
 Download `WinGlance.exe` from the latest [release](../../releases), run it, and
 it sits in the tray. Later launches start silently (no window); the very first
 run — the one that creates the config — opens the tracking window once. The
-pill appears when media plays. Double-click the tray icon for the tracking
-window: it shows the
+pill appears when media plays. Click (or double-click) the tray icon for the
+tracking window: it shows the
 current activity and a per-source history on the **Now Playing** pane, plus a
 **Settings** pane mirroring the tray menu (notifications, duration,
 start-on-login, close-to-tray, allowed apps, layout, position, monitor,

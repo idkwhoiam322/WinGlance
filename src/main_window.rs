@@ -6240,8 +6240,16 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 // The menu owns its window-state borrows itself: the
                 // modal loop must never run under this frame's borrow.
                 show_tray_menu(hwnd);
-            } else if event == WM_LBUTTONDBLCLK && !state_ptr.is_null() {
-                (*state_ptr).show_window();
+            } else if event == WM_LBUTTONDOWN || (event == WM_LBUTTONDBLCLK && !state_ptr.is_null()) {
+                // Left-click opens the tracking window :
+                // the habitual single-click gesture gets a response instead
+                // of silence. A double click then fires this twice —
+                // `show_window` is idempotent (restore/foreground of an
+                // already-visible window), which is the accepted trade for
+                // not adding a defer timer that delays the single click.
+                if !state_ptr.is_null() {
+                    (*state_ptr).show_window();
+                }
             }
             LRESULT(0)
         }
