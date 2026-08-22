@@ -35,11 +35,11 @@ use windows::Win32::UI::Accessibility::{
     IRawElementProviderFragmentRoot, IRawElementProviderFragmentRoot_Impl, IRawElementProviderSimple,
     IRawElementProviderSimple_Impl, IToggleProvider, IToggleProvider_Impl, NavigateDirection,
     NavigateDirection_FirstChild, NavigateDirection_LastChild, NavigateDirection_NextSibling, NavigateDirection_Parent,
-    NavigateDirection_PreviousSibling, ProviderOptions_ServerSideProvider, ToggleState_Off, ToggleState_On,
-    UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId, UIA_IsEnabledPropertyId,
-    UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId, UIA_PATTERN_ID, UIA_PROPERTY_ID, UIA_PaneControlTypeId,
-    UIA_TextControlTypeId, UIA_TogglePatternId, UiaAppendRuntimeId, UiaHostProviderFromHwnd,
-    UiaRaiseAutomationPropertyChangedEvent, UiaRect, UiaReturnRawElementProvider,
+    NavigateDirection_PreviousSibling, ProviderOptions_ServerSideProvider, StructureChangeType_ChildrenInvalidated,
+    ToggleState_Off, ToggleState_On, UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId,
+    UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
+    UIA_PaneControlTypeId, UIA_TextControlTypeId, UIA_TogglePatternId, UiaAppendRuntimeId, UiaHostProviderFromHwnd,
+    UiaRaiseAutomationPropertyChangedEvent, UiaRaiseStructureChangedEvent, UiaRect, UiaReturnRawElementProvider,
 };
 use windows::core::implement;
 use windows::core::{BSTR, Error, IUnknown, Interface};
@@ -554,6 +554,31 @@ pub fn settings_provider(hwnd: HWND) -> Option<IRawElementProviderSimple> {
         }
         .into(),
     )
+}
+
+/// Raises one structure-invalidated event against the Settings fragment
+/// root: a pane swap removes or adds the whole settings subtree, and
+/// a client holding the old fragment otherwise never learns its answers
+/// changed — the tree silently collapses or grows with no other signal.
+/// `pre_captured` carries the root provider captured BEFORE a deactivating
+/// flip (construction is gated on live children and would fail after them);
+/// an activating flip passes `None` and the provider is built here, after
+/// the children exist. Best-effort like every raise; failures log at debug.
+pub(crate) fn raise_settings_structure_changed(hwnd: HWND, pre_captured: Option<IRawElementProviderSimple>) {
+    let provider = pre_captured.or_else(|| settings_provider(hwnd));
+    let Some(provider) = provider else {
+        return;
+    };
+    unsafe {
+        if let Err(error) = UiaRaiseStructureChangedEvent(
+            &provider,
+            StructureChangeType_ChildrenInvalidated,
+            std::ptr::null_mut(),
+            0,
+        ) {
+            log::debug!("raising the settings structure-changed UIA event failed: {error}");
+        }
+    }
 }
 
 /// Builds a provider for one Settings control identified by row and

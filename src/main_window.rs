@@ -5677,6 +5677,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     if matches!(k, VK_TAB | VK_RETURN | VK_SPACE | VK_DOWN | VK_RIGHT) {
                         state.active_pane = Pane::Settings;
                         state.apply_pane();
+                        crate::accessibility::raise_settings_structure_changed(hwnd, None);
                         let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
                         let (client_w, _) = client_size(hwnd);
                         let sidebar_w = (SIDEBAR_W * scale).round() as i32;
@@ -5733,10 +5734,19 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     VK_ESCAPE => {
                         // Return to the Activity pane and clear the keyboard
                         // focus highlight so the next Tab starts fresh.
+                        // The Settings root is captured BEFORE the flip: its
+                        // children vanish with it, and the invalidation must
+                        // name an element that still laid out.
+                        let leaving = if state.active_pane == Pane::Settings {
+                            crate::accessibility::settings_provider(hwnd)
+                        } else {
+                            None
+                        };
                         state.active_pane = Pane::Activity;
                         let old = state.settings_hover;
                         state.settings_hover = None;
                         state.apply_pane();
+                        crate::accessibility::raise_settings_structure_changed(hwnd, leaving);
                         state.invalidate_hover_rows(client_w, old, None);
                         state.invalidate();
                     }
@@ -5786,12 +5796,23 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     let item0_y = (40.0 * scale) as i32;
                     let item1_y = item0_y + item_h + (4.0 * scale) as i32;
                     let previous = state.active_pane;
+                    // Leaving Settings via the sidebar: capture its root
+                    // before the flip.
+                    let leaving = if previous == Pane::Settings {
+                        crate::accessibility::settings_provider(hwnd)
+                    } else {
+                        None
+                    };
                     if y >= item0_y && y < item0_y + item_h {
                         state.active_pane = Pane::Activity;
                     } else if y >= item1_y && y < item1_y + item_h {
                         state.active_pane = Pane::Settings;
                     }
                     if previous != state.active_pane {
+                        crate::accessibility::raise_settings_structure_changed(
+                            hwnd,
+                            if previous == Pane::Settings { leaving } else { None },
+                        );
                         debug!("switched to the {:?} pane", state.active_pane);
                         // When entering Settings via mouse, set keyboard focus
                         // on the first control so the next Tab starts from a
@@ -5875,6 +5896,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                         if state.active_pane != Pane::Settings {
                             state.active_pane = Pane::Settings;
                             state.apply_pane();
+                            crate::accessibility::raise_settings_structure_changed(hwnd, None);
                             state.sync_settings_scroll(client_w, client_h);
                         }
                         let items = state
