@@ -148,34 +148,37 @@ impl Log for FileLogger {
             // which is what the log is for. Flushing every Debug line would
             // stall the SMTC worker under churn; only a power loss can lose
             // the last few lines.
-            match files.live.write_all(line.as_bytes()) {
-                Ok(()) => files.written += line.len() as u64,
-                Err(error) => {
-                    // The live log just became untrustworthy: surface the
-                    // failure through crash.log — the channel that works
-                    // independently of the live log — rate-limited so a
-                    // persistent disk-full condition cannot spam it past its
-                    // own cap. Diagnostics-only: the log line itself is
-                    // dropped either way.
-                    let report = {
-                        let mut last = self
-                            .write_failure_last
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let due = last.is_none_or(|t| t.elapsed() >= WRITE_FAILURE_REPORT_INTERVAL);
-                        if due {
-                            *last = Some(Instant::now());
-                        }
-                        due
-                    };
-                    if report {
-                        let _ = crate::winutil::append_verified_bounded(
-                            &crate::config::Config::default().logs_dir().join("crash.log"),
-                            format!("live-log write failed ({error}); log lines are being dropped\n").as_bytes(),
-                            crate::CRASH_LOG_CAP,
-                        );
+            let write_result = files.live.write_all(line.as_bytes());
+            let write_ok = write_result.is_ok();
+            if write_ok {
+                files.written += line.len() as u64;
+            } else {
+                // The live log just became untrustworthy: surface the
+                // failure through crash.log — the channel that works
+                // independently of the live log — rate-limited so a
+                // persistent disk-full condition cannot spam it past its
+                // own cap. Diagnostics-only: the log line itself is
+                // dropped either way. Control falls through to the console
+                // echo, which in debug builds is the only channel left
+                // when the file write failed.
+                let report = {
+                    let mut last = self
+                        .write_failure_last
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let due = last.is_none_or(|t| t.elapsed() >= WRITE_FAILURE_REPORT_INTERVAL);
+                    if due {
+                        *last = Some(Instant::now());
                     }
-                    return;
+                    due
+                };
+                if report {
+                    let error = write_result.as_ref().unwrap_err();
+                    let _ = crate::winutil::append_verified_bounded(
+                        &crate::config::Config::default().logs_dir().join("crash.log"),
+                        format!("live-log write failed ({error}); log lines are being dropped\n").as_bytes(),
+                        crate::CRASH_LOG_CAP,
+                    );
                 }
             }
             if files.written >= LIVE_LOG_CAP {

@@ -2329,8 +2329,8 @@ impl OverlayState {
         }
         // A pill currently shown over a fullscreen/listed foreground is flagged
         // for collapse-on-dismiss; keep held_content in sync so the resume (when
-        // the foreground clears) restores the latest track, not a stale one
-        //. Save when the collapse flag is up, or when an in-place update
+        // the foreground clears) restores the latest track, not a stale one.
+        // Save when the collapse flag is up, or when an in-place update
         // lands on a visible pill; a show entering FROM Hidden is the resume of
         // this very hold (flag down), which must stay consumed.
         if self.config.overlay.layout == LayoutMode::PersistentCompact
