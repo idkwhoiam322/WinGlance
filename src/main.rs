@@ -293,6 +293,12 @@ fn install_panic_hook(logs_dir: &Path) {
 const RESTART_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const RESTART_READY_WAIT: Duration = Duration::from_secs(15);
 
+/// How long after the first aliveness sample the old process re-samples the
+/// successor before releasing the singleton. A successor that dies right
+/// after signaling ready — its own fallible startup is still ahead of it —
+/// is caught by the second sample instead of leaving zero instances running.
+const RESTART_REVERIFY_DELAY: Duration = Duration::from_millis(500);
+
 /// Owns the single-instance mutex handle for the process lifetime. The handle
 /// is closed exactly once: either by `release` during a successful restart
 /// handoff, or by the OS when the process ends (the guard is held in a
@@ -594,34 +600,46 @@ fn acquire_singleton(restart_nonce: Option<&str>) -> anyhow::Result<Option<Singl
                         // abandoned-mutex takeover covers a crashed predecessor.
                         if SetEvent(ready).is_ok() {
                             let _ = CloseHandle(ready);
-                            return match WaitForSingleObject(handle, RESTART_READY_WAIT.as_millis() as u32) {
-                                WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(SingletonGuard::new(handle))),
-                                WAIT_TIMEOUT => {
-                                    let _ = CloseHandle(handle);
-                                    // The old process either kept the guard (its own
-                                    // ready wait failed, so it is still the live
-                                    // owner) or a concurrent launch acquired the
-                                    // mutex while it was briefly unowned between the
-                                    // old process's release and this wait. Both
-                                    // outcomes leave the singleton with exactly one
-                                    // owner and make this launch the duplicate; the
-                                    // crash.log line makes a stolen handoff
-                                    // diagnosable when the old process is already
-                                    // gone. Logging is not initialized yet, so
-                                    // crash.log it is.
-                                    append_crash_log_line(
-                                        b"restart handoff timed out waiting for the single-instance mutex; the old process either kept the singleton or a concurrent launch acquired it; this launch exits without starting\n",
-                                    );
-                                    Ok(None)
-                                }
-                                WAIT_FAILED => {
-                                    let _ = CloseHandle(handle);
-                                    Ok(None)
-                                }
-                                _ => {
-                                    let _ = CloseHandle(handle);
-                                    anyhow::bail!("unexpected wait result on the single-instance mutex")
-                                }
+                            // Wait for the old process to release the mutex.
+                            // A WAIT_FAILED after we already signaled
+                            // readiness is retried once with the full budget:
+                            // giving up on a transient wait failure would
+                            // strand the handoff with zero running instances
+                            // (the old process releases on our signal).
+                            let mut wait_failed_once = false;
+                            return loop {
+                                break match WaitForSingleObject(handle, RESTART_READY_WAIT.as_millis() as u32) {
+                                    WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(SingletonGuard::new(handle))),
+                                    WAIT_TIMEOUT => {
+                                        let _ = CloseHandle(handle);
+                                        // The old process either kept the guard (its own
+                                        // ready wait failed, so it is still the live
+                                        // owner) or a concurrent launch acquired the
+                                        // mutex while it was briefly unowned between the
+                                        // old process's release and this wait. Both
+                                        // outcomes leave the singleton with exactly one
+                                        // owner and make this launch the duplicate; the
+                                        // crash.log line makes a stolen handoff
+                                        // diagnosable when the old process is already
+                                        // gone. Logging is not initialized yet, so
+                                        // crash.log it is.
+                                        append_crash_log_line(
+                                            b"restart handoff timed out waiting for the single-instance mutex; the old process either kept the singleton or a concurrent launch acquired it; this launch exits without starting\n",
+                                        );
+                                        Ok(None)
+                                    }
+                                    WAIT_FAILED if !wait_failed_once => {
+                                        wait_failed_once = true;
+                                        append_crash_log_line(
+                                            b"restart handoff: waiting on the single-instance mutex failed; retrying once\n",
+                                        );
+                                        continue;
+                                    }
+                                    _ => {
+                                        let _ = CloseHandle(handle);
+                                        anyhow::bail!("unexpected wait result on the single-instance mutex")
+                                    }
+                                };
                             };
                         }
                         let _ = CloseHandle(ready);
@@ -707,6 +725,21 @@ fn random_restart_nonce() -> Option<String> {
         }
     }
     Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Whether the handoff successor is still running at one sampling instant:
+/// `try_wait` reports `Ok(None)` only for a live child. Extracted so the
+/// re-verify decision is testable without spawning processes.
+fn handoff_child_alive(child: &mut process::Child) -> bool {
+    matches!(child.try_wait(), Ok(None))
+}
+
+/// Whether the old instance may release the singleton after re-verifying the
+/// successor: every sample must have seen it alive. A single dead sample
+/// aborts the handoff — releasing on a stale signal would leave zero running
+/// instances (the guard is restored instead and the old instance continues).
+fn handoff_survives_reverify(samples: [bool; 2]) -> bool {
+    samples[0] && samples[1]
 }
 
 /// Restarts the app in place so it reloads `config.toml` from disk. Unlike the
@@ -813,10 +846,17 @@ pub fn relaunch_self() {
     }
     // Handoff accepted by the wait, but a signal alone does not prove the
     // handoff completed: a stale or forged ready signal must never drop the
-    // guard into a gap nothing can take. Release only while the successor is
-    // verifiably alive (`try_wait` is non-blocking here; a running child
-    // reports `Ok(None)`).
-    if let Ok(Some(_)) = child.try_wait() {
+    // guard into a gap nothing can take. Sample the successor's aliveness
+    // twice — once now, once after a short delay — and release only if both
+    // samples saw it alive (`try_wait` is non-blocking; a running child
+    // reports `Ok(None)`). The second sample closes the window where a
+    // successor dies immediately after signaling: its own fallible startup
+    // is still ahead of it, and the old process exiting on a stale signal
+    // would leave zero instances running.
+    let mut samples = [handoff_child_alive(&mut child), false];
+    std::thread::sleep(RESTART_REVERIFY_DELAY);
+    samples[1] = handoff_child_alive(&mut child);
+    if !handoff_survives_reverify(samples) {
         error!("restart: the new process exited before the handoff completed; keeping this instance running");
         unsafe {
             let _ = CloseHandle(ready);
@@ -824,9 +864,9 @@ pub fn relaunch_self() {
         *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
         return;
     }
-    // Handoff accepted: the successor is alive and signaled. Release the
-    // mutex and exit; the child's bounded wait acquires ownership. The child
-    // keeps running, so it must not be waited on.
+    // Handoff accepted: the successor stayed alive across both samples.
+    // Release the mutex and exit; the child's bounded wait acquires
+    // ownership. The child keeps running, so it must not be waited on.
     guard.release();
     unsafe {
         let _ = CloseHandle(ready);
@@ -1629,6 +1669,22 @@ mod tests {
             "a clear latch is silent — no warning was stranded"
         );
         assert!(!latch.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn handoff_survives_reverify_requires_every_sample_alive() {
+        // The old instance releases the singleton only when BOTH aliveness
+        // samples saw the successor running: the first sample is the
+        // pre-existing check, the second runs after a short delay to catch a
+        // successor that dies immediately after signaling ready. One dead
+        // sample aborts — releasing on it would leave zero instances.
+        assert!(handoff_survives_reverify([true, true]));
+        assert!(!handoff_survives_reverify([false, true]), "dead at first sample: abort");
+        assert!(
+            !handoff_survives_reverify([true, false]),
+            "died before re-verify: abort"
+        );
+        assert!(!handoff_survives_reverify([false, false]));
     }
 
     #[test]
