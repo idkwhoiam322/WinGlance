@@ -4559,8 +4559,19 @@ fn show_tray_note(hwnd: HWND, title: &str, text: &str, flags: NOTIFY_ICON_INFOTI
     }
 }
 
-fn show_tray_menu(state: &mut MainWindowState) {
+fn show_tray_menu(hwnd: HWND) {
     debug!("tray menu opened");
+    // Modal-borrow discipline: the menu is built from an immutable read whose borrow
+    // ends before the TrackPopupMenu modal loop — messages dispatched inside
+    // the loop re-enter the wndproc and take the window state themselves, so
+    // this frame must never hold a competing borrow across a modal scope.
+    // The dispatch after the loop re-fetches the pointer for the same
+    // reason.
+    let state_ptr = window_state::<MainWindowState>(hwnd);
+    if state_ptr.is_null() {
+        return;
+    }
+    let state = unsafe { &*state_ptr };
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
         return;
     };
@@ -4781,16 +4792,28 @@ fn show_tray_menu(state: &mut MainWindowState) {
             // The owner must be the foreground window before TrackPopupMenu,
             // or the menu will not disappear when the user clicks away from
             // it or presses Esc (documented Shell_NotifyIcon requirement).
-            let _ = SetForegroundWindow(state.hwnd);
+            let _ = SetForegroundWindow(hwnd);
             let command = track_popup_menu(
                 menu,
                 TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
                 point.x,
                 point.y,
                 0,
-                state.hwnd,
+                hwnd,
                 None,
             ) as usize;
+            // Re-fetch the state after the modal loop: dispatched messages
+            // may have mutated — or, on shutdown, destroyed — the window
+            // state while the loop ran; the dispatch below must operate on
+            // the current one (the build-phase borrow above ended before
+            // the loop).
+            let live_ptr = window_state::<MainWindowState>(hwnd);
+            if live_ptr.is_null() {
+                let _ = post_message(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+                let _ = DestroyMenu(menu);
+                return;
+            }
+            let state = &mut *live_ptr;
             match command {
                 MENU_OPEN_ID => state.show_window(),
                 // Show the pill now with the current track (or the sample
@@ -4854,13 +4877,21 @@ fn show_tray_menu(state: &mut MainWindowState) {
                 }
                 // Custom duration opens a modal dialog so an arbitrary value
                 // can be entered; the change is applied the same way as the
-                // presets, via the overlay message.
+                // presets, via the overlay message. The dialog runs its own
+                // modal loop, so this frame's re-fetched borrow must not be
+                // live across it either: capture what it needs, run the
+                // dialog, then fetch once more to apply.
                 MENU_DURATION_CUSTOM => {
                     let current_ms = state.cfg().overlay.duration_ms;
-                    if let Some(duration) = crate::duration_dialog::show_duration_dialog(state.hwnd, current_ms) {
-                        state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
-                        state.push_effective_duration();
-                        info!("custom overlay duration set to {duration} ms");
+                    let chosen = crate::duration_dialog::show_duration_dialog(hwnd, current_ms);
+                    let state_ptr = window_state::<MainWindowState>(hwnd);
+                    if !state_ptr.is_null() {
+                        let state = &mut *state_ptr;
+                        if let Some(duration) = chosen {
+                            state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
+                            state.push_effective_duration();
+                            info!("custom overlay duration set to {duration} ms");
+                        }
                     }
                 }
                 MENU_MONITOR_ACTIVE => state.apply_monitor(MonitorMode::ActiveWindow),
@@ -4889,7 +4920,7 @@ fn show_tray_menu(state: &mut MainWindowState) {
         }
         // After the modal menu loop, flush the queue with a no-op message so
         // the popup fully tears down when it was dismissed by clicking away.
-        let _ = post_message(state.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = post_message(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menu);
     }
 }
@@ -4943,16 +4974,17 @@ fn setting_sub_click_point(id: SettingId, sub: SettingSub, rect: &RECT, scale: f
 /// Single dispatch point for every way a settings row is activated (mouse
 /// click, UIA invoke, UIA toggle); the argument list mirrors the click data.
 #[allow(clippy::too_many_arguments)]
-fn apply_settings_row_click(
-    state: &mut MainWindowState,
-    hwnd: HWND,
-    id: &SettingId,
-    row_index: usize,
-    rect: &RECT,
-    x: i32,
-    y: i32,
-    scale: f32,
-) {
+fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: &RECT, x: i32, y: i32, scale: f32) {
+    // Modal-borrow discipline: this handler can open a modal (the custom-duration
+    // dialog), so it owns its window-state borrow itself instead of running
+    // under the caller's — the wndproc arm passes only the hwnd, and the
+    // borrow taken here is provably dead across the modal scope (the
+    // custom-duration arm re-fetches and returns before any later use).
+    let state_ptr = window_state::<MainWindowState>(hwnd);
+    if state_ptr.is_null() {
+        return;
+    }
+    let state = unsafe { &mut *state_ptr };
     let control_rect = row_split(rect, scale).control;
     let toggle_before = setting_toggle_on(*id, &state.cfg());
     // Capture the row's UIA name before the click mutates the config, so a
@@ -5002,14 +5034,32 @@ fn apply_settings_row_click(
             let values = [2000u64, 3000, 5000, 10000];
             if let Some((i, _)) = segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right) {
                 // The Custom tile asks for a value; the
-                // chosen one is applied like a preset.
+                // chosen one is applied like a preset. The dialog runs its
+                // own modal loop: this frame's borrow must be dead across
+                // it, so the arm re-fetches and finishes the row (apply,
+                // invalidate, announce) on the fresh state and returns —
+                // the shared tail below would otherwise keep the borrow
+                // alive across the modal scope.
                 if i == 4 {
                     let current_ms = state.cfg().overlay.duration_ms;
-                    if let Some(duration) = crate::duration_dialog::show_duration_dialog(hwnd, current_ms) {
-                        state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
-                        state.push_effective_duration();
-                        info!("custom overlay duration set to {duration} ms");
+                    let chosen = crate::duration_dialog::show_duration_dialog(hwnd, current_ms);
+                    let state_ptr = window_state::<MainWindowState>(hwnd);
+                    if !state_ptr.is_null() {
+                        let state = unsafe { &mut *state_ptr };
+                        if let Some(duration) = chosen {
+                            state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
+                            state.push_effective_duration();
+                            info!("custom overlay duration set to {duration} ms");
+                        }
+                        state.invalidate();
+                        raise_settings_name_changed(
+                            hwnd,
+                            row_index,
+                            &before_name,
+                            &setting_row_name(*id, &state.cfg()),
+                        );
                     }
+                    return;
                 } else {
                     let duration = values[i];
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
@@ -5694,7 +5744,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                             && y >= rect.top
                             && y < rect.bottom
                         {
-                            apply_settings_row_click(state, hwnd, id, row_index, rect, x, y, scale);
+                            apply_settings_row_click(hwnd, id, row_index, rect, x, y, scale);
                             return LRESULT(0);
                         }
                         if matches!(item, SettingsItem::Row { .. }) {
@@ -5737,7 +5787,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                             if let SettingsItem::Row { id, rect } = item {
                                 if row == row_index {
                                     if let Some((x, y)) = setting_sub_click_point(*id, sub, rect, scale) {
-                                        apply_settings_row_click(state, hwnd, id, row_index, rect, x, y, scale);
+                                        apply_settings_row_click(hwnd, id, row_index, rect, x, y, scale);
                                     }
                                     break;
                                 }
@@ -6014,8 +6064,10 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         }
         WM_TRAY => {
             let event = lparam.0 as u32;
-            if event == WM_RBUTTONUP && !state_ptr.is_null() {
-                show_tray_menu(&mut *state_ptr);
+            if event == WM_RBUTTONUP {
+                // The menu owns its window-state borrows itself: the
+                // modal loop must never run under this frame's borrow.
+                show_tray_menu(hwnd);
             } else if event == WM_LBUTTONDBLCLK && !state_ptr.is_null() {
                 (*state_ptr).show_window();
             }
