@@ -85,9 +85,9 @@ static CRASH_LOG_HANDLE: AtomicUsize = AtomicUsize::new(0);
 /// install that crashes at startup cannot fill the disk. The earliest
 /// records survive, which is where a loop's signature lives. Both writers —
 /// the allocation-free vectored handler and the panic hook — append through
-/// the one shared accounting path (`crash_write_retained`), so the cap and
+/// the one shared accounting path (`crash_log_write_retained`), so the cap and
 /// the byte count can never desync between them.
-const CRASH_LOG_CAP: u64 = 8 * 1024 * 1024;
+pub(crate) const CRASH_LOG_CAP: u64 = 8 * 1024 * 1024;
 
 /// Bytes already in crash.log as accounted by this process: seeded from the
 /// file's length when the verified handle is installed, advanced by every
@@ -961,7 +961,22 @@ fn main() -> Result<()> {
     // exactly what is failing).
     install_crash_handler(&config::Config::default().logs_dir());
     install_panic_hook(&config::Config::default().logs_dir());
-    let config = config::Config::load()?;
+    let config = match config::Config::load() {
+        Ok(config) => config,
+        Err(error) => {
+            // A load failure is fatal (the data dir itself is unusable), and
+            // the release build has no console to show it on: record the
+            // reason in crash.log — the one channel independent of both the
+            // live log and config.toml — before exiting. Best-effort
+            // append; if even this fails the exit is as silent as before.
+            let _ = crate::winutil::append_verified_bounded(
+                &config::Config::default().logs_dir().join("crash.log"),
+                format!("config.toml could not be loaded; WinGlance cannot start: {error:#}\n").as_bytes(),
+                crate::CRASH_LOG_CAP,
+            );
+            return Err(error);
+        }
+    };
     config.log_settings();
 
     info!("starting WinGlance");

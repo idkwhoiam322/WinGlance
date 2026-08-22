@@ -52,6 +52,17 @@ pub fn init_logging(logs_dir: &Path, preserve: bool) {
     let files = match open_live_log(&live_path, preserve) {
         Ok((file, written)) => Some(LogFiles { live: file, written }),
         Err(error) => {
+            // The whole run is about to go without diagnostics: the
+            // eprintln reaches no one in a release build (no console), so
+            // record the failure in crash.log — the one channel that does
+            // not depend on the live log existing. One bounded line; if
+            // even that fails (same environmental cause), it is silently
+            // dropped, which changes nothing.
+            let _ = crate::winutil::append_verified_bounded(
+                &logs_dir.join("crash.log"),
+                format!("live log could not be opened ({error}); this run writes no log-Live.log\n").as_bytes(),
+                crate::CRASH_LOG_CAP,
+            );
             eprintln!("log file open failed ({live_path:?}): {error}");
             None
         }
