@@ -20,6 +20,7 @@ mod winutil;
 use crate::config::Config;
 use crate::winapi::post_message;
 use anyhow::Result;
+use chrono::Local;
 use log::{debug, error, info, warn};
 use std::collections::VecDeque;
 use std::env;
@@ -51,6 +52,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, GetCurrentProcessId, OpenEventW, ReleaseMutex, SetEvent,
     WaitForSingleObject,
@@ -81,17 +83,49 @@ static CRASH_LOG_HANDLE: AtomicUsize = AtomicUsize::new(0);
 /// Upper bound on crash.log growth. The file is diagnostic forensics, not
 /// user data: past this size a crash loop stops appending, so a broken
 /// install that crashes at startup cannot fill the disk. The earliest
-/// records survive, which is where a loop's signature lives. The panic-hook
-/// and singleton-failure writers enforce the cap through
-/// `append_verified_bounded`; the allocation-free vectored handler counts
-/// its own appended bytes against the same budget.
+/// records survive, which is where a loop's signature lives. Both writers —
+/// the allocation-free vectored handler and the panic hook — append through
+/// the one shared accounting path (`crash_write_retained`), so the cap and
+/// the byte count can never desync between them.
 const CRASH_LOG_CAP: u64 = 8 * 1024 * 1024;
 
 /// Bytes already in crash.log as accounted by this process: seeded from the
-/// file's length when the verified handle is installed, advanced by the
-/// vectored handler per append. Only touched before/during a crash path, so
-/// plain loads and stores are sufficient.
+/// file's length when the verified handle is installed, advanced by every
+/// writer through `crash_log_write_retained`. Only touched before/during a
+/// crash path, so plain loads and stores are sufficient.
 static CRASH_LOG_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The single accounting path every retained-handle crash write goes
+/// through. Appends `data` at EOF of the verified retained handle and
+/// advances the shared counter; once the counter reaches `CRASH_LOG_CAP`
+/// appends stop (earliest records survive a crash loop). Returns false only
+/// when no handle was retained at startup — callers without a handle fall
+/// back to their own open-append path. Allocation-free, so the vectored
+/// exception handler can call it under heap corruption.
+fn crash_log_write_retained(data: &[u8]) -> bool {
+    let raw = CRASH_LOG_HANDLE.load(Ordering::SeqCst);
+    if raw == 0 {
+        return false;
+    }
+    let written_so_far = CRASH_LOG_BYTES.load(Ordering::SeqCst);
+    if written_so_far >= CRASH_LOG_CAP {
+        // Cap reached: drop the record. The earliest records survive,
+        // which is where a loop's signature lives.
+        return true;
+    }
+    let handle = HANDLE(raw as *mut c_void);
+    unsafe {
+        // Position at EOF first so the record is always APPENDED, never
+        // written over earlier records (the handle carries both
+        // FILE_APPEND_DATA and FILE_WRITE_DATA, so the OS does not force
+        // appends automatically).
+        let _ = SetFilePointer(handle, 0, None, windows::Win32::Storage::FileSystem::FILE_END);
+        let mut written: u32 = 0;
+        let _ = WriteFile(handle, Some(data), Some(&mut written as *mut _), None);
+        CRASH_LOG_BYTES.store((written_so_far + written as u64).min(CRASH_LOG_CAP), Ordering::SeqCst);
+    }
+    true
+}
 
 /// Writes literal bytes into the stack buffer, truncating if the buffer is full.
 /// Returns the new write position.
@@ -189,10 +223,17 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
 
     // Build the entire crash log in a stack-allocated buffer.  No String,
-    // no format!, no heap allocation — safe under heap corruption.
+    // no format!, no heap allocation — safe under heap corruption. The
+    // timestamp is uptime-milliseconds (GetTickCount64): allocation-free,
+    // and enough to order records against each other and against a
+    // panic-hook record's wall clock within one session.
+    let uptime_ms = unsafe { GetTickCount64() };
     let mut buf = [0u8; 2048];
     let mut pos = 0usize;
     pos = crash_write_str(&mut buf, pos, b"CRASH access violation\n");
+    pos = crash_write_str(&mut buf, pos, b"  uptime_ms = ");
+    pos = crash_write_dec(&mut buf, pos, uptime_ms as usize);
+    pos = crash_write_str(&mut buf, pos, b"\n");
     pos = crash_write_str(&mut buf, pos, b"  ip    = ");
     pos = crash_write_hex16(&mut buf, pos, ip);
     pos = crash_write_str(&mut buf, pos, b" (rva ");
@@ -214,27 +255,11 @@ unsafe extern "system" fn crash_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         pos = crash_write_str(&mut buf, pos, b")\n");
     }
 
-    // Append through the verified handle retained at install time: the object
-    // was opened under the pinned parent and identity-validated before the
-    // open returned, so no path component can be swapped out from under the
-    // crash write. No open, no close and no allocation happen here. Appends
-    // stop once the file reaches `CRASH_LOG_CAP`, so a crash loop cannot
-    // fill the disk.
-    let raw = CRASH_LOG_HANDLE.load(Ordering::SeqCst);
-    let written_so_far = CRASH_LOG_BYTES.load(Ordering::SeqCst);
-    if raw != 0 && written_so_far < CRASH_LOG_CAP {
-        let handle = HANDLE(raw as *mut c_void);
-        unsafe {
-            // The pointer is positioned at EOF first so the crash record is
-            // always APPENDED, never written over earlier records (the
-            // handle carries both FILE_APPEND_DATA and FILE_WRITE_DATA, so
-            // the OS does not force appends automatically).
-            let _ = SetFilePointer(handle, 0, None, windows::Win32::Storage::FileSystem::FILE_END);
-            let mut written: u32 = 0;
-            let _ = WriteFile(handle, Some(&buf[..pos]), Some(&mut written as *mut _), None);
-        }
-        CRASH_LOG_BYTES.store((written_so_far + pos as u64).min(CRASH_LOG_CAP), Ordering::SeqCst);
-    }
+    // Append through the shared accounting path: the verified handle was
+    // retained at install time (no open, no close, no allocation here) and
+    // `crash_log_write_retained` owns the cap and the byte counter for every
+    // writer, so the panic hook can never desync it.
+    crash_log_write_retained(&buf[..pos]);
     0 // EXCEPTION_CONTINUE_SEARCH
 }
 
@@ -276,13 +301,18 @@ fn install_panic_hook(logs_dir: &Path) {
             "unknown payload".to_string()
         };
         let location = info.location().map(|l| l.to_string()).unwrap_or_default();
-        let message = format!("PANIC {payload} at {location}\n");
-        let path = dir.join("crash.log");
-        // Verified append — the parent's identity is checked and the
-        // final component is opened without following a pre-created link.
-        // Capped like the vectored handler, so a panic loop cannot fill
-        // the disk (past the cap the file truncates to zero and starts over).
-        let _ = crate::winutil::append_verified_bounded(&path, message.as_bytes(), CRASH_LOG_CAP);
+        // Wall-clock timestamp so a record correlates with the live log's
+        // sessions (the vectored handler records uptime-ms instead — it
+        // must stay allocation-free).
+        let message = format!("PANIC {} {payload} at {location}\n", Local::now().to_rfc3339());
+        if !crash_log_write_retained(message.as_bytes()) {
+            // No retained handle (the startup install failed): fall back to
+            // an open-append-bounded write so panics stay diagnosable. The
+            // shared counter does not track this path, but nothing else
+            // writes through it either.
+            let path = dir.join("crash.log");
+            let _ = crate::winutil::append_verified_bounded(&path, message.as_bytes(), CRASH_LOG_CAP);
+        }
     }));
 }
 
@@ -925,10 +955,14 @@ fn main() -> Result<()> {
     // path the live log is preserved (appended to) instead of truncated.
     let reload_config = std::env::args_os().any(|arg| arg == "--reload-config");
     logging::init_logging(&config::Config::default().logs_dir(), reload_config);
+    // Crash handlers install BEFORE Config::load: a failure during
+    // startup must leave a crash.log record, and the logs directory comes
+    // from the built-in defaults, never from the user's file (which may be
+    // exactly what is failing).
+    install_crash_handler(&config::Config::default().logs_dir());
+    install_panic_hook(&config::Config::default().logs_dir());
     let config = config::Config::load()?;
     config.log_settings();
-    install_crash_handler(&config.logs_dir());
-    install_panic_hook(&config.logs_dir());
 
     info!("starting WinGlance");
 
