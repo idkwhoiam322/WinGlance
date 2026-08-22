@@ -1683,7 +1683,19 @@ impl OverlayState {
                     }
                     self.enqueue(MediaEvent::PlaybackStateChanged(state, source_app));
                 }
-                MediaEvent::TrackChanged(_) | MediaEvent::PlaybackStateChanged(_, _) => {}
+                MediaEvent::TrackChanged(track) => {
+                    // Track pills are disabled, but the cache must still be
+                    // fed: a later state pill for this source renders
+                    // from `track_cache`, and an unfed cache degrades every
+                    // state pill to a source-name-only pill forever —
+                    // contradicting "a state pill still shows the last
+                    // track". Cache-only, matching the notifications-off
+                    // branch: `current_source`/`last_track` drive
+                    // suppression and restore paths whose semantics assume
+                    // a shown pill.
+                    self.cache_track(&track);
+                }
+                MediaEvent::PlaybackStateChanged(_, _) => {}
                 // Rejected sessions, settled sources, worker failures and the
                 // budget-drop warning are history/tray-only: never shown as a
                 // pill.
@@ -1807,6 +1819,16 @@ impl OverlayState {
                         }
                         return;
                     }
+                }
+                // A queued state pill for the same source yields to the new
+                // track: otherwise the stale ⏸/▶ state pill shows the
+                // OLD track's text first and the fresh track second, playing
+                // the skip out loud. The TrackChanged carries its own
+                // snapshot state, so nothing is lost.
+                if let Some(index) = self.pending.iter().position(|queued| {
+                    matches!(queued, MediaEvent::PlaybackStateChanged(_, source) if *source == incoming.source_app)
+                }) {
+                    self.pending.remove(index);
                 }
             }
             // A newer playback state from the same source supersedes the
@@ -2204,9 +2226,10 @@ impl OverlayState {
             Some(MediaEvent::PlaybackStateChanged(_, source)) if !source.is_empty() => Some(source.clone()),
             _ => None,
         };
-        if let Some(source) = source {
-            *cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(source);
-        }
+        // Always write, clearing on an empty source: a stale
+        // now-showing label would keep the worker suppressing re-reports for
+        // a source the pill no longer shows.
+        *cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = source;
     }
 
     fn update_content(&mut self, event: MediaEvent, min_visible: Duration) {
@@ -3600,9 +3623,11 @@ impl OverlayState {
         // too: a screen reader that re-queries the hidden pill (which still
         // exists as an HWND) must not announce a track that is no longer
         // displayed.
-        if let Some(cell) = &self.pill_name
-            && let Ok(mut guard) = cell.lock()
-        {
+        if let Some(cell) = &self.pill_name {
+            // Recover a poisoned lock like every other site: an
+            // `if let Ok` here skipped the clear on poison, leaving a stale
+            // track name readable by a screen reader for a hidden pill.
+            let mut guard = cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             *guard = None;
         }
         // Clear the last-shown source label so a subsequent PlaybackStateChanged
@@ -4769,6 +4794,63 @@ mod tests {
             state.pending.front(),
             Some(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, source)) if source == "youtube-music"
         ));
+    }
+
+    #[test]
+    fn state_pills_keep_track_text_when_track_pills_are_disabled() {
+        // With `enable_track_change = false`, the TrackChanged must
+        // still feed the cache — a later state pill renders from
+        // `track_cache`, and an unfed cache degraded every state pill for
+        // that source to a source-name-only pill forever.
+        let mut config = Config::default();
+        config.behavior.enable_track_change = false;
+        let mut state = OverlayState::new(config, EventQueue::default());
+        let track = track_for("youtube-music", "Love Me Not", "Ravyn Lenae");
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::TrackChanged(track)));
+        state.receive_events();
+
+        assert!(
+            state.track_cache.contains_key("youtube-music"),
+            "a disabled pill kind must not starve the track cache"
+        );
+        assert!(
+            state.content.is_none(),
+            "a disabled pill kind must not show anything for the track itself"
+        );
+        // The follow-up state pill resolves the cached track. It lands in
+        // the pending queue first; flush_pending plays the debounce-timer
+        // role (show_next) so the assertion runs without a window.
+        state.content = None;
+        state.phase = Phase::Hidden;
+        state.current_source = None;
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back(Arc::new(MediaEvent::PlaybackStateChanged(
+                PlaybackState::Playing,
+                "youtube-music".into(),
+            )));
+        state.receive_events();
+        assert_eq!(state.pending.len(), 1, "the state pill queues while hidden");
+        state.flush_pending();
+        assert!(matches!(
+            state.content.as_ref(),
+            Some(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, source))
+                if source == "youtube-music"
+        ));
+        assert!(
+            state.pill_text.as_ref().is_some_and(|t| t.title == "Love Me Not"),
+            "the state pill must render the cached track, got {pill_text:?}",
+            pill_text = state
+                .pill_text
+                .as_ref()
+                .map(|t| (t.title.clone(), t.source_app.clone())),
+        );
     }
 
     #[test]
