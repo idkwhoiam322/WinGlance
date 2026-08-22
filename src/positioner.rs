@@ -43,6 +43,10 @@ static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
 
 struct PositionerState {
     owner: HWND,
+    /// The overlay whose placement this sample edits — the commit converts
+    /// its drop point with the overlay *target's* DPI (queried live), not the
+    /// sample window's own monitor scale.
+    overlay: HWND,
     /// Which position the commit applies to: `POSITION_MSG` for the expanded
     /// pill, `COMPACT_POSITION_MSG` for the independent compact position.
     /// The message routes through the main window (the single config owner),
@@ -99,6 +103,7 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
         let scale = GetDpiForWindow(owner).max(96) as f32 / 96.0;
         let state = Box::new(PositionerState {
             owner,
+            overlay,
             result_msg,
             dragging: false,
             drag_offset: POINT::default(),
@@ -259,12 +264,17 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
         debug!("positioner GetWindowRect failed: {error}");
         return;
     }
-    // The sample lives on the positioner's own monitor — not the pill's — so
-    // the snap edges, threshold and the physical-to-logical conversion must
-    // all come from this window's DPI and work area. Using the overlay's
-    // values would scale and anchor a drag made on a different-DPI monitor
-    // against the wrong monitor.
+    // The snap edges, threshold and the work-area clamp describe the drag
+    // itself, so they come from the sample window's own DPI and work area.
+    // The *stored* value, however, is re-scaled by the overlay target's DPI
+    // when placement applies it (`fullscreen::placement` multiplies the
+    // logical override by the target monitor's scale), so the
+    // physical→logical conversion must use that same target scale — a
+    // mixed-DPI drag (sample monitor ≠ pill target) would otherwise land
+    // displaced.
     let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+    let target_scale =
+        crate::overlay::dpi_for_position(state.overlay, state.result_msg == COMPACT_POSITION_MSG).max(96) as f32 / 96.0;
     let work = monitor_work_area(hwnd);
     let sample_w = (WIDTH as f32 * scale).round() as i32;
     let sample_h = (HEIGHT as f32 * scale).round() as i32;
@@ -286,8 +296,8 @@ fn commit(hwnd: HWND, state: &mut PositionerState) {
     phys_x = phys_x.clamp(work.left, (work.right - sample_w).max(work.left));
     phys_y = phys_y.clamp(work.top, (work.bottom - sample_h).max(work.top));
 
-    let log_x = (phys_x as f32 / scale).round() as i32;
-    let log_y = (phys_y as f32 / scale).round() as i32;
+    let log_x = to_logical(phys_x, target_scale);
+    let log_y = to_logical(phys_y, target_scale);
 
     // Skip when the release did not move the pill: a click without a drag
     // (or a drag back to the same spot) must not re-persist the config and
@@ -522,5 +532,37 @@ unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+/// Converts a dropped physical coordinate into the stored 96-DPI logical
+/// value using the *target* monitor's scale — the same scale `placement`
+/// re-applies — so the pill lands at the exact drop point on mixed-DPI
+/// systems (the sample's own scale governs only snapping and clamping,
+/// where the drag physically happens).
+fn to_logical(phys: i32, target_scale: f32) -> i32 {
+    (phys as f32 / target_scale).round() as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_logical;
+
+    #[test]
+    fn the_stored_point_converts_with_the_target_scale() {
+        // Mixed-DPI drag: the sample sits on a 100% monitor while the pill
+        // targets 150%. A drop at physical x=2400 must store 1600 so that
+        // placement's `logical * target_scale` lands back at 2400 — the
+        // exact drop point, not a displaced coordinate.
+        let log = to_logical(2400, 1.5);
+        assert_eq!(log, 1600);
+        assert_eq!((log as f32 * 1.5).round() as i32, 2400);
+    }
+
+    #[test]
+    fn a_same_monitor_drag_keeps_the_identity_conversion() {
+        assert_eq!(to_logical(1234, 1.0), 1234);
+        // A 200% target halves the physical distance.
+        assert_eq!(to_logical(2000, 2.0), 1000);
     }
 }

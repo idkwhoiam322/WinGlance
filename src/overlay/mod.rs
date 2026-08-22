@@ -744,6 +744,32 @@ impl OverlayPos {
     }
 }
 
+/// DPI of the display the given position slot resolves onto — the same
+/// resolution `placement` uses when it re-applies the stored logical
+/// coordinates. Drag samples convert their drop point with this scale so the
+/// pill lands exactly where the sample was dropped, even on mixed-DPI
+/// systems where the sample's own monitor differs from the pill's target.
+/// `compact` selects the independent compact slot (as separated); every other
+/// combination resolves the expanded position. Falls back to 96 when the
+/// overlay state or no display is available.
+pub(crate) fn dpi_for_position(hwnd: HWND, compact: bool) -> u32 {
+    let state_ptr = window_state::<OverlayState>(hwnd);
+    if state_ptr.is_null() {
+        return 96;
+    }
+    let state = unsafe { &*state_ptr };
+    let position = if compact && state.config.overlay.compact_position_separate {
+        &state.compact_position
+    } else {
+        &state.position
+    };
+    let displays = enumerate_displays_cached();
+    let foreground_nearest = foreground_monitor_index(&displays);
+    resolve_target(position.monitor, &displays, foreground_nearest)
+        .map(|index| monitor_dpi(displays[index].handle))
+        .unwrap_or(96)
+}
+
 /// Updates the live overlay's placement from the resolved expanded and
 /// compact positions.
 pub(crate) fn set_positions(hwnd: HWND, pos: OverlayPos, compact_pos: OverlayPos) {
