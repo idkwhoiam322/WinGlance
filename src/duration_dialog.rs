@@ -30,20 +30,36 @@ use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::HWND_MESSAGE;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, EN_CHANGE, ES_AUTOHSCROLL, GetClientRect, GetMessageW, GetWindowRect, HMENU, IDCANCEL, IDOK,
-    IsDialogMessageW, MSG, PostQuitMessage, SW_HIDE, SW_SHOW, SetForegroundWindow, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC,
-    WM_ERASEBKGND, WM_GETTEXT, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SETTEXT, WS_BORDER, WS_CAPTION, WS_CHILD,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    DispatchMessageW, EN_CHANGE, ES_AUTOHSCROLL, GetClientRect, GetDlgItem, GetMessageW, GetWindowRect, HMENU,
+    IDCANCEL, IDOK, IsDialogMessageW, MSG, PostQuitMessage, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
+    SetForegroundWindow, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_GETTEXT, WM_NCCREATE,
+    WM_NCDESTROY, WM_SETFONT, WM_SETTEXT, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
-/// Hardcoded input range, matching `config.normalize`/`set_duration`.
-const MIN_SECONDS: f64 = 0.5;
-const MAX_SECONDS: f64 = 60.0;
+/// Hardcoded input range — derived from the config clamp constants so the
+/// dialog can never drift from `normalize()`; a cross-check test pins
+/// the equality.
+const MIN_SECONDS: f64 = crate::config::Config::DURATION_MIN_MS as f64 / 1000.0;
+const MAX_SECONDS: f64 = crate::config::Config::DURATION_MAX_MS as f64 / 1000.0;
 
 const CLASS_NAME: &str = "WinGlanceDurationDialog";
 static CLASS_GUARD: OnceLock<()> = OnceLock::new();
+
+/// The dialog's control layout in 96-DPI logical units: (id, x, y, w, h) per
+/// child, in creation order. The creation closure and the WM_DPICHANGED
+/// re-layout both consume this one table, so the geometry has a single
+/// source of truth. Ids: prompt label 103, edit 100 (the gate tests
+/// latch it), error label 101, then the standard IDOK/IDCANCEL.
+const CONTROLS: [(usize, i32, i32, i32, i32); 5] = [
+    (103, 12, 12, 260, 18),
+    (100, 12, 34, 260, 22),
+    (101, 12, 60, 260, 18),
+    (1, 154, 82, 58, 24), // IDOK
+    (2, 214, 82, 58, 24), // IDCANCEL
+];
 
 /// Set when this window's WM_NCCREATE claims the state box handed over in
 /// `lpCreateParams`, so a failed CreateWindowExW can tell whether the box was
@@ -110,6 +126,10 @@ static TEST_DIALOG_EPOCH: AtomicU64 = AtomicU64::new(0);
 struct DialogData {
     chosen: Option<u64>,
     done: bool,
+    /// The dialog's current DPI scale (96-DPI = 1.0), updated by
+    /// WM_DPICHANGED so a drag across monitors can re-layout the controls
+    /// from the shared table.
+    scale: f32,
     edit: HWND,
     /// Hidden error label, shown while the entered text does not parse or
     /// falls outside the range.
@@ -179,6 +199,7 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
         let state_ptr = Box::into_raw(Box::new(DialogData {
             chosen: None,
             done: false,
+            scale: GetDpiForWindow(parent).max(96) as f32 / 96.0,
             edit: HWND::default(),
             error_label: HWND::default(),
         }));
@@ -260,51 +281,52 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
                 HWND::default()
             }
         };
+        let label = CONTROLS[0];
         let _ = child(
             "STATIC",
             "Duration (seconds):",
-            12,
-            12,
-            260,
-            18,
-            0,
+            label.1,
+            label.2,
+            label.3,
+            label.4,
+            label.0,
             WS_CHILD | WS_VISIBLE,
         );
+        let edit_ctl = CONTROLS[1];
         let edit = child(
             "EDIT",
             &format!("{}", current_ms as f64 / 1000.0),
-            12,
-            34,
-            260,
-            22,
-            100,
+            edit_ctl.1,
+            edit_ctl.2,
+            edit_ctl.3,
+            edit_ctl.4,
+            edit_ctl.0,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
         );
         (*state_ptr).edit = edit;
-        let error_label = child(
-            "STATIC", "", 12, 60, 260, 18,
-            101, // Hidden until the entered text fails to parse or is out of range.
-            WS_CHILD,
-        );
+        let err = CONTROLS[2];
+        let error_label = child("STATIC", "", err.1, err.2, err.3, err.4, err.0, WS_CHILD);
         (*state_ptr).error_label = error_label;
+        let ok = CONTROLS[3];
         let _ = child(
             "BUTTON",
             "OK",
-            154,
-            82,
-            58,
-            24,
-            IDOK.0 as usize,
+            ok.1,
+            ok.2,
+            ok.3,
+            ok.4,
+            ok.0,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
         );
+        let cancel = CONTROLS[4];
         let _ = child(
             "BUTTON",
             "Cancel",
-            214,
-            82,
-            58,
-            24,
-            IDCANCEL.0 as usize,
+            cancel.1,
+            cancel.2,
+            cancel.3,
+            cancel.4,
+            cancel.0,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32),
         );
 
@@ -363,6 +385,28 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         dialog_proc_body(hwnd, message, wparam, lparam)
     })
     .unwrap_or(LRESULT(0))
+}
+
+/// Repositions and resizes every child from the shared CONTROLS table at
+/// `scale`: the WM_DPICHANGED handler calls this after the frame has
+/// moved, so a dialog dragged across monitors keeps its controls laid out.
+fn relayout_controls(hwnd: HWND, scale: f32) {
+    for &(id, x, y, w, h) in &CONTROLS {
+        let child = unsafe { GetDlgItem(Some(hwnd), id as i32) };
+        if let Ok(child) = child {
+            let _ = unsafe {
+                crate::winapi::set_window_pos(
+                    child,
+                    HWND::default(),
+                    (x as f32 * scale).round() as i32,
+                    (y as f32 * scale).round() as i32,
+                    (w as f32 * scale).round() as i32,
+                    (h as f32 * scale).round() as i32,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
+        }
+    }
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -435,6 +479,32 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             LRESULT(0)
         }
+        WM_DPICHANGED => {
+            // Re-layout from the shared table at the new scale: the
+            // suggested rect keeps the frame right, the relayout keeps the
+            // controls on it. A modal dialog dragged across monitors is
+            // rare, but a stretched control row is exactly the kind of
+            // breakage that reads as a bug when it happens.
+            if !data_ptr.is_null() {
+                let data = &mut *data_ptr;
+                data.scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
+                relayout_controls(hwnd, data.scale);
+            }
+            let suggested = lparam.0 as *const windows::Win32::Foundation::RECT;
+            if !suggested.is_null() {
+                let rect = unsafe { *suggested };
+                let _ = crate::winapi::set_window_pos(
+                    hwnd,
+                    HWND::default(),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
             if !data_ptr.is_null() {
                 (*data_ptr).done = true;
@@ -478,14 +548,28 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
 #[cfg(test)]
 mod tests {
     use super::{
-        CLASS_GUARD, CLASS_NAME, DIALOG_STATE_CLAIMED, DialogData, TEST_DIALOG_EDIT, TEST_DIALOG_EPOCH,
-        TEST_DIALOG_HWND, TEST_DIALOG_LABEL, TEST_MESSAGE_ONLY_DIALOG, dialog_proc, parse_duration_seconds,
-        show_duration_dialog,
+        CLASS_GUARD, CLASS_NAME, DIALOG_STATE_CLAIMED, DialogData, MAX_SECONDS, MIN_SECONDS, TEST_DIALOG_EDIT,
+        TEST_DIALOG_EPOCH, TEST_DIALOG_HWND, TEST_DIALOG_LABEL, TEST_MESSAGE_ONLY_DIALOG, dialog_proc,
+        parse_duration_seconds, show_duration_dialog,
     };
     use crate::winapi::{create_window, post_message, send_message};
     use crate::winutil::{register_class_once, wide, window_state};
     use std::ffi::c_void;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn dialog_range_matches_the_config_clamp() {
+        // Drift guard: the dialog's parse range is DERIVED from the
+        // config clamp constants; these asserts fail loudly if anyone
+        // reintroduces a second hardcoded range on either side.
+        assert_eq!(MIN_SECONDS * 1000.0, crate::config::Config::DURATION_MIN_MS as f64);
+        assert_eq!(MAX_SECONDS * 1000.0, crate::config::Config::DURATION_MAX_MS as f64);
+        // The boundaries themselves parse; one step past each does not.
+        assert_eq!(parse_duration_seconds("0.5"), Some(500));
+        assert_eq!(parse_duration_seconds("60"), Some(60_000));
+        assert_eq!(parse_duration_seconds("0.4"), None);
+        assert_eq!(parse_duration_seconds("60.1"), None);
+    }
     use std::sync::{Mutex, OnceLock, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -645,6 +729,9 @@ mod tests {
         let state_ptr = Box::into_raw(Box::new(DialogData {
             chosen: None,
             done: false,
+            // Test helper: the message-only parent has no meaningful DPI;
+            // the layout math never runs for this instance.
+            scale: 1.0,
             edit: HWND::default(),
             error_label: HWND::default(),
         }));

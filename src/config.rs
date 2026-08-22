@@ -780,8 +780,17 @@ impl Config {
         Self::data_dir().unwrap_or_else(|_| PathBuf::from("data")).join("logs")
     }
 
+    /// The pill-duration clamp range, in milliseconds. The single source of
+    /// truth for both `normalize()` and the custom-duration dialog's input
+    /// range, so the two can never drift apart.
+    pub(crate) const DURATION_MIN_MS: u64 = 500;
+    pub(crate) const DURATION_MAX_MS: u64 = 60_000;
+
     fn normalize(&mut self) {
-        self.overlay.duration_ms = self.overlay.duration_ms.clamp(500, 60_000);
+        self.overlay.duration_ms = self
+            .overlay
+            .duration_ms
+            .clamp(Self::DURATION_MIN_MS, Self::DURATION_MAX_MS);
         self.overlay.animation_ms = self.overlay.animation_ms.clamp(100, 1000);
         self.overlay.max_width = self.overlay.max_width.clamp(180, 800);
         self.overlay.max_tick_hz = self.overlay.max_tick_hz.map(|hz| hz.clamp(60, 1000));

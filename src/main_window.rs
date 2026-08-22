@@ -64,8 +64,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect,
-    GetCursorPos, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindowVisible, LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT,
-    LB_GETITEMHEIGHT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX,
+    GetCursorPos, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindowVisible, IsZoomed, LB_ADDSTRING, LB_DELETESTRING,
+    LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX,
     LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP,
     MF_SEPARATOR, MF_STRING, PostQuitMessage, RegisterWindowMessageW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
     SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLBAR_COMMAND, SCROLLINFO, SIF_PAGE, SIF_POS,
@@ -5514,6 +5514,25 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
         WM_DPICHANGED => {
+            // Apply the system-suggested rect first: for a *restored*
+            // window dragged across monitors, the OS computes the size that
+            // keeps the physical dimensions at the new scale — ignoring it
+            // left stale pixels no font rebuild can fix. Maximized windows
+            // are resized by the system itself (IsZoomed) and keep their
+            // bounds; the pointer may be null per the WM_DPICHANGED contract.
+            let suggested = lparam.0 as *const RECT;
+            if !suggested.is_null() && !IsZoomed(hwnd).as_bool() {
+                let rect = unsafe { *suggested };
+                let _ = set_window_pos(
+                    hwnd,
+                    HWND_TOP,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
             if !state_ptr.is_null() {
                 (*state_ptr).on_dpi_changed((wparam.0 >> 16) as u32);
             }
@@ -6194,7 +6213,11 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 debug!("re-sampled system preferences after WM_SETTINGCHANGE: {prefs:?}");
                 state.rebuild_settings_appearance();
                 // The effective accent may have flipped (e.g. high contrast
-                // toggled): re-color the title bar from the new state.
+                // toggled): rebuild the accent-derived brushes too, not just
+                // the title bar — they were only refreshed on creation
+                // and palette changes, leaving mixed-theme fills until the
+                // next artwork change.
+                state.rebuild_accent_brushes();
                 state.apply_title_bar_color();
                 state.push_effective_duration();
                 state.invalidate();
