@@ -2622,7 +2622,10 @@ pub(super) fn draw_text_line_pixels(
                 // strip starts sliding. Returns early because the strip
                 // composite below replaces the general glyph composite at the
                 // end of this function.
-                let total = text_w + MARQUEE_GAP as i32;
+                // The gap is a LOGICAL measurement like the edge fade above
+                //: scaling it keeps the visual gap consistent across
+                // DPI, instead of reading half-width at 200%.
+                let total = text_w + (MARQUEE_GAP * scale) as i32;
                 // Unselect our font before the strip build may replace or
                 // drop this scratch DC; the guard becomes a no-op.
                 font_guard.restore();
