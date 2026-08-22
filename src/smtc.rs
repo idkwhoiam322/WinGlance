@@ -1559,13 +1559,31 @@ impl ListenerState {
         // `prioritize_sessions` over lightweight (key, source) pairs, shared
         // with the tests so the priority contract is pinned by both; the
         // allow-list and current-session filters are applied within the loop
-        // below. Truncating the new-candidate enumeration to the session cap
-        // also extends the caps' DoS intent to the per-sync work (WinRT
-        // source reads and allocations) performed before they apply.
-        let snapshot_keys: Vec<(usize, String)> = sessions
-            .iter()
-            .map(|session| (session_key(session), read_source_app(session)))
-            .collect();
+        // below. The enumeration itself is bounded to the sessions the caps
+        // can ever admit — the current session, every surviving
+        // subscription, and at most `MAX_TRACKED_SESSIONS` genuinely new
+        // candidates — so a hostile snapshot listing thousands of sessions
+        // cannot make this pass pay a WinRT source read per entry: the
+        // per-sync work stops at the same line the caps draw for everything
+        // downstream.
+        let mut new_candidates = 0usize;
+        let mut dropped_by_bound = 0usize;
+        let mut snapshot_keys: Vec<(usize, String)> = Vec::new();
+        for session in &sessions {
+            let key = session_key(session);
+            let is_current = Some(key) == current_key;
+            if !is_current && !before.contains(&key) {
+                if new_candidates >= MAX_TRACKED_SESSIONS {
+                    dropped_by_bound += 1;
+                    continue;
+                }
+                new_candidates += 1;
+            }
+            snapshot_keys.push((key, read_source_app(session)));
+        }
+        if dropped_by_bound > 0 {
+            debug!("SMTC snapshot enumeration bounded | dropped={dropped_by_bound} entries beyond the admission caps");
+        }
         let ordered = prioritize_sessions(
             &snapshot_keys,
             current_key.zip(current_source.clone()),
@@ -1762,7 +1780,12 @@ impl ListenerState {
         // from one snapshot and then returns; the grace window below keeps its
         // entry (and its caches, via the retention predicates further down)
         // alive so no spurious STOP fires in that gap.
-        let alive_sources: HashSet<String> = sessions.iter().map(read_source_app).collect();
+        // Derived from the bounded snapshot pairs instead of a second
+        // full-snapshot read pass: a source whose every session fell beyond
+        // the enumeration bound is treated as departed — under a hostile
+        // storm that is exactly the caps' intent, and under normal volumes
+        // the bound never drops anything.
+        let alive_sources: HashSet<String> = snapshot_keys.iter().map(|(_, source)| source.clone()).collect();
         for key in &stale {
             if let Some(subscription) = self.subscriptions.get(key) {
                 let source = read_source_app(&subscription.session);
