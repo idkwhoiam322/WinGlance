@@ -1531,9 +1531,14 @@ impl OverlayState {
                         // (see `tick`'s render gate), so a live position update — and a
                         // seek it re-anchors — would otherwise stay stale on screen
                         // until the next content-driven render. Paint the re-based bar
-                        // right away while the pill is up; skip it when hidden so a
-                        // dismissed pill never gets dragged back to life by a late event.
-                        if !matches!(self.phase, Phase::Hidden) {
+                        // right away while the pill is up, but only when it moves at
+                        // least one pixel: paused sources' ~2 s timeline pings
+                        // must not trigger whole-pill rasterizes for identical pixels.
+                        // Skip when hidden so a dismissed pill is never dragged back
+                        // to life by a late event.
+                        if !matches!(self.phase, Phase::Hidden)
+                            && self.progress_sample_moved(position_secs, duration_secs)
+                        {
                             self.render();
                         }
                     }
@@ -1725,6 +1730,14 @@ impl OverlayState {
         // post drops the pending batch (and accounts for it) instead of
         // stranding events without a wake.
         crate::repost_if_pending(&self.queue, &self.wake, self.hwnd, "overlay");
+        // If the animation driver failed to arm earlier (transient
+        // resource exhaustion), every received event retries arming it — a
+        // shown pill must never sit frozen just because no phase transition
+        // re-ran `sync_anim_timer`.
+        if !matches!(self.phase, Phase::Hidden) && self.anim_timer.0.is_null() && !self.anim_timer_fallback {
+            debug!("animation timer missing; retrying after received events");
+            self.ensure_anim_timer();
+        }
     }
 
     /// Caches the current track for a source, moving the source to the back
@@ -2208,6 +2221,33 @@ impl OverlayState {
     /// anchor plus elapsed seconds times rate, never negative.
     fn estimate_position(base: f64, rate: f64, elapsed: f64) -> f64 {
         (base + elapsed * rate).max(0.0)
+    }
+
+    /// Whether an incoming timeline sample moves the bar at least one pixel
+    ///: mirrors the tick path's gate so a paused source's ~2 s
+    /// timeline pings do not trigger whole-pill rasterizes for identical
+    /// pixels. A seek — the sample jumping far from the current estimate —
+    /// always counts as movement.
+    fn progress_sample_moved(&self, position_secs: Option<f64>, duration_secs: Option<u64>) -> bool {
+        let Some(position) = position_secs else {
+            return false;
+        };
+        if let Some(est) = self.estimated_position_secs
+            && (est - position).abs() > PROGRESS_LATENCY_TOL_SECS
+        {
+            return true;
+        }
+        let Some(duration) = duration_secs.filter(|d| *d > 0) else {
+            return false;
+        };
+        let fraction = (position / duration as f64).clamp(0.0, 1.0) as f32;
+        match self.last_bar_fraction {
+            None => true,
+            Some(prev) => {
+                let span = self.last_frame_w.max(1) as f32;
+                (fraction - prev).abs() >= (1.0 / span).max(1e-4)
+            }
+        }
     }
 
     /// Publishes the source of the content just displayed into the shared
@@ -3700,6 +3740,13 @@ impl OverlayState {
     /// creation), so the cost of a release is one CreateDIBSection round on
     /// the next pill, not on the release itself.
     fn release_idle_buffers(&mut self) {
+        // Log only when there was something to release: the timer
+        // used to re-fire this every 30 s while hidden, spamming the
+        // diagnostics log with no-op releases.
+        let had_buffers = self.text_scratch.is_some()
+            || self.dib.is_some()
+            || !self.frame_scratch.is_empty()
+            || self.chrome_cache.is_some();
         // Dropping the buffers unselects the bitmaps and frees the DIBs and
         // DCs via the `Drop` impls.
         self.text_scratch = None;
@@ -3710,7 +3757,9 @@ impl OverlayState {
         // show always rebuilds it (a hide bumps `content_rev`, so the key
         // never matches), which is already the cost of showing anyway.
         self.chrome_cache = None;
-        debug!("released idle overlay buffers");
+        if had_buffers {
+            debug!("released idle overlay buffers");
+        }
     }
 
     fn toggle_enabled(&mut self) {
@@ -4141,9 +4190,13 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         WM_TIMER if wparam.0 == IDLE_BUFFER_TIMER_ID => {
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
-                // Every show path kills this timer, so firing with a visible
-                // pill would be a logic error elsewhere; the check keeps the
-                // release from ever racing a render.
+                // The timer has done its job the first time it fires: kill
+                // it here so a long-hidden pill does not re-fire this no-op
+                // every 30 s. Every show path also kills it, so
+                // firing with a visible pill would be a logic error
+                // elsewhere; the check keeps the release from ever racing a
+                // render.
+                let _ = kill_timer(hwnd, IDLE_BUFFER_TIMER_ID);
                 if state.content.is_none() {
                     state.release_idle_buffers();
                 }
