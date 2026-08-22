@@ -7,7 +7,7 @@
 //! or falls outside the config range [0.5, 60] seconds keeps the dialog open
 //! with an inline error label; valid input is converted to milliseconds.
 
-use crate::winapi::{create_window, send_message, set_focus};
+use crate::winapi::{create_window, post_message, send_message, set_focus};
 use crate::winutil::{StateClaim, register_class_once, release_window_state, set_window_state, wide, window_state};
 use log::warn;
 use std::ffi::c_void;
@@ -50,6 +50,22 @@ static CLASS_GUARD: OnceLock<()> = OnceLock::new();
 /// caller. Reset before each open. See `winutil::StateClaim` for the shared
 /// mechanics.
 static DIALOG_STATE_CLAIMED: StateClaim = StateClaim::new();
+
+/// The live custom-duration dialog's hwnd, or 0 while none is open. Quit
+/// paths close an open dialog before destroying the main window so the
+/// dialog's modal loop drains over a live owner.
+static OPEN_DIALOG_HWND: AtomicUsize = AtomicUsize::new(0);
+
+/// Best-effort close of an open custom-duration dialog (its cancel path):
+/// a Quit that destroys the owner underneath the dialog's modal loop would
+/// leave the loop running over a dead parent — close it first so the loop
+/// ends cleanly.
+pub(crate) fn close_if_open() {
+    let raw = OPEN_DIALOG_HWND.load(Ordering::SeqCst);
+    if raw != 0 {
+        let _ = unsafe { post_message(HWND(raw as *mut c_void), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+    }
+}
 
 /// Test seam for the duration-dialog gate tests: while armed,
 /// `show_duration_dialog` creates the dialog against `HWND_MESSAGE` instead
@@ -208,6 +224,7 @@ pub fn show_duration_dialog(parent: HWND, current_ms: u64) -> Option<u64> {
             }
         };
         let font = GetStockObject(DEFAULT_GUI_FONT);
+        OPEN_DIALOG_HWND.store(hwnd.0 as usize, Ordering::SeqCst);
         let child = |class: &str, text: &str, x: i32, y: i32, w: i32, h: i32, id: usize, style: WINDOW_STYLE| {
             let child = create_window(
                 WINDOW_EX_STYLE(0),
@@ -430,6 +447,7 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             // nothing else tears down here. Every close path (OK/Cancel/
             // close button) goes through DestroyWindow; without this the box
             // leaked on each open.
+            OPEN_DIALOG_HWND.store(0, Ordering::SeqCst);
             release_window_state(hwnd, data_ptr);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }

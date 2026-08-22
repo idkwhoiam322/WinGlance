@@ -327,10 +327,37 @@ pub(crate) fn catch_callback_panic<T>(
     })
 }
 
-/// WNDPROC wrapper: on a contained panic it logs, asks the thread's
-/// message loop to quit so the process exits through its normal teardown
-/// path, and answers with the default window procedure's result for the
-/// message so the OS sees a well-formed reply.
+/// Best-effort cleanup for a contained wndproc panic. A window that owns
+/// resources the OS will not reclaim cleanly on a hard exit (the tray icon —
+/// Explorer reaps it only on hover) registers a closure here; the
+/// containment arm of `guarded_wndproc` runs it before posting the quit.
+/// First registration wins; the cleanup itself is panic-contained so a
+/// broken cleanup cannot turn a contained panic into an abort.
+static PANIC_CLEANUP: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Registers the process-wide contained-panic cleanup (see `PANIC_CLEANUP`).
+pub(crate) fn set_panic_cleanup(cleanup: Box<dyn Fn() + Send + Sync>) {
+    let _ = PANIC_CLEANUP.set(cleanup);
+}
+
+/// Runs the registered panic cleanup, if any, panic-contained.
+fn run_panic_cleanup() {
+    if let Some(cleanup) = PANIC_CLEANUP.get() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup));
+        if result.is_err() {
+            // Never panics out of the containment arm itself; a failed
+            // cleanup is logged best-effort through the ordinary logger.
+            log::debug!("panic cleanup itself panicked; ignored");
+        }
+    }
+}
+
+/// WNDPROC wrapper: on a contained panic it logs, runs the registered
+/// panic cleanup (e.g. removing the tray icon — the normal WM_DESTROY
+/// teardown is skipped), asks the thread's message loop to quit so the
+/// process exits through its normal teardown path, and answers with the
+/// default window procedure's result for the message so the OS sees a
+/// well-formed reply.
 pub(crate) fn guarded_wndproc(
     hwnd: HWND,
     message: u32,
@@ -342,6 +369,7 @@ pub(crate) fn guarded_wndproc(
     match catch_callback_panic(context, body) {
         Ok(result) => result,
         Err(_) => unsafe {
+            run_panic_cleanup();
             PostQuitMessage(0);
             DefWindowProcW(hwnd, message, wparam, lparam)
         },
@@ -1178,6 +1206,27 @@ mod tests {
             panic!("injected")
         });
         assert_eq!(result.0, 0);
+    }
+
+    #[test]
+    fn a_contained_wndproc_panic_runs_the_registered_cleanup() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_NULL;
+        // First registration wins process-wide, so this test both registers
+        // and proves the containment arm runs it before the quit. A second
+        // registration (the app's tray cleanup in a live run) would be
+        // ignored — exactly the set-once semantics the tray path relies on.
+        static RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        set_panic_cleanup(Box::new(|| {
+            RAN.store(true, Ordering::SeqCst);
+        }));
+        let result = guarded_wndproc(HWND::default(), WM_NULL, WPARAM(0), LPARAM(0), "test wndproc", || {
+            panic!("injected")
+        });
+        assert_eq!(result.0, 0);
+        assert!(
+            RAN.load(Ordering::SeqCst),
+            "the containment arm must run the registered cleanup"
+        );
     }
 
     #[test]

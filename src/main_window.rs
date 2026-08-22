@@ -4493,6 +4493,15 @@ fn tray_icon() -> Result<HICON> {
 }
 
 fn install_tray_icon(hwnd: HWND) -> Result<()> {
+    // A contained wndproc panic skips the normal WM_DESTROY teardown, which
+    // would leave a ghost tray icon (Explorer reaps it only on hover): give
+    // the panic containment a best-effort removal for this window. First
+    // registration wins, and every install uses the same main-window hwnd.
+    // The raw handle travels as a usize so the closure stays Send + Sync.
+    let hwnd_raw = hwnd.0 as usize;
+    crate::winutil::set_panic_cleanup(Box::new(move || {
+        remove_tray_icon(HWND(hwnd_raw as *mut core::ffi::c_void));
+    }));
     if !unsafe { Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)?) }.as_bool() {
         anyhow::bail!("Shell_NotifyIconW(NIM_ADD) failed");
     }
@@ -4857,7 +4866,14 @@ fn show_tray_menu(hwnd: HWND) {
                 }
                 MENU_QUIT_ID => {
                     info!("quit requested from the tray menu");
-                    let _ = DestroyWindow(state.hwnd);
+                    // Close an open modal child first (the custom-duration
+                    // dialog): its modal loop must drain over a live owner
+                    // instead of running on after the owner is destroyed
+                    // underneath it. Modeless owned popups (the pickers,
+                    // the positioner) are destroyed with their owner by the
+                    // OS and need no help.
+                    crate::duration_dialog::close_if_open();
+                    let _ = DestroyWindow(hwnd);
                 }
                 MENU_DURATION_2S => {
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = 2000);
