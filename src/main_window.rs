@@ -6683,13 +6683,30 @@ fn raise_settings_focus_event(hwnd: HWND, focus: Option<(usize, SettingSub)>) {
     }
 }
 
+/// The sub-control a value-change announcement is raised against: the
+/// row's first focusable child as laid out right now. Toggle and
+/// button rows expose their whole control as one `None` child, but segmented
+/// rows (duration, layout, monitor, position anchors) expose only their
+/// individual `Seg(n)` segments — raising against the literal `None` there
+/// resolves no provider and silently drops the announcement even though the
+/// docs promise it. Resolving from the live children keeps the raised
+/// element identical to an element the client already sees.
+fn settings_announce_sub(hwnd: HWND, row_index: usize) -> SettingSub {
+    settings_accessibility_children(hwnd)
+        .into_iter()
+        .find(|child| child.row_index == row_index)
+        .map(|child| child.sub)
+        .unwrap_or(SettingSub::None)
+}
+
 /// Raises the UIA toggle property-changed event for a Settings row whose ON/OFF
 /// value just flipped. `before`/`after` are the displayed toggle states.
 fn raise_settings_toggle_event(hwnd: HWND, row_index: usize, before: bool, after: bool) {
     if hwnd.0.is_null() || before == after {
         return;
     }
-    let Some(provider) = crate::accessibility::settings_child_provider(hwnd, row_index, SettingSub::None) else {
+    let sub = settings_announce_sub(hwnd, row_index);
+    let Some(provider) = crate::accessibility::settings_child_provider(hwnd, row_index, sub) else {
         return;
     };
     let old = windows::Win32::System::Variant::VARIANT::from(if before { ToggleState_On.0 } else { ToggleState_Off.0 });
@@ -6712,7 +6729,8 @@ fn raise_settings_name_changed(hwnd: HWND, row_index: usize, before: &str, after
     if hwnd.0.is_null() || before == after {
         return;
     }
-    let Some(provider) = crate::accessibility::settings_child_provider(hwnd, row_index, SettingSub::None) else {
+    let sub = settings_announce_sub(hwnd, row_index);
+    let Some(provider) = crate::accessibility::settings_child_provider(hwnd, row_index, sub) else {
         return;
     };
     let old = windows::Win32::System::Variant::VARIANT::from(BSTR::from(before));
