@@ -132,10 +132,22 @@ const TIMER_OPENED_ID: usize = 104;
 /// Timer that retries a failed initial tray add: Explorer may not have built
 /// the notification area yet at logon, which makes the first `NIM_ADD` fail.
 const TRAY_RETRY_TIMER_ID: usize = 105;
-/// Retry cadence and budget for the tray add: five attempts two seconds
-/// apart (~10 s), then one bounded error instead of failing startup.
+/// Base retry cadence for the tray add and the per-attempt cap: 2 s
+/// doubling up to 60 s (see `tray_retry_delay_ms`), so a slow logon —
+/// Explorer taking minutes — still gets the icon instead of the old ~8 s
+/// budget giving up on it.
 const TRAY_RETRY_INTERVAL_MS: u32 = 2000;
-const TRAY_RETRY_MAX_ATTEMPTS: u32 = 5;
+const TRAY_RETRY_INTERVAL_MAX_MS: u32 = 60_000;
+/// Backoff schedule length: 2+4+8+16+32 s then 60 s steps ≈ 7.5 minutes of
+/// sustained retries before the one-shot give-up error.
+const TRAY_RETRY_MAX_ATTEMPTS: u32 = 12;
+
+/// The delay before tray-add retry `attempt` (1-based): 2 s doubling to a
+/// 60 s cap. Pure so the schedule is pinned by test.
+fn tray_retry_delay_ms(attempt: u32) -> u32 {
+    let shift = attempt.saturating_sub(1).min(5);
+    (TRAY_RETRY_INTERVAL_MS << shift).min(TRAY_RETRY_INTERVAL_MAX_MS)
+}
 const TIMER_TOOLTIPS_ID: usize = 102;
 /// One-shot timer that frees the cached artwork blit after the window has
 /// been tray-hidden for `IDLE_ART_RELEASE_MS` (see `on_close`). The blit
@@ -1243,9 +1255,10 @@ pub fn create_window(
     if let Err(error) = install_tray_icon(hwnd) {
         // A failed initial add (Explorer not up yet at logon, a transient
         // shell state) must not abort startup silently: retry on a window
-        // timer for ~10 s, then give up with one bounded error. A later
-        // Explorer restart still recovers the icon via TaskbarCreated.
-        warn!("initial tray add failed ({error}); retrying every {TRAY_RETRY_INTERVAL_MS} ms");
+        // timer on a backoff schedule (2 s doubling to 60 s), then give up
+        // with one bounded error. A later Explorer restart still recovers
+        // the icon via TaskbarCreated.
+        warn!("initial tray add failed ({error}); retrying on the backoff schedule");
         unsafe {
             (*state_ptr).tray_add_attempts = 1;
             let _ = set_timer(hwnd, TRAY_RETRY_TIMER_ID, TRAY_RETRY_INTERVAL_MS, None);
@@ -5428,13 +5441,22 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     state.tray_add_attempts += 1;
                     if state.tray_add_attempts >= TRAY_RETRY_MAX_ATTEMPTS {
                         error!(
-                            "the tray icon could not be added after {} attempts over {} ms; \
+                            "the tray icon could not be added after {} attempts over the backoff schedule; \
                              pills are unaffected and an Explorer restart will re-add it",
-                            state.tray_add_attempts,
-                            TRAY_RETRY_MAX_ATTEMPTS * TRAY_RETRY_INTERVAL_MS
+                            state.tray_add_attempts
                         );
                         state.tray_add_attempts = 0;
                         let _ = kill_timer(hwnd, TRAY_RETRY_TIMER_ID);
+                    } else {
+                        // Backoff: 2 s doubling to a 60 s cap, so a slow
+                        // logon keeps retrying for minutes instead of giving
+                        // up after the old ~8 s window.
+                        let _ = set_timer(
+                            hwnd,
+                            TRAY_RETRY_TIMER_ID,
+                            tray_retry_delay_ms(state.tray_add_attempts),
+                            None,
+                        );
                     }
                 }
             }
@@ -6764,6 +6786,21 @@ mod tests {
                 "fixed tray id {id} intrudes into the display-entry range starting at {MENU_MONITOR_DISPLAY_BASE}"
             );
         }
+    }
+
+    #[test]
+    fn tray_retry_backoff_doubles_to_a_sixty_second_cap() {
+        assert_eq!(tray_retry_delay_ms(1), 2000);
+        assert_eq!(tray_retry_delay_ms(2), 4000);
+        assert_eq!(tray_retry_delay_ms(3), 8000);
+        assert_eq!(tray_retry_delay_ms(4), 16000);
+        assert_eq!(tray_retry_delay_ms(5), 32000);
+        assert_eq!(tray_retry_delay_ms(6), 60000, "the schedule caps at 60 s");
+        assert_eq!(
+            tray_retry_delay_ms(12),
+            60000,
+            "the cap holds to the end of the schedule"
+        );
     }
 
     /// A uniquely-named temporary directory removed on drop, so the
