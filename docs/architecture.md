@@ -539,14 +539,22 @@ switching between two panes:
   meta) and the per-session history listbox (newest first, capped at 400
   rows; an insert follows the reader's scroll position — pinned while the
   top rows are visible, shifted by one row otherwise, so a mid-history
-  position is not yanked back to the newest entry). Every reported
+  position is not yanked back to the newest entry). The table's columns —
+  TIME | STATE | TITLE | ARTIST | ALBUM | DURATION | TRACK | GENRE |
+  SOURCE — come from one shared `HISTORY_COLUMNS` spec feeding the
+  owner-draw paint, the header strings, and the tooltip hit-test together,
+  so the three can never drift. Every reported
   transition is recorded, and highlighting marks the rows that reached the
   pill: a tracked source's redundant re-report (the state the activity
   already displays — exactly what the overlay suppresses) records grey like
   a rejected session, and while notifications are off nothing reaches the
   pill, so every row records grey. A native `TOOLTIPS_CLASSW` control shows
-  full row details on hover,
-  synced to the visible row band on a 1 Hz timer while the window is visible.
+  hover details: over a history cell it shows that cell's full untruncated
+  text (the cursor is mapped into the row's column rects recomputed at
+  query time), over the row's gaps it falls back to the whole-row details,
+  and over the Now Playing block it shows the current track's details; the
+  control is synced to the visible row band on a 1 Hz timer while the
+  window is visible.
 - **Settings** — cards mirroring the tray menu and `[behavior]`/`[overlay]`
   config: notifications toggle, duration presets and the respect-system-
   duration toggle, start-on-login, close-to-tray, allowed apps, auto-compact
@@ -633,7 +641,13 @@ nothing else (no patterns, never keyboard-focusable, click-through). On a
 genuine track change, `OverlayState::resolve_pill_text` raises
 `UIA_NamePropertyChangedEvent` (`accessibility::raise_pill_name_changed`)
 with the old and new names, so a client tracking the pill announces the new
-track. The raise is best-effort like every event in the surface (a fresh
+track. A genuine track change additionally raises
+`UiaRaiseNotificationEvent` (`accessibility::raise_pill_track_notification`,
+kind `ItemAdded`, processing `MostRecent`, activity id
+`WinGlance.TrackChanged`) — the modern documented mechanism that active
+screen readers speak without focus, where property-changed events only
+reach clients already watching the element. The raise is best-effort like
+every event in the surface (a fresh
 provider per event, no-op without a listening client) and fires only when
 the resolved name *actually differs* from what the cell held — a same-track
 artwork refresh re-shows without re-announcing. It is also gated
