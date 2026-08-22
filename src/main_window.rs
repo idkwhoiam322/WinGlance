@@ -35,7 +35,7 @@ use windows::Win32::Graphics::Gdi::{
     CLIP_DEFAULT_PRECIS, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOWFRAME, COLOR_WINDOWTEXT,
     CreateCompatibleDC, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC, EndPaint,
     FF_DONTCARE, FillRect, FrameRect, GetStockObject, GetSysColor, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
-    OUT_DEFAULT_PRECIS, PAINTSTRUCT, SYS_COLOR_INDEX, SetBkColor, SetTextColor,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, SYS_COLOR_INDEX, ScreenToClient, SetBkColor, SetTextColor,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard};
@@ -1706,13 +1706,68 @@ impl MainWindowState {
         PWSTR(buffer.as_mut_ptr())
     }
 
-    /// Text for the native tooltip: the column header for row 0, otherwise
-    /// the full details of the entry at the given row.
-    fn tooltip_text_for(&self, row: usize) -> Option<String> {
+    /// Text for the native tooltip: the column header for row 0; otherwise
+    /// the hovered cell's full text when the cursor sits inside a column,
+    /// or the whole-row details when the cursor is in a gap between columns.
+    /// `cursor_x` is the cursor in listbox client coordinates (None: not
+    /// recoverable — answer the row fallback).
+    fn tooltip_text_for(&self, row: usize, cursor_x: Option<i32>) -> Option<String> {
         if row == 0 {
             return Some(history_header_line());
         }
-        self.history.entries.get(row - 1).map(entry_detail)
+        let entry = self.history.entries.get(row - 1)?;
+        if let Some(x) = cursor_x
+            && let Some(col) = self.history_cell_column_at_cursor(row, x)
+            && let Some(text) = self.history_cell_tooltip_text(entry, col)
+            && !text.trim().is_empty()
+        {
+            return Some(format!("{}: {}", HISTORY_COLUMNS[col].label, text));
+        }
+        // Gap hover, collapsed cell, or empty field: the full details line.
+        Some(entry_detail(entry))
+    }
+
+    /// Recomputes the row's column rects at query time (the same geometry
+    /// the paint used) and answers the hovered column index. Returns None
+    /// on a gap, a collapsed column, or an out-of-range x.
+    fn history_cell_column_at_cursor(&self, row: usize, cursor_x: i32) -> Option<usize> {
+        if self.listbox.0.is_null() {
+            return None;
+        }
+        unsafe {
+            let mut rect = RECT::default();
+            let ok = send_message(
+                self.listbox,
+                LB_GETITEMRECT,
+                WPARAM(row),
+                LPARAM(&mut rect as *mut _ as isize),
+            );
+            if ok.0 == 0 {
+                return None;
+            }
+            let scale = GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0;
+            let rects = history_column_rects(&rect, scale);
+            history_cell_at_x(&rects, cursor_x)
+        }
+    }
+
+    /// The tooltip text of one cell: the state column spells the glyph out,
+    /// everything else shows the painted value verbatim.
+    fn history_cell_tooltip_text(&self, entry: &HistoryEntry, col: usize) -> Option<String> {
+        match col {
+            HISTORY_COL_STATE => Some(
+                match entry.state {
+                    PlaybackState::Playing | PlaybackState::NowPlaying => "Playing",
+                    PlaybackState::Paused => "Paused",
+                    PlaybackState::Stopped => "Stopped",
+                }
+                .to_string(),
+            ),
+            _ => {
+                let text = history_cell_text(entry, col);
+                (!text.is_empty()).then_some(text)
+            }
+        }
     }
 
     /// Records a source's playback state, capping the remembered set so a
@@ -4463,6 +4518,16 @@ fn history_header_line() -> String {
     HISTORY_COLUMNS.iter().map(|c| c.label).collect::<Vec<_>>().join(" | ")
 }
 
+/// Maps a listbox-client x to the column index whose rect contains it. A
+/// point in an inter-column gap or on a collapsed (zero-width) column
+/// answers None — never a neighboring cell's text. Mirrors the paint's
+/// rect arithmetic through the same `history_column_rects` source.
+fn history_cell_at_x(rects: &[RECT], x: i32) -> Option<usize> {
+    rects
+        .iter()
+        .position(|rect| x >= rect.left && x < rect.right && rect.right > rect.left)
+}
+
 /// A data cell's full (untruncated) text for painting and for the per-cell
 /// tooltip. An absent field yields an empty string: the paint skips it, and
 /// the tooltip answers "no text" rather than showing a stale neighbor value.
@@ -5767,7 +5832,16 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 let header = unsafe { &*(lparam.0 as *const NMHDR) };
                 if header.code == TTN_GETDISPINFOW {
                     let state = &mut *state_ptr;
-                    if let Some(text) = state.tooltip_text_for(header.idFrom) {
+                    // Map the cursor into the listbox's client coordinates so
+                    // the per-cell hit-test sees the same basis the paint
+                    // does (the paint works in listbox client space too).
+                    let cursor_x = unsafe {
+                        let mut point = POINT::default();
+                        GetCursorPos(&mut point)
+                            .ok()
+                            .and_then(|_| ScreenToClient(state.listbox, &mut point).as_bool().then_some(point.x))
+                    };
+                    if let Some(text) = state.tooltip_text_for(header.idFrom, cursor_x) {
                         let info = unsafe { &mut *(lparam.0 as *mut NMTTDISPINFOW) };
                         // Point lpszText at a window-owned buffer instead of
                         // copying into the built-in szText (bounded at 80 u16):
@@ -7675,6 +7749,72 @@ mod tests {
             history_header_line(),
             "TIME | STATE | TITLE | ARTIST | ALBUM | DURATION | TRACK | GENRE | SOURCE"
         );
+    }
+
+    #[test]
+    fn history_cell_at_x_answers_none_on_gaps_and_collapsed_cells() {
+        // Build rects straight from the shared geometry so the test pins the
+        // exact paint arithmetic.
+        let row = RECT {
+            left: 0,
+            top: 0,
+            right: 1200,
+            bottom: 18,
+        };
+        let rects = history_column_rects(&row, 1.0);
+        let gap = 4i32;
+
+        // The center of each rect answers that column's index.
+        for (index, rect) in rects.iter().enumerate() {
+            if rect.right > rect.left {
+                let middle = rect.left + (rect.right - rect.left) / 2;
+                assert_eq!(
+                    history_cell_at_x(&rects, middle),
+                    Some(index),
+                    "center of column {index}"
+                );
+            }
+        }
+        // Left edge inclusive, right edge exclusive.
+        let first = &rects[0];
+        assert_eq!(history_cell_at_x(&rects, first.left), Some(0));
+        assert_eq!(
+            history_cell_at_x(&rects, first.right),
+            None,
+            "right edge is a gap pixel"
+        );
+
+        // Every inter-column gap pixel answers None.
+        for pair in rects.windows(2) {
+            let gap_x = pair[0].right;
+            assert_eq!(history_cell_at_x(&rects, gap_x + gap / 2), None, "gap between columns");
+        }
+        // Outside the padded interior: None.
+        assert_eq!(history_cell_at_x(&rects, -1), None);
+
+        // A fully collapsed column never claims its neighbor's pixels.
+        let collapsed = vec![
+            RECT {
+                left: 0,
+                top: 0,
+                right: 50,
+                bottom: 10,
+            },
+            RECT {
+                left: 54,
+                top: 0,
+                right: 54,
+                bottom: 10,
+            },
+            RECT {
+                left: 58,
+                top: 0,
+                right: 100,
+                bottom: 10,
+            },
+        ];
+        assert_eq!(history_cell_at_x(&collapsed, 52), None, "collapsed cell is skipped");
+        assert_eq!(history_cell_at_x(&collapsed, 60), Some(2));
     }
 
     #[test]
