@@ -1849,7 +1849,7 @@ pub(super) fn pill_text_from_track(track: &TrackInfo) -> PillText {
 }
 
 /// Draws the pill's text rows into the same premultiplied pixel buffer as the
-/// shapes: glyph coverage from fontdue becomes alpha, so text alpha-composites
+/// shapes: GDI glyph coverage becomes alpha, so text alpha-composites
 /// exactly like every other element (GDI text cannot do this on a layered
 /// window — it never touches the alpha channel). While a morph is in flight
 /// `draw_morph_content` takes over: the shared elements (title, playback

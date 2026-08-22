@@ -3,7 +3,8 @@
 The config file is `%APPDATA%\WinGlance\WinGlance\data\config.toml`. It is created
 automatically with the defaults below on first run. `Config::normalize()`
 clamps every value to the safe ranges listed; out-of-range values are
-corrected silently but the file is not rewritten (see `docs/architecture.md`).
+clamped to the safe ranges listed and each clamp is logged as a warning, but
+the file itself is not rewritten (see `docs/architecture.md`).
 
 > **Known limitation:** a hand-edited `config.toml` is only read at startup.
 > There is no live reload while the app is running — restart WinGlance after
@@ -253,14 +254,18 @@ Beyond these knobs the pill derives its look from the playing track:
 Logging has no configuration. A single `log-Live.log` file in
 `<data_dir>\logs` captures the current run; it is truncated at startup and
 capped at 1 MiB during the run (a churn-heavy session cannot grow the file
-without bound). No history is retained.
+without bound). The in-app **Restart app** action is the exception: it
+preserves the previous session's lines and appends a restart boundary, so a
+reloaded run stays diagnosable.
 
 ## [main window] and the system tray
 
 WinGlance keeps a maximized tracking window alongside the WinGlance pill. The window shows
 the current activity (art, state, title/artist/album) and the per-session history;
-it is opened from the tray icon (double-click, or the **Open WinGlance** menu item).
-It is never shown as a pop-up on launch.
+it is opened from the tray icon (single click, double-click, or the **Open WinGlance**
+menu item). Launches stay silent: `start_in_tray = true` (the default) shows only the
+tray icon and pill, `start_in_tray = false` opens the window, and the very first run —
+the launch that creates config.toml — shows it once regardless.
 
 The tray menu mirrors the `[behavior]` toggles in real time:
 

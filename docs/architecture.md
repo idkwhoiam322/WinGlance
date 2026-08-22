@@ -74,7 +74,9 @@ after one hung shell call)
   stall — the supervisor stops restarting, logs, and sends one `WorkerFailed`
   event (history row + tray note): media notifications will not resume until
   the app restarts. A hung worker is never joined (it may be blocked inside
-  COM forever); the restart cap bounds that leak.
+  COM forever); the consecutive-failure cap bounds that leak per stretch, and a
+rolling window budget (`MAX_LEAKED_WORKERS` within `LEAK_WINDOW`) stops
+restarts entirely if hung workers keep accumulating.
 - The event forwarder is a thin thread that drains the bounded event channel
   into the two window queues and pokes the UI thread with `PostMessageW`. It
   exists so the UI thread stays responsive even if several SMTC callbacks
@@ -315,7 +317,10 @@ Each frame is rendered into an in-memory premultiplied-BGRA buffer:
    `DrawTextW` into a scratch DIB and composites them alpha-correctly; rows
    marquee-scroll only while their text overflows the visible band.
 3. `UpdateLayeredWindow` with `ULW_ALPHA` composites the window; the window
-   uses per-monitor DPI-aware scaling via `GetDpiForWindow`.
+   uses per-monitor DPI-aware scaling: sizes, fonts and margins come from
+`GetDpiForMonitor(MDT_EFFECTIVE_DPI)` of the *target* display (see "Placement
+and resolution" below), so the first frame after a display switch is already
+scaled correctly.
 
 The window is created with `WS_EX_LAYERED | WS_EX_TRANSPARENT |
 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`, returns `HTTRANSPARENT` from
@@ -326,10 +331,11 @@ Animation runs through three phases — expanding (grow + fade in), light (a
 short 120 ms fade for playback-state changes), collapsing (shrink + fade out)
 — on the spring model described in "Morph springs" below, driven by a
 high-resolution timer matched to the monitor's refresh rate while the pill
-animates, a text line scrolls, or the aura comet sweep orbits — playing
-content keeps the sweep alive, so a playing pill stays at the refresh-rate
-cap for its whole duration (the period is capped by `max_tick_hz`,
-default 60 Hz). A fully static pill drops to a coarse 250 ms tick — the
+animates or a text line scrolls. The aura comet sweep keeps playing content
+alive too, but at its own coarse cadence: once nothing else animates, the
+timer drops to `COMET_TICK_MS` (66 ms, ~15 Hz), which cuts a playing pill's
+steady-state render load to about a quarter (the period is additionally
+capped by `max_tick_hz`). A fully static pill drops to a coarse 250 ms tick — the
 dismiss countdown and hover polling do not need frame rate — and the pill
 repaints only while animating or marquee-scrolling; a static pill does no
 per-frame drawing. Queueing a newer notification caps the remaining display
@@ -419,18 +425,31 @@ unveil as the pill's animated bottom edge sweeps past their bands.
 ## Palette and aura
 
 Two vibrant colors are extracted from the album art (a 4-bit-per-channel
-histogram over the decoded display buffer, guarded by saturation ≥ 0.25 and
-luminance 0.20–0.85, secondary ≥ 30° away in hue). The primary recolors the
-playback symbols, the clock icon and the music note; a muted pastel variant
-tints the artist and source-app rows; and a 16% blend of the primary tints the
-pill fill itself, so the near-opaque body picks up a hint of the cover's hue. The
-aura is a soft C₁→C₂ glow drawn in the DIB margin around the pill, brighter on
-the album-art side, with peak alpha ~140 at the pill boundary fading
-exponentially over a 6 logical-px halo — the window is inflated by the halo
-extent so the glow extends into the desktop rather than being clipped. A
-directional edge highlight (white, brighter at the top-left) traces the pill's
-own boundary, drawn as a supersampled coverage ring so the corners stay
-anti-aliased.
+histogram over the worker's fixed 256^2 decode, box-averaged onto a stable
+16x16 grid first so the pick cannot shift with decode size or re-encoding).
+Candidates pass a four-tier guard hierarchy: AndroidX-style vibrant scoring,
+then a strict guard (saturation >= 0.25, luminance 0.20-0.85), a relaxed tier
+for dark covers (S >= 0.10, L >= 0.10), and finally a monochrome tier for B&W
+and high-key artwork - so moody portraits and white covers still yield a
+palette instead of the accent default. The primary recolors the playback
+symbols, the clock icon and the music note; a muted pastel variant tints the
+artist and source-app rows; and a 16% blend of the primary tints the pill fill
+itself, so the near-opaque body picks up a hint of the cover's hue. Derived
+row colors run through `ensure_contrast`, which enforces WCAG AA (4.5:1)
+against the pill fill before painting. The aura is a soft C1->C2 glow drawn in
+the DIB margin around the pill, brighter on the album-art side, with peak
+alpha ~140 at the pill boundary fading exponentially over a 6 logical-px halo
+- the window is inflated by the halo extent so the glow extends into the
+desktop rather than being clipped. A directional edge highlight (white,
+brighter at the top-left) traces the pill's own boundary, drawn as a
+supersampled coverage ring so the corners stay anti-aliased.
+
+> **Hostile-input caution:** polling GSMTC session APIs at high frequency
+> (~1 ms) crashes inside `Windows.Media.MediaControl.dll` with heap corruption
+> - an OS-level bug reproduced from Rust and C# (microsoft/windows-rs#3734).
+> The worker's safety-net poll runs at a 2 s cadence and must not be tightened
+> without revisiting that issue; never add sub-second timeline sampling for a
+> "smoother" progress bar.
 
 ## Placement and resolution
 
@@ -530,9 +549,12 @@ switching between two panes:
   synced to the visible row band on a 1 Hz timer while the window is visible.
 - **Settings** — cards mirroring the tray menu and `[behavior]`/`[overlay]`
   config: notifications toggle, duration presets and the respect-system-
-  duration toggle, start-on-login, close-to-tray, allowed apps, position
-  anchors + Reset/Adjust, target display selection, "Preview Notification",
-  and the "Copy logs" button. The main window is the
+  duration toggle, start-on-login, close-to-tray, allowed apps, auto-compact
+  apps, pinned source, layout, expanded + compact position anchors with
+  Reset/Adjust, hover toggles (dismiss on hover, expand compact on hover),
+  hide-for-auto-compact and fade-persistent flags, target display selection,
+  "Show sample" preview, and a Diagnostics row (copy/open logs, open config,
+  restart app). The main window is the
   single writer of the in-memory config (see the guardrail in `AGENTS.md`);
   every change goes through `mutate_config` and is persisted.
 

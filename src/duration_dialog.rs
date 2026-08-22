@@ -464,7 +464,10 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     (*data_ptr).chosen = Some(ms);
                     (*data_ptr).done = true;
                 } else {
-                    let error_text = wide("Enter a duration between 0.5 and 60 seconds.");
+                    let error_text = wide(&format!(
+                        "Enter a duration between {} and {} seconds.",
+                        MIN_SECONDS, MAX_SECONDS
+                    ));
                     let _ = send_message(
                         (*data_ptr).error_label,
                         WM_SETTEXT,

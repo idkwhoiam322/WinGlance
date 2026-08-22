@@ -351,7 +351,7 @@ struct ChromeCache {
 }
 
 /// Scratch device context + DIB used to render pill text with Windows' own
-/// GDI text engine (ClearType, proper hinting), then composite the glyph
+/// GDI text engine (grayscale anti-aliasing - ClearType subpixel fringes would contaminate the layered alpha), then composite the glyph
 /// coverage into the pill's premultiplied buffer. GDI writes alpha 0 for text
 /// into 32bpp DIBs, so the RGB of each glyph pixel (text color × coverage)
 /// supplies the coverage.

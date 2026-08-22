@@ -48,8 +48,8 @@ interrupts and never needs interaction.
 - **Small footprint** — raw Win32 + GDI, no UI framework, no webview, no GPU
   runtime. Five isolated threads: SMTC worker, supervisor watchdog, event
   forwarder, icon worker, and the UI thread; the pill repaints only while
-  animating or scrolling — and while media plays, the aura comet sweep counts
-  as animation, keeping playing content at the tick cap for its duration.
+  animating or scrolling — and while media plays, the aura comet sweep keeps
+  the tick loop alive at a reduced ~15 Hz cadence for its duration.
 
 ## Getting started
 
