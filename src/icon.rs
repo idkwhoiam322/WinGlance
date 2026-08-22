@@ -183,7 +183,7 @@ fn icon_sender() -> Option<mpsc::SyncSender<IconJob>> {
             let (job_tx, job_rx) = mpsc::sync_channel::<IconJob>(ICON_QUEUE_CAP);
             match thread::Builder::new()
                 .name("WinGlance-icon".to_string())
-                .stack_size(512 * 1024)
+                .stack_size(2 * 1024 * 1024)
                 .spawn(move || icon_worker(job_rx))
             {
                 Ok(_) => Some(job_tx),

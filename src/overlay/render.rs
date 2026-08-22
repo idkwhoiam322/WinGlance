@@ -534,7 +534,11 @@ pub(super) fn create_dc_with_dib(width: i32, height: i32) -> Result<(HDC, HBITMA
             }
         };
     if bits.is_null() {
+        // The bitmap object exists even though it exposed no bits —
+        // delete it alongside the DC, or this bail leaks one HBITMAP per
+        // call (the file's only unpaired exit).
         unsafe {
+            let _ = crate::winapi::delete_object(bitmap);
             let _ = DeleteDC(hdc);
         }
         anyhow::bail!("CreateDIBSection returned no pixel buffer");

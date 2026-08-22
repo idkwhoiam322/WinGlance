@@ -3230,12 +3230,18 @@ impl OverlayState {
         // got `frame.morph` (None during Shown), so the corner radius
         // snapped to the expanded value and the interpolated art tile never
         // rendered at its morph position on the very first hover frame.
-        let morph = if let Some(hover) = &self.hover_expand {
+        // Evaluated once per frame and shared by the radius and
+        // size paths below instead of twice.
+        let hover_progress_now = self
+            .hover_expand
+            .as_ref()
+            .map(|hover| hover_progress(hover, &self.config));
+        let morph = if self.hover_expand.is_some() {
             debug_assert!(
                 frame.morph.is_none(),
                 "the hover morph must not overlap the entrance/exit grow"
             );
-            Some(hover_progress(hover, &self.config))
+            hover_progress_now
         } else {
             frame.morph
         };
@@ -3245,8 +3251,8 @@ impl OverlayState {
         // the pill grows in place. The entrance/exit grow uses the same
         // reveal. Every other frame uses the plain size of the applied
         // layout.
-        let (logical_width, logical_height, morph_progress) = if let Some(hover) = &self.hover_expand {
-            let progress = hover_progress(hover, &self.config);
+        let (logical_width, logical_height, morph_progress) = if self.hover_expand.is_some() {
+            let progress = hover_progress_now.expect("hover morph present implies a progress");
             let size = morph_size(&self.config, &content, progress);
             (size.0, size.1, progress)
         } else if let Some(progress) = frame.morph {

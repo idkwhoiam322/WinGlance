@@ -3666,8 +3666,20 @@ fn read_track_info(
         if n > 0 { Some(n as u32) } else { None }
     };
     let genre = {
-        let genres: Vec<String> = properties.Genres()?.into_iter().map(|g| g.to_string()).collect();
-        let joined = cap_meta(genres.join(", "));
+        // Accumulate only while under the display cap: a hostile
+        // genre list previously materialized the full join before
+        // `cap_meta` truncated it.
+        let mut joined = String::new();
+        for g in properties.Genres()?.into_iter() {
+            if !joined.is_empty() {
+                joined.push_str(", ");
+            }
+            joined.push_str(&g.to_string());
+            if joined.len() >= MAX_META_CHARS {
+                break;
+            }
+        }
+        let joined = cap_meta(joined);
         if joined.trim().is_empty() { None } else { Some(joined) }
     };
     // One timeline read yields the raw duration + live position + read
