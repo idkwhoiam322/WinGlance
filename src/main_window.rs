@@ -5260,10 +5260,16 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
     }
     // Session end (logoff/shutdown): consent through DefWindowProcW, but
     // remove the tray icon first so no ghost icon lingers in a session that
-    // is about to disappear. Best-effort; config saves are atomic renames,
-    // so there is nothing else to flush here.
+    // is about to disappear — only when the session is *really* ending.
+    // wParam == FALSE means another app vetoed the shutdown after our
+    // WM_QUERYENDSESSION consent and the session continues; removing the
+    // icon there would strand the app without a tray until the next
+    // Explorer restart. Best-effort; config saves are atomic renames, so
+    // there is nothing else to flush here.
     if message == WM_ENDSESSION {
-        remove_tray_icon(hwnd);
+        if wparam.0 != 0 {
+            remove_tray_icon(hwnd);
+        }
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
     if message == WM_NCCREATE {
