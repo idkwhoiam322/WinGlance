@@ -4209,6 +4209,27 @@ impl MainWindowState {
         crate::relaunch_self();
     }
 
+    /// Toggles start-on-login with the registry and config kept consistent
+    ///: the registry write happens first so a failed write never
+    /// leaves a config value the OS does not honor; if the subsequent config
+    /// save fails (banner set by `persist_change`), the registry change is
+    /// rolled back to the previous value, so the next launch cannot silently
+    /// revert the user's toggle.
+    fn toggle_autostart(&mut self, new_value: bool) {
+        let previous = self.cfg().behavior.start_on_login;
+        if let Err(error) = autostart::apply(new_value) {
+            error!("start-on-login update failed: {error:#}");
+            return;
+        }
+        self.mutate_config(|cfg| cfg.behavior.start_on_login = new_value);
+        if self.config_status.is_some() {
+            warn!("config save failed after the start-on-login change; reverting the registry entry");
+            if let Err(error) = autostart::apply(previous) {
+                error!("reverting the start-on-login registry entry also failed: {error:#}");
+            }
+        }
+    }
+
     /// Pins the overlay to a vertical/horizontal anchor: clears any absolute
     /// override, persists the choice, and nudges the live overlay into place.
     fn apply_anchor(&mut self, vertical: VerticalPosition, horizontal: HorizontalPosition) {
@@ -4910,14 +4931,7 @@ fn show_tray_menu(hwnd: HWND) {
                 }
                 MENU_AUTOSTART_ID => {
                     let new_value = !state.cfg().behavior.start_on_login;
-                    // Write the registry entry before committing the config
-                    // value: a failed write must not persist a state the
-                    // registry does not reflect.
-                    if let Err(error) = autostart::apply(new_value) {
-                        error!("start-on-login update failed: {error:#}");
-                    } else {
-                        state.mutate_config(|cfg| cfg.behavior.start_on_login = new_value);
-                    }
+                    state.toggle_autostart(new_value);
                 }
                 MENU_CLOSE_TRAY_ID => {
                     let new_value = !state.cfg().behavior.close_to_tray;
@@ -5091,15 +5105,7 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
         }
         SettingId::StartOnLogin => {
             let new_value = !state.cfg().behavior.start_on_login;
-            // Write the registry entry before committing
-            // the config value: a failed write must not
-            // persist a state the registry does not
-            // reflect.
-            if let Err(error) = autostart::apply(new_value) {
-                error!("start-on-login update failed: {error:#}");
-            } else {
-                state.mutate_config(|cfg| cfg.behavior.start_on_login = new_value);
-            }
+            state.toggle_autostart(new_value);
             state.invalidate();
         }
         SettingId::CloseToTray => {
