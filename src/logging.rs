@@ -4,6 +4,7 @@ use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// The live log is reset when it exceeds this many bytes counted against it:
 /// a churn-heavy session can otherwise write tens of MB of Debug lines to
@@ -70,6 +71,7 @@ pub fn init_logging(logs_dir: &Path, preserve: bool) {
 
     let logger = FileLogger {
         files: Mutex::new(files),
+        write_failure_last: Mutex::new(None),
     };
     if LOGGER.set(logger).is_ok() && log::set_logger(LOGGER.get().expect("logger initialized")).is_ok() {
         // Debug level: session churn, dedup skips and suppressed states are all
@@ -111,7 +113,14 @@ struct LogFiles {
 
 struct FileLogger {
     files: Mutex<Option<LogFiles>>,
+    /// Rate-limits the write-failure fallback: when the live log cannot be
+    /// written, one crash.log line per window instead of one per log call.
+    /// `None` until the first failure.
+    write_failure_last: Mutex<Option<Instant>>,
 }
+
+/// How often the write-failure fallback reports to crash.log.
+const WRITE_FAILURE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 impl Log for FileLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
@@ -141,7 +150,33 @@ impl Log for FileLogger {
             // the last few lines.
             match files.live.write_all(line.as_bytes()) {
                 Ok(()) => files.written += line.len() as u64,
-                Err(_) => return,
+                Err(error) => {
+                    // The live log just became untrustworthy: surface the
+                    // failure through crash.log — the channel that works
+                    // independently of the live log — rate-limited so a
+                    // persistent disk-full condition cannot spam it past its
+                    // own cap. Diagnostics-only: the log line itself is
+                    // dropped either way.
+                    let report = {
+                        let mut last = self
+                            .write_failure_last
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let due = last.is_none_or(|t| t.elapsed() >= WRITE_FAILURE_REPORT_INTERVAL);
+                        if due {
+                            *last = Some(Instant::now());
+                        }
+                        due
+                    };
+                    if report {
+                        let _ = crate::winutil::append_verified_bounded(
+                            &crate::config::Config::default().logs_dir().join("crash.log"),
+                            format!("live-log write failed ({error}); log lines are being dropped\n").as_bytes(),
+                            crate::CRASH_LOG_CAP,
+                        );
+                    }
+                    return;
+                }
             }
             if files.written >= LIVE_LOG_CAP {
                 // Start the log fresh instead of growing without bound; the
