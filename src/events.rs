@@ -135,6 +135,18 @@ pub fn artwork_same(a: Option<&[u8]>, b: Option<&[u8]>) -> bool {
     }
 }
 
+/// Formats a duration in seconds as m:ss, switching to h:mm:ss at one hour
+/// so a 3661 s podcast reads "1:01:01" instead of the misleading "61:01".
+/// Shared by the meta line (whose callers prefix their own glyphs) and the
+/// history pane's DURATION column, so the two can never disagree.
+pub fn format_duration_secs(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    } else {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    }
+}
+
 impl TrackInfo {
     /// Compact secondary info line: album (or subtitle/album-artist fallback) ·
     /// duration · track n/c · genre. Only the parts the app actually provided
@@ -144,15 +156,8 @@ impl TrackInfo {
         let mut parts: Vec<String> = Vec::new();
         if let Some(d) = self.duration_secs {
             // The stopwatch glyph labels the number as a duration; without it
-            // "3:45" reads ambiguously in a line of text. At one hour and up
-            // the line switches to h:mm:ss so a 3661 s podcast reads
-            // "1:01:01" instead of the misleading "61:01".
-            let line = if d >= 3600 {
-                format!("⏱ {}:{:02}:{:02}", d / 3600, (d % 3600) / 60, d % 60)
-            } else {
-                format!("⏱ {}:{:02}", d / 60, d % 60)
-            };
-            parts.push(line);
+            // "3:45" reads ambiguously in a line of text.
+            parts.push(format!("⏱ {}", format_duration_secs(d)));
         }
         if include_album {
             let album_line = if !self.album.trim().is_empty() {
@@ -499,6 +504,17 @@ mod tests {
             ..TrackInfo::default()
         };
         assert_eq!(sub_hour.meta_line(true), "⏱ 3:45");
+    }
+
+    #[test]
+    fn format_duration_secs_switches_to_hours_at_3600() {
+        // The h:mm:ss cutover must sit exactly at one hour: 3599 stays
+        // m:ss (59:59), 3600 flips to 1:00:00 — matching the pill's meta
+        // line, which shares this formatter.
+        assert_eq!(super::format_duration_secs(0), "0:00");
+        assert_eq!(super::format_duration_secs(3599), "59:59");
+        assert_eq!(super::format_duration_secs(3600), "1:00:00");
+        assert_eq!(super::format_duration_secs(18061), "5:01:01");
     }
 
     #[test]

@@ -1519,7 +1519,11 @@ impl MainWindowState {
                     WPARAM(self.listbox_font.get().0 as usize),
                     LPARAM(1),
                 );
-                let header = wide("TIME     EVENT");
+                // The header row's listbox string is a placeholder — the
+                // owner-draw paint renders the real per-column headers from
+                // HISTORY_COLUMNS. Kept non-empty so the row exists to be
+                // drawn and hit.
+                let header = wide("HISTORY");
                 log_lb_result(
                     send_message(self.listbox, LB_ADDSTRING, WPARAM(0), LPARAM(header.as_ptr() as isize)),
                     "add header",
@@ -1706,7 +1710,7 @@ impl MainWindowState {
     /// the full details of the entry at the given row.
     fn tooltip_text_for(&self, row: usize) -> Option<String> {
         if row == 0 {
-            return Some("TIME | STATE | TITLE | ARTIST | ALBUM | SOURCE".to_string());
+            return Some(history_header_line());
         }
         self.history.entries.get(row - 1).map(entry_detail)
     }
@@ -3906,60 +3910,28 @@ impl MainWindowState {
             let _ = FillRect(hdc, &item.rcItem, brush);
         }
 
-        // Column layout: TIME | STATE | TITLE | ARTIST | ALBUM | SOURCE.
-        let pad = (8.0 * scale) as i32;
-        let gap = (4.0 * scale) as i32;
-        let time_w = (78.0 * scale) as i32;
-        let state_w = (30.0 * scale) as i32;
-        let left = item.rcItem.left + pad;
-        let rest = (item.rcItem.right - pad - left - time_w - state_w - gap).max(0);
-        let title_w = (rest as f32 * 0.34) as i32;
-        let artist_w = (rest as f32 * 0.24) as i32;
-        let album_w = (rest as f32 * 0.20) as i32;
-        let source_w = (rest - title_w - artist_w - album_w).max(0);
-        let col_x = [left, left + time_w + gap, left + time_w + gap + state_w + gap];
-        let title_x = col_x[2];
-        let artist_x = title_x + title_w + gap;
-        let album_x = artist_x + artist_w + gap;
-        let source_x = album_x + album_w + gap;
-        let header_font = (11.0 * scale) as i32;
+        // Column layout comes from the shared HISTORY_COLUMNS table via
+        // history_column_rects; the per-cell tooltip hit-test reads the same
+        // geometry, so paint and tooltip can never disagree.
+        let rects = history_column_rects(&item.rcItem, scale);
         let row_font = (13.0 * scale) as i32;
+        let header_font = (11.0 * scale) as i32;
         let header_color = [0x9A, 0x9A, 0x9A, 0xFF];
         let accent_color = self.accent_color;
 
-        let cell = |x: i32, w: i32, text: &str, font: i32, color: [u8; 4], bold: bool| {
-            if w <= 0 {
+        let cell = |rect: RECT, text: &str, font: i32, color: [u8; 4], bold: bool| {
+            if rect.right - rect.left <= 0 {
                 return;
             }
-            let mut rect = RECT {
-                left: x,
-                top: item.rcItem.top,
-                right: x + w,
-                bottom: item.rcItem.bottom,
-            };
-            draw_string(&self.fonts, hdc, text, &mut rect, font, color, bold, false);
+            draw_string(&self.fonts, hdc, text, &mut { rect }, font, color, bold, false);
         };
 
         if index == 0 {
             // Header row.
-            cell(col_x[0], time_w, "TIME", header_font, header_color, true);
-            cell(col_x[1], state_w, "", header_font, header_color, true);
-            cell(title_x, title_w, "TITLE", header_font, header_color, true);
-            cell(artist_x, artist_w, "ARTIST", header_font, header_color, true);
-            cell(album_x, album_w, "ALBUM", header_font, header_color, true);
-            cell(source_x, source_w, "SOURCE", header_font, header_color, true);
+            for (column, rect) in HISTORY_COLUMNS.iter().zip(&rects) {
+                cell(*rect, column.label, header_font, header_color, true);
+            }
         } else if let Some(entry) = self.history.entries.get(index - 1) {
-            let status = match entry.state {
-                PlaybackState::Playing => "▶",
-                PlaybackState::Paused => "‖",
-                PlaybackState::Stopped => "■",
-                PlaybackState::NowPlaying => "♪",
-            };
-            let artist = if entry.track.artist.trim().is_empty() {
-                ""
-            } else {
-                &entry.track.artist
-            };
             // Rows whose state reached the pill are highlighted in pink (the
             // accent color) with bold text; redundant re-reports and rejected
             // sessions render muted, so the bright rows are exactly what the
@@ -3969,12 +3941,10 @@ impl MainWindowState {
             } else {
                 ([0x66, 0x66, 0x66, 0xFF], false)
             };
-            cell(col_x[0], time_w, &entry.at_label, row_font, row_color, bold);
-            cell(col_x[1], state_w, status, row_font, row_color, bold);
-            cell(title_x, title_w, &entry.track.title, row_font, row_color, bold);
-            cell(artist_x, artist_w, artist, row_font, row_color, bold);
-            cell(album_x, album_w, &entry.track.album, row_font, row_color, bold);
-            cell(source_x, source_w, &entry.track.source_app, row_font, row_color, bold);
+            for (col, rect) in rects.iter().enumerate() {
+                let text = history_cell_text(entry, col);
+                cell(*rect, &text, row_font, row_color, bold);
+            }
         }
     }
 
@@ -4364,6 +4334,175 @@ fn history_row(track: &TrackInfo, at: DateTime<Local>, state: PlaybackState) -> 
         row.push_str(&format!(" — {}", track.album));
     }
     row
+}
+
+/// One history table column. `fixed_w` (logical px) wins when set; otherwise
+/// the column takes `share` of the flexible width left after the fixed
+/// columns and the inter-column gaps, with the final column absorbing the
+/// floor-truncation remainder.
+struct HistoryColumn {
+    /// Header label; also the source for both header strings.
+    label: &'static str,
+    fixed_w: Option<f32>,
+    share: f32,
+}
+
+/// The history table's single source of truth: the owner-draw paint, the
+/// per-cell tooltip hit-test, and the header strings all read this slice,
+/// so adding a column cannot desync any of them.
+const HISTORY_COLUMNS: [HistoryColumn; 9] = [
+    HistoryColumn {
+        label: "TIME",
+        fixed_w: Some(78.0),
+        share: 0.0,
+    },
+    HistoryColumn {
+        label: "STATE",
+        fixed_w: Some(30.0),
+        share: 0.0,
+    },
+    HistoryColumn {
+        label: "TITLE",
+        fixed_w: None,
+        share: 0.30,
+    },
+    HistoryColumn {
+        label: "ARTIST",
+        fixed_w: None,
+        share: 0.20,
+    },
+    HistoryColumn {
+        label: "ALBUM",
+        fixed_w: None,
+        share: 0.17,
+    },
+    HistoryColumn {
+        label: "DURATION",
+        fixed_w: Some(52.0),
+        share: 0.0,
+    },
+    HistoryColumn {
+        label: "TRACK",
+        fixed_w: Some(40.0),
+        share: 0.0,
+    },
+    HistoryColumn {
+        label: "GENRE",
+        fixed_w: None,
+        share: 0.13,
+    },
+    HistoryColumn {
+        label: "SOURCE",
+        fixed_w: None,
+        share: 0.0,
+    },
+];
+
+const HISTORY_COL_TIME: usize = 0;
+const HISTORY_COL_STATE: usize = 1;
+
+/// Computes every column's client rect within one listbox row. Reproduces
+/// the historical arithmetic exactly (pad/gap scaling, floor-truncated
+/// proportions, remainder on the last column) so the paint looks unchanged
+/// apart from the added columns; the tooltip hit-test consumes the same
+/// result, so the two can never disagree.
+fn history_column_rects(row: &RECT, scale: f32) -> Vec<RECT> {
+    let pad = (8.0 * scale) as i32;
+    let gap = (4.0 * scale) as i32;
+    let inner_left = row.left + pad;
+    let inner_right = (row.right - pad).max(inner_left);
+
+    let mut widths = vec![0i32; HISTORY_COLUMNS.len()];
+    let mut fixed_total = 0i32;
+    for (index, column) in HISTORY_COLUMNS.iter().enumerate() {
+        if let Some(w) = column.fixed_w {
+            widths[index] = (w * scale) as i32;
+            fixed_total += widths[index];
+        }
+    }
+    let gaps = gap * (HISTORY_COLUMNS.len() as i32 - 1);
+    let flexible = (inner_right - inner_left - fixed_total - gaps).max(0);
+    let mut used = 0i32;
+    for (index, column) in HISTORY_COLUMNS.iter().enumerate() {
+        if column.fixed_w.is_none() && column.share > 0.0 {
+            widths[index] = (flexible as f32 * column.share) as i32;
+            used += widths[index];
+        }
+    }
+    // The last share-less column absorbs the proportion rounding remainder.
+    if let Some(last) = HISTORY_COLUMNS
+        .iter()
+        .rposition(|c| c.fixed_w.is_none() && c.share == 0.0)
+    {
+        widths[last] = (flexible - used).max(0);
+    }
+
+    let mut x = inner_left;
+    widths
+        .into_iter()
+        .map(|w| {
+            // Clamp both edges into the row's padded interior: fixed-width
+            // columns can overrun a narrower-than-needed row, and an
+            // unclamped left edge would invert the rect (right < left).
+            let left = x.min(inner_right);
+            let rect = RECT {
+                left,
+                top: row.top,
+                right: (x + w).min(inner_right),
+                bottom: row.bottom,
+            };
+            x += w + gap;
+            rect
+        })
+        .collect()
+}
+
+/// The header line shown in the row-0 tooltip, derived from the shared
+/// column table so it can never drift from the painted headers.
+fn history_header_line() -> String {
+    HISTORY_COLUMNS.iter().map(|c| c.label).collect::<Vec<_>>().join(" | ")
+}
+
+/// A data cell's full (untruncated) text for painting and for the per-cell
+/// tooltip. An absent field yields an empty string: the paint skips it, and
+/// the tooltip answers "no text" rather than showing a stale neighbor value.
+fn history_cell_text(entry: &HistoryEntry, col: usize) -> String {
+    match col {
+        HISTORY_COL_TIME => entry.at_label.clone(),
+        HISTORY_COL_STATE => match entry.state {
+            PlaybackState::Playing => "▶",
+            PlaybackState::Paused => "‖",
+            PlaybackState::Stopped => "■",
+            PlaybackState::NowPlaying => "♪",
+        }
+        .to_string(),
+        2 => entry.track.title.clone(),
+        3 => {
+            if entry.track.artist.trim().is_empty() {
+                String::new()
+            } else {
+                entry.track.artist.clone()
+            }
+        }
+        4 => entry.track.album.clone(),
+        5 => entry
+            .track
+            .duration_secs
+            .map(crate::events::format_duration_secs)
+            .unwrap_or_default(),
+        6 => match (entry.track.track_number, entry.track.track_count) {
+            (Some(n), Some(c)) => format!("{n}/{c}"),
+            _ => String::new(),
+        },
+        7 => entry.track.genre.clone().unwrap_or_default(),
+        _ => {
+            if entry.track.source_app.trim().is_empty() {
+                String::new()
+            } else {
+                entry.track.source_app.clone()
+            }
+        }
+    }
 }
 
 /// Last time a persistent artwork-blit failure was logged, so a broken blit
@@ -7443,6 +7582,99 @@ mod tests {
             genre: None,
             ..TrackInfo::default()
         }
+    }
+
+    #[test]
+    fn history_column_rects_matches_paint_arithmetic_and_collapses_gracefully() {
+        // 96 DPI, wide row: fixed columns take their scaled width, the
+        // flexible shares divide the remainder proportionally, and the last
+        // share-less column (SOURCE) absorbs the rounding remainder. Seams
+        // must tile exactly: each column starts where the previous one ended
+        // plus the gap.
+        let scale = 1.0f32;
+        let row = RECT {
+            left: 0,
+            top: 0,
+            right: 1200,
+            bottom: 18,
+        };
+        let rects = history_column_rects(&row, scale);
+        assert_eq!(rects.len(), HISTORY_COLUMNS.len());
+        let gap = (4.0 * scale) as i32;
+        for pair in rects.windows(2) {
+            assert_eq!(pair[0].right + gap, pair[1].left, "columns must tile with the gap");
+        }
+        assert_eq!((rects[0].left - row.left), (8.0 * scale) as i32);
+        assert_eq!(row.right - rects.last().unwrap().right, (8.0 * scale) as i32);
+        let duration = &HISTORY_COLUMNS[5];
+        assert_eq!(duration.label, "DURATION", "column order sanity");
+        // The DURATION rect's width equals its scaled fixed width.
+        assert_eq!(
+            rects[5].right - rects[5].left,
+            (52.0 * scale) as i32,
+            "fixed column width is exact"
+        );
+
+        // Degenerate row: narrower than pad+gap alone — every flexible
+        // column collapses to zero width instead of going negative.
+        let tiny = RECT {
+            left: 0,
+            top: 0,
+            right: 12,
+            bottom: 18,
+        };
+        let rects = history_column_rects(&tiny, scale);
+        for (index, rect) in rects.iter().enumerate() {
+            if HISTORY_COLUMNS[index].fixed_w.is_none() {
+                assert_eq!(rect.right - rect.left, 0, "flexible column {index} collapses");
+            }
+            assert!(rect.right >= rect.left, "rect {index} never inverts");
+        }
+
+        // Extreme DPI: the same invariants hold at 200%.
+        let rects = history_column_rects(&row, 2.0);
+        for pair in rects.windows(2) {
+            assert_eq!(pair[0].right + (4.0 * 2.0) as i32, pair[1].left, "tiled at 2x");
+        }
+    }
+
+    #[test]
+    fn history_cell_text_covers_every_column_and_skips_absent_fields() {
+        let mut entry = HistoryEntry {
+            at: Local::now(),
+            at_label: "12:34:56".into(),
+            track: track("Song"),
+            state: PlaybackState::NowPlaying,
+            accepted: true,
+        };
+        entry.track.duration_secs = Some(225);
+        entry.track.track_number = Some(3);
+        entry.track.track_count = Some(12);
+        entry.track.genre = Some("Synthwave".into());
+        assert_eq!(history_cell_text(&entry, HISTORY_COL_TIME), "12:34:56");
+        // The STATE cell paints the glyph; words live only in tooltips that
+        // need them elsewhere.
+        assert_eq!(history_cell_text(&entry, HISTORY_COL_STATE), "♪");
+        assert_eq!(history_cell_text(&entry, 2), "Song");
+        assert_eq!(history_cell_text(&entry, 5), "3:45");
+        assert_eq!(history_cell_text(&entry, 6), "3/12");
+        assert_eq!(history_cell_text(&entry, 7), "Synthwave");
+        // Absent fields render empty so paint skips and the tooltip can
+        // answer "no text" rather than a stale neighbor value.
+        entry.track.duration_secs = None;
+        entry.track.genre = None;
+        assert_eq!(history_cell_text(&entry, 5), "");
+        assert_eq!(history_cell_text(&entry, 7), "");
+        // Out-of-range column falls back to the source app (last column).
+        assert_eq!(history_cell_text(&entry, 99), "Spotify");
+    }
+
+    #[test]
+    fn history_header_line_lists_all_columns_in_order() {
+        assert_eq!(
+            history_header_line(),
+            "TIME | STATE | TITLE | ARTIST | ALBUM | DURATION | TRACK | GENRE | SOURCE"
+        );
     }
 
     #[test]
