@@ -2951,9 +2951,15 @@ impl OverlayState {
         }
         // Persistent-compact: when the cursor leaves the pill, restart the
         // fade timer so the pill fades from full opacity after another
-        // duration_ms idle period.
+        // duration_ms idle period. Skipped while an auto-hide is armed
+        // (persistent_collapse_on_dismiss): the pending hide over a
+        // fullscreen/listed foreground must land on its deferred schedule —
+        // letting this restart clobber the deadline delayed the hide by a
+        // full extra duration (the reported "switch to VLC doesn't hide
+        // after time").
         if self.config.overlay.layout == LayoutMode::PersistentCompact
             && !cursor_over
+            && !self.persistent_collapse_on_dismiss
             && self.hover_leave_at == Some(now)
         {
             self.dismiss_at = Some(now + Duration::from_millis(self.config.overlay.duration_ms.max(500)));
@@ -6077,6 +6083,57 @@ mod tests {
         assert!(
             state.held_content.is_some(),
             "the content must be held for the future resume"
+        );
+    }
+
+    #[test]
+    fn hide_for_auto_compact_hides_young_pill_at_deadline_for_listed_app() {
+        // The reported flow: persistent pill INSIDE its display window when
+        // the foreground switches to a listed app ("vlc"). The switch defers
+        // the auto-hide to the dismiss deadline; once that deadline fires,
+        // the pill must reach Hidden — not linger for another full duration.
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        config.behavior.auto_compact_sources = vec!["vlc".into()];
+        let mut state = OverlayState::new(config, EventQueue::default());
+        state.test_cursor_over = Some(false);
+        state.content = Some(MediaEvent::TrackChanged(track_for("spotify", "Song", "Artist")));
+        state.phase = Phase::Shown;
+        state.dismiss_at = Some(Instant::now() + Duration::from_millis(300));
+
+        // Foreground switches to VLC (no fullscreen — name match only).
+        state.test_fg_verdict = Some(ForegroundVerdict {
+            exe: Some("vlc.exe".into()),
+            fullscreen: false,
+        });
+        state.on_foreground_change();
+
+        assert!(
+            !matches!(state.phase, Phase::Hidden),
+            "a young pill must defer the auto-hide to its deadline"
+        );
+        assert!(
+            state.persistent_collapse_on_dismiss,
+            "the listed-app match must arm collapse-on-dismiss"
+        );
+
+        // Deadline fires: collapse leg, then hide(). Pump ticks well past a
+        // full duration so the assertion distinguishes "hides on schedule"
+        // from "lingers another duration_ms".
+        state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
+        let mut hid_at: Option<usize> = None;
+        for i in 0..170 {
+            state.tick();
+            if matches!(state.phase, Phase::Hidden) {
+                hid_at = Some(i);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let iterations = hid_at.expect("the pill must reach Hidden after the deferred deadline over a listed app");
+        assert!(
+            iterations < 24,
+            "the hide must land on the deferred schedule (~1.2 s), not a full extra duration; took {iterations} ticks"
         );
     }
 
