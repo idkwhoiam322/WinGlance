@@ -389,6 +389,30 @@ impl Drop for TextScratch {
     }
 }
 
+/// Builds the pill's accessible name from its resolved text: "title —
+/// artist (source)", with empty parts dropped and a source-name fallback
+/// when both are empty. Shared by the UIA name cell, the name-changed
+/// event payload, and the track-change notification display string ("Now
+/// playing: …" is prefixed at the raise site), so all three can never
+/// drift apart.
+fn pill_accessible_name(text: &PillText) -> String {
+    let mut parts = Vec::new();
+    if !text.title.trim().is_empty() {
+        parts.push(text.title.trim().to_string());
+    }
+    if !text.artist.trim().is_empty() {
+        parts.push(text.artist.trim().to_string());
+    }
+    let joined = parts.join(" — ");
+    if joined.is_empty() {
+        text.source_app.clone()
+    } else if !text.source_app.trim().is_empty() {
+        format!("{joined} ({})", text.source_app.trim())
+    } else {
+        joined
+    }
+}
+
 /// Pre-rendered text pieces of the pill currently on screen, built once per
 /// content change so animation frames neither rebuild the meta line nor
 /// clone the cached TrackInfo. The draw path takes it out of the state and
@@ -2390,23 +2414,7 @@ impl OverlayState {
         // exactly what the pill shows. A state pill with no cached track
         // (the pill then renders the source-name layout) falls back to
         // naming the source app.
-        let name = self.pill_text.as_ref().map(|text| {
-            let mut parts = Vec::new();
-            if !text.title.trim().is_empty() {
-                parts.push(text.title.trim().to_string());
-            }
-            if !text.artist.trim().is_empty() {
-                parts.push(text.artist.trim().to_string());
-            }
-            let joined = parts.join(" — ");
-            if joined.is_empty() {
-                text.source_app.clone()
-            } else if !text.source_app.trim().is_empty() {
-                format!("{joined} ({})", text.source_app.trim())
-            } else {
-                joined
-            }
-        });
+        let name = self.pill_text.as_ref().map(pill_accessible_name);
         // The state-pill source-name fallback: no cached track, so the pill
         // text is None but the pill still names its source app on screen.
         let name = name.or_else(|| match &self.content {
@@ -2430,7 +2438,14 @@ impl OverlayState {
             *guard = name.clone();
             drop(guard);
             if changed && Self::announces_pill_name_change(&self.content) {
-                crate::accessibility::raise_pill_name_changed(self.hwnd, cell, old, name);
+                crate::accessibility::raise_pill_name_changed(self.hwnd, cell, old, name.clone());
+                // The notification event is what active screen readers speak
+                // without focus; the property-changed event above serves
+                // clients already tracking the element. Both announce only a
+                // genuine track change (see announces_pill_name_change).
+                if let Some(display) = name.clone() {
+                    crate::accessibility::raise_pill_track_notification(self.hwnd, cell, display);
+                }
             }
         }
     }
@@ -4338,6 +4353,33 @@ mod tests {
     // Test-only imports: the bin compilation must not see these (the moved
     // modules and the windows APIs below are used only by the tests).
     use super::fullscreen::{DisplayInfo, auto_source_matches, rect_covers_monitor, resolve_target};
+
+    fn pill_text(title: &str, artist: &str, source: &str) -> PillText {
+        PillText {
+            title: title.into(),
+            artist: artist.into(),
+            source_app: source.into(),
+            app_icon: None,
+            meta_clock: false,
+            meta: String::new(),
+        }
+    }
+
+    #[test]
+    fn pill_accessible_name_drops_empty_parts_and_falls_back_to_source() {
+        assert_eq!(
+            pill_accessible_name(&pill_text("Song", "Artist", "Spotify")),
+            "Song — Artist (Spotify)"
+        );
+        // Empty artist drops the separator entirely.
+        assert_eq!(
+            pill_accessible_name(&pill_text("Song", "", "Spotify")),
+            "Song (Spotify)"
+        );
+        // Both empty: the source name is the whole announcement.
+        assert_eq!(pill_accessible_name(&pill_text("", " ", "")), "");
+    }
+
     use super::morph::{
         EXPAND_SPRING, animation_duration_with, art_edge_gate, compact_alpha, compact_metrics, compact_size,
         compact_title_viewport, content_size, dim_color, expanded_alpha, lag_progress, morph_art_tile, morph_icon_pos,

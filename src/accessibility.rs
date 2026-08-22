@@ -35,11 +35,13 @@ use windows::Win32::UI::Accessibility::{
     IRawElementProviderFragmentRoot, IRawElementProviderFragmentRoot_Impl, IRawElementProviderSimple,
     IRawElementProviderSimple_Impl, IToggleProvider, IToggleProvider_Impl, NavigateDirection,
     NavigateDirection_FirstChild, NavigateDirection_LastChild, NavigateDirection_NextSibling, NavigateDirection_Parent,
-    NavigateDirection_PreviousSibling, ProviderOptions_ServerSideProvider, StructureChangeType_ChildrenInvalidated,
-    ToggleState_Off, ToggleState_On, UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId,
-    UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
-    UIA_PaneControlTypeId, UIA_TextControlTypeId, UIA_TogglePatternId, UiaAppendRuntimeId, UiaHostProviderFromHwnd,
-    UiaRaiseAutomationPropertyChangedEvent, UiaRaiseStructureChangedEvent, UiaRect, UiaReturnRawElementProvider,
+    NavigateDirection_PreviousSibling, NotificationKind_ItemAdded, NotificationProcessing_MostRecent,
+    ProviderOptions_ServerSideProvider, StructureChangeType_ChildrenInvalidated, ToggleState_Off, ToggleState_On,
+    UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId, UIA_IsEnabledPropertyId,
+    UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId, UIA_PATTERN_ID, UIA_PROPERTY_ID, UIA_PaneControlTypeId,
+    UIA_TextControlTypeId, UIA_TogglePatternId, UiaAppendRuntimeId, UiaHostProviderFromHwnd,
+    UiaRaiseAutomationPropertyChangedEvent, UiaRaiseNotificationEvent, UiaRaiseStructureChangedEvent, UiaRect,
+    UiaReturnRawElementProvider,
 };
 use windows::core::implement;
 use windows::core::{BSTR, Error, IUnknown, Interface};
@@ -543,6 +545,37 @@ pub(crate) fn raise_pill_name_changed(
     let new = VARIANT::from(BSTR::from(new.unwrap_or_default()));
     if let Err(error) = unsafe { UiaRaiseAutomationPropertyChangedEvent(&provider, UIA_NamePropertyId, &old, &new) } {
         log::debug!("raising the pill name-changed UIA event failed: {error}");
+    }
+}
+
+/// Raises a UIA notification event for a genuine track change — the modern
+/// (Win10 1709+), documented mechanism that makes a screen reader announce
+/// new content without any focus or activation, the aria-live equivalent.
+/// The property-changed event above only reaches clients already tracking
+/// this element; the notification reaches active readers directly. Same
+/// fresh-provider-per-event pattern, best-effort like every raise here,
+/// and passive: announcement only, never focus or activation. Processing
+/// is `MostRecent` (never interrupts the reader's current utterance) with
+/// a stable activity id so clients can filter or dedup.
+pub(crate) fn raise_pill_track_notification(hwnd: HWND, cell: &Arc<Mutex<Option<String>>>, track_name: String) {
+    if hwnd.0.is_null() || track_name.is_empty() {
+        return;
+    }
+    // Reuse the pill's existing name-provider element: clients already watch
+    // it, and its HostRawElementProvider merge keeps the notification
+    // attached to the overlay window's own UIA surface.
+    let provider = pill_name_provider(hwnd, Arc::clone(cell));
+    let display_string = format!("Now playing: {track_name}");
+    if let Err(error) = unsafe {
+        UiaRaiseNotificationEvent(
+            &provider,
+            NotificationKind_ItemAdded,
+            NotificationProcessing_MostRecent,
+            &BSTR::from(display_string.as_str()),
+            &BSTR::from("WinGlance.TrackChanged"),
+        )
+    } {
+        log::debug!("raising the pill track notification UIA event failed: {error}");
     }
 }
 
