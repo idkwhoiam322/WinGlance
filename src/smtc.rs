@@ -382,8 +382,10 @@ struct ListenerState {
     /// wedged-read exclusion (an async read that timed out — see
     /// `READ_ASYNC_TIMEOUT`). Both entries mean the same thing downstream:
     /// `session_source_allowed` returns false, so the source's sessions are
-    /// never read, subscribed, or emitted.
-    excluded_sources: HashMap<String, Instant>,
+    /// never read, subscribed, or emitted. Shared across worker generations
+    /// (see `SharedExclusions`): a supervisor restart must not reset the
+    /// exclusions the previous worker paid a 10 s read for.
+    excluded_sources: SharedExclusions,
     /// Keys of rejected sessions already reported to the history, so a
     /// rejected session is logged once per appearance instead of on every
     /// re-sync (the 2-second poll re-lists all sessions). Bounded by
@@ -490,6 +492,18 @@ pub(crate) struct ListenerSeed {
     pub(crate) debounce_ms: u64,
 }
 
+/// Exclusion map (churn cool-downs + wedged-read exclusions) shared across
+/// worker generations: created in `main` and handed to every worker the
+/// supervisor spawns, so a replacement worker does not re-pay a fresh
+/// `READ_ASYNC_TIMEOUT` read for every source its predecessor already
+/// excluded — the exclusion survives the restart it exists to bound.
+pub(crate) type SharedExclusions = Arc<Mutex<HashMap<String, Instant>>>;
+
+/// Creates the process-wide shared exclusion map (see `SharedExclusions`).
+pub(crate) fn shared_exclusions() -> SharedExclusions {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 pub struct SmtcListener {
     output: SyncSender<Arc<MediaEvent>>,
     /// Shared in-flight artwork byte counter (see `MAX_IN_FLIGHT_ARTWORK_BYTES`
@@ -533,6 +547,10 @@ pub struct SmtcListener {
     /// cell, so a session recreated after a restart still compares against
     /// what the user actually sees.
     now_showing: Arc<Mutex<Option<String>>>,
+    /// Shared exclusion map (see `ListenerState::excluded_sources`).
+    /// Survives worker restarts: exclusions a predecessor paid for carry
+    /// into the replacement worker.
+    excluded_sources: SharedExclusions,
 }
 
 impl SmtcListener {
@@ -547,6 +565,7 @@ impl SmtcListener {
         my_generation: u64,
         shutdown: Arc<AtomicBool>,
         now_showing: Arc<Mutex<Option<String>>>,
+        excluded_sources: SharedExclusions,
         control_tx: SyncSender<Signal>,
         control_rx: Arc<Mutex<mpsc::Receiver<Signal>>>,
         control_mailbox: Arc<Mutex<ControlMailbox>>,
@@ -564,6 +583,7 @@ impl SmtcListener {
             my_generation,
             shutdown,
             now_showing,
+            excluded_sources,
         }
     }
 
@@ -597,6 +617,7 @@ impl SmtcListener {
             self.my_generation,
             self.shutdown,
             self.now_showing,
+            self.excluded_sources,
             self.control_mailbox,
         );
 
@@ -627,6 +648,7 @@ impl ListenerState {
         my_generation: u64,
         shutdown: Arc<AtomicBool>,
         now_showing: Arc<Mutex<Option<String>>>,
+        excluded_sources: SharedExclusions,
         control_mailbox: Arc<Mutex<ControlMailbox>>,
     ) -> Self {
         Self {
@@ -646,7 +668,7 @@ impl ListenerState {
             last_heap_compact: Instant::now(),
             last_session_check: Instant::now(),
             churn: HashMap::new(),
-            excluded_sources: HashMap::new(),
+            excluded_sources,
             rejected_seen: HashSet::new(),
             ignored_seen: HashSet::new(),
             terminal_pending: HashMap::new(),
@@ -1793,7 +1815,10 @@ impl ListenerState {
         // reappearance is reported again.
         self.rejected_seen.retain(|key| alive.contains(key));
         self.ignored_seen.retain(|key| alive.contains(key));
-        self.excluded_sources.retain(|_, until| *until > Instant::now());
+        self.excluded_sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|_, until| *until > Instant::now());
         // Keep the picker's candidate list in sync with what is actually
         // open, including apps whose sessions were rejected: checking them
         // is how the user adds them to the allow-list. Dedup and cap it
@@ -2073,10 +2098,13 @@ impl ListenerState {
     /// every source.
     fn exclude_wedged_source(&mut self, session: &GlobalSystemMediaTransportControlsSession) {
         let source = read_source_app(session);
-        self.excluded_sources.insert(
-            source.clone(),
-            Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
-        );
+        self.excluded_sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                source.clone(),
+                Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
+            );
         warn!(
             "source {source} did not answer an SMTC read within {READ_ASYNC_TIMEOUT:?}; excluding it from tracking for {CHURN_COOLDOWN_MS}ms"
         );
@@ -2129,6 +2157,8 @@ impl ListenerState {
     /// wedged-read exclusion).
     fn source_on_cooldown(&self, source: &str) -> bool {
         self.excluded_sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(source)
             .is_some_and(|until| *until > Instant::now())
     }
@@ -2153,6 +2183,8 @@ impl ListenerState {
         }
         if events.len() >= CHURN_THRESHOLD && !self.source_on_cooldown(source) {
             self.excluded_sources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(source.to_string(), now + Duration::from_millis(CHURN_COOLDOWN_MS));
             warn!(
                 "source {source} is churning sessions ({CHURN_THRESHOLD}+ new sessions in {CHURN_WINDOW_MS}ms); excluding it from tracking for {CHURN_COOLDOWN_MS}ms"
@@ -4729,6 +4761,13 @@ mod tests {
     /// the null manager's `IUnknown` Drop calls `Release` on a null pointer,
     /// which crashes — the test process exit reclaims everything instead.
     fn listener_state_for_exclusion_tests() -> ListenerState {
+        listener_state_with_exclusions(shared_exclusions())
+    }
+
+    /// Same as `listener_state_for_exclusion_tests`, but with a caller-owned
+    /// shared exclusion map — the seam that pins the cross-generation
+    /// lifetime of exclusions.
+    fn listener_state_with_exclusions(excluded_sources: SharedExclusions) -> ListenerState {
         let (output, _rx) = mpsc::sync_channel(1);
         let (signal_tx, _signal_rx) = mpsc::sync_channel(1);
         ListenerState::new(
@@ -4746,6 +4785,7 @@ mod tests {
             0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
+            excluded_sources,
             Arc::new(Mutex::new(ControlMailbox::default())),
         )
     }
@@ -4773,6 +4813,7 @@ mod tests {
             0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(ControlMailbox::default())),
         );
         let (raw, normalized) = state.cached_allowed.as_ref().expect("seed cached");
@@ -4808,6 +4849,7 @@ mod tests {
             0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(ControlMailbox::default())),
         );
         state
@@ -4872,6 +4914,7 @@ mod tests {
             0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
+            shared_exclusions(),
             mailbox.clone(),
         );
         // Fill the queue exactly to capacity: the push that fails proves the
@@ -4922,6 +4965,7 @@ mod tests {
             0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
+            shared_exclusions(),
             mailbox.clone(),
         );
         mailbox
@@ -4972,6 +5016,7 @@ mod tests {
             0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
+            shared_exclusions(),
             mailbox.clone(),
         );
         live_generation.store(1, Ordering::SeqCst);
@@ -5005,8 +5050,46 @@ mod tests {
         // and the exclusion is not extended (the guard prevents re-insert).
         state.record_churn("spotify");
         assert!(state.source_on_cooldown("spotify"));
-        assert_eq!(state.excluded_sources.len(), 1, "one exclusion per source");
+        assert_eq!(
+            state
+                .excluded_sources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "one exclusion per source"
+        );
         std::mem::forget(state);
+    }
+
+    #[test]
+    fn exclusions_survive_into_a_replacement_worker() {
+        // The exclusion map is created in `main` and shared across worker
+        // generations: a supervisor restart must not reset the exclusions
+        // the previous worker paid for — a replacement worker re-excluding
+        // a wedged source costs a fresh READ_ASYNC_TIMEOUT read each time.
+        let shared = shared_exclusions();
+        let predecessor = listener_state_with_exclusions(shared.clone());
+        {
+            let mut map = predecessor
+                .excluded_sources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            map.insert(
+                "spotify".to_string(),
+                Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
+            );
+        }
+        // The replacement worker is constructed with the same cell (exactly
+        // how `main` hands it to every spawn) and must observe the
+        // predecessor's exclusion without any write of its own.
+        let replacement = listener_state_with_exclusions(shared.clone());
+        assert!(
+            replacement.source_on_cooldown("spotify"),
+            "an exclusion written by the predecessor worker must gate the replacement"
+        );
+        std::mem::forget(predecessor);
+        std::mem::forget(replacement);
     }
 
     #[test]
@@ -5015,14 +5098,20 @@ mod tests {
         // path — insert into the same `excluded_sources` map, so the expiry
         // semantics are shared: a source whose deadline has passed is
         // re-admitted and re-tested.
-        let mut state = listener_state_for_exclusion_tests();
-        state.excluded_sources.insert(
-            "spotify".to_string(),
-            Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
-        );
+        let state = listener_state_for_exclusion_tests();
+        state
+            .excluded_sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                "spotify".to_string(),
+                Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
+            );
         assert!(state.source_on_cooldown("spotify"), "a live exclusion gates the source");
         state
             .excluded_sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert("spotify".to_string(), Instant::now() - Duration::from_millis(1));
         assert!(
             !state.source_on_cooldown("spotify"),

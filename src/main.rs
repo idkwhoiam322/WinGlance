@@ -954,6 +954,12 @@ fn main() -> Result<()> {
     // compares against what the user actually sees.
     let now_showing: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let now_showing_supervisor = now_showing.clone();
+    // Churn/wedged-read exclusions, shared across worker generations: a
+    // replacement worker must not re-pay a fresh 10 s read for every source
+    // its predecessor already excluded — the exclusion survives the
+    // restart it exists to bound.
+    let exclusions = smtc::shared_exclusions();
+    let exclusions_supervisor = exclusions.clone();
     // Supervisor: runs the SMTC worker and restarts it when it stalls (a WinRT
     // call can hang under heavy session churn, which would otherwise silently
     // stop all events and pills). The hung worker thread is leaked; a fresh
@@ -1011,6 +1017,7 @@ fn main() -> Result<()> {
                 let control_rx_worker = supervisor_control_rx.clone();
                 let control_mailbox_worker = supervisor_control_mailbox.clone();
                 let now_showing_worker = now_showing_supervisor.clone();
+                let exclusions_worker = exclusions_supervisor.clone();
                 let worker_started = Instant::now();
                 // A replacement worker starts with a fresh heartbeat:
                 // the supervisor may still be reading the previous worker's
@@ -1054,6 +1061,7 @@ fn main() -> Result<()> {
                             my_generation,
                             worker_shutdown,
                             now_showing_worker,
+                            exclusions_worker,
                             control_tx_worker,
                             control_rx_worker,
                             control_mailbox_worker,
