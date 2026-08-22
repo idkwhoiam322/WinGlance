@@ -3,7 +3,8 @@
 use super::OverlayPos;
 use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, VerticalPosition};
 use log::{debug, warn};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
@@ -254,6 +255,56 @@ pub(crate) fn resolve_target(
             }
         }
     }
+}
+
+/// Remembered device names for `MonitorMode::Index(n)` picks. Windows can
+/// reorder `EnumDisplayMonitors` order across dock/driver events while the
+/// counts stay in range, which would silently retarget an index-configured
+/// pill onto a different physical display: the first resolution of an index
+/// records the picked device's name, and later resolutions prefer that same
+/// device wherever it moved. Falls back to the raw index when the remembered
+/// device is gone. In-memory only — across restarts the index keeps its
+/// documented enumeration-order meaning.
+static INDEXED_DISPLAY_NAMES: LazyLock<Mutex<HashMap<u32, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// `resolve_target` with the sticky device-name memory for index picks (see
+/// `INDEXED_DISPLAY_NAMES`); every other mode resolves identically.
+pub(super) fn resolve_target_sticky(
+    mode: MonitorMode,
+    displays: &[DisplayInfo],
+    foreground_nearest: Option<usize>,
+) -> Option<usize> {
+    let MonitorMode::Index(index) = mode else {
+        return resolve_target(mode, displays, foreground_nearest);
+    };
+    let mut remembered = INDEXED_DISPLAY_NAMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(name) = remembered.get(&index) {
+        if let Some(pos) = displays.iter().position(|display| &display.name == name) {
+            return Some(pos);
+        }
+    }
+    let picked = resolve_target(mode, displays, foreground_nearest)?;
+    // Record only genuine index hits — never a primary fallback, so the
+    // memory cannot glue an unplugged index to the primary and the setting
+    // still reapplies when the display returns. Never overwritten: the
+    // remembered device is the identity of the pick, by design.
+    if index as usize == picked {
+        if let Some(display) = displays.get(picked) {
+            remembered.entry(index).or_insert_with(|| display.name.clone());
+        }
+    }
+    Some(picked)
+}
+
+/// Test seam: forgets every remembered index→device association.
+#[cfg(test)]
+pub(super) fn forget_indexed_displays() {
+    INDEXED_DISPLAY_NAMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }
 
 /// Warns about a configured-but-unattached display index, at most once per

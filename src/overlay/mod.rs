@@ -49,7 +49,7 @@ pub(crate) use render::contrast_ratio;
 use fullscreen::{
     DisplayInfo, ForegroundVerdict, TargetMonitor, anchor_unchanged, decide_layout, effective_position_rect,
     foreground_fullscreens_target, foreground_monitor_index, log_target_once, monitor_dpi, placement,
-    refresh_period_ms, resolve_target, window_is_fullscreen,
+    refresh_period_ms, resolve_target, resolve_target_sticky, window_is_fullscreen,
 };
 use morph::{
     ENTRANCE_GROW, HoverExpand, HoverStep, HoverTick, MorphDirection, MorphProgress, animation_duration, bounce_scale,
@@ -765,7 +765,7 @@ pub(crate) fn dpi_for_position(hwnd: HWND, compact: bool) -> u32 {
     };
     let displays = enumerate_displays_cached();
     let foreground_nearest = foreground_monitor_index(&displays);
-    resolve_target(position.monitor, &displays, foreground_nearest)
+    resolve_target_sticky(position.monitor, &displays, foreground_nearest)
         .map(|index| monitor_dpi(displays[index].handle))
         .unwrap_or(96)
 }
@@ -3335,7 +3335,7 @@ impl OverlayState {
     /// `target` against an explicit display snapshot (pure core, so the
     /// compact-monitor selection is testable without live displays).
     fn target_on(&self, displays: &[DisplayInfo], foreground_nearest: Option<usize>) -> Option<TargetMonitor> {
-        let index = resolve_target(self.active_pos().monitor, displays, foreground_nearest)?;
+        let index = resolve_target_sticky(self.active_pos().monitor, displays, foreground_nearest)?;
         let display = &displays[index];
         let target = TargetMonitor {
             handle: display.handle,
@@ -11643,6 +11643,30 @@ mod tests {
         state.scroll[0].measured_w = 77;
         state.refresh_fonts(144);
         assert_eq!(state.scroll[0].measured_w, 77);
+    }
+
+    #[test]
+    fn an_indexed_monitor_keeps_its_device_across_a_reorder() {
+        super::fullscreen::forget_indexed_displays();
+        let displays = vec![fake_display(1, true), fake_display(2, false)];
+        // First resolution of Index(1) remembers DISPLAY2 by name.
+        assert_eq!(resolve_target_sticky(MonitorMode::Index(1), &displays, None), Some(1));
+        // A dock/driver event reorders enumeration (DISPLAY2 first): the
+        // remembered device wins over the raw index.
+        let reordered = vec![fake_display(2, false), fake_display(1, true)];
+        assert_eq!(
+            resolve_target_sticky(MonitorMode::Index(1), &reordered, None),
+            Some(0),
+            "the remembered device must win over the raw index after a reorder"
+        );
+        // The remembered display unplugged: the raw index governs again —
+        // here out of range, so the primary fallback applies.
+        let gone = vec![fake_display(3, true)];
+        assert_eq!(
+            resolve_target_sticky(MonitorMode::Index(1), &gone, None),
+            Some(0),
+            "a gone device falls back to the raw index resolution (primary here)"
+        );
     }
 
     #[test]
