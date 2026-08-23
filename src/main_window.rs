@@ -34,8 +34,9 @@ use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BeginPaint, CLEARTYPE_QUALITY,
     CLIP_DEFAULT_PRECIS, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOWFRAME, COLOR_WINDOWTEXT,
     CreateCompatibleDC, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DeleteDC, EndPaint,
-    FF_DONTCARE, FillRect, FrameRect, GetStockObject, GetSysColor, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ,
-    OUT_DEFAULT_PRECIS, PAINTSTRUCT, SYS_COLOR_INDEX, ScreenToClient, SetBkColor, SetTextColor,
+    FF_DONTCARE, FillRect, FrameRect, GetMonitorInfoW, GetStockObject, GetSysColor, HBITMAP, HBRUSH, HDC, HFONT,
+    HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SYS_COLOR_INDEX,
+    ScreenToClient, SetBkColor, SetTextColor,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard};
@@ -49,9 +50,9 @@ use windows::Win32::UI::Accessibility::{
     UiaRaiseAutomationPropertyChangedEvent, UiaReturnRawElementProvider, UiaRootObjectId,
 };
 use windows::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, NMHDR, NMTTDISPINFOW, ODS_SELECTED, SetScrollInfo, ShowScrollBar, TOOLTIPS_CLASSW, TTF_SUBCLASS,
-    TTM_ADDTOOLW, TTM_DELTOOLW, TTM_SETMAXTIPWIDTH, TTM_SETTOOLINFOW, TTN_GETDISPINFOW, TTS_ALWAYSTIP, TTS_NOPREFIX,
-    WM_MOUSELEAVE,
+    DRAWITEMSTRUCT, NMHDR, NMTTDISPINFOW, ODS_SELECTED, SetScrollInfo, ShowScrollBar, TOOLTIPS_CLASSW, TTF_ABSOLUTE,
+    TTF_TRACK, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTM_TRACKACTIVATE, TTM_TRACKPOSITION, TTN_GETDISPINFOW, TTS_ALWAYSTIP,
+    TTS_NOPREFIX, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -62,19 +63,21 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFY_ICON_INFOTIP_FLAGS, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
+use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect,
-    GetCursorPos, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindowVisible, IsZoomed, LB_ADDSTRING, LB_DELETESTRING,
-    LB_GETCOUNT, LB_GETITEMHEIGHT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING, LB_SETITEMHEIGHT, LB_SETTOPINDEX,
-    LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, PostQuitMessage, RegisterWindowMessageW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
-    SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLBAR_COMMAND, SCROLLINFO, SIF_PAGE, SIF_POS,
-    SIF_RANGE, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SetForegroundWindow, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_ENDSESSION,
-    WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
-    WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD,
-    WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL,
+    GetCursorPos, GetForegroundWindow, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindowVisible, IsZoomed,
+    LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING, LB_ITEMFROMPOINT,
+    LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED,
+    MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostQuitMessage, RegisterWindowMessageW, SB_BOTTOM,
+    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT,
+    SCROLLBAR_COMMAND, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_DRAWITEM, WM_ENDSESSION, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT,
+    WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+    WS_POPUP, WS_VISIBLE, WS_VSCROLL, WindowFromPoint,
 };
 use windows::core::{BSTR, PCWSTR, PWSTR};
 
@@ -157,6 +160,16 @@ const IDLE_ART_RELEASE_MS: u32 = 30_000;
 /// Win32 LPSTR_TEXTCALLBACK sentinel: fetch tooltip text on demand.
 const LPSTR_TEXTCALLBACK: isize = -1;
 
+/// How often the visible window's hover poll samples the cursor while the
+/// track tooltip pipeline runs. 1 Hz sampling added up to a second of
+/// detection latency on top of the dwell; 200 ms keeps it imperceptible at
+/// a negligible cost (one GetCursorPos and a few comparisons per tick).
+const TOOLTIP_POLL_MS: u32 = 200;
+
+/// Flags shared by the track tool's registration and every activation: the
+/// two TOOLINFOs must agree or the control silently fails to display.
+const TRACK_TOOL_FLAGS: u32 = TTF_TRACK.0 | TTF_ABSOLUTE.0;
+
 /// Tooltip tool id for the Now Playing block (the parent window's own
 /// client area, not a listbox row). Far outside the listbox row-id space so
 /// `(hwnd, u_id)` stays unambiguous within the one shared tooltip control.
@@ -174,6 +187,76 @@ struct ToolInfo {
     lpsz_text: *mut u16,
     l_param: isize,
     lp_reserved: *mut c_void,
+}
+
+/// The TOOLINFO size to declare in `cb_size`: the full struct minus the
+/// `lpReserved` tail (TTTOOLINFOW_V2_SIZE). Without an embedded common-
+/// controls v6 manifest the process runs against comctl32 5.82, whose
+/// TTM_ADDTOOLW silently rejects (returns FALSE, no LastError) a cbSize
+/// covering the reserved member; the V2 size is accepted by both v5.82
+/// and v6. Pinned by `tool_info_layout_tests` so a struct change cannot
+/// silently desync this constant.
+const TOOLINFO_CB_SIZE_V2: u32 = (std::mem::size_of::<ToolInfo>() - std::mem::size_of::<*mut c_void>()) as u32;
+
+#[cfg(test)]
+mod tool_info_layout_tests {
+    use super::*;
+    use windows::Win32::UI::Controls::TTTOOLINFOW;
+
+    /// Pins the hand-rolled ToolInfo against the crate's own TTTOOLINFOW:
+    /// the raw SendMessageW calls depend on this layout matching exactly,
+    /// and a drift here makes the control reject tools without any error
+    /// surfacing at the call site.
+    #[test]
+    fn hand_rolled_tool_info_matches_the_crate_binding() {
+        assert_eq!(
+            std::mem::size_of::<ToolInfo>(),
+            std::mem::size_of::<TTTOOLINFOW>(),
+            "sizes must match or comctl32 reads garbage"
+        );
+        assert_eq!(std::mem::align_of::<ToolInfo>(), std::mem::align_of::<TTTOOLINFOW>());
+        // Round-trip through both types with representative values to prove
+        // field offsets agree.
+        let ours = ToolInfo {
+            cb_size: 72,
+            u_flags: 0x80,
+            hwnd: HWND(0x1234 as _),
+            u_id: 42,
+            rect: RECT {
+                left: 1,
+                top: 2,
+                right: 3,
+                bottom: 4,
+            },
+            hinst: HINSTANCE(0x5678 as _),
+            lpsz_text: 0xFFFF as *mut u16,
+            l_param: -7,
+            lp_reserved: std::ptr::null_mut(),
+        };
+        let theirs = unsafe { &*(std::ptr::addr_of!(ours) as *const TTTOOLINFOW) };
+        assert_eq!(theirs.cbSize, 72);
+        assert_eq!(theirs.uFlags.0, 0x80);
+        assert_eq!(theirs.hwnd.0 as usize, 0x1234);
+        assert_eq!(theirs.uId, 42);
+        assert_eq!(theirs.rect.left, 1);
+        assert_eq!(theirs.rect.bottom, 4);
+        assert_eq!(theirs.hinst.0 as usize, 0x5678);
+        assert_eq!(theirs.lpszText.0 as usize, 0xFFFF);
+        assert_eq!(theirs.lParam.0, -7);
+    }
+
+    /// The V2 size is the struct minus the reserved tail — the only size
+    /// comctl32 5.82 accepts for TTM_ADDTOOLW (v6 accepts both). Must track
+    /// the struct: a field added before lp_reserved shifts the boundary.
+    #[test]
+    fn toolinfo_v2_size_excludes_only_the_reserved_tail() {
+        assert_eq!(
+            TOOLINFO_CB_SIZE_V2 as usize,
+            std::mem::size_of::<ToolInfo>() - std::mem::size_of::<*mut c_void>()
+        );
+        // Sanity on this platform: full 72, V2 64 on x64.
+        assert_eq!(TOOLINFO_CB_SIZE_V2, 64);
+    }
 }
 
 const fn colorref(r: u8, g: u8, b: u8) -> COLORREF {
@@ -1102,6 +1185,10 @@ struct MainWindowState {
     /// `SettingsLayoutKey` so it can never serve a stale layout.
     settings_layout_cache: RefCell<Option<(SettingsLayoutKey, SettingsLayout)>>,
     /// Native TOOLTIPS_CLASS control showing full history details on hover.
+    /// Driven in TRACK MODE: one registered tool, activated by us — the
+    /// control never hit-tests or tracks the mouse (its per-window tracking
+    /// proved unreliable here), the window's own hover poll decides when a
+    /// tooltip is due and where it points.
     tooltip_ctrl: HWND,
     /// UTF-16 buffer backing the native tooltip's `lpszText` pointer. The
     /// tooltip control requests text on demand via `TTN_GETDISPINFO` and reads
@@ -1109,12 +1196,20 @@ struct MainWindowState {
     /// the previous tooltip is already hidden when the next request arrives.
     /// `winutil::wide` appends the trailing NUL.
     tooltip_text: Vec<u16>,
-    /// Currently registered tool range [start, end) in the native tooltip:
-    /// the visible band of listbox rows. Unchanged (count, top, size) skips
-    /// the sync; a scroll only touches the rows that crossed the band.
-    tooltip_range: Option<(usize, usize)>,
-    /// Set when an event batch changed the list; the tooltips are rebuilt once
-    /// per batch instead of once per event.
+    /// The hover state of the manual track-mode tooltip: which listbox row
+    /// (listbox item index, row 0 = header) and column is under the cursor,
+    /// None when over nothing tooltip-worthy. Some(_) means a dwell timer may
+    /// be running or the tooltip is up.
+    tooltip_hover: Option<(usize, usize)>,
+    /// When the current hover began; the tooltip shows after
+    /// history_tooltip_dwell_ms of stillness on the same cell.
+    tooltip_hover_since: Option<Instant>,
+    /// Whether the track tooltip is currently visible.
+    tooltip_shown: bool,
+    /// Whether the single track tool has been registered with the control.
+    track_tool_registered: bool,
+    /// Set when an event batch changed the list; the live tooltip re-renders
+    /// once per batch instead of once per event.
     tooltips_dirty: bool,
     /// Timestamp of the last "Copy logs" press, for the "Copied" feedback.
     logs_copied_at: Option<Instant>,
@@ -1250,7 +1345,7 @@ pub fn create_window(
             // The tooltip timer is normally started by show_window(); this
             // visible-at-start path bypasses it, so start it and sync once
             // here (the window is already shown, so sync_tooltips can run).
-            let _ = set_timer(hwnd, TIMER_TOOLTIPS_ID, 1000, None);
+            let _ = set_timer(hwnd, TIMER_TOOLTIPS_ID, TOOLTIP_POLL_MS, None);
             let state_ref = &mut *state_ptr;
             state_ref.sync_tooltips();
         } else {
@@ -1397,7 +1492,10 @@ impl MainWindowState {
             settings_layout_cache: RefCell::new(None),
             tooltip_ctrl: HWND::default(),
             tooltip_text: Vec::new(),
-            tooltip_range: None,
+            tooltip_hover: None,
+            tooltip_hover_since: None,
+            tooltip_shown: false,
+            track_tool_registered: false,
             tooltips_dirty: false,
             logs_copied_at: None,
             logs_opened_at: None,
@@ -1544,7 +1642,7 @@ impl MainWindowState {
     /// per-item text through TTN_GETDISPINFO, so no custom window procs or
     /// subclassing are needed here.
     fn install_tooltip(&mut self) {
-        self.tooltip_ctrl = unsafe {
+        let created = unsafe {
             crate::winapi::create_window(
                 WS_EX_TOPMOST,
                 TOOLTIPS_CLASSW,
@@ -1559,8 +1657,14 @@ impl MainWindowState {
                 self.instance,
                 None,
             )
+        };
+        // A failed creation is otherwise silent forever (every later
+        // operation null-guards), so log the Win32 error — an unregistered
+        // class, for example, reads ERROR_CANNOT_FIND_WND_CLASS (1407).
+        if let Err(error) = &created {
+            log::debug!("history tooltip control creation failed: {error}");
         }
-        .unwrap_or_default();
+        self.tooltip_ctrl = created.unwrap_or_default();
         if !self.tooltip_ctrl.0.is_null() {
             unsafe {
                 let _ = send_message(self.tooltip_ctrl, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM(600));
@@ -1568,7 +1672,6 @@ impl MainWindowState {
             self.sync_tooltips();
         }
     }
-
     /// Shows or hides the pane-owned child windows (history listbox and its
     /// tooltip) to match the active pane. Called on pane switches and on
     /// window show/hide — not from WM_PAINT, which would call ShowWindow on
@@ -1593,141 +1696,299 @@ impl MainWindowState {
         }
     }
 
-    /// Rebuilds the per-item tool definitions so rects and row count match
-    /// the listbox (rows are fixed-height, so scroll changes the mapping).
-    /// The 1 Hz timer calls this constantly, so the full rebuild (3N+1
-    /// SendMessageW) is skipped when the item count and scroll position are
-    /// unchanged since the last sync. Only the *visible* band of rows is
-    /// registered (off-screen rows cannot be hovered): a scroll updates the
-    /// band's rects in place via TTM_NEWTOOLW and drops the rows that
-    /// scrolled out, so the per-tick message count is bounded by the visible
-    /// row count instead of the history size. While the window is hidden in
-    /// the tray there is nothing to sync, so the timer's probe messages are
-    /// skipped entirely (the show path re-syncs on restore).
+    /// The configured dwell time for the history tooltip (clamped by
+    /// `Config::normalize`).
+    fn history_tooltip_dwell_ms(&self) -> u64 {
+        self.cfg().behavior.history_tooltip_dwell_ms
+    }
+
+    /// Drives the track-mode tooltip from the window's own hover poll (1 Hz
+    /// timer, the same cadence that used to re-register per-row tools). The
+    /// control is never asked to hit-test or track: one tool is registered
+    /// once, and this method decides each tick whether a tooltip is due —
+    /// cursor over a history cell for the configured dwell — then activates,
+    /// positions and feeds it text, or hides it. All hit-testing runs on
+    /// coordinates we verify ourselves; nothing depends on comctl32's mouse
+    /// handling, which proved unreliable across every registration scheme.
     fn sync_tooltips(&mut self) {
-        if !unsafe { IsWindowVisible(self.hwnd).as_bool() } {
+        if !unsafe { IsWindowVisible(self.hwnd).as_bool() } || self.active_pane != Pane::Activity {
+            self.hide_track_tooltip();
             return;
         }
         if self.tooltip_ctrl.0.is_null() || self.listbox.0.is_null() {
             return;
         }
+        // Register the single track tool exactly once.
+        if !self.tooltip_shown && self.tooltip_hover.is_none() && self.tooltip_hover_since.is_none() {
+            // First tick after creation: register the tool. Cheap enough to
+            // guard with a dedicated flag-free probe below instead of state.
+        }
         unsafe {
-            let count = send_message(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0 as usize;
-            let top = send_message(self.listbox, LB_GETTOPINDEX, WPARAM(0), LPARAM(0)).0 as usize;
-            let mut client = RECT::default();
-            let _ = GetClientRect(self.listbox, &mut client);
-            let item_h = send_message(self.listbox, LB_GETITEMHEIGHT, WPARAM(0), LPARAM(0)).0 as usize;
-            let visible = client.bottom as usize / item_h.max(1) + 1;
-            let end = (top + visible).min(count);
-            if self.tooltip_range == Some((top, end)) {
-                return;
-            }
-            let (old_start, old_end) = self.tooltip_range.unwrap_or((0, 0));
-            for index in old_start..old_end {
-                if index < top || index >= end {
-                    let mut tool = ToolInfo {
-                        cb_size: std::mem::size_of::<ToolInfo>() as u32,
-                        u_flags: 0,
-                        hwnd: self.listbox,
-                        u_id: index,
-                        rect: RECT::default(),
-                        hinst: HINSTANCE::default(),
-                        lpsz_text: std::ptr::null_mut(),
-                        l_param: 0,
-                        lp_reserved: std::ptr::null_mut(),
-                    };
-                    let _ = send_message(
-                        self.tooltip_ctrl,
-                        TTM_DELTOOLW,
-                        WPARAM(0),
-                        LPARAM(&mut tool as *mut _ as isize),
-                    );
-                }
-            }
-            for index in top..end {
-                let mut rect = RECT::default();
-                let ok = send_message(
-                    self.listbox,
-                    LB_GETITEMRECT,
-                    WPARAM(index),
-                    LPARAM(&mut rect as *mut _ as isize),
-                );
-                if ok.0 == 0 {
-                    continue;
-                }
+            if !self.track_tool_registered {
                 let mut tool = ToolInfo {
-                    cb_size: std::mem::size_of::<ToolInfo>() as u32,
-                    u_flags: TTF_SUBCLASS.0,
-                    hwnd: self.listbox,
-                    u_id: index,
-                    rect,
+                    cb_size: TOOLINFO_CB_SIZE_V2,
+                    u_flags: TRACK_TOOL_FLAGS,
+                    hwnd: self.hwnd,
+                    u_id: NOW_PLAYING_TOOL_ID,
+                    rect: RECT::default(),
                     hinst: HINSTANCE::default(),
                     lpsz_text: LPSTR_TEXTCALLBACK as *mut u16,
                     l_param: 0,
                     lp_reserved: std::ptr::null_mut(),
                 };
-                // Adds the tool, or updates the existing one's rect in place
-                // (the row's client position moved with the scroll).
-                let message = if index >= old_start && index < old_end {
-                    TTM_SETTOOLINFOW
-                } else {
-                    TTM_ADDTOOLW
-                };
-                let _ = send_message(
+                let added = send_message(
                     self.tooltip_ctrl,
-                    message,
+                    TTM_ADDTOOLW,
                     WPARAM(0),
                     LPARAM(&mut tool as *mut _ as isize),
                 );
+                self.track_tool_registered = added.0 != 0;
+                log::debug!("track tooltip tool registered: {}", self.track_tool_registered);
             }
-            self.tooltip_range = Some((top, end));
-            self.sync_now_playing_tool();
+
+            // Where is the cursor, in listbox client coordinates?
+            let mut point = POINT::default();
+            let _ = GetCursorPos(&mut point);
+            // Ownership gate: GetCursorPos is global, so without a check the
+            // hit-test fires while the cursor is over another application.
+            // The tooltip may fire when either (a) the window under the
+            // cursor belongs to our UI thread, or (b) WinGlance is the
+            // foreground window and the cursor geometrically falls inside us
+            // — a topmost fullscreen game can sit above our foreground
+            // window, and the user is interacting with WinGlance, not with
+            // what covers it. Any other combination (another app foreground,
+            // cursor over it) stays silent.
+            let under = WindowFromPoint(point);
+            let same_thread = GetWindowThreadProcessId(under, None) == GetCurrentThreadId();
+            let mut in_main = point;
+            let _ = ScreenToClient(self.hwnd, &mut in_main);
+            let mut main_client = RECT::default();
+            let _ = GetClientRect(self.hwnd, &mut main_client);
+            let geometrically_inside =
+                in_main.x >= 0 && in_main.x < main_client.right && in_main.y >= 0 && in_main.y < main_client.bottom;
+            let foreground_ours = GetForegroundWindow() == self.hwnd;
+            if !same_thread && !(foreground_ours && geometrically_inside) {
+                self.tooltip_hover = None;
+                self.tooltip_hover_since = None;
+                self.hide_track_tooltip();
+                return;
+            }
+            let mut in_listbox = point;
+            let _ = ScreenToClient(self.listbox, &mut in_listbox);
+
+            // Hit-test the row under the cursor via the listbox itself, so
+            // scroll position is always authoritative. The return packs
+            // "outside any item" into the high word and the item index into
+            // the low word — the empty stretch below the last row must not
+            // answer as the last row.
+            let hit = send_message(
+                self.listbox,
+                LB_ITEMFROMPOINT,
+                WPARAM(0),
+                LPARAM(((in_listbox.y.max(0) << 16) | in_listbox.x.max(0) & 0xFFFF) as isize),
+            )
+            .0;
+            let outside_any_item = (hit >> 16) != 0;
+            let over_listbox_area = {
+                let mut client = RECT::default();
+                let _ = GetClientRect(self.listbox, &mut client);
+                in_listbox.x >= 0 && in_listbox.x < client.right && in_listbox.y >= 0 && in_listbox.y < client.bottom
+            };
+            let row = if outside_any_item || !over_listbox_area {
+                None
+            } else {
+                Some((hit & 0xFFFF) as usize)
+            };
+
+            // Which column? Reuse the shared geometry on the row's rect.
+            let column = row.and_then(|row| {
+                let mut rect = RECT::default();
+                let ok = send_message(
+                    self.listbox,
+                    LB_GETITEMRECT,
+                    WPARAM(row),
+                    LPARAM(&mut rect as *mut _ as isize),
+                );
+                if ok.0 == 0 {
+                    return None;
+                }
+                let scale = GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0;
+                let rects = history_column_rects(&rect, scale);
+                history_cell_at_x(&rects, in_listbox.x)
+            });
+
+            match (row, column) {
+                // A real cell (or header/gap): dwell toward a tooltip.
+                (Some(row), _) => {
+                    if self.tooltip_hover != Some((row, column.unwrap_or(usize::MAX))) {
+                        self.tooltip_hover = Some((row, column.unwrap_or(usize::MAX)));
+                        self.tooltip_hover_since = Some(Instant::now());
+                        // A moved hover hides the current bubble immediately.
+                        self.hide_track_tooltip();
+                    } else if let Some(since) = self.tooltip_hover_since
+                        && since.elapsed().as_millis() >= u128::from(self.history_tooltip_dwell_ms())
+                        && !self.tooltip_shown
+                    {
+                        self.show_track_tooltip(row, column, point);
+                    }
+                }
+                // Over our window but not the table: the Now Playing block.
+                // Same dwell, whole-track details.
+                _ if {
+                    let scale = GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0;
+                    let pad = (PAD * scale) as i32;
+                    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+                    let art = (ART_SIZE * scale).round() as i32;
+                    let art_y = (ART_Y * scale) as i32;
+                    let (client_w, _) = client_size(self.hwnd);
+                    let np_rect = RECT {
+                        left: sidebar_w + pad,
+                        top: art_y,
+                        right: client_w - pad,
+                        bottom: art_y + art,
+                    };
+                    let mut in_main = point;
+                    let _ = ScreenToClient(self.hwnd, &mut in_main);
+                    in_main.x >= np_rect.left
+                        && in_main.x < np_rect.right
+                        && in_main.y >= np_rect.top
+                        && in_main.y < np_rect.bottom
+                } =>
+                {
+                    if self.tooltip_hover != Some((usize::MAX, usize::MAX)) {
+                        self.tooltip_hover = Some((usize::MAX, usize::MAX));
+                        self.tooltip_hover_since = Some(Instant::now());
+                        self.hide_track_tooltip();
+                    } else if let Some(since) = self.tooltip_hover_since
+                        && since.elapsed().as_millis() >= u128::from(self.history_tooltip_dwell_ms())
+                        && !self.tooltip_shown
+                        && let Some(current) = &self.current
+                    {
+                        let text = now_playing_detail(&current.track, current.state);
+                        self.show_track_tooltip_text(text, point);
+                    }
+                }
+                _ => {
+                    self.tooltip_hover = None;
+                    self.tooltip_hover_since = None;
+                    self.hide_track_tooltip();
+                }
+            }
         }
     }
 
-    /// Adds or updates the one tool covering the Now Playing block in the
-    /// main window's client area. The block's geometry derives from the
-    /// same layout constants `paint_activity` uses, so a resize or DPI
-    /// change lands here on the next 1 Hz tick without extra invalidation.
-    /// Registered only while the Activity pane is showing; `apply_pane`
-    /// hides the whole tooltip control on pane switches, which covers the
-    /// rest of the pane lifecycle.
-    fn sync_now_playing_tool(&mut self) {
-        // Mirrors paint_activity's block extent: from the header top down to
-        // the source-app row bottom (art_y + art height).
-        let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
-        let (client_w, _) = client_size(self.hwnd);
-        let pad = (PAD * scale) as i32;
-        let sidebar_w = (SIDEBAR_W * scale).round() as i32;
-        let art = (ART_SIZE * scale).round() as i32;
-        let art_y = (ART_Y * scale) as i32;
-        let np_rect = RECT {
-            left: sidebar_w + pad,
-            top: art_y,
-            right: client_w - pad,
-            bottom: art_y + art,
+    /// Shows the track tooltip with literal text at the given screen point.
+    fn show_track_tooltip_text(&mut self, text: String, cursor_screen: POINT) {
+        self.activate_track_tooltip(&text, cursor_screen);
+    }
+
+    /// Shows (or re-textures and repositions) the track-mode tooltip for the
+    /// given row/column hit. `cursor_screen` is the live cursor position.
+    fn show_track_tooltip(&mut self, row: usize, column: Option<usize>, cursor_screen: POINT) {
+        let text = if row == 0 {
+            history_header_line()
+        } else {
+            match self.history.entries.get(row - 1) {
+                None => return,
+                Some(entry) => match column {
+                    // A real column always answers with its own label — an
+                    // unreported field says so instead of falling back to
+                    // the whole row.
+                    Some(col) => history_cell_tooltip_line(entry, col),
+                    None => entry_detail(entry),
+                },
+            }
         };
-        let mut tool = ToolInfo {
-            cb_size: std::mem::size_of::<ToolInfo>() as u32,
-            u_flags: TTF_SUBCLASS.0,
-            hwnd: self.hwnd,
-            u_id: NOW_PLAYING_TOOL_ID,
-            rect: np_rect,
-            hinst: HINSTANCE::default(),
-            lpsz_text: LPSTR_TEXTCALLBACK as *mut u16,
-            l_param: 0,
-            lp_reserved: std::ptr::null_mut(),
-        };
-        // TTM_ADDTOOLW replaces an existing tool with the same (hwnd, id),
-        // so this updates the rect in place after a resize/DPI change.
-        let _ = unsafe {
-            send_message(
+        self.activate_track_tooltip(&text, cursor_screen);
+    }
+
+    /// Activates (or re-textures and moves) the track-mode tooltip with the
+    /// given literal text near the cursor, clamped into the nearest
+    /// monitor's work area.
+    fn activate_track_tooltip(&mut self, text: &str, cursor_screen: POINT) {
+        unsafe {
+            // Feed the text through the window-owned buffer and hand the
+            // pointer to the tool directly: with a literal lpszText the
+            // control shows exactly this string, no TTN_GETDISPINFO
+            // round-trip that could answer for a different tool.
+            let text_ptr = MainWindowState::tooltip_text_buffer(&mut self.tooltip_text, text);
+            // Position below-right of the cursor, clamped to the nearest
+            // monitor's work area (TTF_ABSOLUTE coordinates are screen
+            // coordinates; the control does no clamping of its own).
+            let width = 320i32.max((text.len().min(120) as i32) * 6);
+            let height = 60i32;
+            let monitor = MonitorFromPoint(cursor_screen, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let clamped = if GetMonitorInfoW(monitor, &mut info).as_bool() {
+                let work = info.rcWork;
+                RECT {
+                    left: (cursor_screen.x + 12).min(work.right - width - 8).max(work.left + 8),
+                    top: (cursor_screen.y + 20).min(work.bottom - height - 8).max(work.top + 8),
+                    right: 0,
+                    bottom: 0,
+                }
+            } else {
+                RECT {
+                    left: cursor_screen.x + 12,
+                    top: cursor_screen.y + 20,
+                    right: 0,
+                    bottom: 0,
+                }
+            };
+            // Activate (first show) or re-texture (already showing) the track
+            // for our tool. The TOOLINFO must match the registered one on
+            // (hwnd, u_id) AND flags; a mismatch silently fails to display.
+            let mut tool = ToolInfo {
+                cb_size: TOOLINFO_CB_SIZE_V2,
+                u_flags: TRACK_TOOL_FLAGS,
+                hwnd: self.hwnd,
+                u_id: NOW_PLAYING_TOOL_ID,
+                rect: RECT::default(),
+                hinst: HINSTANCE::default(),
+                lpsz_text: text_ptr.0,
+                l_param: 0,
+                lp_reserved: std::ptr::null_mut(),
+            };
+            let _ = send_message(
                 self.tooltip_ctrl,
-                TTM_ADDTOOLW,
+                TTM_TRACKACTIVATE,
+                WPARAM(1),
+                LPARAM(&mut tool as *mut _ as isize),
+            );
+            self.tooltip_shown = true;
+
+            let packed = ((clamped.top.max(0) as isize) << 16) | (clamped.left.max(0) as isize & 0xFFFF);
+            let _ = send_message(self.tooltip_ctrl, TTM_TRACKPOSITION, WPARAM(0), LPARAM(packed));
+        }
+    }
+    /// Hides the track tooltip if it is up.
+    fn hide_track_tooltip(&mut self) {
+        if !self.tooltip_shown || self.tooltip_ctrl.0.is_null() {
+            return;
+        }
+        self.tooltip_shown = false;
+        unsafe {
+            let mut tool = ToolInfo {
+                cb_size: TOOLINFO_CB_SIZE_V2,
+                u_flags: TRACK_TOOL_FLAGS,
+                hwnd: self.hwnd,
+                u_id: NOW_PLAYING_TOOL_ID,
+                rect: RECT::default(),
+                hinst: HINSTANCE::default(),
+                lpsz_text: std::ptr::null_mut(),
+                l_param: 0,
+                lp_reserved: std::ptr::null_mut(),
+            };
+            let _ = send_message(
+                self.tooltip_ctrl,
+                TTM_TRACKACTIVATE,
                 WPARAM(0),
                 LPARAM(&mut tool as *mut _ as isize),
-            )
-        };
+            );
+        }
     }
 
     /// Where the listbox should rest after a history row has been inserted at
@@ -1755,70 +2016,6 @@ impl MainWindowState {
     fn tooltip_text_buffer(buffer: &mut Vec<u16>, text: &str) -> PWSTR {
         *buffer = wide(text);
         PWSTR(buffer.as_mut_ptr())
-    }
-
-    /// Text for the native tooltip: the column header for row 0; otherwise
-    /// the hovered cell's full text when the cursor sits inside a column,
-    /// or the whole-row details when the cursor is in a gap between columns.
-    /// `cursor_x` is the cursor in listbox client coordinates (None: not
-    /// recoverable — answer the row fallback).
-    fn tooltip_text_for(&self, row: usize, cursor_x: Option<i32>) -> Option<String> {
-        if row == 0 {
-            return Some(history_header_line());
-        }
-        let entry = self.history.entries.get(row - 1)?;
-        if let Some(x) = cursor_x
-            && let Some(col) = self.history_cell_column_at_cursor(row, x)
-            && let Some(text) = self.history_cell_tooltip_text(entry, col)
-            && !text.trim().is_empty()
-        {
-            return Some(format!("{}: {}", HISTORY_COLUMNS[col].label, text));
-        }
-        // Gap hover, collapsed cell, or empty field: the full details line.
-        Some(entry_detail(entry))
-    }
-
-    /// Recomputes the row's column rects at query time (the same geometry
-    /// the paint used) and answers the hovered column index. Returns None
-    /// on a gap, a collapsed column, or an out-of-range x.
-    fn history_cell_column_at_cursor(&self, row: usize, cursor_x: i32) -> Option<usize> {
-        if self.listbox.0.is_null() {
-            return None;
-        }
-        unsafe {
-            let mut rect = RECT::default();
-            let ok = send_message(
-                self.listbox,
-                LB_GETITEMRECT,
-                WPARAM(row),
-                LPARAM(&mut rect as *mut _ as isize),
-            );
-            if ok.0 == 0 {
-                return None;
-            }
-            let scale = GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0;
-            let rects = history_column_rects(&rect, scale);
-            history_cell_at_x(&rects, cursor_x)
-        }
-    }
-
-    /// The tooltip text of one cell: the state column spells the glyph out,
-    /// everything else shows the painted value verbatim.
-    fn history_cell_tooltip_text(&self, entry: &HistoryEntry, col: usize) -> Option<String> {
-        match col {
-            HISTORY_COL_STATE => Some(
-                match entry.state {
-                    PlaybackState::Playing | PlaybackState::NowPlaying => "Playing",
-                    PlaybackState::Paused => "Paused",
-                    PlaybackState::Stopped => "Stopped",
-                }
-                .to_string(),
-            ),
-            _ => {
-                let text = history_cell_text(entry, col);
-                (!text.is_empty()).then_some(text)
-            }
-        }
     }
 
     /// Records a source's playback state, capping the remembered set so a
@@ -4146,7 +4343,7 @@ impl MainWindowState {
         // The tooltip timer only runs while the window is visible (see
         // install_tooltip and on_close), so it must be (re)started here.
         unsafe {
-            let _ = set_timer(self.hwnd, TIMER_TOOLTIPS_ID, 1000, None);
+            let _ = set_timer(self.hwnd, TIMER_TOOLTIPS_ID, TOOLTIP_POLL_MS, None);
         }
         // The window was hidden, so the timer skipped its syncs; rebuild
         // the tool definitions now so hover works immediately on restore.
@@ -4594,6 +4791,37 @@ fn history_cell_at_x(rects: &[RECT], x: i32) -> Option<usize> {
     rects
         .iter()
         .position(|rect| x >= rect.left && x < rect.right && rect.right > rect.left)
+}
+
+/// The tooltip text of one cell: the state column spells the glyph out,
+/// everything else shows the painted value verbatim. None when the field
+/// is absent (the caller decides the fallback).
+fn history_cell_tooltip_text(entry: &HistoryEntry, col: usize) -> Option<String> {
+    match col {
+        HISTORY_COL_STATE => Some(
+            match entry.state {
+                PlaybackState::Playing | PlaybackState::NowPlaying => "Playing",
+                PlaybackState::Paused => "Paused",
+                PlaybackState::Stopped => "Stopped",
+            }
+            .to_string(),
+        ),
+        _ => {
+            let text = history_cell_text(entry, col);
+            (!text.is_empty()).then_some(text)
+        }
+    }
+}
+
+/// The full tooltip line for one cell: "LABEL: value", or "LABEL: Unknown"
+/// when the source did not report that field.
+fn history_cell_tooltip_line(entry: &HistoryEntry, col: usize) -> String {
+    let label = HISTORY_COLUMNS[col].label;
+    let value = history_cell_tooltip_text(entry, col).filter(|text| !text.trim().is_empty());
+    match value {
+        Some(value) => format!("{label}: {value}"),
+        None => format!("{label}: Unknown"),
+    }
 }
 
 /// A data cell's full (untruncated) text for painting and for the per-cell
@@ -5918,47 +6146,21 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
         WM_NOTIFY => {
-            // The native history tooltip requests the per-item text on demand.
-            if !state_ptr.is_null() && lparam.0 != 0 {
-                let header = unsafe { &*(lparam.0 as *const NMHDR) };
-                if header.code == TTN_GETDISPINFOW {
-                    let state = &mut *state_ptr;
-                    // The Now Playing tool answers before any listbox cursor
-                    // math; its sentinel id cannot collide with row ids.
-                    let text = if header.idFrom == NOW_PLAYING_TOOL_ID {
-                        // The block has no timestamp (it is "now"), so the
-                        // tooltip carries the same details minus the time line.
-                        Some(
-                            state
-                                .current
-                                .as_ref()
-                                .map(|current| now_playing_detail(&current.track, current.state))
-                                .unwrap_or_else(|| "No media playing".to_string()),
-                        )
-                    } else {
-                        // Map the cursor into the listbox's client coordinates so
-                        // the per-cell hit-test sees the same basis the paint
-                        // does (the paint works in listbox client space too).
-                        let cursor_x = unsafe {
-                            let mut point = POINT::default();
-                            GetCursorPos(&mut point)
-                                .ok()
-                                .and_then(|_| ScreenToClient(state.listbox, &mut point).as_bool().then_some(point.x))
-                        };
-                        state.tooltip_text_for(header.idFrom, cursor_x)
-                    };
-                    if let Some(text) = text {
-                        let info = unsafe { &mut *(lparam.0 as *mut NMTTDISPINFOW) };
-                        // Point lpszText at a window-owned buffer instead of
-                        // copying into the built-in szText (bounded at 80 u16):
-                        // a long details string would otherwise truncate at 79
-                        // chars. The buffer stays valid until the next tooltip
-                        // request overwrites it, by which point this tooltip is
-                        // no longer being shown.
-                        info.lpszText = MainWindowState::tooltip_text_buffer(&mut state.tooltip_text, &text);
-                        info.hinst = HINSTANCE::default();
-                    }
-                }
+            // The track-mode tooltip registers its tool with
+            // LPSTR_TEXTCALLBACK, so when the control prepares to display it
+            // requests text through TTN_GETDISPINFO. The hover poller stages
+            // the exact string to show into the window-owned wide buffer on
+            // every activation; serving that pointer keeps the displayed
+            // text and the dwell decision in lockstep. Without this answer
+            // the control never shows the tooltip at all.
+            if !state_ptr.is_null()
+                && lparam.0 != 0
+                && unsafe { (*(lparam.0 as *const NMHDR)).code } == TTN_GETDISPINFOW
+            {
+                let state = &mut *state_ptr;
+                let info = unsafe { &mut *(lparam.0 as *mut NMTTDISPINFOW) };
+                info.lpszText = PWSTR(state.tooltip_text.as_mut_ptr());
+                info.hinst = HINSTANCE::default();
             }
             LRESULT(0)
         }
@@ -7880,6 +8082,24 @@ mod tests {
             history_header_line(),
             "TIME | STATE | TITLE | ARTIST | ALBUM | DURATION | TRACK | GENRE | SOURCE"
         );
+    }
+
+    #[test]
+    fn history_cell_tooltip_line_labels_values_and_unknowns() {
+        let mut entry = HistoryEntry {
+            at: Local::now(),
+            at_label: "12:00:00".into(),
+            track: track("Song"),
+            state: PlaybackState::Paused,
+            accepted: true,
+        };
+        entry.track.genre = Some("Synthwave".into());
+        // A reported value reads "LABEL: value".
+        assert_eq!(history_cell_tooltip_line(&entry, 7), "GENRE: Synthwave");
+        // The state column spells the glyph out as a word.
+        assert_eq!(history_cell_tooltip_line(&entry, HISTORY_COL_STATE), "STATE: Paused");
+        // An unreported field says Unknown instead of the whole-row fallback.
+        assert_eq!(history_cell_tooltip_line(&entry, 6), "TRACK: Unknown");
     }
 
     #[test]
