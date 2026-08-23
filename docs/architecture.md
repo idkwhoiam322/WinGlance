@@ -549,12 +549,15 @@ switching between two panes:
   already displays — exactly what the overlay suppresses) records grey like
   a rejected session, and while notifications are off nothing reaches the
   pill, so every row records grey. A native `TOOLTIPS_CLASSW` control shows
-  hover details: over a history cell it shows that cell's full untruncated
-  text (the cursor is mapped into the row's column rects recomputed at
-  query time), over the row's gaps it falls back to the whole-row details,
-  and over the Now Playing block it shows the current track's details; the
-  control is synced to the visible row band on a 1 Hz timer while the
-  window is visible.
+  hover details in **track mode**: one `TTF_TRACK | TTF_ABSOLUTE` tool is
+  registered against the main window, and the window's own hover poll
+  hit-tests the cursor — through `LB_ITEMFROMPOINT` plus the shared column
+  geometry — dwelling for the configured `[behavior] history_tooltip_dwell_ms`
+  over a cell before activating, positioning and feeding the tooltip its
+  text (a cell answers `LABEL: value`, an unreported field `LABEL: Unknown`,
+  the row's gaps the whole-row details, and the Now Playing block the
+  current track's details). The control's own hit-testing and mouse
+  tracking are never relied on.
 - **Settings** — cards mirroring the tray menu and `[behavior]`/`[overlay]`
   config: notifications toggle, duration presets and the respect-system-
   duration toggle, start-on-login, close-to-tray, allowed apps, auto-compact
