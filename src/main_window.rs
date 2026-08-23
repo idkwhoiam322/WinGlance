@@ -4445,12 +4445,15 @@ fn history_row(track: &TrackInfo, at: DateTime<Local>, state: PlaybackState) -> 
 /// One history table column. `fixed_w` (logical px) wins when set; otherwise
 /// the column takes `share` of the flexible width left after the fixed
 /// columns and the inter-column gaps, with the final column absorbing the
-/// floor-truncation remainder.
+/// floor-truncation remainder. `min_w` floors a column's rendered width so
+/// its header text fits without ellipsis (headers are 11px, rows 13px at
+/// 96 DPI).
 struct HistoryColumn {
     /// Header label; also the source for both header strings.
     label: &'static str,
     fixed_w: Option<f32>,
     share: f32,
+    min_w: f32,
 }
 
 /// The history table's single source of truth: the owner-draw paint, the
@@ -4461,57 +4464,67 @@ const HISTORY_COLUMNS: [HistoryColumn; 9] = [
         label: "TIME",
         fixed_w: Some(78.0),
         share: 0.0,
+        min_w: 0.0,
     },
+    // STATE shows only a glyph, but its header must fit.
     HistoryColumn {
         label: "STATE",
-        fixed_w: Some(30.0),
+        fixed_w: Some(44.0),
         share: 0.0,
+        min_w: 44.0,
     },
     HistoryColumn {
         label: "TITLE",
         fixed_w: None,
         share: 0.30,
+        min_w: 40.0,
     },
     HistoryColumn {
         label: "ARTIST",
         fixed_w: None,
         share: 0.20,
+        min_w: 42.0,
     },
     HistoryColumn {
         label: "ALBUM",
         fixed_w: None,
         share: 0.17,
+        min_w: 46.0,
     },
     HistoryColumn {
         label: "DURATION",
-        fixed_w: Some(52.0),
-        share: 0.0,
+        fixed_w: None,
+        share: 0.09,
+        min_w: 66.0,
     },
     HistoryColumn {
         label: "TRACK",
-        fixed_w: Some(40.0),
-        share: 0.0,
+        fixed_w: None,
+        share: 0.06,
+        min_w: 46.0,
     },
     HistoryColumn {
         label: "GENRE",
         fixed_w: None,
         share: 0.13,
+        min_w: 44.0,
     },
     HistoryColumn {
         label: "SOURCE",
         fixed_w: None,
         share: 0.0,
+        min_w: 52.0,
     },
 ];
 
 const HISTORY_COL_TIME: usize = 0;
 const HISTORY_COL_STATE: usize = 1;
 
-/// Computes every column's client rect within one listbox row. Reproduces
-/// the historical arithmetic exactly (pad/gap scaling, floor-truncated
-/// proportions, remainder on the last column) so the paint looks unchanged
-/// apart from the added columns; the tooltip hit-test consumes the same
-/// result, so the two can never disagree.
+/// Computes every column's client rect within one listbox row: pad/gap
+/// scaling, floor-truncated proportional shares, remainder on the last
+/// share-less column. Every column is floored at its header-fit `min_w`
+/// (fixed widths are max(fixed_w, min_w) scaled); the tooltip hit-test
+/// consumes the same result, so paint and hit-test can never disagree.
 fn history_column_rects(row: &RECT, scale: f32) -> Vec<RECT> {
     let pad = (8.0 * scale) as i32;
     let gap = (4.0 * scale) as i32;
@@ -4519,10 +4532,14 @@ fn history_column_rects(row: &RECT, scale: f32) -> Vec<RECT> {
     let inner_right = (row.right - pad).max(inner_left);
 
     let mut widths = vec![0i32; HISTORY_COLUMNS.len()];
+    // Only genuinely fixed columns reserve space up front; the flexible
+    // shares divide what remains, then each is floored at its own minimum
+    // (a floor can exceed its share on a narrow window — the rects clamp
+    // into the row's interior, and the hit-test sees the same result).
     let mut fixed_total = 0i32;
     for (index, column) in HISTORY_COLUMNS.iter().enumerate() {
         if let Some(w) = column.fixed_w {
-            widths[index] = (w * scale) as i32;
+            widths[index] = (w.max(column.min_w) * scale) as i32;
             fixed_total += widths[index];
         }
     }
@@ -4531,7 +4548,7 @@ fn history_column_rects(row: &RECT, scale: f32) -> Vec<RECT> {
     let mut used = 0i32;
     for (index, column) in HISTORY_COLUMNS.iter().enumerate() {
         if column.fixed_w.is_none() && column.share > 0.0 {
-            widths[index] = (flexible as f32 * column.share) as i32;
+            widths[index] = ((flexible as f32 * column.share) as i32).max((column.min_w * scale) as i32);
             used += widths[index];
         }
     }
@@ -4540,7 +4557,7 @@ fn history_column_rects(row: &RECT, scale: f32) -> Vec<RECT> {
         .iter()
         .rposition(|c| c.fixed_w.is_none() && c.share == 0.0)
     {
-        widths[last] = (flexible - used).max(0);
+        widths[last] = ((flexible - used).max(0)).max((HISTORY_COLUMNS[last].min_w * scale) as i32);
     }
 
     let mut x = inner_left;
@@ -7771,15 +7788,28 @@ mod tests {
         assert_eq!(row.right - rects.last().unwrap().right, (8.0 * scale) as i32);
         let duration = &HISTORY_COLUMNS[5];
         assert_eq!(duration.label, "DURATION", "column order sanity");
-        // The DURATION rect's width equals its scaled fixed width.
-        assert_eq!(
-            rects[5].right - rects[5].left,
-            (52.0 * scale) as i32,
-            "fixed column width is exact"
-        );
+        // The DURATION width honors its share of the flexible pool
+        // ((inner - fixed - gaps) derived from this row) and never drops
+        // below its header-fit minimum.
+        let flexible_pool =
+            (row.right - row.left) - 2 * ((8.0 * scale) as i32) - ((78.0 + 44.0) * scale) as i32 - 8 * gap;
+        let expected = ((flexible_pool as f32 * duration.share) as i32).max((duration.min_w * scale) as i32);
+        assert_eq!(rects[5].right - rects[5].left, expected, "share-with-minimum width");
+        // Every header fits: no column renders narrower than its minimum.
+        for (index, rect) in rects.iter().enumerate() {
+            let min = (HISTORY_COLUMNS[index]
+                .min_w
+                .max(HISTORY_COLUMNS[index].fixed_w.unwrap_or(0.0))
+                * scale) as i32;
+            assert!(
+                rect.right - rect.left >= min,
+                "column {index} renders at least its header-fit minimum"
+            );
+        }
 
-        // Degenerate row: narrower than pad+gap alone — every flexible
-        // column collapses to zero width instead of going negative.
+        // Degenerate row: narrower than a single fixed column — the padded
+        // interior collapses, so every rect renders zero-width (nothing
+        // paints), never inverting.
         let tiny = RECT {
             left: 0,
             top: 0,
@@ -7787,17 +7817,29 @@ mod tests {
             bottom: 18,
         };
         let rects = history_column_rects(&tiny, scale);
-        for (index, rect) in rects.iter().enumerate() {
-            if HISTORY_COLUMNS[index].fixed_w.is_none() {
-                assert_eq!(rect.right - rect.left, 0, "flexible column {index} collapses");
-            }
-            assert!(rect.right >= rect.left, "rect {index} never inverts");
+        for rect in &rects {
+            assert_eq!(rect.right, rect.left, "clamped to zero width, never inverted");
         }
 
-        // Extreme DPI: the same invariants hold at 200%.
-        let rects = history_column_rects(&row, 2.0);
+        // Extreme DPI: the same invariants hold at 200% — the row scales
+        // with it (a 2x monitor doubles the window's pixel width), so the
+        // columns still tile and every header still fits.
+        let scaled_row = RECT {
+            left: 0,
+            top: 0,
+            right: (1200.0 * 2.0) as i32,
+            bottom: 18,
+        };
+        let rects = history_column_rects(&scaled_row, 2.0);
         for pair in rects.windows(2) {
             assert_eq!(pair[0].right + (4.0 * 2.0) as i32, pair[1].left, "tiled at 2x");
+        }
+        for (index, rect) in rects.iter().enumerate() {
+            let min = (HISTORY_COLUMNS[index]
+                .min_w
+                .max(HISTORY_COLUMNS[index].fixed_w.unwrap_or(0.0))
+                * 2.0) as i32;
+            assert!(rect.right - rect.left >= min, "column {index} header fits at 2x");
         }
     }
 
