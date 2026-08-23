@@ -329,6 +329,9 @@ pub struct BehaviorConfig {
     /// restart; the main window is the owner, the overlay mirrors it.
     pub notifications_enabled: bool,
     pub debounce_ms: u64,
+    /// How long the cursor must rest on a history-table cell before its
+    /// tooltip appears, in milliseconds. Default: 300.
+    pub history_tooltip_dwell_ms: u64,
     pub start_on_login: bool,
     pub start_in_tray: bool,
     pub close_to_tray: bool,
@@ -485,6 +488,7 @@ impl Default for BehaviorConfig {
             enable_playback_state_change: true,
             notifications_enabled: true,
             debounce_ms: 200,
+            history_tooltip_dwell_ms: 300,
             start_on_login: false,
             start_in_tray: true,
             close_to_tray: true,
@@ -806,6 +810,7 @@ impl Config {
         self.overlay.margin = self.overlay.margin.clamp(0, 500);
         self.overlay.compact_margin = self.overlay.compact_margin.clamp(0, 500);
         self.behavior.debounce_ms = self.behavior.debounce_ms.clamp(150, 250);
+        self.behavior.history_tooltip_dwell_ms = self.behavior.history_tooltip_dwell_ms.clamp(0, 2_000);
         // `pinned_source` is a single source pattern: trim it (a hand-edited
         // value with stray whitespace must match the same way the picker's
         // patterns do) and treat an empty string as "no pin" — the same
@@ -992,10 +997,12 @@ mod tests {
         config.overlay.max_width = u32::MAX;
         config.appearance.art_size = 0;
         config.behavior.debounce_ms = 1;
+        config.behavior.history_tooltip_dwell_ms = 5_000;
         config.normalize();
         assert_eq!(config.overlay.max_width, 800);
         assert_eq!(config.appearance.art_size, 24);
         assert_eq!(config.behavior.debounce_ms, 150);
+        assert_eq!(config.behavior.history_tooltip_dwell_ms, 2_000);
     }
 
     #[test]

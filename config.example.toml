@@ -67,6 +67,9 @@ enable_playback_state_change = true
 # "Toggle notifications" item; persisted so the toggle survives a restart.
 notifications_enabled = true
 debounce_ms = 200
+# How long the cursor must rest on a history-table cell before its tooltip
+# appears, in milliseconds (0 shows it immediately).
+history_tooltip_dwell_ms = 300
 # Launch quietly to the system tray: no window pops up, just the WinGlance + tray icon.
 start_in_tray = true
 # Create a startup registry entry so Windows launches WinGlance at logon.
