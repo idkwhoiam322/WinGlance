@@ -57,6 +57,13 @@ log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 
+[build-dependencies]
+# Embeds the Common-Controls v6 manifest so comctl32 runs its modern,
+# widely-exercised tooltip implementation instead of legacy 5.82 (whose
+# per-window tool tracking silently dropped every history-row tooltip).
+# Build-time only; the binary carries one XML resource.
+embed-manifest = "1.5"
+
 [profile.release]
 codegen-units = 1
 debug = false
