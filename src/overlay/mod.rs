@@ -1402,10 +1402,16 @@ impl OverlayState {
             // (INVALID_HANDLE_VALUE): the callback is a single non-blocking
             // PostMessageW, so the wait cannot deadlock, and no stale tick
             // message can be posted to a window that is being torn down.
-            unsafe {
-                let _ = crate::winapi::delete_timer_queue_timer(None, self.anim_timer, Some(INVALID_HANDLE_VALUE));
+            // A failed deletion keeps the handle: zeroing it would orphan
+            // the timer (still posting ticks) with no way to ever delete
+            // it — the next delete attempt and teardown retry instead.
+            let deleted =
+                unsafe { crate::winapi::delete_timer_queue_timer(None, self.anim_timer, Some(INVALID_HANDLE_VALUE)) };
+            if deleted.is_ok() {
+                self.anim_timer = HANDLE::default();
+            } else {
+                warn!("animation timer deletion failed; retrying on the next delete/teardown");
             }
-            self.anim_timer = HANDLE::default();
         }
         if self.anim_timer_fallback {
             unsafe {
@@ -1765,15 +1771,21 @@ impl OverlayState {
             // A newer notification is waiting: the pill on screen is never
             // pulled early — the queue advances when it collapses. The tick
             // caps the remaining time (EARLY_EXIT_MS) once the pill is no
-            // longer held, so the queued notification shows promptly.
+            // longer held, so the queued notification shows promptly. A
+            // failed re-arm is logged like the animation fallback: queued
+            // events would otherwise strand until some future event re-runs
+            // this block.
             unsafe {
                 let _ = kill_timer(self.hwnd, TIMER_DEBOUNCE);
-                set_timer(
+                if set_timer(
                     self.hwnd,
                     TIMER_DEBOUNCE,
                     self.config.behavior.debounce_ms.clamp(150, 250) as u32,
                     None,
-                );
+                ) == 0
+                {
+                    warn!("debounce timer re-arm failed; queued notifications wait for the next event");
+                }
             }
         }
         // Events that arrived while we were draining need a wake-up: re-arm
@@ -2840,6 +2852,10 @@ impl OverlayState {
         // Computed here, outside the phase guard, so the `held` gate below
         // can use it.
         let cursor_over = self.is_cursor_over_pill();
+        // The previous tick's sample: the entrance-phase dismiss arm
+        // requires two consecutive over-samples, so a single stray poll
+        // inside the growing pill's hitbox cannot arm the one-way dismiss.
+        let cursor_was_over = self.last_cursor_over_pill;
         self.last_cursor_over_pill = cursor_over;
         if cursor_over {
             self.hover_leave_at = None;
@@ -2960,13 +2976,19 @@ impl OverlayState {
                     }
                     HoverStep::None => {}
                 }
-            } else if cursor_over && self.hover_dismiss_at.is_none() && self.config.overlay.dismiss_on_hover {
+            } else if cursor_over
+                && cursor_was_over
+                && self.hover_dismiss_at.is_none()
+                && self.config.overlay.dismiss_on_hover
+            {
                 // Hover during the entrance/collapse animation: only an
                 // Expanded-layout pill arms (Compact pills only ever expand
-                // on hover, which the Shown path handles). The arm caps the
-                // remaining time at 500ms with `min`, never extends an
-                // already-sooner deadline — same shape as the
-                // Shown-path arm above.
+                // on hover, which the Shown path handles). Two consecutive
+                // over-samples are required — a single stray poll inside the
+                // growing hitbox must not arm the one-way dismiss and kill a
+                // just-appeared pill. The arm caps the remaining time at
+                // 500ms with `min`, never extends an already-sooner deadline
+                // — same shape as the Shown-path arm above.
                 if self.layout == LayoutMode::Expanded {
                     self.hover_dismiss_at = Some(now);
                     let early = now + Duration::from_millis(EARLY_EXIT_MS);
@@ -3690,6 +3712,16 @@ impl OverlayState {
         // or a resume after pause), instead of snapping back to zero. Only a
         // fresh process start zeroes it (see `new`).
         self.persistent_collapse_on_dismiss = false;
+        // The fade state belongs to the shown pill: a later show (including
+        // a settings-push sample resurrecting an auto-hidden pill) must
+        // start bright, not inherit the stale faded flag — the siblings
+        // (`show_with_duration`, `set_layout`, `show_sample`) reset it too.
+        self.persistent_faded = false;
+        // The two-sample hover gate reads the previous tick's cursor state;
+        // a stale `true` frozen by the last shown pill would let the first
+        // tick of the next showing arm its dismiss from one sample — the
+        // exact stray-poll arming the gate exists to prevent.
+        self.last_cursor_over_pill = false;
         self.phase = Phase::Hidden;
         // Release the per-show render state: the next show re-converts the
         // artwork and rebuilds the marquee rasters from the cached track, so

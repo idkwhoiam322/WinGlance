@@ -459,7 +459,17 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     LPARAM(buffer.as_mut_ptr() as isize),
                 )
                 .0 as usize;
-                let text = String::from_utf16_lossy(&buffer[..copied.min(buffer.len())]);
+                // A paste longer than the read buffer is rejected rather
+                // than silently parsed from its truncated prefix: a 63-char
+                // numeric paste could truncate to exactly "60" and commit an
+                // out-of-range duration the user never typed. The empty
+                // string fails the parse below, which shows the inline
+                // error.
+                let text = if copied >= buffer.len() - 1 {
+                    String::new()
+                } else {
+                    String::from_utf16_lossy(&buffer[..copied.min(buffer.len())])
+                };
                 if let Some(ms) = parse_duration_seconds(&text) {
                     (*data_ptr).chosen = Some(ms);
                     (*data_ptr).done = true;

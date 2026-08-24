@@ -1,4 +1,4 @@
-use crate::autostart;
+﻿use crate::autostart;
 use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, SaveOutcome, VerticalPosition};
 use crate::events::{
     COMPACT_POSITION_MSG, MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo,
@@ -985,6 +985,11 @@ fn segment_rects(rect: &RECT, count: usize, gap: i32) -> Vec<RECT> {
 
 #[derive(Debug, Clone)]
 struct HistoryEntry {
+    /// Monotonic per-window id, so an in-place metadata refresh can find
+    /// exactly the row it belongs to — a title/artist/source match cannot
+    /// distinguish two same-named media (an audio track and its video) that
+    /// legitimately occupy two rows.
+    id: u64,
     at: DateTime<Local>,
     /// Pre-formatted HH:MM:SS time, so the listbox paint never re-formats
     /// (or allocates) per row per repaint.
@@ -1000,6 +1005,8 @@ struct HistoryEntry {
 struct History {
     entries: VecDeque<HistoryEntry>,
     cap: usize,
+    /// Id the next pushed entry receives.
+    next_id: u64,
 }
 
 impl History {
@@ -1007,16 +1014,20 @@ impl History {
         Self {
             entries: VecDeque::new(),
             cap,
+            next_id: 0,
         }
     }
 
     /// Pushes a new entry at the front: the history is a reverse list, newest
-    /// first, matching the listbox rendering order.
-    fn push(&mut self, entry: HistoryEntry) {
+    /// first, matching the listbox rendering order. Returns the entry's id.
+    fn push(&mut self, mut entry: HistoryEntry) -> u64 {
+        entry.id = self.next_id;
+        self.next_id += 1;
         self.entries.push_front(entry);
         while self.entries.len() > self.cap {
             self.entries.pop_back();
         }
+        self.next_id - 1
     }
 
     fn len(&self) -> usize {
@@ -1137,6 +1148,10 @@ struct MainWindowState {
     overlay_hwnd: HWND,
     listbox: HWND,
     current: Option<CurrentActivity>,
+    /// The history row id `current` was appended as, so an in-place metadata
+    /// refresh updates exactly that row — a title/artist/source lookup would
+    /// match an older same-named row (audio track vs its video) first.
+    current_entry_id: Option<u64>,
     history: History,
     listbox_font: OwnedFont,
     fonts: FontProvider,
@@ -1461,6 +1476,7 @@ impl MainWindowState {
             overlay_hwnd,
             listbox: HWND::default(),
             current: None,
+            current_entry_id: None,
             history: History::new(HISTORY_CAP),
             listbox_font: OwnedFont::null(),
             fonts: FontProvider::new(96),
@@ -2258,14 +2274,15 @@ impl MainWindowState {
     /// The listbox top stays where the reader left it: rows above the new one
     /// only shift by one, so a scroll position mid-history is not yanked back
     /// to the newest row on every track change.
-    fn push_history(&mut self, track: TrackInfo, state: PlaybackState, accepted: bool) {
+    fn push_history(&mut self, track: TrackInfo, state: PlaybackState, accepted: bool) -> u64 {
         let track = track.into_history_text();
         let at = Local::now();
         let at_label = at.format("%H:%M:%S").to_string();
         let row = history_row(&track, at, state);
         let row = wide(&row);
         let before = self.history.len();
-        self.history.push(HistoryEntry {
+        let entry_id = self.history.push(HistoryEntry {
+            id: 0,
             at,
             at_label,
             track,
@@ -2299,6 +2316,7 @@ impl MainWindowState {
         // Tooltip rebuilds are coalesced per event batch (receive_events) or
         // picked up by the 1 Hz timer.
         self.tooltips_dirty = true;
+        entry_id
     }
 
     /// Records one playback transition of the current activity. Every
@@ -2394,11 +2412,15 @@ impl MainWindowState {
                 }
             }
             // Rejected-session rows can be pushed on top of the current
-            // track's row, so find the entry by identity instead of assuming
-            // it is the newest.
-            let entry_index = self.history.entries.iter().position(|e| {
-                e.track.title == track.title && e.track.artist == track.artist && e.track.source_app == track.source_app
-            });
+            // track's row, so find the entry by its recorded id instead of
+            // assuming it is the newest — and instead of a title/artist/
+            // source match, which cannot tell two same-named rows (an audio
+            // track and its video) apart and would refresh the older one.
+            let entry_index = self
+                .history
+                .entries
+                .iter()
+                .position(|e| Some(e.id) == self.current_entry_id);
             if let Some(index) = entry_index {
                 let entry = &mut self.history.entries[index];
                 entry.track = track.clone().into_history_text();
@@ -2448,7 +2470,7 @@ impl MainWindowState {
         // nothing does.
         let reached = self.cfg().behavior.notifications_enabled;
         let history_track = track.clone().into_history_text();
-        self.push_history(history_track, state, reached);
+        self.current_entry_id = Some(self.push_history(history_track, state, reached));
         self.current = Some(CurrentActivity {
             track,
             state,
@@ -4883,15 +4905,20 @@ fn log_art_blit_failure() {
 }
 
 /// Logs a refused listbox mutation: `LB_ERRSPACE` (−2) means the
-/// insert/delete was rejected under memory pressure, silently desyncing the
-/// listbox from the history mirror. The mirror degrades gracefully — its
-/// reads re-query `LB_GETCOUNT` rather than trusting a stored count — so
-/// this is a diagnostics line, not an error path.
+/// insert/delete was rejected under memory pressure, and `LB_ERR` (−1) a bad
+/// index or no item — either silently desyncs the listbox from the history
+/// mirror. The mirror degrades gracefully — its reads re-query
+/// `LB_GETCOUNT` rather than trusting a stored count — so this is a
+/// diagnostics line, not an error path.
 fn log_lb_result(result: LRESULT, operation: &str) {
-    if result.0 == -2 {
-        debug!(
+    match result.0 {
+        -2 => debug!(
             "history listbox {operation} refused with LB_ERRSPACE (memory pressure); the list may diverge from the history mirror"
-        );
+        ),
+        -1 => debug!(
+            "history listbox {operation} failed with LB_ERR (bad index or missing item); the list may diverge from the history mirror"
+        ),
+        _ => {}
     }
 }
 
@@ -5935,8 +5962,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Explorer (re)started and rebuilt the notification area: re-add the
-    // tray icon, which Explorer's restart wiped.
-    if message == taskbar_created_msg() {
+    // tray icon, which Explorer's restart wiped. The zero check mirrors the
+    // show-yourself probe below: a failed RegisterWindowMessageW returns 0
+    // (WM_NULL), and re-firing NIM_ADD on every WM_NULL would be nonsense.
+    if message != 0 && message == taskbar_created_msg() {
         debug!("Explorer restarted the notification area; re-adding the tray icon");
         match install_tray_icon(hwnd) {
             Ok(()) => {
@@ -6155,14 +6184,17 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             // every activation; serving that pointer keeps the displayed
             // text and the dwell decision in lockstep. Without this answer
             // the control never shows the tooltip at all.
-            if !state_ptr.is_null()
-                && lparam.0 != 0
-                && unsafe { (*(lparam.0 as *const NMHDR)).code } == TTN_GETDISPINFOW
-            {
-                let state = &mut *state_ptr;
-                let info = unsafe { &mut *(lparam.0 as *mut NMTTDISPINFOW) };
-                info.lpszText = PWSTR(state.tooltip_text.as_mut_ptr());
-                info.hinst = HINSTANCE::default();
+            if !state_ptr.is_null() && lparam.0 != 0 {
+                let nmhdr = unsafe { &*(lparam.0 as *const NMHDR) };
+                // Only our own tooltip control's notifications are answered:
+                // the shared text-buffer contract must not silently extend
+                // to a future child control forwarding the same message.
+                if nmhdr.code == TTN_GETDISPINFOW && nmhdr.hwndFrom == (*state_ptr).tooltip_ctrl {
+                    let state = &mut *state_ptr;
+                    let info = unsafe { &mut *(lparam.0 as *mut NMTTDISPINFOW) };
+                    info.lpszText = PWSTR(state.tooltip_text.as_mut_ptr());
+                    info.hinst = HINSTANCE::default();
+                }
             }
             LRESULT(0)
         }
@@ -8050,6 +8082,7 @@ mod tests {
     #[test]
     fn history_cell_text_covers_every_column_and_skips_absent_fields() {
         let mut entry = HistoryEntry {
+            id: 0,
             at: Local::now(),
             at_label: "12:34:56".into(),
             track: track("Song"),
@@ -8089,6 +8122,7 @@ mod tests {
     #[test]
     fn history_cell_tooltip_line_labels_values_and_unknowns() {
         let mut entry = HistoryEntry {
+            id: 0,
             at: Local::now(),
             at_label: "12:00:00".into(),
             track: track("Song"),
@@ -8516,6 +8550,7 @@ mod tests {
         let mut history = History::new(3);
         for index in 0..5 {
             history.push(HistoryEntry {
+                id: 0,
                 at: Local::now(),
                 at_label: String::new(),
                 track: track(&format!("Track {index}")),
@@ -8599,6 +8634,7 @@ mod tests {
     fn history_keeps_accepted_flag_with_newest_first() {
         let mut history = History::new(3);
         history.push(HistoryEntry {
+            id: 0,
             at: Local::now(),
             at_label: String::new(),
             track: track("Track A"),
@@ -8606,6 +8642,7 @@ mod tests {
             accepted: true,
         });
         history.push(HistoryEntry {
+            id: 0,
             at: Local::now(),
             at_label: String::new(),
             track: track("Track B"),

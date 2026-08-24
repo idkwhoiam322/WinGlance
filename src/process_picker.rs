@@ -27,7 +27,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_SPACE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, SetFocus, VK_ESCAPE, VK_SPACE};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GetClientRect, GetParent,
@@ -265,9 +265,17 @@ pub(crate) fn enumerate_app_processes() -> Vec<ProcessEntry> {
 
     let our_pid = unsafe { GetCurrentProcessId() };
     let mut seen = std::collections::HashSet::new();
+    // One row per distinct app pattern: a launcher process and its main
+    // process (identical normalized exe names) must not produce two
+    // indistinguishable rows — confirming both would write the pattern
+    // twice into the allow list.
+    let mut seen_patterns = std::collections::HashSet::new();
     let mut entries = Vec::new();
     for (pid, entry) in scan.found {
         if pid == our_pid || !seen.insert(pid) {
+            continue;
+        }
+        if !seen_patterns.insert(normalize_pattern(&entry.pattern)) {
             continue;
         }
         entries.push(entry);
@@ -750,6 +758,16 @@ pub(crate) fn open(
             }
         }
 
+        // Select and focus the list so keyboard navigation works from the
+        // first keystroke: the picker's Enter/Esc/Space handling exists
+        // precisely for keyboard use, and without focus the keys would
+        // scroll the Settings pane underneath instead. The listbox handle
+        // lives in the state (the block above scoped its own binding).
+        let lb = (*state_ptr).listbox;
+        if let Some(first) = checked.iter().position(|&checked| checked) {
+            let _ = send_message(lb, LB_SETCURSEL, WPARAM(first), LPARAM(0));
+        }
+        let _ = SetFocus(Some(lb));
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         debug!("process picker opened");
         true
@@ -984,13 +1002,15 @@ unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPAR
                     let i = item_idx as usize;
                     let state = unsafe { &mut *state_ptr };
 
-                    // Double-click on the same item within 400ms confirms and
-                    // closes, applying the state left by the first click.
+                    // Double-click on the same item within the system's
+                    // double-click interval confirms and closes, applying
+                    // the state left by the first click.
                     let now = Instant::now();
+                    let double_click_ms = u64::from(unsafe { GetDoubleClickTime() });
                     let is_double = state.last_click_item == Some(i)
                         && state
                             .last_click_time
-                            .is_some_and(|t| t.elapsed() < Duration::from_millis(400));
+                            .is_some_and(|t| t.elapsed() < Duration::from_millis(double_click_ms));
                     state.last_click_item = Some(i);
                     state.last_click_time = Some(now);
 
