@@ -53,11 +53,10 @@ dismiss_on_hover = true
 # Expanded ones.
 expand_compact_on_hover = true
 # With layout = "persistent-compact", fade the pill to idle opacity after
-# duration_ms of no cursor interaction. Off: while media is playing the
-# pill stays at full opacity and never fades; when nothing is playing
-# (paused or stopped) it hides after duration_ms instead of lingering.
-# Hiding for fullscreen/listed foregrounds (hide_for_auto_compact_sources)
-# applies either way.
+# duration_ms of no cursor interaction. Off: the pill stays at full opacity
+# while media is playing or paused (no idle fade), and hides only when the
+# source has stopped (the tombstone). Hiding for fullscreen/listed
+# foregrounds (hide_for_auto_compact_sources) applies either way.
 fade_persistent_pill = true
 
 [behavior]

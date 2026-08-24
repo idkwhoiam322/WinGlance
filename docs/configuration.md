@@ -11,6 +11,22 @@ the file itself is not rewritten (see `docs/architecture.md`).
 > editing the file by hand. Settings changed from the tray menu or the
 > Settings pane are applied immediately and persisted.
 
+> **Strict whole-file parsing.** Every documented range above is clamped
+> with a warning per field. A file that cannot be *parsed*, though — a
+> value whose type doesn't match its field, a color component outside
+> 0–255, a wrong array length, or an integer too large for the field — is
+> rejected as a whole: defaults apply for that run, the file is left
+> untouched, and persistence is disabled (the Settings pane shows a banner)
+> until the file is fixed. Every rejection is logged at startup. A
+> misspelled key is not a parse error: it is an unknown key (preserved and
+> warned about, see below).
+
+> **Saves are canonical.** A settings change rewrites the file in canonical
+> form: unknown fields and their values are preserved (each is warned about
+> at startup), but comments, key order and formatting are not. Unknown
+> integer values are preserved up to the 64-bit signed range; anything
+> larger makes the file unparsable (see above).
+
 ## [overlay]
 
 | Key            | Default | Range   | Effect                                            |
@@ -55,6 +71,11 @@ the file itself is not rewritten (see `docs/architecture.md`).
   foreground app is fullscreen or its executable matches an
   `auto_compact_sources` pattern, and expands otherwise. The verdict is
   re-sampled at every show and whenever the foreground window changes.
+  The fullscreen verdict compares the foreground window's rect against
+  the foreground window's own monitor's full rect, which a maximized
+  window only covers when the taskbar reserves no work-area space: with
+  the taskbar set to auto-hide (or replaced by a third-party shell), a
+  maximized window reads as fullscreen and the pill compacts for it too.
 - `"persistent-compact"` — the pill is always shown, but in the Compact
   layout (a slim, lower-profile pill). Useful for a permanent status
    indicator that never auto-hides. The pill fades to idle opacity after
