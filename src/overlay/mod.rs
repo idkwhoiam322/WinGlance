@@ -339,6 +339,12 @@ struct ChromeKey {
     corner_radius: f32,
     compact_corner_radius: f32,
     morph: Option<(f32, f32)>,
+    /// Per-row scrolling states at build time. A flip (animations toggled
+    /// while a row overflows, or the row crossing its band) changes what the
+    /// background must bake — a static row's text is baked in, a scrolling
+    /// row's is omitted for the strip pass — so the flip must rebuild, or
+    /// the reused raster ghosts the old static text under the strip.
+    scrolling: [bool; 4],
 }
 
 /// The retained static-background raster produced by a `RenderLayer::Background`
@@ -1252,6 +1258,12 @@ impl OverlayState {
             corner_radius: a.corner_radius,
             compact_corner_radius: a.compact_corner_radius,
             morph: morph.map(|m| (m.width, m.height)),
+            scrolling: [
+                self.scroll[0].scrolling,
+                self.scroll[1].scrolling,
+                self.scroll[2].scrolling,
+                self.scroll[3].scrolling,
+            ],
         }
     }
 
