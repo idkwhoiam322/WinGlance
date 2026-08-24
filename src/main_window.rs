@@ -1002,6 +1002,10 @@ struct HistoryEntry {
     /// Pre-formatted HH:MM:SS time, so the listbox paint never re-formats
     /// (or allocates) per row per repaint.
     at_label: String,
+    /// All nine column strings precomputed at push time (see
+    /// `history_cell_texts`): the owner-draw paint reads them directly, so a
+    /// scroll repaint allocates nothing per cell.
+    cells: [String; 9],
     track: TrackInfo,
     state: PlaybackState,
     /// Whether the source session passed the `media_sources` filter.
@@ -2289,6 +2293,7 @@ impl MainWindowState {
         let track = track.into_history_text();
         let at = Local::now();
         let at_label = at.format("%H:%M:%S").to_string();
+        let cells = history_cell_texts(&track, &at_label, state);
         let row = history_row(&track, at, state);
         let row = wide(&row);
         let before = self.history.len();
@@ -2296,6 +2301,7 @@ impl MainWindowState {
             id: 0,
             at,
             at_label,
+            cells,
             track,
             state,
             accepted,
@@ -2413,6 +2419,14 @@ impl MainWindowState {
                     free_art_blit(&mut current.icon_blit);
                 }
                 current.track = track.clone();
+                // The refresh's snapshot state is authoritative for what the
+                // pill displays (the worker suppresses the paired state event
+                // when a TrackChanged emits): without this, the Activity pane
+                // and the rewritten history row could disagree about the
+                // playback state.
+                if let Some(s) = track.playback_state {
+                    current.state = s;
+                }
                 // Artwork is decoded lazily on first paint; a metadata refresh
                 // re-reporting the same cover must not re-decode, so only bump
                 // the fingerprint and drop the cached bitmap when bytes changed.
@@ -2435,15 +2449,16 @@ impl MainWindowState {
             if let Some(index) = entry_index {
                 let entry = &mut self.history.entries[index];
                 entry.track = track.clone().into_history_text();
+                let row_state = track
+                    .playback_state
+                    .unwrap_or_else(|| self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing));
+                // The cell strings are precomputed at push time; a refresh
+                // replaces the track, so they must be rebuilt with it or the
+                // row would paint the old text.
+                entry.cells = history_cell_texts(&entry.track, &entry.at_label, row_state);
                 // Keep the row's original timestamp: only the metadata
                 // refreshed, and the tooltip formats from the same `at`.
-                let row = history_row(
-                    &track,
-                    entry.at,
-                    track
-                        .playback_state
-                        .unwrap_or_else(|| self.current.as_ref().map(|c| c.state).unwrap_or(PlaybackState::Playing)),
-                );
+                let row = history_row(&track, entry.at, row_state);
                 let row = wide(&row);
                 if !self.listbox.0.is_null() {
                     unsafe {
@@ -4272,8 +4287,9 @@ impl MainWindowState {
                 ([0x66, 0x66, 0x66, 0xFF], false)
             };
             for (col, rect) in rects.iter().enumerate() {
-                let text = history_cell_text(entry, col);
-                cell(*rect, &text, row_font, row_color, bold);
+                // Zero-allocate: the cell strings were precomputed at push
+                // time (see `HistoryEntry::cells`).
+                cell(*rect, &entry.cells[col], row_font, row_color, bold);
             }
         }
     }
@@ -4764,6 +4780,7 @@ const HISTORY_COL_ALBUM: usize = 4;
 const HISTORY_COL_DURATION: usize = 5;
 const HISTORY_COL_TRACK: usize = 6;
 const HISTORY_COL_GENRE: usize = 7;
+const HISTORY_COL_SOURCE: usize = 8;
 
 /// Computes every column's client rect within one listbox row: pad/gap
 /// scaling, floor-truncated proportional shares, remainder on the last
@@ -4846,6 +4863,7 @@ fn history_cell_at_x(rects: &[RECT], x: i32) -> Option<usize> {
 /// is absent (the caller decides the fallback).
 fn history_cell_tooltip_text(entry: &HistoryEntry, col: usize) -> Option<String> {
     match col {
+        HISTORY_COL_TIME => (!entry.cells[HISTORY_COL_TIME].is_empty()).then(|| entry.cells[HISTORY_COL_TIME].clone()),
         HISTORY_COL_STATE => Some(
             match entry.state {
                 PlaybackState::Playing | PlaybackState::NowPlaying => "Playing",
@@ -4854,10 +4872,25 @@ fn history_cell_tooltip_text(entry: &HistoryEntry, col: usize) -> Option<String>
             }
             .to_string(),
         ),
-        _ => {
-            let text = history_cell_text(entry, col);
-            (!text.is_empty()).then_some(text)
+        HISTORY_COL_TITLE => {
+            (!entry.cells[HISTORY_COL_TITLE].is_empty()).then(|| entry.cells[HISTORY_COL_TITLE].clone())
         }
+        HISTORY_COL_ARTIST => {
+            (!entry.cells[HISTORY_COL_ARTIST].is_empty()).then(|| entry.cells[HISTORY_COL_ARTIST].clone())
+        }
+        HISTORY_COL_ALBUM => {
+            (!entry.cells[HISTORY_COL_ALBUM].is_empty()).then(|| entry.cells[HISTORY_COL_ALBUM].clone())
+        }
+        HISTORY_COL_DURATION => {
+            (!entry.cells[HISTORY_COL_DURATION].is_empty()).then(|| entry.cells[HISTORY_COL_DURATION].clone())
+        }
+        HISTORY_COL_TRACK => {
+            (!entry.cells[HISTORY_COL_TRACK].is_empty()).then(|| entry.cells[HISTORY_COL_TRACK].clone())
+        }
+        HISTORY_COL_GENRE => {
+            (!entry.cells[HISTORY_COL_GENRE].is_empty()).then(|| entry.cells[HISTORY_COL_GENRE].clone())
+        }
+        _ => (!entry.cells[HISTORY_COL_SOURCE].is_empty()).then(|| entry.cells[HISTORY_COL_SOURCE].clone()),
     }
 }
 
@@ -4872,46 +4905,42 @@ fn history_cell_tooltip_line(entry: &HistoryEntry, col: usize) -> String {
     }
 }
 
-/// A data cell's full (untruncated) text for painting and for the per-cell
-/// tooltip. An absent field yields an empty string: the paint skips it, and
-/// the tooltip answers "no text" rather than showing a stale neighbor value.
-fn history_cell_text(entry: &HistoryEntry, col: usize) -> String {
-    match col {
-        HISTORY_COL_TIME => entry.at_label.clone(),
-        HISTORY_COL_STATE => match entry.state {
+/// Precomputes all nine cell strings for one history row at push time, so
+/// the owner-draw paint (which re-runs per visible row per repaint) never
+/// allocates: the paint reads `entry.cells[col]` directly. Same content the
+/// per-column matcher produced before, just materialized once.
+fn history_cell_texts(track: &TrackInfo, at_label: &str, state: PlaybackState) -> [String; 9] {
+    [
+        at_label.to_string(),
+        match state {
             PlaybackState::Playing => "▶",
             PlaybackState::Paused => "‖",
             PlaybackState::Stopped => "■",
             PlaybackState::NowPlaying => "♪",
         }
         .to_string(),
-        HISTORY_COL_TITLE => entry.track.title.clone(),
-        HISTORY_COL_ARTIST => {
-            if entry.track.artist.trim().is_empty() {
-                String::new()
-            } else {
-                entry.track.artist.clone()
-            }
-        }
-        HISTORY_COL_ALBUM => entry.track.album.clone(),
-        HISTORY_COL_DURATION => entry
-            .track
+        track.title.clone(),
+        if track.artist.trim().is_empty() {
+            String::new()
+        } else {
+            track.artist.clone()
+        },
+        track.album.clone(),
+        track
             .duration_secs
             .map(crate::events::format_duration_secs)
             .unwrap_or_default(),
-        HISTORY_COL_TRACK => match (entry.track.track_number, entry.track.track_count) {
+        match (track.track_number, track.track_count) {
             (Some(n), Some(c)) => format!("{n}/{c}"),
             _ => String::new(),
         },
-        HISTORY_COL_GENRE => entry.track.genre.clone().unwrap_or_default(),
-        _ => {
-            if entry.track.source_app.trim().is_empty() {
-                String::new()
-            } else {
-                entry.track.source_app.clone()
-            }
-        }
-    }
+        track.genre.clone().unwrap_or_default(),
+        if track.source_app.trim().is_empty() {
+            String::new()
+        } else {
+            track.source_app.clone()
+        },
+    ]
 }
 
 /// Last time a persistent artwork-blit failure was logged, so a broken blit
@@ -8179,20 +8208,37 @@ mod tests {
         }
     }
 
+    /// Reads one precomputed cell (the production paint indexes `cells`
+    /// directly; this accessor keeps the column-indexed assertions
+    /// readable). Out-of-range columns fall back to the source cell, the
+    /// same fallback the old matcher's catch-all arm provided.
+    fn history_cell_text(entry: &HistoryEntry, col: usize) -> String {
+        entry
+            .cells
+            .get(col)
+            .cloned()
+            .unwrap_or_else(|| entry.cells[HISTORY_COL_SOURCE].clone())
+    }
+
     #[test]
     fn history_cell_text_covers_every_column_and_skips_absent_fields() {
-        let mut entry = HistoryEntry {
+        // Full track: every reported column renders its value. The cells are
+        // precomputed at construction, so the track is built completely
+        // first.
+        let mut full_track = track("Song");
+        full_track.duration_secs = Some(225);
+        full_track.track_number = Some(3);
+        full_track.track_count = Some(12);
+        full_track.genre = Some("Synthwave".into());
+        let entry = HistoryEntry {
             id: 0,
             at: Local::now(),
             at_label: "12:34:56".into(),
-            track: track("Song"),
+            cells: history_cell_texts(&full_track, "12:34:56", PlaybackState::NowPlaying),
+            track: full_track,
             state: PlaybackState::NowPlaying,
             accepted: true,
         };
-        entry.track.duration_secs = Some(225);
-        entry.track.track_number = Some(3);
-        entry.track.track_count = Some(12);
-        entry.track.genre = Some("Synthwave".into());
         assert_eq!(history_cell_text(&entry, HISTORY_COL_TIME), "12:34:56");
         // The STATE cell paints the glyph; words live only in tooltips that
         // need them elsewhere.
@@ -8201,14 +8247,19 @@ mod tests {
         assert_eq!(history_cell_text(&entry, 5), "3:45");
         assert_eq!(history_cell_text(&entry, 6), "3/12");
         assert_eq!(history_cell_text(&entry, 7), "Synthwave");
+
         // Absent fields render empty so paint skips and the tooltip can
         // answer "no text" rather than a stale neighbor value.
-        entry.track.duration_secs = None;
-        entry.track.genre = None;
-        assert_eq!(history_cell_text(&entry, 5), "");
-        assert_eq!(history_cell_text(&entry, 7), "");
+        let bare_track = track("Song");
+        let bare = HistoryEntry {
+            cells: history_cell_texts(&bare_track, "12:34:56", PlaybackState::NowPlaying),
+            track: bare_track,
+            ..entry
+        };
+        assert_eq!(history_cell_text(&bare, 5), "");
+        assert_eq!(history_cell_text(&bare, 7), "");
         // Out-of-range column falls back to the source app (last column).
-        assert_eq!(history_cell_text(&entry, 99), "Spotify");
+        assert_eq!(history_cell_text(&bare, 99), "Spotify");
     }
 
     #[test]
@@ -8221,16 +8272,19 @@ mod tests {
 
     #[test]
     fn history_cell_tooltip_line_labels_values_and_unknowns() {
-        let mut entry = HistoryEntry {
+        let mut tooltip_track = track("Song");
+        tooltip_track.genre = Some("Synthwave".into());
+        let entry = HistoryEntry {
             id: 0,
             at: Local::now(),
             at_label: "12:00:00".into(),
-            track: track("Song"),
+            cells: history_cell_texts(&tooltip_track, "12:00:00", PlaybackState::Paused),
+            track: tooltip_track,
             state: PlaybackState::Paused,
             accepted: true,
         };
-        entry.track.genre = Some("Synthwave".into());
-        // A reported value reads "LABEL: value".
+        // A reported value reads "LABEL: value" (the cells were precomputed
+        // with the genre set).
         assert_eq!(history_cell_tooltip_line(&entry, 7), "GENRE: Synthwave");
         // The state column spells the glyph out as a word.
         assert_eq!(history_cell_tooltip_line(&entry, HISTORY_COL_STATE), "STATE: Paused");
@@ -8654,11 +8708,13 @@ mod tests {
     fn history_keeps_cap_and_order() {
         let mut history = History::new(3);
         for index in 0..5 {
+            let track = track(&format!("Track {index}"));
             history.push(HistoryEntry {
                 id: 0,
                 at: Local::now(),
                 at_label: String::new(),
-                track: track(&format!("Track {index}")),
+                cells: history_cell_texts(&track, "", PlaybackState::Playing),
+                track,
                 state: PlaybackState::Playing,
                 accepted: true,
             });
@@ -8738,19 +8794,23 @@ mod tests {
     #[test]
     fn history_keeps_accepted_flag_with_newest_first() {
         let mut history = History::new(3);
+        let track_a = track("Track A");
         history.push(HistoryEntry {
             id: 0,
             at: Local::now(),
             at_label: String::new(),
-            track: track("Track A"),
+            cells: history_cell_texts(&track_a, "", PlaybackState::Playing),
+            track: track_a,
             state: PlaybackState::Playing,
             accepted: true,
         });
+        let track_b = track("Track B");
         history.push(HistoryEntry {
             id: 0,
             at: Local::now(),
             at_label: String::new(),
-            track: track("Track B"),
+            cells: history_cell_texts(&track_b, "", PlaybackState::Paused),
+            track: track_b,
             state: PlaybackState::Paused,
             accepted: false,
         });
