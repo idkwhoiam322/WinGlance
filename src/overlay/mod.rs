@@ -477,6 +477,15 @@ struct OverlayState {
     /// frame buffer at exactly this size.
     last_frame_w: usize,
     last_frame_h: usize,
+    /// Geometry of the last layered-window upload. `UpdateLayeredWindow`
+    /// already applies the position and size, so when nothing moved the
+    /// follow-up topmost reassert runs with `SWP_NOMOVE | SWP_NOSIZE` and
+    /// skips the redundant geometry work. `i32::MIN` sentinels force the
+    /// first frame after creation to apply full geometry.
+    last_upload_x: i32,
+    last_upload_y: i32,
+    last_upload_w: i32,
+    last_upload_h: i32,
     /// The aura comet sweep's displayed angle in radians (atan2 convention:
     /// 0 = right of the pill center, positive = clockwise on screen),
     /// derived from the wall-clock anchor below while `orbiting`. Frozen
@@ -1068,6 +1077,10 @@ impl OverlayState {
             content_fade: None,
             last_frame_w: 0,
             last_frame_h: 0,
+            last_upload_x: i32::MIN,
+            last_upload_y: i32::MIN,
+            last_upload_w: i32::MIN,
+            last_upload_h: i32::MIN,
             orbit_angle: 0.0,
             orbit_base: 0.0,
             orbit_started_at: Instant::now(),

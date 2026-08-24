@@ -24,7 +24,9 @@ use windows::Win32::Graphics::Gdi::{
     DT_CALCRECT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DrawTextW, ETO_CLIPPED,
     ExtTextOutW, GdiFlush, GetSysColor, HBITMAP, HDC, HFONT, HGDIOBJ, SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW, ULW_ALPHA};
+use windows::Win32::UI::WindowsAndMessaging::{
+    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, ULW_ALPHA,
+};
 use windows::core::PCWSTR;
 
 /// Which parts of the pill a text-drawing pass should produce. This lets the
@@ -355,16 +357,26 @@ pub(super) fn render_layered(
             ULW_ALPHA,
         )
     };
+    // Re-assert topmost on every upload (a foreground fullscreen window can
+    // take the z-order), but let `UpdateLayeredWindow` own the geometry: when
+    // position and size match the previous upload it re-applies them anyway,
+    // so the follow-up call runs with NOMOVE|NOSIZE and skips the redundant
+    // window-manager work during animation.
+    let geometry_changed = state.last_upload_x != position.x
+        || state.last_upload_y != position.y
+        || state.last_upload_w != buf_w
+        || state.last_upload_h != buf_h;
+    let mut flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
+    if geometry_changed {
+        state.last_upload_x = position.x;
+        state.last_upload_y = position.y;
+        state.last_upload_w = buf_w;
+        state.last_upload_h = buf_h;
+    } else {
+        flags |= SWP_NOMOVE | SWP_NOSIZE;
+    }
     unsafe {
-        let _ = set_window_pos(
-            state.hwnd,
-            HWND_TOPMOST,
-            position.x,
-            position.y,
-            buf_w,
-            buf_h,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
+        let _ = set_window_pos(state.hwnd, HWND_TOPMOST, position.x, position.y, buf_w, buf_h, flags);
     }
     result.context("UpdateLayeredWindow")
 }
@@ -694,15 +706,28 @@ pub(super) fn draw_pixels(
     // loop spans the full `0..width` / `0..height` range so the exterior
     // anti-aliasing pixels (which carry the supersampled blend at the rounded
     // corners and right edge) are not truncated by `inset + pill_w`.
+    // Interior pixels are classified per row instead of per pixel: on a row
+    // whose center is inside `round_rect_coverage_fast`'s proven-interior
+    // band, the columns of the matching span answer exactly 1.0 — the same
+    // predicate the fast path applies per pixel, hoisted so interior pixels
+    // skip the classification call entirely. Bit-identical output (see
+    // `solid_body_span`, where the hoisted predicate is test-pinned).
     for y in 0..height {
+        let (solid_from, solid_to) =
+            solid_body_span(pill_w as f32, pill_h as f32, radius, inset as i32, y as i32, width);
+        let solid_row = solid_to > solid_from;
         for x in 0..width {
-            let coverage = round_rect_coverage_supersampled(
-                (x as i32 - inset as i32) as f32,
-                (y as i32 - inset as i32) as f32,
-                pill_w as f32,
-                pill_h as f32,
-                radius,
-            );
+            let coverage = if solid_row && x >= solid_from && x < solid_to {
+                1.0
+            } else {
+                round_rect_coverage_supersampled(
+                    (x as i32 - inset as i32) as f32,
+                    (y as i32 - inset as i32) as f32,
+                    pill_w as f32,
+                    pill_h as f32,
+                    radius,
+                )
+            };
             if coverage > 0.0 {
                 let alpha = (effective_bg[3] as f32 * coverage) as u32;
                 composite(
@@ -893,6 +918,57 @@ pub(super) fn draw_art_tile(
 /// physical cut edge rather than a flat outline. Purely a boundary
 /// definition line; the aura glow (drawn earlier, underneath) is what
 /// carries color outside it.
+/// Per-row evaluation ranges for the edge-stroke ring. The ring (the outer
+/// shape minus the shape inset by `stroke_w`) has coverage only where a
+/// supersample lands inside the outer shape but not deep inside the inner
+/// one, and the rounded-rect SDF offsets exactly — so per row that support
+/// is the span of the outer shape dilated by 0.75 (the coverage ramp) plus
+/// 0.5 (sample-to-center reach), minus the open span of the inner shape
+/// eroded by 0.75 + 0.5. Everything deeper inside is provably coverage-0.
+/// Rows past the shape's anti-alias reach return empty; rows within the
+/// band of the top or bottom edge return the full row (the boundary there
+/// is the horizontal edge itself). Pure, so the windowing contract is
+/// test-pinned against a brute-force sweep.
+fn edge_stroke_ranges(pill_w: usize, pill_h: usize, radius: f32, stroke_w: f32, y: usize) -> [(usize, usize); 2] {
+    let half_w = pill_w as f32 / 2.0;
+    let half_h = pill_h as f32 / 2.0;
+    let r_eff = radius.min(half_w.min(half_h));
+    let band = 1.25;
+    let cy = y as f32 + 0.5 - half_h;
+    // Past the anti-alias reach of the shape every sample is at least
+    // 0.9px outside, so the outer coverage is exactly 0 for the row.
+    if cy.abs() > half_h + band {
+        return [(0, 0), (0, 0)];
+    }
+    if cy.abs() <= half_h - stroke_w - band {
+        let so = row_half_span(half_w + band, half_h + band, r_eff + band, cy);
+        let si = row_half_span(
+            (half_w - stroke_w - band).max(0.0),
+            (half_h - stroke_w - band).max(0.0),
+            (r_eff - stroke_w - band).max(0.0),
+            cy,
+        )
+        .min(so);
+        // Center coords: contributors sit in [-so, -si] and [si, so]; pixel
+        // x has its center at x + 0.5. Floor/ceil plus one pixel of slack
+        // only widens the evaluated set — the per-pixel math skips
+        // non-contributing pixels exactly as before.
+        let l0 = ((half_w - so).floor().max(0.0) as usize).saturating_sub(1);
+        let l1 = (((half_w - si).ceil() as usize) + 1).min(pill_w);
+        let r0 = ((half_w + si).floor().max(0.0) as usize).saturating_sub(1);
+        let r1 = (((half_w + so).ceil() as usize) + 1).min(pill_w);
+        if r0 <= l1 {
+            // Degenerate pill: the bands meet — sweep one merged range so a
+            // pixel between them can never composite twice.
+            [(l0, r1.max(l1)), (0, 0)]
+        } else {
+            [(l0, l1), (r0, r1)]
+        }
+    } else {
+        [(0, pill_w), (0, 0)]
+    }
+}
+
 pub(super) fn draw_edge_stroke(
     pixels: &mut [u8],
     width: usize,
@@ -914,25 +990,34 @@ pub(super) fn draw_edge_stroke(
     let inner_w = (pill_w as f32 - 2.0 * stroke_w).max(0.0);
     let inner_h = (pill_h as f32 - 2.0 * stroke_w).max(0.0);
     let inner_radius = (radius - stroke_w).max(0.0);
+    // The ring's per-row evaluation ranges (see `edge_stroke_ranges`): the
+    // windowing is exact — the SDF offsets exactly, so pixels outside the
+    // returned ranges are provably coverage-0 and skip both supersampled
+    // evaluations. Rows within the band of the top or bottom edge keep the
+    // full sweep: there the boundary is the horizontal edge itself,
+    // spanning the whole straight section.
     for y in 0..pill_h {
-        for x in 0..pill_w {
-            let px = x as f32;
-            let py = y as f32;
-            let outer = round_rect_coverage_supersampled(px, py, pill_w as f32, pill_h as f32, radius);
-            if outer <= 0.0 {
-                continue;
+        let py = y as f32;
+        for (start, end) in edge_stroke_ranges(pill_w, pill_h, radius, stroke_w, y) {
+            for x in start..end {
+                let px = x as f32;
+                let outer = round_rect_coverage_supersampled(px, py, pill_w as f32, pill_h as f32, radius);
+                if outer <= 0.0 {
+                    continue;
+                }
+                let inner =
+                    round_rect_coverage_supersampled(px - stroke_w, py - stroke_w, inner_w, inner_h, inner_radius);
+                let coverage = (outer - inner).clamp(0.0, 1.0);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                // Diagonal light bias: brightest at top-left (0,0), dimmest
+                // at bottom-right (pill_w, pill_h), normalized to [0, 1].
+                let t = ((x as f32 / pill_w.max(1) as f32) + (y as f32 / pill_h.max(1) as f32)) * 0.5;
+                let peak = PEAK_ALPHA - (PEAK_ALPHA - MIN_ALPHA) * t;
+                let alpha = (peak * coverage).round() as u32;
+                composite(pixels, width, inset + x, inset + y, STROKE_COLOR, alpha);
             }
-            let inner = round_rect_coverage_supersampled(px - stroke_w, py - stroke_w, inner_w, inner_h, inner_radius);
-            let coverage = (outer - inner).clamp(0.0, 1.0);
-            if coverage <= 0.0 {
-                continue;
-            }
-            // Diagonal light bias: brightest at top-left (0,0), dimmest
-            // at bottom-right (pill_w, pill_h), normalized to [0, 1].
-            let t = ((x as f32 / pill_w.max(1) as f32) + (y as f32 / pill_h.max(1) as f32)) * 0.5;
-            let peak = PEAK_ALPHA - (PEAK_ALPHA - MIN_ALPHA) * t;
-            let alpha = (peak * coverage).round() as u32;
-            composite(pixels, width, inset + x, inset + y, STROKE_COLOR, alpha);
         }
     }
 }
@@ -2652,7 +2737,14 @@ pub(super) fn draw_text_line_pixels(
                 if layer != RenderLayer::Background
                     && let Some(strip) = ctx.strip.as_ref()
                 {
-                    let off = (ctx.scroll.offset % total as f32) as i32;
+                    // Renormalize the accumulator against this line's period:
+                    // the tick loop advances `offset` without knowing the
+                    // text width, so without this wrap the f32 accumulator
+                    // grows for the lifetime of a long-running scroll and
+                    // past ~2^24 its ULP exceeds a pixel (visible stutter).
+                    // The modulo leaves the used offset bit-identical.
+                    ctx.scroll.offset %= total as f32;
+                    let off = ctx.scroll.offset as i32;
                     // Edge fade relative to the visible band: during the hold
                     // only the trailing edge fades — nothing exits the left
                     // edge, and the text head sits at the band boundary where
@@ -2996,6 +3088,26 @@ impl Drop for SelectedObjectGuard {
     }
 }
 
+/// The `[start, end)` column span a pill-body row can fill with coverage
+/// exactly 1.0 without per-pixel classification: the same predicate
+/// `round_rect_coverage_fast` applies per pixel (radius clamped to the half
+/// extents, `+0.5` center convention, conservative `max(radius, 0.75) +
+/// 0.35` interior inset), hoisted to the row so interior pixels skip the
+/// call. `(0, 0)` when the row itself is not provably solid. Pure, so the
+/// hoist is test-pinned against the per-pixel classification.
+fn solid_body_span(pill_w: f32, pill_h: f32, radius: f32, inset: i32, y: i32, width: usize) -> (usize, usize) {
+    let r_eff = radius.min(pill_w / 2.0).min(pill_h / 2.0);
+    let fast_inset = r_eff.max(0.75) + 0.35;
+    let cy = (y - inset) as f32 + 0.5;
+    if cy < fast_inset || cy > pill_h - fast_inset {
+        return (0, 0);
+    }
+    (
+        ((fast_inset - 0.5 + inset as f32).ceil().max(0.0)) as usize,
+        (((pill_w - fast_inset - 0.5 + inset as f32).floor() + 1.0).min(width as f32)) as usize,
+    )
+}
+
 /// Returns the scratch DC + DIB for GDI text, growing it when a larger text
 /// row arrives. The DIB is kept across frames and released at window
 /// destruction.
@@ -3230,6 +3342,28 @@ pub(super) fn draw_source_app_row(
         );
     }
 }
+/// Half-width of the horizontal span a rounded rectangle occupies at signed
+/// height `dy` from its center (the SDF's pixel-center convention): the
+/// straight sides at `±half_w`, pulling in along the corner arcs beyond
+/// `half_h - radius`. `radius` is clamped to the half extents exactly like
+/// `round_rect_signed_dist`, and a non-positive radius degenerates to the
+/// plain rectangle. Because the rounded-rect SDF offsets exactly — dilating
+/// by `s` is the same shape with `radius + s` and half extents `+ s`, eroding
+/// by `s` the same with `- s` — the row span of the dilated/eroded shapes is
+/// the exact per-row support of a distance band, which the edge-stroke and
+/// aura sweeps use to skip provably non-contributing pixels.
+fn row_half_span(half_w: f32, half_h: f32, radius: f32, dy: f32) -> f32 {
+    let radius = radius.max(0.0).min(half_w.min(half_h));
+    let straight = half_h - radius;
+    let dy = dy.abs();
+    if dy >= straight {
+        let t = (dy - straight).min(radius);
+        (half_w - radius) + (radius * radius - t * t).sqrt()
+    } else {
+        half_w
+    }
+}
+
 /// Signed distance to a rounded rectangle's boundary at pixel (x, y),
 /// negative inside the shape. Used for the pill's outer shape, the
 /// placeholder art and the album-artwork corner mask.
@@ -3327,6 +3461,70 @@ pub(super) const ORBIT_COMET_HALF_SPAN_DEG: f32 = 55.0;
 /// so the sweep is clearly brighter without burning out.
 pub(super) const ORBIT_COMET_PEAK_ALPHA: f32 = 210.0;
 
+/// Per-row evaluation windows for the aura sweep, as two `[start, end)`
+/// pixel ranges (the second empty when the bands merge or the row is full).
+/// A contributing pixel's signed distance satisfies `-1.5 < d <= margin`,
+/// and the SDF offsets exactly — so on rows far enough from the top/bottom
+/// edges the support is the span of the shape dilated by `margin` minus the
+/// open span of the shape eroded by 1.5: the deep interior is provably
+/// non-contributing and skips the signed-distance evaluation. Rows within
+/// 1.5 + margin of the top or bottom edge return the full row (the boundary
+/// there is the horizontal edge itself); rows past the margin's vertical
+/// reach return empty. Pure, so the windowing contract is test-pinned
+/// against a brute-force sweep.
+fn aura_row_windows(
+    buf_w: usize,
+    inset: usize,
+    pill_w: usize,
+    pill_h: usize,
+    radius: f32,
+    margin: usize,
+    y: usize,
+) -> (usize, usize, usize, usize) {
+    let margin_f = margin as f32;
+    let half_w = pill_w as f32 / 2.0;
+    let half_h = pill_h as f32 / 2.0;
+    let r_eff = radius.min(half_w.min(half_h));
+    // Rows farther than the margin from the pill's bounding box are
+    // certainly farther than the margin from the rounded pill itself (the
+    // box contains the pill), so their signed distance — at least the
+    // vertical distance — can never reach the margin.
+    let py = y as f32 + 0.5;
+    if py < inset as f32 - margin_f || py > inset as f32 + pill_h as f32 + margin_f {
+        return (0, 0, 0, 0);
+    }
+    let cy = py - inset as f32 - half_h;
+    if cy.abs() <= half_h - margin_f - 1.5 {
+        let so = row_half_span(half_w + margin_f, half_h + margin_f, r_eff + margin_f, cy);
+        let si = row_half_span(
+            (half_w - 1.5).max(0.0),
+            (half_h - 1.5).max(0.0),
+            (r_eff - 1.5).max(0.0),
+            cy,
+        )
+        .min(so);
+        // Center coords: contributors sit in [-so, -si] and [si, so]; pixel
+        // x has its center at x + 0.5 - inset. Slack of one pixel per side
+        // only widens the evaluated set — the per-pixel predicates in the
+        // caller skip non-contributors exactly as before.
+        let off = half_w + inset as f32 - 0.5;
+        let l0 = ((off - so).floor().max(0.0) as usize).saturating_sub(1);
+        let l1 = (((off - si).ceil() as usize) + 1).min(buf_w);
+        let r0 = ((off + si).floor().max(0.0) as usize).saturating_sub(1);
+        let r1 = (((off + so).ceil() as usize) + 1).min(buf_w);
+        if r0 <= l1 {
+            // Degenerate pill: the bands meet — merge into one range so a
+            // pixel between them can never composite twice.
+            (l0, r1.max(l1), buf_w, 0)
+        } else {
+            (l0, l1, r0, r1)
+        }
+    } else {
+        // Full row: the first window spans it, the second is empty.
+        (0, buf_w, buf_w, 0)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_aura(
     pixels: &mut [u8],
@@ -3344,23 +3542,21 @@ pub(super) fn draw_aura(
     let margin = (AURA_HALO_LOGICAL * scale).round().max(1.0) as usize;
 
     for y in 0..buf_h {
+        let (wa, wb, wc, wd) = aura_row_windows(buf_w, inset, pill_w, pill_h, radius, margin, y);
         for x in 0..buf_w {
+            // Side-band windows for straight rows; the merged/full fallback
+            // above makes the second window empty or covers the whole row.
+            if !(x >= wa && x < wb) && !(x >= wc && x < wd) {
+                continue;
+            }
             // Pixels farther than the margin from the pill's bounding box are
             // certainly farther than the margin from the rounded pill itself
             // (the box contains the pill), so they can never contribute —
             // skip before evaluating the signed distance.
             let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
             let box_left = inset as f32;
             let box_right = box_left + pill_w as f32;
-            let box_top = inset as f32;
-            let box_bottom = box_top + pill_h as f32;
-            let margin_f = margin as f32;
-            if px < box_left - margin_f
-                || px > box_right + margin_f
-                || py < box_top - margin_f
-                || py > box_bottom + margin_f
-            {
+            if px < box_left - margin as f32 || px > box_right + margin as f32 {
                 continue;
             }
             let d = round_rect_signed_dist(
@@ -3619,6 +3815,151 @@ mod tests {
                 DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
                 PCWSTR(name.as_ptr()),
             )
+        }
+    }
+
+    #[test]
+    fn body_solid_span_matches_the_per_pixel_fast_classification() {
+        // The hoisted row span must classify pixels exactly like the
+        // per-pixel fast path: the span is precisely the set of pixels the
+        // fast path answers Some(1.0) for. A drift would paint a wrong
+        // interior ring the stroke/aura windowing cannot compensate for.
+        for &(pill_w, pill_h, radius) in &[
+            (340.0_f32, 78.0, 26.0_f32),
+            (200.0, 52.0, 12.0),
+            (800.0, 200.0, 48.0),
+            (60.0, 24.0, 4.0),
+            (3.0, 16.0, 1.0),
+        ] {
+            let inset = 10usize;
+            let width = pill_w as usize + inset * 2;
+            let height = pill_h as usize + inset * 2;
+            for y in 0..height {
+                let (from, to) = solid_body_span(pill_w, pill_h, radius, inset as i32, y as i32, width);
+                for x in 0..width {
+                    let fast = round_rect_coverage_fast(
+                        (x as i32 - inset as i32) as f32,
+                        (y as i32 - inset as i32) as f32,
+                        pill_w,
+                        pill_h,
+                        radius,
+                    );
+                    let hoisted = x >= from && x < to;
+                    assert_eq!(
+                        hoisted,
+                        fast == Some(1.0),
+                        "span drift at ({x},{y}) shape {pill_w}x{pill_h} r={radius}: hoisted={hoisted} fast={fast:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_half_span_lands_on_the_sdf_boundary() {
+        // The span endpoint must sit on the shape's boundary: the signed
+        // distance evaluated at ±span for the row's height is ~0. This pins
+        // the interval math the stroke and aura windowing lean on — a wrong
+        // span would silently skip contributing pixels.
+        for &(w, h, r) in &[
+            (340.0_f32, 78.0, 26.0),
+            (200.0, 52.0, 12.0),
+            (800.0, 200.0, 48.0),
+            (64.0, 32.0, 4.0),
+            (50.0, 50.0, 25.0), // fully-capsule corner clamp
+        ] {
+            let half_w = w / 2.0;
+            let half_h = h / 2.0;
+            for step in -20..=20 {
+                let dy = (step as f32 / 20.0) * half_h;
+                let span = row_half_span(half_w, half_h, r, dy);
+                // SDF input is pixel-corner convention (+0.5); the center
+                // point (cx, cy) maps to (cx + half_w - 0.5, cy + half_h - 0.5).
+                for sign in [-1.0_f32, 1.0] {
+                    let d = round_rect_signed_dist(sign * span + half_w - 0.5, dy + half_h - 0.5, w, h, r);
+                    assert!(
+                        d.abs() < 0.01,
+                        "span endpoint off the boundary: w={w} h={h} r={r} dy={dy} span={span} d={d}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edge_stroke_ranges_cover_every_contributing_pixel() {
+        // Contract: a pixel outside the returned ranges has ring coverage of
+        // exactly 0 — skipping it changes nothing. Sweep every pixel the
+        // expensive way and assert the windowing never drops a contributor.
+        for &(pill_w, pill_h, radius, scale) in &[
+            (340usize, 78usize, 26.0_f32, 1.0_f32),
+            (200, 52, 12.0, 2.0),
+            (800, 200, 48.0, 4.0),
+            (60, 24, 4.0, 1.0),
+            // Narrow enough that the two side bands meet: pins the merged
+            // single-range branch (no pixel may composite twice).
+            (3, 16, 1.0, 1.0),
+        ] {
+            let stroke_w = (1.25 * scale).round().max(1.0);
+            let inner_w = (pill_w as f32 - 2.0 * stroke_w).max(0.0);
+            let inner_h = (pill_h as f32 - 2.0 * stroke_w).max(0.0);
+            let inner_radius = (radius - stroke_w).max(0.0);
+            for y in 0..pill_h {
+                let ranges = edge_stroke_ranges(pill_w, pill_h, radius, stroke_w, y);
+                let py = y as f32;
+                for x in 0..pill_w {
+                    let px = x as f32;
+                    let outer = round_rect_coverage_supersampled(px, py, pill_w as f32, pill_h as f32, radius);
+                    let inner =
+                        round_rect_coverage_supersampled(px - stroke_w, py - stroke_w, inner_w, inner_h, inner_radius);
+                    let coverage = (outer - inner).clamp(0.0, 1.0);
+                    if coverage > 0.0 {
+                        let in_range = ranges.iter().any(|(start, end)| x >= *start && x < *end);
+                        assert!(
+                            in_range,
+                            "contributing pixel outside the stroke windows: \
+                             {pill_w}x{pill_h} r={radius} s={scale} at ({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aura_row_windows_cover_every_contributing_pixel() {
+        // Contract: a pixel outside the returned windows has d > margin (past
+        // the halo) or d <= -1.5 (deep inside, inner_aa == 0) — it can never
+        // contribute, so skipping it changes nothing.
+        for &(pill_w, pill_h, radius, scale) in &[
+            (340usize, 78usize, 26.0_f32, 1.0_f32),
+            (200, 52, 12.0, 2.0),
+            (800, 200, 48.0, 4.0),
+        ] {
+            let inset = 10usize;
+            let margin = (AURA_HALO_LOGICAL * scale).round().max(1.0) as usize;
+            let buf_w = pill_w + inset * 2;
+            let buf_h = pill_h + inset * 2;
+            for y in 0..buf_h {
+                let (wa, wb, wc, wd) = aura_row_windows(buf_w, inset, pill_w, pill_h, radius, margin, y);
+                for x in 0..buf_w {
+                    let in_window = (x >= wa && x < wb) || (x >= wc && x < wd);
+                    if !in_window {
+                        let d = round_rect_signed_dist(
+                            x as f32 - inset as f32,
+                            y as f32 - inset as f32,
+                            pill_w as f32,
+                            pill_h as f32,
+                            radius,
+                        );
+                        assert!(
+                            d > margin as f32 || d <= -1.5,
+                            "contributing pixel outside the aura windows: \
+                             {pill_w}x{pill_h} r={radius} s={scale} at ({x},{y}) d={d}"
+                        );
+                    }
+                }
+            }
         }
     }
 
