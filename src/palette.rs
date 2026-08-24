@@ -176,14 +176,18 @@ fn box_downsample_square(rgba: &[u8], grid: usize) -> Option<Vec<u8>> {
     if (side as u64) * (side as u64) != n || side < grid {
         return None;
     }
-    let cell = side / grid;
+    // Exact per-cell partition: each cell's window is derived from its grid
+    // index against `side` itself, so every pixel belongs to exactly one
+    // cell even when `side` is not a multiple of `grid` (a remainder strip
+    // would otherwise never be histogrammed). For the production decode
+    // (256 = 16 × 16) the windows equal the fixed `side / grid` cells.
     let mut out = Vec::with_capacity(grid * grid * 4);
     for gy in 0..grid {
-        let y0 = gy * cell;
-        let y1 = (y0 + cell).min(side);
+        let y0 = gy * side / grid;
+        let y1 = (gy + 1) * side / grid;
         for gx in 0..grid {
-            let x0 = gx * cell;
-            let x1 = (x0 + cell).min(side);
+            let x0 = gx * side / grid;
+            let x1 = (gx + 1) * side / grid;
             let (mut sum_r, mut sum_g, mut sum_b, mut count) = (0u64, 0u64, 0u64, 0u32);
             for y in y0..y1 {
                 for x in x0..x1 {
@@ -456,6 +460,31 @@ mod tests {
         buf[0..4].copy_from_slice(&[220, 40, 40, 255]); // row 0, col 0
         let out = box_downsample_square(&buf, 2).expect("4×4 must downscale to 2×2");
         assert_eq!(out, [220, 40, 40, 255], "transparent pixels must be skipped");
+    }
+
+    #[test]
+    fn box_downsample_covers_the_remainder_strip_on_non_multiple_sides() {
+        // 20×20 onto a 16-wide grid: the old fixed `side / grid` cells
+        // sampled only the first 16 rows and columns, silently dropping the
+        // remainder strip. The exact per-cell partition must histogram it —
+        // the bottom-right cell averages pure-red remainder pixels, so a
+        // zero mean would mean they were skipped again.
+        let side = 20usize;
+        let mut rgba = vec![0u8; side * side * 4];
+        for y in 0..side {
+            for x in 0..side {
+                let px = &mut rgba[(y * side + x) * 4..(y * side + x) * 4 + 4];
+                let red_band = y >= 16 || x >= 16;
+                px.copy_from_slice(&[if red_band { 255 } else { 0 }, 0, 0, 255]);
+            }
+        }
+        let cells = box_downsample_square(&rgba, 16).expect("20×20 must downscale to 16×16");
+        assert_eq!(cells.len(), 16 * 16 * 4, "every cell must emit a sample");
+        let bottom_right = &cells[(15 * 16 + 15) * 4..(15 * 16 + 15) * 4 + 3];
+        assert!(
+            bottom_right[0] > 0,
+            "the remainder strip must be histogrammed: {bottom_right:?}"
+        );
     }
 
     #[test]

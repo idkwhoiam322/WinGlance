@@ -885,7 +885,45 @@ pub(crate) fn sweep_orphan_temps(dir: &Path) {
             continue;
         };
         if name.starts_with(ORPHAN_TEMP_PATTERN.0) && name.ends_with(ORPHAN_TEMP_PATTERN.1) {
+            // The temp name embeds the creating pid (`temp_name`). A pid that
+            // still runs may be mid-save — this exact window exists during
+            // the restart handoff, where the successor sweeps while the old
+            // instance is still alive — so only a provably dead pid's temp
+            // is an orphan. Unparseable names keep the old behavior: they
+            // match the app's pattern and are best-effort removed.
+            let pid_alive = name
+                .trim_start_matches(ORPHAN_TEMP_PATTERN.0)
+                .split('-')
+                .next()
+                .and_then(|pid| u32::from_str_radix(pid, 16).ok())
+                .is_some_and(orphan_temp_pid_alive);
+            if pid_alive {
+                continue;
+            }
             let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether `pid` names a live process: `OpenProcess` + a zero wait. A pid
+/// that opens and is not signaled is alive; one that cannot be opened at all
+/// is treated as alive too (a protected process must not lose its in-flight
+/// temp) — except a clean "no such process", which is the dead-pid signature
+/// and lets the sweep do its job.
+fn orphan_temp_pid_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    unsafe {
+        match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            Ok(handle) => {
+                let wait = WaitForSingleObject(handle, 0);
+                let _ = CloseHandle(handle);
+                // WAIT_TIMEOUT is the live signature; WAIT_FAILED is treated
+                // as alive too — every ambiguous answer errs toward keeping
+                // an in-flight temp, which is the guard's whole point.
+                wait == WAIT_TIMEOUT || wait == WAIT_FAILED
+            }
+            Err(error) => error.code() != windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0),
         }
     }
 }
@@ -1225,13 +1263,24 @@ mod tests {
 
     #[test]
     fn orphan_temp_sweep_removes_only_matching_names() {
-        // The sweep must delete exactly this app's `wg-*.tmp` files
-        // and nothing else — a foreign temp-looking file or an unrelated
-        // document stays put.
+        // The sweep must delete exactly this app's dead-pid `wg-*.tmp`
+        // files and nothing else — a foreign temp-looking file, an
+        // unrelated document, or a temp whose creating pid is still alive
+        // (the restart-handoff window) stays put.
         let dir = std::env::temp_dir().join(format!("wg-sweep-{}-{}", std::process::id(), std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let keep = ["config.toml", "not-wg.tmp", "wg-preserved.tmp.bak", "random.tmp"];
-        let remove = ["wg-1234-0-5678.tmp", "wg-abcd-ef-1234.tmp"];
+        let keep = [
+            "config.toml",
+            "not-wg.tmp",
+            "wg-preserved.tmp.bak",
+            "random.tmp",
+            // This process is alive: its temp must survive the sweep.
+            &format!("wg-{:x}-0-0.tmp", std::process::id()),
+        ];
+        // Pids near the u32 ceiling: no real process can sit there (kernel
+        // pid space tops out far below), so the sweep's dead-pid verdict is
+        // machine-independent and these temps are always removed.
+        let remove = ["wg-fffffffe-0-5678.tmp", "wg-fffffffd-ef-1234.tmp"];
         for name in keep.iter().chain(remove.iter()) {
             std::fs::write(dir.join(name), b"x").unwrap();
         }

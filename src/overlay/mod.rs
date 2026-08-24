@@ -255,11 +255,17 @@ struct LineScroll {
     /// least one line is scrolling; static text needs no per-frame redraw.
     scrolling: bool,
     /// Cached natural (DT_CALCRECT) width of this row's current text, valid
-    /// only while `measured_font` is the font the row draws with — the same
+    /// only while `measured_font` is the font the row draws with AND
+    /// `measured_text` is the hash of the text the row draws — the same
     /// keying discipline as the marquee strip. Spares every animation tick a
     /// GDI measure pass for unchanged text; reset with the content.
     measured_w: i32,
     measured_font: HFONT,
+    /// Hash of the text the cached width was measured for (see above): a
+    /// content change that misses `reset_scroll` must not inherit the old
+    /// measurement, and GDI may recycle font handle values, so the font
+    /// handle alone is not a complete key.
+    measured_text: u64,
 }
 
 /// Bundles the scroll state of one line with the cached raster of that line,
@@ -1158,6 +1164,7 @@ impl OverlayState {
             // scrolls an over-wide empty strip.
             line.measured_w = 0;
             line.measured_font = HFONT(std::ptr::null_mut());
+            line.measured_text = 0;
         }
     }
 

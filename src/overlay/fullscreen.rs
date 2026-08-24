@@ -46,7 +46,12 @@ pub(super) fn refresh_period_ms(target: Option<&TargetMonitor>, overlay_hwnd: HW
             // Refresh rate = numerator / denominator (Hz); 0/0 means DWM
             // did not report a rate (e.g. composition paused).
             if ratio.uiNumerator != 0 && ratio.uiDenominator != 0 {
-                Some(1000 * ratio.uiDenominator / ratio.uiNumerator)
+                // Widen before multiplying: a pathological denominator must
+                // not overflow the u32 math (debug builds would panic). The
+                // caller clamps the period to 1..=100 ms, so an absurd ratio
+                // saturating to u32::MAX is indistinguishable from "very
+                // high refresh" and lands on the same clamped value.
+                Some((1000u64 * ratio.uiDenominator as u64 / ratio.uiNumerator as u64).min(u32::MAX as u64) as u32)
             } else {
                 None
             }

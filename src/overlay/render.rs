@@ -2655,10 +2655,18 @@ pub(super) fn draw_text_line_pixels(
         };
         if let Some(ctx) = marquee {
             // The overflow decision needs the text's natural width. It is
-            // cached per row (keyed by the selected font, like the marquee
-            // strip's key), so an animation tick never re-runs the DT_CALCRECT
-            // measure for unchanged text.
-            let text_w = if ctx.scroll.measured_font.0 == font.0 {
+            // cached per row, keyed by the selected font AND the text itself
+            // (like the marquee strip's key), so an animation tick never
+            // re-runs the DT_CALCRECT measure for unchanged text while a
+            // content change that missed `reset_scroll` can never inherit
+            // the old measurement.
+            let text_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::hash::DefaultHasher::new();
+                value.hash(&mut hasher);
+                hasher.finish()
+            };
+            let text_w = if ctx.scroll.measured_font.0 == font.0 && ctx.scroll.measured_text == text_hash {
                 ctx.scroll.measured_w
             } else {
                 let mut measured = RECT::default();
@@ -2671,6 +2679,7 @@ pub(super) fn draw_text_line_pixels(
                 let width = measured.right - measured.left;
                 ctx.scroll.measured_w = width;
                 ctx.scroll.measured_font = font;
+                ctx.scroll.measured_text = text_hash;
                 width
             };
             // Whether this line overflows its visible band: while a
@@ -3172,9 +3181,11 @@ pub(crate) fn pm_bgra_to_rgba(pm: &[u8]) -> Option<Vec<u8>> {
             continue;
         }
         // Un-premultiply: straight channel = premultiplied × 255 / alpha.
-        rgba.push((r * 255 / a) as u8);
-        rgba.push((g * 255 / a) as u8);
-        rgba.push((b * 255 / a) as u8);
+        // The worker's decode guarantees rgb <= alpha; a violating input
+        // (decoder bug, corrupted buffer) must saturate rather than wrap.
+        rgba.push(((r * 255 / a).min(255)) as u8);
+        rgba.push(((g * 255 / a).min(255)) as u8);
+        rgba.push(((b * 255 / a).min(255)) as u8);
         rgba.push(a as u8);
     }
     Some(rgba)
