@@ -52,9 +52,9 @@ use fullscreen::{
     refresh_period_ms, resolve_target_sticky, window_is_fullscreen,
 };
 use morph::{
-    ENTRANCE_GROW, HoverExpand, HoverStep, HoverTick, MorphDirection, MorphProgress, animation_duration, bounce_scale,
-    collapse_duration, content_size_of, ease_out_quint, hover_engaged, hover_progress, hover_step, lagged_collapse,
-    lagged_expand, morph_duration, morph_size, normalized_elapsed, reversal_seed, spring_collapse,
+    ENTRANCE_GROW, HoverExpand, HoverStep, HoverTick, MorphDirection, MorphProgress, animation_duration,
+    collapse_duration, ease_out_quint, frame_content_size, hover_engaged, hover_progress, hover_step, lagged_collapse,
+    lagged_expand, morph_duration, normalized_elapsed, reversal_seed, spring_collapse,
 };
 use render::{AURA_HALO_LOGICAL, ORBIT_PERIOD_SECS, pill_text_from_track, playback_state_for_track, render_layered};
 
@@ -3292,42 +3292,24 @@ impl OverlayState {
         // the pill grows in place. The entrance/exit grow uses the same
         // reveal. Every other frame uses the plain size of the applied
         // layout.
-        let (logical_width, logical_height, morph_progress) = if self.hover_expand.is_some() {
-            let progress = hover_progress_now.expect("hover morph present implies a progress");
-            let size = morph_size(&self.config, &content, progress);
-            (size.0, size.1, progress)
-        } else if let Some(progress) = frame.morph {
-            let size = morph_size(&self.config, &content, progress);
-            (size.0, size.1, progress)
-        } else {
-            let size = content_size_of(&self.config, &content, compact);
-            (
-                size.0,
-                size.1,
-                MorphProgress {
-                    width: 0.0,
-                    height: 0.0,
-                },
-            )
-        };
-        // The settle-bounce: while the size spring passes its endpoint, the
-        // whole pill scales about its anchor past the final size and back
-        // (see `bounce_scale`) — the bounce rides the spring itself, so it
-        // starts the instant the size completes, with no still pause. The
-        // scale multiplies the size (window and hitbox alike) and is applied
-        // to the rendered frame in `render_layered`.
-        let direction = if let Some(hover) = &self.hover_expand {
-            hover.direction
-        } else if matches!(self.phase, Phase::Collapsing(_)) {
-            MorphDirection::Collapse
-        } else {
-            MorphDirection::Expand
-        };
-        let scale_factor = bounce_scale(morph_progress, direction);
-        let logical_width = logical_width * scale_factor;
-        let logical_height = logical_height * scale_factor;
-        let width = (logical_width * dpi).round().max(1.0) as i32;
-        let height = (logical_height * dpi).round().max(1.0) as i32;
+        // The settle-bounce scale rides the spring itself and multiplies the
+        // size (window and hitbox alike) — see `frame_content_size`, the
+        // single source shared with the hover hitbox so the visible window
+        // and the cursor hitbox can never drift apart.
+        let (width, height, scale_factor) = frame_content_size(
+            &self.config,
+            &content,
+            compact,
+            self.hover_expand.as_ref().map(|hover| {
+                (
+                    hover,
+                    hover_progress_now.expect("hover morph present implies a progress"),
+                )
+            }),
+            frame.morph,
+            matches!(self.phase, Phase::Collapsing(_)),
+            dpi,
+        );
         self.aura_inset = (AURA_HALO_LOGICAL * dpi).round() as i32;
         // A genuine fullscreen foreground window on the target monitor collapses
         // the work area to the full `rcMonitor`; otherwise the pill anchors
@@ -3873,44 +3855,23 @@ impl OverlayState {
 
     /// The shown content's pixel size at an explicit scale (logical × `dpi`),
     /// tracking the active morph and the settle bounce so the hitbox matches
-    /// the visible pill. Pure geometry — the caller resolves the DPI.
+    /// the visible pill. Pure geometry — the caller resolves the DPI. The
+    /// size itself comes from `frame_content_size`, the same source the
+    /// render path uses.
     fn content_size_at(&self, dpi: f32) -> Option<(i32, i32)> {
         let content = self.content.as_ref()?;
         let frame = self.frame();
-        // The hitbox must track the morph, or the cursor would stop being
-        // "over" the pill the moment it outgrows the compact size.
-        let (logical_width, logical_height, morph_progress) = if let Some(morph) = &self.hover_expand {
-            let progress = hover_progress(morph, &self.config);
-            let size = morph_size(&self.config, content, progress);
-            (size.0, size.1, progress)
-        } else if let Some(progress) = frame.morph {
-            let size = morph_size(&self.config, content, progress);
-            (size.0, size.1, progress)
-        } else {
-            let size = content_size_of(&self.config, content, self.layout == LayoutMode::Compact);
-            (
-                size.0,
-                size.1,
-                MorphProgress {
-                    width: 0.0,
-                    height: 0.0,
-                },
-            )
-        };
-        // The settle-bounce scales the size too, so the hitbox matches the
-        // visible pill (see `bounce_scale`).
-        let direction = if let Some(morph) = &self.hover_expand {
-            morph.direction
-        } else if matches!(self.phase, Phase::Collapsing(_)) {
-            MorphDirection::Collapse
-        } else {
-            MorphDirection::Expand
-        };
-        let scale_factor = bounce_scale(morph_progress, direction);
-        let logical_width = logical_width * scale_factor;
-        let logical_height = logical_height * scale_factor;
-        let width = (logical_width * dpi).round().max(1.0) as i32;
-        let height = (logical_height * dpi).round().max(1.0) as i32;
+        let (width, height, _) = frame_content_size(
+            &self.config,
+            content,
+            self.layout == LayoutMode::Compact,
+            self.hover_expand
+                .as_ref()
+                .map(|morph| (morph, hover_progress(morph, &self.config))),
+            frame.morph,
+            matches!(self.phase, Phase::Collapsing(_)),
+            dpi,
+        );
         Some((width, height))
     }
 
@@ -4401,9 +4362,10 @@ mod tests {
     }
 
     use super::morph::{
-        EXPAND_SPRING, animation_duration_with, art_edge_gate, compact_alpha, compact_metrics, compact_size,
-        compact_title_viewport, content_size, dim_color, expanded_alpha, lag_progress, morph_art_tile, morph_icon_pos,
-        morph_radius, morph_symbol_pos, morph_title_band, row_unveil_alpha, spring_expand,
+        EXPAND_SPRING, animation_duration_with, art_edge_gate, bounce_scale, compact_alpha, compact_metrics,
+        compact_size, compact_title_viewport, content_size, content_size_of, dim_color, expanded_alpha, lag_progress,
+        morph_art_tile, morph_icon_pos, morph_radius, morph_size, morph_symbol_pos, morph_title_band, row_unveil_alpha,
+        spring_expand,
     };
     use super::render::{
         FILL_TINT_WEIGHT, RenderLayer, blend_frames, blit_packed_rows, circle_coverage, clear_frame_scratch,

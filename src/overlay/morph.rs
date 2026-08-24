@@ -161,6 +161,64 @@ pub(super) fn content_size_of(config: &Config, content: &MediaEvent, compact: bo
     }
 }
 
+/// The shown content's pixel size for one frame at `dpi`: the hover morph's
+/// size while one is in flight (progress supplied by the caller — the render
+/// path has it precomputed from the tick), else the entrance/exit leg's
+/// size, else the applied layout's size — with the settle-bounce scale
+/// applied. Single source shared by the render path and the hover hitbox,
+/// so the visible window and the cursor hitbox can never drift apart. The
+/// bounce direction is the hover morph's own, Collapse while collapsing,
+/// Expand otherwise — the exact decision both call sites made inline.
+/// Returns the size plus the bounce scale, which the upload path needs for
+/// the frame resample.
+pub(super) fn frame_content_size(
+    config: &Config,
+    content: &MediaEvent,
+    compact: bool,
+    hover: Option<(&HoverExpand, MorphProgress)>,
+    frame_morph: Option<MorphProgress>,
+    phase_collapsing: bool,
+    dpi: f32,
+) -> (i32, i32, f32) {
+    let (logical_width, logical_height, morph_progress, direction) = match hover {
+        Some((hover, progress)) => {
+            let size = morph_size(config, content, progress);
+            (size.0, size.1, progress, hover.direction)
+        }
+        None => {
+            let direction = if phase_collapsing {
+                MorphDirection::Collapse
+            } else {
+                MorphDirection::Expand
+            };
+            match frame_morph {
+                Some(progress) => {
+                    let size = morph_size(config, content, progress);
+                    (size.0, size.1, progress, direction)
+                }
+                None => {
+                    let size = content_size_of(config, content, compact);
+                    (
+                        size.0,
+                        size.1,
+                        MorphProgress {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        direction,
+                    )
+                }
+            }
+        }
+    };
+    let scale_factor = bounce_scale(morph_progress, direction);
+    (
+        (logical_width * scale_factor * dpi).round().max(1.0) as i32,
+        (logical_height * scale_factor * dpi).round().max(1.0) as i32,
+        scale_factor,
+    )
+}
+
 /// The whole-pill scale factor of the settle-bounce, as a pure function of
 /// the leg's progress — there is no appended phase, so the bounce starts the
 /// instant the size completes and there is never a still pause before it.
