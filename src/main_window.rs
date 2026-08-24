@@ -5920,7 +5920,7 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
         }
         SettingId::CopyLogs => {
             let gap = (4.0 * scale) as i32;
-            let (open_rect, _copy_rect) = halve(&control_rect, gap);
+            let (open_rect, copy_rect) = halve(&control_rect, gap);
             if x >= open_rect.left && x < open_rect.right {
                 // Feedback only on a real open: a failed
                 // ShellExecuteW must not paint "Opened ✓".
@@ -5938,7 +5938,7 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
                         NIIF_ERROR,
                     );
                 }
-            } else if !state.copy_logs() {
+            } else if x >= copy_rect.left && x < copy_rect.right && !state.copy_logs() {
                 show_tray_note(
                     hwnd,
                     "WinGlance",
@@ -5949,7 +5949,7 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
         }
         SettingId::OpenConfig => {
             let gap = (4.0 * scale) as i32;
-            let (open_rect, _reload_rect) = halve(&control_rect, gap);
+            let (open_rect, reload_rect) = halve(&control_rect, gap);
             if x >= open_rect.left && x < open_rect.right {
                 if state.open_config() {
                     state.config_opened_at = Some(Instant::now());
@@ -5963,7 +5963,7 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
                         NIIF_ERROR,
                     );
                 }
-            } else {
+            } else if x >= reload_rect.left && x < reload_rect.right {
                 state.reload_config();
             }
         }
@@ -6977,31 +6977,36 @@ fn setting_value(id: SettingId, cfg: &Config) -> String {
         // No pin is spelled out (like the empty Auto-compact list) so the UIA
         // name never reads a bare "Pinned source:".
         SettingId::PinnedSource => cfg.behavior.pinned_source.clone().unwrap_or_else(|| "None".into()),
+        // The configured duration, plus the same "(system Ns)" suffix the
+        // painted row shows when the system preference wins — a screen
+        // reader must not hide the reason the configured value is not the
+        // effective one.
+        SettingId::Duration => {
+            let prefs = crate::winutil::system_preferences();
+            let effective = crate::config::effective_display_duration(
+                cfg.overlay.duration_ms,
+                prefs.message_duration_ms,
+                cfg.overlay.respect_system_message_duration,
+            );
+            if effective > cfg.overlay.duration_ms {
+                format!(
+                    "{} (system {})",
+                    format_duration_label(cfg.overlay.duration_ms),
+                    format_duration_label(effective)
+                )
+            } else {
+                format_duration_label(cfg.overlay.duration_ms)
+            }
+        }
         // The painted row is the bare "Preview Notification" button.
         SettingId::ShowSample => String::new(),
-        // The configured duration; the painted row additionally spells out a
-        // larger system preference, which the provider cannot know without a
-        // live system query.
-        SettingId::Duration => format_duration_label(cfg.overlay.duration_ms),
         // The Layout row is a segmented control: the painted row carries no
         // value text (the segments show it), so the UIA name is the label
         // alone — never a Rust Debug spelling.
         SettingId::Layout => String::new(),
-        // Same spellings the painted row uses — never the Debug format.
-        SettingId::Monitor => match cfg.overlay.monitor {
-            MonitorMode::ActiveWindow => "Active window".into(),
-            MonitorMode::Primary => "Primary".into(),
-            MonitorMode::Index(index) => {
-                // The live display count only decides the "(unavailable)"
-                // suffix, exactly like the painted label.
-                let count = crate::overlay::enumerate_displays_cached().len();
-                if (index as usize) < count {
-                    format!("Display {}", index + 1)
-                } else {
-                    format!("Display {} (unavailable)", index + 1)
-                }
-            }
-        },
+        // Same spellings the painted row uses — routed through the same
+        // helper the paint calls, so the two can never drift.
+        SettingId::Monitor => monitor_label(cfg, crate::overlay::enumerate_displays_cached().len()),
         SettingId::Position => position_label(cfg),
         SettingId::CompactPosition => compact_position_label(cfg),
         // An empty allow-list means every source is allowed; an empty
@@ -7043,8 +7048,11 @@ fn setting_toggle_on(id: SettingId, cfg: &Config) -> bool {
     }
 }
 
+/// The toggle value spelling for UIA names: matches the painted rows'
+/// "ON"/"OFF" exactly, so what a screen reader announces is word-for-word
+/// what the screen shows.
 fn on_off(value: bool) -> String {
-    if value { "On" } else { "Off" }.into()
+    if value { "ON" } else { "OFF" }.into()
 }
 
 /// The Settings content rectangle (client coordinates) for the provider's root
@@ -7846,20 +7854,39 @@ mod tests {
         // conscious, reviewed edit.
         let mut cfg = Config::default();
 
-        // Toggles: label + On/Off.
+        // Toggles: label + ON/OFF, word-for-word the painted values.
         cfg.behavior.notifications_enabled = true;
-        assert_eq!(setting_row_name(SettingId::Notifications, &cfg), "Notifications: On");
+        assert_eq!(setting_row_name(SettingId::Notifications, &cfg), "Notifications: ON");
         cfg.behavior.notifications_enabled = false;
-        assert_eq!(setting_row_name(SettingId::Notifications, &cfg), "Notifications: Off");
+        assert_eq!(setting_row_name(SettingId::Notifications, &cfg), "Notifications: OFF");
         cfg.overlay.dismiss_on_hover = true;
         assert_eq!(
             setting_row_name(SettingId::DismissOnHover, &cfg),
-            "Dismiss on hover: On"
+            "Dismiss on hover: ON"
         );
 
-        // Formatted values.
+        // Formatted values. Duration mirrors the painted row: the configured
+        // value, plus the "(system Ns)" suffix when the system preference
+        // wins — computed through the same expression, so the assertion is
+        // machine-independent.
         cfg.overlay.duration_ms = 5000;
-        assert_eq!(setting_row_name(SettingId::Duration, &cfg), "Duration: 5s");
+        cfg.overlay.respect_system_message_duration = true;
+        let prefs = crate::winutil::system_preferences();
+        let effective = crate::config::effective_display_duration(
+            cfg.overlay.duration_ms,
+            prefs.message_duration_ms,
+            cfg.overlay.respect_system_message_duration,
+        );
+        let expected_duration = if effective > cfg.overlay.duration_ms {
+            format!(
+                "Duration: {} (system {})",
+                format_duration_label(cfg.overlay.duration_ms),
+                format_duration_label(effective)
+            )
+        } else {
+            format!("Duration: {}", format_duration_label(cfg.overlay.duration_ms))
+        };
+        assert_eq!(setting_row_name(SettingId::Duration, &cfg), expected_duration);
         // The Layout row is a segmented control: the painted row carries no
         // value text, so the UIA name is the label alone (never a Rust
         // Debug spelling).
