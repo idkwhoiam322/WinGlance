@@ -27,7 +27,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, SetFocus, VK_ESCAPE, VK_SPACE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_SPACE,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, DefWindowProcW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GetClientRect, GetParent,
@@ -594,7 +596,11 @@ pub(crate) fn open(
                     true
                 } else {
                     let ne = normalize_pattern(&e.pattern);
-                    norm_current.iter().any(|n| ne.contains(n.as_str()) || n.contains(&ne))
+                    // An entry that normalizes to nothing (an image named
+                    // literally ".exe") must never pre-check: the empty
+                    // pattern is contained in every stored pattern, which
+                    // would check the row against the whole allow list.
+                    !ne.is_empty() && norm_current.iter().any(|n| ne.contains(n.as_str()) || n.contains(&ne))
                 }
             })
             .collect();
@@ -763,11 +769,17 @@ pub(crate) fn open(
         // precisely for keyboard use, and without focus the keys would
         // scroll the Settings pane underneath instead. The listbox handle
         // lives in the state (the block above scoped its own binding).
+        // Capturing the mouse here routes every click to the listbox, so a
+        // click anywhere outside the popup dismisses it (the listbox proc
+        // detects out-of-client coordinates) — the standard popup
+        // convention. Capture is released on the first click, and
+        // implicitly when the window is destroyed.
         let lb = (*state_ptr).listbox;
         if let Some(first) = checked.iter().position(|&checked| checked) {
             let _ = send_message(lb, LB_SETCURSEL, WPARAM(first), LPARAM(0));
         }
         let _ = SetFocus(Some(lb));
+        let _ = SetCapture(lb);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         debug!("process picker opened");
         true
@@ -988,7 +1000,21 @@ unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPAR
         WM_LBUTTONDOWN => {
             let state_ptr = window_state::<PickerState>(parent);
             if !state_ptr.is_null() {
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                let x = (lparam.0 as u16) as i16 as i32;
+                let y = ((lparam.0 >> 16) as u16) as i16 as i32;
+                // Mouse capture is held from open(): every click anywhere on
+                // screen is delivered to this listbox. A click outside the
+                // listbox client is a click outside the popup — the standard
+                // dismiss convention — so release the capture and cancel.
+                let mut rc = RECT::default();
+                let _ = unsafe { GetClientRect(lb, &mut rc) };
+                let cw = rc.right;
+                let ch = rc.bottom;
+                if x < 0 || y < 0 || x >= cw || y >= ch {
+                    let _ = ReleaseCapture();
+                    let _ = unsafe { DestroyWindow(parent) };
+                    return LRESULT(0);
+                }
                 // The row height is DPI-scaled like the listbox item height,
                 // so hit-testing matches the rendered rows on any display.
                 // The listbox scrolls (only MAX_VISIBLE rows fit), so the

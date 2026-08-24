@@ -885,6 +885,13 @@ pub(crate) fn sweep_orphan_temps(dir: &Path) {
             continue;
         };
         if name.starts_with(ORPHAN_TEMP_PATTERN.0) && name.ends_with(ORPHAN_TEMP_PATTERN.1) {
+            // A directory wearing the temp naming pattern (a misbehaving
+            // tool) would fail every remove_file with ACCESS_DENIED — once
+            // per boot, silently. Skip it explicitly.
+            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                debug!("orphan-temp sweep skipped a directory wearing the temp naming pattern: {name:?}");
+                continue;
+            }
             // The temp name embeds the creating pid (`temp_name`). A pid that
             // still runs may be mid-save — this exact window exists during
             // the restart handoff, where the successor sweeps while the old

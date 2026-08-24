@@ -33,9 +33,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EN_CHANGE, ES_AUTOHSCROLL, GetClientRect, GetDlgItem, GetMessageW, GetWindowRect, HMENU,
     IDCANCEL, IDOK, IsDialogMessageW, MSG, PostQuitMessage, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
     SetForegroundWindow, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_GETTEXT, WM_NCCREATE,
-    WM_NCDESTROY, WM_SETFONT, WM_SETTEXT, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_GETTEXT, WM_GETTEXTLENGTH,
+    WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SETTEXT, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
@@ -452,22 +452,23 @@ unsafe fn dialog_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 // keep the dialog open with the inline error label.
                 let edit = (*data_ptr).edit;
                 let mut buffer = [0u16; 64];
-                let copied = send_message(
-                    edit,
-                    WM_GETTEXT,
-                    WPARAM(buffer.len()),
-                    LPARAM(buffer.as_mut_ptr() as isize),
-                )
-                .0 as usize;
-                // A paste longer than the read buffer is rejected rather
-                // than silently parsed from its truncated prefix: a 63-char
-                // numeric paste could truncate to exactly "60" and commit an
-                // out-of-range duration the user never typed. The empty
-                // string fails the parse below, which shows the inline
-                // error.
-                let text = if copied >= buffer.len() - 1 {
+                // The exact text length is queried first: WM_GETTEXT with a
+                // fixed buffer cannot distinguish "exactly fills the buffer"
+                // from "was truncated" (both return len-1), which would
+                // falsely reject a valid 63-char value. Over-length input is
+                // still rejected via the empty string failing the parse
+                // below, which shows the inline error.
+                let text_len = send_message(edit, WM_GETTEXTLENGTH, WPARAM(0), LPARAM(0)).0 as usize;
+                let text = if text_len >= buffer.len() - 1 {
                     String::new()
                 } else {
+                    let copied = send_message(
+                        edit,
+                        WM_GETTEXT,
+                        WPARAM(buffer.len()),
+                        LPARAM(buffer.as_mut_ptr() as isize),
+                    )
+                    .0 as usize;
                     String::from_utf16_lossy(&buffer[..copied.min(buffer.len())])
                 };
                 if let Some(ms) = parse_duration_seconds(&text) {
