@@ -1582,11 +1582,20 @@ fn spawn_event_forwarder(
         .name("WinGlance-events".to_string())
         .stack_size(256 * 1024)
         .spawn(move || {
+            // Idle wait adaptation: with nothing arriving, the recv timeout
+            // stretches from 200 ms up to 1 s so an always-running utility
+            // does not wake the machine five times a second for two
+            // container checks. Any event resets it; the shutdown flag is
+            // polled on every wakeup, and the supervisor's own 1 s join
+            // budget already dominates exit latency, so the longer wait
+            // does not slow shutdown down.
+            let mut quiet_cycles: u32 = 0;
             while !shutdown.load(Ordering::SeqCst) {
                 // One-shot status events from the supervisor (at most one
                 // WorkerFailed per session, then it gives up). History-only:
                 // never wake the pill or occupy its queue.
                 while let Ok(event) = supervisor_rx.try_recv() {
+                    quiet_cycles = 0;
                     push_and_wake(
                         &main_queue,
                         &main_wake,
@@ -1595,8 +1604,9 @@ fn spawn_event_forwarder(
                         "main window",
                     );
                 }
-                let event = match receiver.recv_timeout(Duration::from_millis(200)) {
+                let event = match receiver.recv_timeout(Duration::from_millis(200 * (1 + quiet_cycles.min(4) as u64))) {
                     Ok(event) => {
+                        quiet_cycles = 0;
                         // The event left the worker's outbound queue: its
                         // artwork bytes are no longer in flight here. The
                         // window queues share the same `Arc` allocations and

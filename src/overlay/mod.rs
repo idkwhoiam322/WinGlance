@@ -2874,7 +2874,18 @@ impl OverlayState {
         // starts. Re-entering (or never leaving) keeps the pill engaged.
         // Computed here, outside the phase guard, so the `held` gate below
         // can use it.
-        let cursor_over = self.is_cursor_over_pill();
+        let cursor_over = if self.config.overlay.dismiss_on_hover
+            || self.config.overlay.expand_compact_on_hover
+            || self.config.overlay.layout == LayoutMode::PersistentCompact
+        {
+            self.is_cursor_over_pill()
+        } else {
+            // No hover consumer is enabled: no code path can act on the
+            // cursor, so skip the poll chain (display lookup, DPI query,
+            // work-area probe) and sample "not over" — the two-sample gate
+            // and the leave machinery stay consistent on the constant.
+            false
+        };
         // The previous tick's sample: the entrance-phase dismiss arm
         // requires two consecutive over-samples, so a single stray poll
         // inside the growing pill's hitbox cannot arm the one-way dismiss.
