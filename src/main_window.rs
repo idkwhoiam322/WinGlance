@@ -6347,7 +6347,10 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                         state.sync_settings_scroll(client_w, client_h);
                         state.invalidate();
                     }
-                    return LRESULT(0);
+                    // Handled keys switch panes; every other key falls through
+                    // to the default handler instead of being silently eaten,
+                    // so future default key behavior keeps working.
+                    return DefWindowProcW(hwnd, message, wparam, lparam);
                 }
                 // Settings pane: walk focusable controls and activate one.
                 let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
