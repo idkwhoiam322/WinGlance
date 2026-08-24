@@ -1,4 +1,4 @@
-﻿use crate::autostart;
+use crate::autostart;
 use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, SaveOutcome, VerticalPosition};
 use crate::events::{
     COMPACT_POSITION_MSG, MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo,
@@ -4379,23 +4379,25 @@ impl MainWindowState {
     }
 
     /// Copies the current run's log file to the clipboard (UTF-16 with per-line
-    /// newlines preserved) and shows a transient "Copied" state.
-    fn copy_logs(&mut self) {
+    /// newlines preserved) and shows a transient "Copied" state. Returns
+    /// whether the copy landed, so a failed click can surface feedback
+    /// instead of doing nothing visible.
+    fn copy_logs(&mut self) -> bool {
         let path = self.cfg().logs_dir().join("log-Live.log");
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
                 debug!("copy logs: reading {path:?} failed: {error}");
-                return;
+                return false;
             }
         };
         let clipboard = wide(&text);
         let bytes = clipboard.len() * 2;
 
-        unsafe {
+        let ok = unsafe {
             if OpenClipboard(None).is_err() {
                 debug!("copy logs: OpenClipboard failed");
-                return;
+                return false;
             }
             let _ = EmptyClipboard();
             let ok = GlobalAlloc(GMEM_MOVEABLE, bytes).is_ok_and(|hmem| {
@@ -4418,10 +4420,11 @@ impl MainWindowState {
                 }
             });
             let _ = CloseClipboard();
-            if !ok {
-                debug!("copy logs: clipboard set failed");
-                return;
-            }
+            ok
+        };
+        if !ok {
+            debug!("copy logs: clipboard set failed");
+            return false;
         }
 
         self.logs_copied_at = Some(Instant::now());
@@ -4430,6 +4433,7 @@ impl MainWindowState {
             let _ = set_timer(self.hwnd, TIMER_LOGS_ID, 2000, None);
         }
         self.invalidate();
+        true
     }
 
     /// Opens `path` with the OS's default handler, from the UI thread, with a
@@ -4523,10 +4527,18 @@ impl MainWindowState {
         }
         self.mutate_config(|cfg| cfg.behavior.start_on_login = new_value);
         if self.config_status.is_some() {
-            warn!("config save failed after the start-on-login change; reverting the registry entry");
+            warn!(
+                "config save failed after the start-on-login change; reverting the registry entry and the in-memory toggle"
+            );
             if let Err(error) = autostart::apply(previous) {
                 error!("reverting the start-on-login registry entry also failed: {error:#}");
             }
+            // The in-memory value must follow the registry back: the pane
+            // must not show ON while no autostart entry exists. Under
+            // PersistenceDisabled/Conflict the re-save writes nothing (the
+            // banner stays), so this only realigns what the UI shows with
+            // what the OS honors.
+            self.mutate_config(|cfg| cfg.behavior.start_on_login = previous);
         }
     }
 
@@ -5916,9 +5928,23 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
                     state.logs_opened_at = Some(Instant::now());
                     unsafe { set_timer(hwnd, TIMER_OPENED_ID, 2000, None) };
                     state.invalidate();
+                } else {
+                    // A silent click teaches nothing: the tray note is the
+                    // one channel that reaches a hidden window.
+                    show_tray_note(
+                        hwnd,
+                        "WinGlance",
+                        "Opening the log file failed. The file lives in the diagnostics row's folder.",
+                        NIIF_ERROR,
+                    );
                 }
-            } else {
-                state.copy_logs();
+            } else if !state.copy_logs() {
+                show_tray_note(
+                    hwnd,
+                    "WinGlance",
+                    "Copying the log to the clipboard failed — the clipboard may be busy; try again.",
+                    NIIF_ERROR,
+                );
             }
         }
         SettingId::OpenConfig => {
@@ -5929,6 +5955,13 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
                     state.config_opened_at = Some(Instant::now());
                     unsafe { set_timer(hwnd, TIMER_OPENED_ID, 2000, None) };
                     state.invalidate();
+                } else {
+                    show_tray_note(
+                        hwnd,
+                        "WinGlance",
+                        "Opening config.toml failed. The file lives in the diagnostics row's folder.",
+                        NIIF_ERROR,
+                    );
                 }
             } else {
                 state.reload_config();
@@ -6883,13 +6916,13 @@ fn setting_label(id: SettingId) -> &'static str {
         SettingId::SeparateCompact => "Compact Position follows Expanded Position",
         SettingId::CompactPosition => "Compact Position",
         SettingId::DismissOnHover => "Dismiss on hover",
-        SettingId::ExpandCompactOnHover => "Expand compact pill on hover",
-        SettingId::HideForAutoCompactSources => "Hide for auto-compact sources",
-        SettingId::FadePersistentPill => "Fade persistent pill",
+        SettingId::ExpandCompactOnHover => "Expand compact on hover",
+        SettingId::HideForAutoCompactSources => "Hide Persistent Compact Pill for Auto-compact Apps",
+        SettingId::FadePersistentPill => "Fade Persistent Compact Pill after duration",
         SettingId::PinnedSource => "Pinned source",
         SettingId::Monitor => "Monitor",
-        SettingId::ShowSample => "Show sample",
-        SettingId::CopyLogs => "Diagnostics",
+        SettingId::ShowSample => "Preview Notification",
+        SettingId::CopyLogs => "Logs",
         SettingId::OpenConfig => "Config",
         SettingId::AutoCompactApps => "Auto-compact apps",
     }
@@ -6937,34 +6970,56 @@ fn setting_value(id: SettingId, cfg: &Config) -> String {
         SettingId::DismissOnHover => on_off(cfg.overlay.dismiss_on_hover),
         SettingId::ExpandCompactOnHover => on_off(cfg.overlay.expand_compact_on_hover),
         SettingId::HideForAutoCompactSources => on_off(cfg.behavior.hide_for_auto_compact_sources),
-        SettingId::FadePersistentPill => on_off(cfg.overlay.fade_persistent_pill),
+        SettingId::FadePersistentPill => if cfg.overlay.fade_persistent_pill { "Yes" } else { "No" }.into(),
         // No pin is spelled out (like the empty Auto-compact list) so the UIA
         // name never reads a bare "Pinned source:".
         SettingId::PinnedSource => cfg.behavior.pinned_source.clone().unwrap_or_else(|| "None".into()),
-        SettingId::ShowSample => "Show a sample notification".into(),
+        // The painted row is the bare "Preview Notification" button.
+        SettingId::ShowSample => String::new(),
+        // The configured duration; the painted row additionally spells out a
+        // larger system preference, which the provider cannot know without a
+        // live system query.
         SettingId::Duration => format_duration_label(cfg.overlay.duration_ms),
-        SettingId::Layout => format!("{:?}", cfg.overlay.layout),
-        SettingId::Monitor => format!("{:?}", cfg.overlay.monitor),
+        // The Layout row is a segmented control: the painted row carries no
+        // value text (the segments show it), so the UIA name is the label
+        // alone — never a Rust Debug spelling.
+        SettingId::Layout => String::new(),
+        // Same spellings the painted row uses — never the Debug format.
+        SettingId::Monitor => match cfg.overlay.monitor {
+            MonitorMode::ActiveWindow => "Active window".into(),
+            MonitorMode::Primary => "Primary".into(),
+            MonitorMode::Index(index) => {
+                // The live display count only decides the "(unavailable)"
+                // suffix, exactly like the painted label.
+                let count = crate::overlay::enumerate_displays_cached().len();
+                if (index as usize) < count {
+                    format!("Display {}", index + 1)
+                } else {
+                    format!("Display {} (unavailable)", index + 1)
+                }
+            }
+        },
         SettingId::Position => position_label(cfg),
         SettingId::CompactPosition => compact_position_label(cfg),
         // An empty allow-list means every source is allowed; an empty
-        // auto-compact list means none. Spell that out instead of an empty
-        // UIA value.
+        // auto-compact list means none. The painted values lead with the
+        // fullscreen coverage; the UIA value mirrors them word for word.
         SettingId::AllowedApps => {
             if cfg.behavior.media_sources.is_empty() {
-                "All apps".into()
+                "All".into()
             } else {
                 cfg.behavior.media_sources.join(", ")
             }
         }
         SettingId::AutoCompactApps => {
             if cfg.behavior.auto_compact_sources.is_empty() {
-                "None".into()
+                "Full screen apps".into()
             } else {
-                cfg.behavior.auto_compact_sources.join(", ")
+                format!("Full screen apps, {}", cfg.behavior.auto_compact_sources.join(", "))
             }
         }
-        SettingId::CopyLogs => "Copy logs / Open logs".into(),
+        // Sub-button order matches the painted buttons (open on the left).
+        SettingId::CopyLogs => "Open logs / Copy logs".into(),
         SettingId::OpenConfig => "Open config / Restart app".into(),
     }
 }
@@ -7802,13 +7857,16 @@ mod tests {
         // Formatted values.
         cfg.overlay.duration_ms = 5000;
         assert_eq!(setting_row_name(SettingId::Duration, &cfg), "Duration: 5s");
+        // The Layout row is a segmented control: the painted row carries no
+        // value text, so the UIA name is the label alone (never a Rust
+        // Debug spelling).
         cfg.overlay.layout = LayoutMode::PersistentCompact;
-        assert_eq!(setting_row_name(SettingId::Layout, &cfg), "Layout: PersistentCompact");
+        assert_eq!(setting_row_name(SettingId::Layout, &cfg), "Layout");
         cfg.overlay.monitor = MonitorMode::ActiveWindow;
         assert_eq!(
             setting_row_name(SettingId::Monitor, &cfg),
-            "Monitor: ActiveWindow",
-            "the UIA name uses the Debug spelling the provider answers with"
+            "Monitor: Active window",
+            "the UIA name uses the painted spelling, not the Debug format"
         );
 
         // Position: the anchor label when uncustomized, custom coords when set.
@@ -7825,15 +7883,16 @@ mod tests {
             "Expanded Position: Custom (120, 80)"
         );
 
-        // List rows: the empty-list spellings and a populated list.
+        // List rows: the empty-list spellings and a populated list, word for
+        // word what the painted row shows.
         cfg.behavior.media_sources = vec![];
-        assert_eq!(setting_row_name(SettingId::AllowedApps, &cfg), "Allowed apps: All apps");
+        assert_eq!(setting_row_name(SettingId::AllowedApps, &cfg), "Allowed apps: All");
         cfg.behavior.media_sources = vec!["spotify".to_string()];
         assert_eq!(setting_row_name(SettingId::AllowedApps, &cfg), "Allowed apps: spotify");
         cfg.behavior.auto_compact_sources = vec![];
         assert_eq!(
             setting_row_name(SettingId::AutoCompactApps, &cfg),
-            "Auto-compact apps: None"
+            "Auto-compact apps: Full screen apps"
         );
 
         // Pin: None spelled out, or the pin name.
@@ -8548,11 +8607,16 @@ mod tests {
                 "duplicate label {}",
                 setting_label(id)
             );
-            assert!(
-                !setting_value(id, &cfg).is_empty(),
-                "empty value for {}",
-                setting_label(id)
-            );
+            // The Layout row (segmented control) and the Preview button
+            // intentionally carry no painted value text — the UIA name is
+            // the label alone, mirroring the paint.
+            if !matches!(id, SettingId::Layout | SettingId::ShowSample) {
+                assert!(
+                    !setting_value(id, &cfg).is_empty(),
+                    "empty value for {}",
+                    setting_label(id)
+                );
+            }
         }
     }
 
