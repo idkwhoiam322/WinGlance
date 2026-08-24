@@ -246,6 +246,31 @@ pub(super) fn render_layered(
             );
         }
     }
+    // The progress bar is painted after whichever background was produced —
+    // full rebuild, cached reuse, or foreground pass — because the chrome
+    // cache deliberately stays bar-free: a playing pill's bar advances by
+    // repainting this ~2 px band over the clean fill instead of invalidating
+    // the whole cache per pixel-step (and a seek re-base that shrinks the
+    // bar can never leave a stale tail, since no bar pixels were ever
+    // baked).
+    {
+        let aura_palette = state
+            .palette
+            .map(|p| p.primary)
+            .unwrap_or(state.config.appearance.accent_color);
+        draw_progress_bar(
+            &mut scratch[..needed],
+            content_buf_w as usize,
+            state.aura_inset as usize,
+            (content_buf_w as usize).saturating_sub(state.aura_inset as usize * 2),
+            (content_buf_h as usize).saturating_sub(state.aura_inset as usize * 2),
+            state.config.appearance.effective_corner_radius(compact),
+            scale,
+            aura_palette,
+            state.estimated_position_secs,
+            state.progress_duration_secs,
+        );
+    }
     state.render_layer = RenderLayer::Full;
     // Record the composed frame's dimensions, so the next in-place content
     // swap can snapshot it for its cross-fade (see `update_content`).
@@ -744,37 +769,11 @@ pub(super) fn draw_pixels(
 
     // Progress bar: a thin accent fill at the pill's bottom edge, masked to
     // the rounded body so it never paints into the transparent aura ring at
-    // the corners. Present only when the source reports both a position and a
-    // non-zero duration. The width comes from the shared `bar_pixel_w` — the
-    // cache key's bar formula — so the painted step and the cache
-    // invalidation step can never drift.
-    if let Some(bar_w) = bar_pixel_w(state.estimated_position_secs, state.progress_duration_secs, pill_w) {
-        let bar_h = (2.0 * scale).round().max(1.0) as usize;
-        let bar_y = inset + pill_h.saturating_sub(bar_h);
-        let bar_color = aura_palette.primary;
-        let bar_alpha = (bar_color[3] as f32 * 0.8) as u32;
-        for y in bar_y..(bar_y + bar_h).min(height) {
-            for x in inset..(inset + bar_w).min(width) {
-                let cov = round_rect_coverage_supersampled(
-                    (x as i32 - inset as i32) as f32,
-                    (y as i32 - inset as i32) as f32,
-                    pill_w as f32,
-                    pill_h as f32,
-                    radius,
-                );
-                if cov > 0.0 {
-                    composite(
-                        pixels,
-                        width,
-                        x,
-                        y,
-                        [bar_color[0], bar_color[1], bar_color[2]],
-                        bar_alpha,
-                    );
-                }
-            }
-        }
-    }
+    // the corners. Present only when the source reports both a position and
+    // a non-zero duration. Deliberately NOT painted here: the chrome cache
+    // must stay bar-free (a baked bar would leave a stale tail when the bar
+    // shrinks on a seek re-base), so `render_layered` repaints it over
+    // whichever background this build produced.
 
     // Directional edge highlight: white stroke on the pill's own boundary,
     // brighter along the top-left than the bottom-right.
@@ -1017,6 +1016,55 @@ pub(super) fn draw_edge_stroke(
                 let peak = PEAK_ALPHA - (PEAK_ALPHA - MIN_ALPHA) * t;
                 let alpha = (peak * coverage).round() as u32;
                 composite(pixels, width, inset + x, inset + y, STROKE_COLOR, alpha);
+            }
+        }
+    }
+}
+
+/// Draws the progress bar: a thin accent fill at the pill's bottom edge,
+/// masked to the rounded body. Present only when the source reports both a
+/// position and a non-zero duration. Called from the full rebuild AND after
+/// every chrome-cache reuse — the bar's width is deliberately not part of
+/// `ChromeKey`, so a playing pill's bar advances by repainting only this
+/// ~2 px band on top of the reused background instead of invalidating the
+/// whole cache per pixel-step.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_progress_bar(
+    pixels: &mut [u8],
+    width: usize,
+    inset: usize,
+    pill_w: usize,
+    pill_h: usize,
+    radius: f32,
+    scale: f32,
+    bar_color: [u8; 4],
+    position_secs: Option<f64>,
+    duration_secs: Option<u64>,
+) {
+    let Some(bar_w) = bar_pixel_w(position_secs, duration_secs, pill_w) else {
+        return;
+    };
+    let bar_h = (2.0 * scale).round().max(1.0) as usize;
+    let bar_y = inset + pill_h.saturating_sub(bar_h);
+    let bar_alpha = (bar_color[3] as f32 * 0.8) as u32;
+    for y in bar_y..(bar_y + bar_h).min(pill_h + inset * 2) {
+        for x in inset..(inset + bar_w) {
+            let cov = round_rect_coverage_supersampled(
+                (x as i32 - inset as i32) as f32,
+                (y as i32 - inset as i32) as f32,
+                pill_w as f32,
+                pill_h as f32,
+                radius,
+            );
+            if cov > 0.0 {
+                composite(
+                    pixels,
+                    width,
+                    x,
+                    y,
+                    [bar_color[0], bar_color[1], bar_color[2]],
+                    bar_alpha,
+                );
             }
         }
     }
@@ -2744,6 +2792,13 @@ pub(super) fn draw_text_line_pixels(
             const MAX_MARQUEE_TEXT_W: i32 = 4096;
             let scrollable = text_w > rw && text_w <= rw.saturating_mul(MAX_MARQUEE_BANDS).min(MAX_MARQUEE_TEXT_W);
             ctx.scroll.scrolling = scrollable && motion;
+            if ctx.scroll.scrolling != was_scrolling {
+                // A flip changes what the background bakes (static text in,
+                // scrolling row omitted) and invalidates the last-rendered
+                // offset: force one render so the flip is painted, then the
+                // sub-pixel gate takes over.
+                ctx.scroll.rendered_offset = i32::MIN;
+            }
             if ctx.scroll.scrolling && !was_scrolling {
                 debug!("marquee overflow | text_w={text_w} | draw_w={rw} | title={value}");
             }
@@ -2808,6 +2863,10 @@ pub(super) fn draw_text_line_pixels(
                     // The modulo leaves the used offset bit-identical.
                     ctx.scroll.offset %= total as f32;
                     let off = ctx.scroll.offset as i32;
+                    // Record the integer phase this frame paints: the tick
+                    // skips a scrolling line's render while its integer
+                    // offset is unchanged (the sub-pixel gate).
+                    ctx.scroll.rendered_offset = off;
                     // Edge fade relative to the visible band: during the hold
                     // only the trailing edge fades — nothing exits the left
                     // edge, and the text head sits at the band boundary where

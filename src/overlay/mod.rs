@@ -266,6 +266,13 @@ struct LineScroll {
     /// measurement, and GDI may recycle font handle values, so the font
     /// handle alone is not a complete key.
     measured_text: u64,
+    /// The integer pixel offset this line was last rendered at. The tick
+    /// renders a scrolling line only when its integer offset moved — the
+    /// marquee advances 40 logical px/s, so roughly a third of the 60 Hz
+    /// ticks would otherwise re-render and re-upload an identical frame.
+    /// `i32::MIN` forces the next tick to render (set on a scroll-state
+    /// flip, where the background must be rebuilt or re-composited once).
+    rendered_offset: i32,
 }
 
 /// Bundles the scroll state of one line with the cached raster of that line,
@@ -327,7 +334,11 @@ struct ChromeKey {
     buf_w: usize,
     buf_h: usize,
     scale: f32,
-    bar_w: Option<usize>,
+    // The progress bar's width is deliberately NOT keyed: the bar is
+    // repainted over the reused background after every cache hit (see
+    // `render::draw_progress_bar`), so a playing pill's bar advances by
+    // refilling a 2 px band instead of invalidating the whole cache per
+    // pixel-step.
     high_contrast: bool,
     palette: Option<([u8; 4], [u8; 4])>,
     background_color: [u8; 4],
@@ -1234,11 +1245,11 @@ impl OverlayState {
         morph: Option<MorphProgress>,
     ) -> ChromeKey {
         let a = &self.config.appearance;
-        // The bar width must use the exact draw formula (`render::bar_pixel_w`,
-        // shared with `draw_pixels`): the key has to change on the pixel step
-        // the draw takes and not before, or the cache drifts silently either
-        // way.
-        let pill_w = buf_w.saturating_sub(self.aura_inset as usize * 2);
+        // The progress bar's width is deliberately not part of the key: the
+        // bar is repainted over the reused background after every cache hit
+        // (see `render::draw_progress_bar`), so a playing pill's bar
+        // advances by refilling a 2 px band instead of invalidating the
+        // whole cache per pixel-step.
         ChromeKey {
             content_rev: self.content_rev,
             compact,
@@ -1246,7 +1257,6 @@ impl OverlayState {
             buf_w,
             buf_h,
             scale,
-            bar_w: render::bar_pixel_w(self.estimated_position_secs, self.progress_duration_secs, pill_w),
             high_contrast: crate::winutil::system_preferences().high_contrast,
             palette: self.palette.map(|p| (p.primary, p.secondary)),
             background_color: a.background_color,
@@ -3258,7 +3268,10 @@ impl OverlayState {
         if layout_flipped
             || animating
             || self.hover_expand.is_some()
-            || marquee_active
+            || self
+                .scroll
+                .iter()
+                .any(|line| line.scrolling && (line.offset as i32) != line.rendered_offset)
             || bar_moved
             || self.persistent_fade_active()
             || self.orbiting()
@@ -11028,40 +11041,41 @@ mod tests {
     }
 
     #[test]
-    fn chrome_cache_key_tracks_the_bar_by_visible_pixels() {
-        // The cached background is reused while a marquee scrolls, so the key
-        // must change exactly when the drawn bar changes: the draw quantizes
-        // the bar to integer pixels (`(pill_w * fraction).round()`), so a
-        // position that stays inside the same pixel step keeps the key (and
-        // the cache) and a step (or the bar appearing/disappearing) rebuilds.
-        // Keying on the raw position would invalidate every playing tick and
-        // never reuse the cache; keying on the paused scheduling fraction
-        // would hide paused seeks behind a stale cached bar.
+    fn chrome_cache_key_ignores_the_bar_which_is_repainted_per_frame() {
+        // The cached background is bar-free by design: the bar is repainted
+        // over the reused raster after every cache hit, so a playing pill's
+        // bar advances without invalidating the cache. The key must be
+        // IDENTICAL across position changes, appearance, and disappearance —
+        // the opposite contract of the old bar-keyed scheme — while the
+        // position inputs themselves stay live for the repaint (they are
+        // read from the state, not the key).
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.progress_duration_secs = Some(120);
         state.estimated_position_secs = Some(60.0);
-        // 300 px pill at scale 1.0: one bar pixel = 0.4 s.
         let at_half = state.chrome_cache_key(300, 100, 96, 1.0, false, None);
         state.estimated_position_secs = Some(60.1);
         assert_eq!(
             state.chrome_cache_key(300, 100, 96, 1.0, false, None),
             at_half,
-            "sub-pixel movement must keep the cached background"
+            "sub-pixel movement must not touch the cached background"
         );
         state.estimated_position_secs = Some(62.5);
-        assert_ne!(
+        assert_eq!(
             state.chrome_cache_key(300, 100, 96, 1.0, false, None),
             at_half,
-            "a visible bar step must rebuild the background"
+            "a visible bar step must be repainted, not rebuilt"
         );
         state.estimated_position_secs = None;
-        let barless = state.chrome_cache_key(300, 100, 96, 1.0, false, None);
-        assert_ne!(barless, at_half, "a disappearing bar must invalidate the cache");
+        assert_eq!(
+            state.chrome_cache_key(300, 100, 96, 1.0, false, None),
+            at_half,
+            "a disappearing bar must not invalidate the cache"
+        );
         state.progress_duration_secs = None;
         assert_eq!(
             state.chrome_cache_key(300, 100, 96, 1.0, false, None),
-            barless,
-            "no position and no duration both draw no bar"
+            at_half,
+            "no position and no duration both draw no bar and no rebuild"
         );
     }
 
