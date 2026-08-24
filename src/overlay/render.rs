@@ -932,6 +932,10 @@ fn edge_stroke_ranges(pill_w: usize, pill_h: usize, radius: f32, stroke_w: f32, 
     let half_w = pill_w as f32 / 2.0;
     let half_h = pill_h as f32 / 2.0;
     let r_eff = radius.min(half_w.min(half_h));
+    // The band must cover the coverage ramp's half-width (0.75) plus the
+    // supersamples' corner reach (0.35·√2 ≈ 0.495) — 1.25 clears that by a
+    // hair. Widening the AA band or the sample offsets requires widening
+    // this constant with it.
     let band = 1.25;
     let cy = y as f32 + 0.5 - half_h;
     // Past the anti-alias reach of the shape every sample is at least

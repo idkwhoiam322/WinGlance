@@ -453,7 +453,10 @@ fn winglance_instance_running_retried() -> bool {
 /// crash record while reporting success). Only when the startup install
 /// failed — no retained handle — does this fall back to an open-append
 /// bounded write; in that mode no counter is active, so there is nothing to
-/// strand.
+/// strand. Two concurrent writers can still interleave records (seek-write
+/// is not atomic and the counter can lose an increment) — accepted:
+/// records are diagnostics, and a crash-time lock is not viable under heap
+/// corruption.
 pub(crate) fn crash_log_append(message: &[u8]) {
     if crash_log_write_retained(message) {
         return;
@@ -1437,7 +1440,10 @@ const MAX_WORKER_RESTARTS: u32 = 5;
 /// the window must hold several such gaps for `MAX_LEAKED_WORKERS` samples
 /// to actually accumulate — a 60 s window held at most two and the budget
 /// could never trip. Ten minutes admits the fourth leak at the real
-/// minimum spacing (105 s) with room for slower wedges.
+/// minimum spacing (105 s) with room for slower wedges. Accepted residual:
+/// a wedge recurring every 3–9 minutes (after each 2-minute healthy reset)
+/// leaks at most three threads per window forever without tripping — every
+/// tighter bound would punish legitimate occasional stalls.
 const LEAK_WINDOW: Duration = Duration::from_secs(600);
 
 /// How many hung-thread leaks inside `LEAK_WINDOW` the supervisor tolerates

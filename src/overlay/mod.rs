@@ -747,7 +747,9 @@ struct OverlayState {
     /// this thread, so its inner lock is uncontended.
     fonts: FontProvider,
     /// Physical-pixel inset from the buffer edge to the pill body, computed
-    /// each frame from `AURA_HALO_LOGICAL * dpi * shape`. The pill is
+    /// each frame from `AURA_HALO_LOGICAL * dpi` (deliberately independent of
+    /// the morph shape, so the inset — and with it the buffer layout — stays
+    /// constant across animation frames). The pill is
     /// drawn at `(aura_inset, aura_inset)` so the aura fills the outer ring.
     aura_inset: i32,
     /// Test-only: forces `is_cursor_over_pill` to a fixed answer, so `tick()`
@@ -1234,7 +1236,11 @@ impl OverlayState {
     /// the static-text GDI entirely and only re-composite the scrolling rows.
     /// `content_rev` carries the structural content identity (title/artist/etc.
     /// are not hashed here); palette and art travel with the content, so they
-    /// are covered by both `content_rev` and the `palette` tuple.
+    /// are covered by both `content_rev` and the `palette` tuple. The art tile
+    /// of a shown STATE pill resolves from `track_cache` at draw time, which
+    /// is safe only because every `cache_track` that could replace that entry
+    /// co-occurs with a `content_rev` bump — keep that coupling if the cache
+    /// paths ever change.
     fn chrome_cache_key(
         &self,
         buf_w: usize,

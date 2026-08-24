@@ -1728,8 +1728,8 @@ impl MainWindowState {
         self.cfg().behavior.history_tooltip_dwell_ms
     }
 
-    /// Drives the track-mode tooltip from the window's own hover poll (1 Hz
-    /// timer, the same cadence that used to re-register per-row tools). The
+    /// Drives the track-mode tooltip from the window's own hover poll (the
+    /// TOOLTIP_POLL_MS timer). The
     /// control is never asked to hit-test or track: one tool is registered
     /// once, and this method decides each tick whether a tooltip is due —
     /// cursor over a history cell for the configured dwell — then activates,
@@ -2306,7 +2306,7 @@ impl MainWindowState {
             state,
             accepted,
         });
-        if self.history.len() <= before && before > 0 {
+        if !self.listbox.0.is_null() && self.history.len() <= before && before > 0 {
             // The cap dropped the oldest entry, which sits at the bottom of
             // the listbox (newest-first rendering, header at index 0).
             let count = unsafe { send_message(self.listbox, LB_GETCOUNT, WPARAM(0), LPARAM(0)) }.0 as usize;
@@ -2331,7 +2331,7 @@ impl MainWindowState {
             }
         }
         // Tooltip rebuilds are coalesced per event batch (receive_events) or
-        // picked up by the 1 Hz timer.
+        // picked up by the TOOLTIP_POLL_MS hover timer.
         self.tooltips_dirty = true;
         entry_id
     }

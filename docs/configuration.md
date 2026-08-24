@@ -19,7 +19,9 @@ the file itself is not rewritten (see `docs/architecture.md`).
 > untouched, and persistence is disabled (the Settings pane shows a banner)
 > until the file is fixed. Every rejection is logged at startup. A
 > misspelled key is not a parse error: it is an unknown key (preserved and
-> warned about, see below).
+> warned about, see below). Files larger than 1 MiB are likewise rejected
+> without being read, and a file that grows past that bound is treated as
+> an external edit: settings changes stay in memory and refuse to save.
 
 > **Saves are canonical.** A settings change rewrites the file in canonical
 > form: unknown fields and their values are preserved (each is warned about
