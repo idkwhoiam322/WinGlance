@@ -3741,16 +3741,21 @@ fn read_track_info(
     let genre = {
         // Accumulate only while under the display cap: a hostile
         // genre list previously materialized the full join before
-        // `cap_meta` truncated it.
+        // `cap_meta` truncated it. Each entry is also bounded to the
+        // remaining budget before pushing, so one multi-megabyte genre
+        // name cannot blow the joined string past the cap (the final
+        // `cap_meta` keeps the emitted string identical).
         let mut joined = String::new();
         for g in properties.Genres()?.into_iter() {
-            if !joined.is_empty() {
-                joined.push_str(", ");
-            }
-            joined.push_str(&g.to_string());
             if joined.len() >= MAX_META_CHARS {
                 break;
             }
+            if !joined.is_empty() {
+                joined.push_str(", ");
+            }
+            let remaining = MAX_META_CHARS.saturating_sub(joined.len());
+            let text: String = g.to_string().chars().take(remaining).collect();
+            joined.push_str(&text);
         }
         let joined = cap_meta(joined);
         if joined.trim().is_empty() { None } else { Some(joined) }

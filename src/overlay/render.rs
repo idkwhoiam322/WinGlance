@@ -2691,7 +2691,17 @@ pub(super) fn draw_text_line_pixels(
             // statically, end-ellipsized.
             let motion = crate::winutil::animations_enabled();
             let was_scrolling = ctx.scroll.scrolling;
-            ctx.scroll.scrolling = text_w > rw && motion;
+            // Scrolling rasters the full text width into the strip (plus a
+            // same-size scratch DIB for the GDI pass), so the width is
+            // capped: a hostile or absurd title beyond a multiple of the
+            // visible band — or an absolute ceiling — renders statically,
+            // end-ellipsized, instead of allocating an unbounded raster
+            // from external input. Eight bands cover every legitimate
+            // title many times over.
+            const MAX_MARQUEE_BANDS: i32 = 8;
+            const MAX_MARQUEE_TEXT_W: i32 = 4096;
+            let scrollable = text_w > rw && text_w <= rw.saturating_mul(MAX_MARQUEE_BANDS).min(MAX_MARQUEE_TEXT_W);
+            ctx.scroll.scrolling = scrollable && motion;
             if ctx.scroll.scrolling && !was_scrolling {
                 debug!("marquee overflow | text_w={text_w} | draw_w={rw} | title={value}");
             }
@@ -2699,7 +2709,10 @@ pub(super) fn draw_text_line_pixels(
             // Edge-fade width in the rendering coordinate space (the same
             // scale the row rects live in), 12 logical px per side.
             let fade_w = MARQUEE_FADE * scale;
-            if text_w <= rw || !motion {
+            // Over-cap titles take this static path too: the strip branch
+            // would otherwise rasterize the full unbounded width the cap
+            // exists to prevent. The static draw end-ellipsizes.
+            if text_w <= rw || !motion || !scrollable {
                 // Text fits: render once statically (no scrolling needed).
                 // A `Foreground` pass only re-composites scrolling rows, so a
                 // non-scrolling row is already in the cached background — skip it.

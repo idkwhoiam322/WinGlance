@@ -1431,9 +1431,14 @@ fn main() -> Result<()> {
 /// 90 seconds forever.
 const MAX_WORKER_RESTARTS: u32 = 5;
 
-/// Rolling window for the leaked-worker budget : leaks older
-/// than this fall off and stop counting.
-const LEAK_WINDOW: Duration = Duration::from_secs(60);
+/// Rolling window for the leaked-worker budget: leaks older than this fall
+/// off and stop counting. Consecutive leaks are spaced at least
+/// `worker_restart_delay(1) + WORKER_STALL_THRESHOLD` apart (5 s + 30 s), so
+/// the window must hold several such gaps for `MAX_LEAKED_WORKERS` samples
+/// to actually accumulate — a 60 s window held at most two and the budget
+/// could never trip. Ten minutes admits the fourth leak at the real
+/// minimum spacing (105 s) with room for slower wedges.
+const LEAK_WINDOW: Duration = Duration::from_secs(600);
 
 /// How many hung-thread leaks inside `LEAK_WINDOW` the supervisor tolerates
 /// before stopping restarts. Bounds the one resource the consecutive-failure
@@ -1797,11 +1802,28 @@ mod tests {
     }
 
     #[test]
+    fn leak_budget_trips_at_the_real_minimum_stall_spacing() {
+        // Consecutive leaks are spaced at least restart-delay + stall
+        // threshold apart (5 s + 30 s). The window must be wide enough for
+        // MAX_LEAKED_WORKERS samples to actually accumulate at that spacing,
+        // or the rolling budget can never trip and hung workers leak
+        // without bound — the exact failure a 60 s window had.
+        let now = Instant::now();
+        let spacing = worker_restart_delay(1) + WORKER_STALL_THRESHOLD;
+        let mut leaks: Vec<Instant> = (0..MAX_LEAKED_WORKERS).map(|i| now - spacing * i as u32).collect();
+        assert!(
+            leak_budget_exhausted(&mut leaks, LEAK_WINDOW, MAX_LEAKED_WORKERS, now),
+            "the budget must be reachable at the real minimum spacing ({spacing:?})"
+        );
+    }
+
+    #[test]
     fn leak_budget_prunes_the_window_and_stops_at_max() {
         // Old leaks fall off and stop counting; the budget trips only
-        // when MAX_LEAKED_WORKERS samples sit inside the window.
+        // when MAX_LEAKED_WORKERS samples sit inside the window. The
+        // stale samples sit past LEAK_WINDOW (600 s).
         let now = Instant::now();
-        let mut leaks = vec![now - Duration::from_secs(120), now - Duration::from_secs(90)];
+        let mut leaks = vec![now - Duration::from_secs(700), now - Duration::from_secs(610)];
         assert!(
             !leak_budget_exhausted(&mut leaks, LEAK_WINDOW, MAX_LEAKED_WORKERS, now),
             "stale leaks must not count"
