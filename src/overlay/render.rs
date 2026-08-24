@@ -3680,6 +3680,7 @@ pub(super) fn draw_aura(
     let c1 = palette.primary;
     let c2 = palette.secondary;
     let margin = (AURA_HALO_LOGICAL * scale).round().max(1.0) as usize;
+    let lut = falloff_lut(margin, scale);
 
     for y in 0..buf_h {
         let (wa, wb, wc, wd) = aura_row_windows(buf_w, inset, pill_w, pill_h, radius, margin, y);
@@ -3736,8 +3737,9 @@ pub(super) fn draw_aura(
             // the expand/collapse shape are folded into `scale`). The margin
             // guard above truncates the halo at its extent; the last px
             // ramps linearly to 0 so the glow ends smoothly mid-curve
-            // instead of hitting a hard edge.
-            let falloff = (-d * AURA_DECAY / AURA_MARGIN_LOGICAL / scale).exp();
+            // instead of hitting a hard edge. The exp is served from the
+            // quantized, interpolated LUT (visually identical, far cheaper).
+            let falloff = falloff_lookup(&lut, d);
             let edge = (margin as f32 - d).clamp(0.0, 1.0);
             let alpha = (AURA_PEAK_ALPHA * inner_aa * falloff * edge)
                 .round()
@@ -3748,6 +3750,34 @@ pub(super) fn draw_aura(
             }
         }
     }
+}
+
+/// Quantized exp-falloff table for the aura ring and comet sweep: the
+/// falloff depends only on the signed distance and the scale, so a per-call
+/// table (0.25 px steps over the band the sweeps evaluate, linearly
+/// interpolated) replaces one `exp` per pixel with two loads and a lerp.
+/// Built per call — ~100 entries against hundreds of thousands of pixels —
+/// and consumed via `falloff_lookup`.
+fn falloff_lut(margin: usize, scale: f32) -> Vec<f32> {
+    let lo = -2.0f32;
+    let hi = margin as f32 + 1.0;
+    let steps = ((hi - lo) * 4.0).ceil() as usize + 1;
+    (0..steps)
+        .map(|i| {
+            let d = lo + i as f32 * 0.25;
+            (-d * AURA_DECAY / AURA_MARGIN_LOGICAL / scale).exp()
+        })
+        .collect()
+}
+
+/// Linearly-interpolated lookup into `falloff_lut` at signed distance `d`.
+fn falloff_lookup(lut: &[f32], d: f32) -> f32 {
+    let pos = ((d + 2.0) * 4.0).clamp(0.0, (lut.len() - 1) as f32);
+    let i = pos as usize;
+    let frac = pos - i as f32;
+    let a = lut[i];
+    let b = lut[(i + 1).min(lut.len() - 1)];
+    a + (b - a) * frac
 }
 
 /// The aura comet sweep: an arc of boosted glow riding the static aura ring
@@ -3776,24 +3806,20 @@ pub(super) fn draw_comet(
     let center_x = inset as f32 + pill_w as f32 * 0.5;
     let center_y = inset as f32 + pill_h as f32 * 0.5;
     let half_span = ORBIT_COMET_HALF_SPAN_DEG.to_radians();
+    // The comet contributes on exactly the same signed-distance band as the
+    // ring (-1.5 < d <= margin), so the aura's per-row windows bound it too:
+    // without them this sweep evaluates the SDF, an atan2 and an exp for
+    // every pixel of the buffer at 15 Hz — the hottest steady-state loop on
+    // a low-end device.
+    let lut = falloff_lut(margin, scale);
     for y in 0..buf_h {
+        let (wa, wb, wc, wd) = aura_row_windows(buf_w, inset, pill_w, pill_h, radius, margin, y);
         for x in 0..buf_w {
-            // Same halo-band reject as the ring: pixels farther than the
-            // margin from the pill's bounding box can never be in the glow.
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let box_left = inset as f32;
-            let box_right = box_left + pill_w as f32;
-            let box_top = inset as f32;
-            let box_bottom = box_top + pill_h as f32;
-            let margin_f = margin as f32;
-            if px < box_left - margin_f
-                || px > box_right + margin_f
-                || py < box_top - margin_f
-                || py > box_bottom + margin_f
-            {
+            if !(x >= wa && x < wb) && !(x >= wc && x < wd) {
                 continue;
             }
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
             let d = round_rect_signed_dist(
                 (x as f32) - inset as f32,
                 (y as f32) - inset as f32,
@@ -3831,9 +3857,9 @@ pub(super) fn draw_comet(
                 (c1[2] as f32 * (1.0 - tc) + c2[2] as f32 * tc).round() as u8,
             ];
             // Radial shape identical to the ring's: same exponential falloff
-            // and linear edge ramp, so the comet's silhouette matches the
-            // glow it rides.
-            let falloff = (-d * AURA_DECAY / AURA_MARGIN_LOGICAL / scale).exp();
+            // (LUT-served) and linear edge ramp, so the comet's silhouette
+            // matches the glow it rides.
+            let falloff = falloff_lookup(&lut, d);
             let edge = (margin as f32 - d).clamp(0.0, 1.0);
             let alpha = (ORBIT_COMET_PEAK_ALPHA * inner_aa * bump * falloff * edge).round() as u32;
             if alpha > 0 {
