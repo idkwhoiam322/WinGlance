@@ -3428,7 +3428,7 @@ fn register_current_session_handler(
 ) -> Result<i64> {
     let handler: TypedEventHandler<GlobalSystemMediaTransportControlsSessionManager, CurrentSessionChangedEventArgs> =
         TypedEventHandler::new(move |_, _| {
-            contained_winrt_event("the sessions handler", || {
+            contained_winrt_event("the current-session handler", || {
                 if let Err(e) = signal_tx.try_send(Signal::Sessions) {
                     debug!("signal dropped | kind=Sessions | {e:?}");
                 }
@@ -4214,6 +4214,40 @@ mod tests {
         assert!(!pattern_matches("youtubemusic", "   "));
         assert!(!pattern_matches("youtubemusic", "-_. "));
         assert!(!pattern_matches("", "youtube"));
+    }
+
+    #[test]
+    fn inline_allow_list_matcher_stays_in_lockstep_with_pattern_matches() {
+        // The hot path evaluates precomputed normalized patterns with an
+        // inlined copy of `pattern_matches`'s rule; the two must agree on
+        // every input shape, or an allow-list decision could depend on
+        // which copy ran. Any divergence here is a bug in one of them.
+        let cases: &[(&[&str], &str, &str)] = &[
+            (&["spotify"], "spotify.exe", "Spotify"),
+            (&["spotify"], "Spotify-Free", "spoticfy"), // near-miss label
+            (&[""], "anything", "anything"),            // empty pattern never matches
+            (&["   "], "anything", "anything"),         // whitespace-only normalizes empty
+            (&["SPOT-IFY"], "spotify", "other"),        // separator normalization
+            (&["music.be"], "musicbee", "MusicBee"),    // dot normalization
+            (&["nope"], "spotify", "Spotify"),
+            (&[], "spotify", "Spotify"), // empty list matches nothing
+            (&["a", "b"], "xxx", "bbb"), // second pattern matches the label only
+        ];
+        for (patterns, aumid, label) in cases {
+            let normalized: Vec<String> = patterns.iter().map(|p| normalize_for_match(p)).collect();
+            let naumid = normalize_for_match(aumid);
+            let nlabel = normalize_for_match(label);
+            let inline = normalized
+                .iter()
+                .any(|np| !np.is_empty() && (naumid.contains(np) || nlabel.contains(np)));
+            let reference = patterns
+                .iter()
+                .any(|p| pattern_matches(&naumid, p) || pattern_matches(&nlabel, p));
+            assert_eq!(
+                inline, reference,
+                "patterns {patterns:?} aumid {aumid:?} label {label:?}"
+            );
+        }
     }
 
     #[test]

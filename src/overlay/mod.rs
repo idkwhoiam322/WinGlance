@@ -627,7 +627,7 @@ struct OverlayState {
     last_tick: Instant,
     /// Last time the topmost z-order was re-asserted. While the pill is fully
     /// shown (static), the re-assert is throttled to 1 Hz instead of running
-    /// on every 4 ms tick.
+    /// on every animation tick.
     last_reassert: Option<Instant>,
     /// Cached monitor refresh period (ms), re-sampled at most once per
     /// second. `sync_anim_timer` runs on every animation tick; the underlying
@@ -655,9 +655,11 @@ struct OverlayState {
     /// state. The alpha drops to the idle level (0.25 * 255 = 64) after the
     /// dismiss timeout. Reset on hover, track change, or playback change.
     persistent_faded: bool,
-    /// `auto_compact_sources` list) is foreground. Saved here before
-    /// `hide()` clears `content`, so `on_foreground_change` can restore it
-    /// on the resume path without depending on the queue.
+    /// The persistent pill's content snapshot taken when it auto-hid because
+    /// a fullscreen or listed (`auto_compact_sources`) foreground is active.
+    /// Saved here before `hide()` clears `content`, so
+    /// `on_foreground_change` can restore it on the resume path without
+    /// depending on the queue.
     held_content: Option<MediaEvent>,
     /// Shared cell the SMTC worker reads for its session-recreation gate
     /// (see `smtc::ListenerState::now_showing`): the source of the pill
@@ -2272,8 +2274,8 @@ impl OverlayState {
         (base + elapsed * rate).max(0.0)
     }
 
-    /// Whether an incoming timeline sample moves the bar at least one pixel
-    ///: mirrors the tick path's gate so a paused source's ~2 s
+    /// Whether an incoming timeline sample moves the bar at least one pixel:
+    /// mirrors the tick path's gate so a paused source's ~2 s
     /// timeline pings do not trigger whole-pill rasterizes for identical
     /// pixels. A seek — the sample jumping far from the current estimate —
     /// always counts as movement.
@@ -3114,8 +3116,8 @@ impl OverlayState {
             Phase::Collapsing(start) if start.elapsed() >= collapse_duration(&self.config) => {
                 // Persistent-compact: the collapse animation shrinks the pill
                 // back to compact size, but the pill stays visible (fades to
-                // idle opacity instead of hiding) — unless
-                // fullscreen/listed), in which case the pill fully hides.
+                // idle opacity instead of hiding) — unless the foreground is
+                // fullscreen/listed, in which case the pill fully hides.
                 // A Stopped-state pill (tombstone: source is done) also hides
                 // here regardless of the fade setting — nothing can revive it.
                 if self.config.overlay.layout == LayoutMode::PersistentCompact && !self.persistent_collapse_on_dismiss {
@@ -3138,10 +3140,10 @@ impl OverlayState {
         // Advance marquee offsets (driven by this same tick, entirely
         // independent of the dismiss countdown). Time-based so the scroll
         // speed is identical at any frame rate. With animations disabled the
-        // offsets never advance: overflowing lines render statically
-        // . The DPI scale is queried only while a line is actually
-        // scrolling: a static pill repaints nothing, so its coarse tick must
-        // not pay for a per-tick DPI call.
+        // offsets never advance: overflowing lines render statically,
+        // end-ellipsized. The DPI scale is queried only while a line is
+        // actually scrolling: a static pill repaints nothing, so its coarse
+        // tick must not pay for a per-tick DPI call.
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
         let scale = if marquee_active {
             self.fonts.dpi().max(96) as f32 / 96.0

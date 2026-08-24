@@ -131,7 +131,6 @@ const HISTORY_CAP: usize = 400;
 const TIMER_LOGS_ID: usize = 101;
 /// Timer used to clear the "Opened" feedback on the Open logs/Open config buttons.
 const TIMER_OPENED_ID: usize = 104;
-/// Timer used to keep the native history tooltip's item rects in sync (scroll).
 /// Timer that retries a failed initial tray add: Explorer may not have built
 /// the notification area yet at logon, which makes the first `NIM_ADD` fail.
 const TRAY_RETRY_TIMER_ID: usize = 105;
@@ -1717,11 +1716,6 @@ impl MainWindowState {
         }
         if self.tooltip_ctrl.0.is_null() || self.listbox.0.is_null() {
             return;
-        }
-        // Register the single track tool exactly once.
-        if !self.tooltip_shown && self.tooltip_hover.is_none() && self.tooltip_hover_since.is_none() {
-            // First tick after creation: register the tool. Cheap enough to
-            // guard with a dedicated flag-free probe below instead of state.
         }
         unsafe {
             if !self.track_tool_registered {
@@ -3495,7 +3489,7 @@ impl MainWindowState {
                                     if exact {
                                         "Custom".to_string()
                                     } else {
-                                        format!("{}s", duration_ms as f64 / 1000.0)
+                                        format_duration_label(duration_ms)
                                     }
                                 } else {
                                     format!("{}s", values[i] / 1000)
@@ -4716,6 +4710,15 @@ const HISTORY_COLUMNS: [HistoryColumn; 9] = [
 
 const HISTORY_COL_TIME: usize = 0;
 const HISTORY_COL_STATE: usize = 1;
+// Indices into HISTORY_COLUMNS for the remaining columns, so a reorder
+// cannot silently scramble the cell↔header mapping in `history_cell_text`.
+// SOURCE (8) is the matcher's fallback arm and needs no name.
+const HISTORY_COL_TITLE: usize = 2;
+const HISTORY_COL_ARTIST: usize = 3;
+const HISTORY_COL_ALBUM: usize = 4;
+const HISTORY_COL_DURATION: usize = 5;
+const HISTORY_COL_TRACK: usize = 6;
+const HISTORY_COL_GENRE: usize = 7;
 
 /// Computes every column's client rect within one listbox row: pad/gap
 /// scaling, floor-truncated proportional shares, remainder on the last
@@ -4837,25 +4840,25 @@ fn history_cell_text(entry: &HistoryEntry, col: usize) -> String {
             PlaybackState::NowPlaying => "♪",
         }
         .to_string(),
-        2 => entry.track.title.clone(),
-        3 => {
+        HISTORY_COL_TITLE => entry.track.title.clone(),
+        HISTORY_COL_ARTIST => {
             if entry.track.artist.trim().is_empty() {
                 String::new()
             } else {
                 entry.track.artist.clone()
             }
         }
-        4 => entry.track.album.clone(),
-        5 => entry
+        HISTORY_COL_ALBUM => entry.track.album.clone(),
+        HISTORY_COL_DURATION => entry
             .track
             .duration_secs
             .map(crate::events::format_duration_secs)
             .unwrap_or_default(),
-        6 => match (entry.track.track_number, entry.track.track_count) {
+        HISTORY_COL_TRACK => match (entry.track.track_number, entry.track.track_count) {
             (Some(n), Some(c)) => format!("{n}/{c}"),
             _ => String::new(),
         },
-        7 => entry.track.genre.clone().unwrap_or_default(),
+        HISTORY_COL_GENRE => entry.track.genre.clone().unwrap_or_default(),
         _ => {
             if entry.track.source_app.trim().is_empty() {
                 String::new()
@@ -5574,7 +5577,6 @@ fn setting_sub_rect(id: SettingId, sub: SettingSub, rect: &RECT, scale: f32) -> 
     }
 }
 
-#[allow(unsafe_op_in_unsafe_fn)]
 /// The point inside a settings row's `rect` that activates `sub` — the center
 /// of the exact interaction rectangle (`setting_sub_rect`), so the UIA
 /// activation path clicks the same geometry the provider enumerates. `None`
