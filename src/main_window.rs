@@ -7167,6 +7167,16 @@ fn on_ui_thread() -> bool {
         .is_some_and(|id| *id == unsafe { GetCurrentThreadId() })
 }
 
+/// When the UI thread last stored a Settings snapshot. Provider queries
+/// arriving within `SNAPSHOT_STALENESS` share that build instead of forcing
+/// one rebuild per property: a Narrator tree walk over N controls would
+/// otherwise cost N full rebuilds plus a UI-thread round trip each.
+static LAST_SNAPSHOT_BUILD: Mutex<Option<Instant>> = Mutex::new(None);
+/// How long a stored snapshot may be served without a rebuild. Bounds how
+/// far a UIA answer can lag a settings change; short enough to be
+/// imperceptible next to the provider round trip itself.
+const SNAPSHOT_STALENESS: Duration = Duration::from_millis(150);
+
 /// Stores a snapshot under the next generation and wakes any thread waiting
 /// for a build.
 fn store_settings_ui_snapshot(snapshot: Arc<SettingsUiSnapshot>) {
@@ -7175,6 +7185,10 @@ fn store_settings_ui_snapshot(snapshot: Arc<SettingsUiSnapshot>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let generation = slot.as_ref().map(|(generation, _)| *generation + 1).unwrap_or(1);
     *slot = Some((generation, snapshot));
+    drop(slot);
+    *LAST_SNAPSHOT_BUILD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
     // Best-effort: a failed signal only costs a waiting thread its next poll
     // slice before it reads the slot anyway.
     unsafe {
@@ -7239,6 +7253,18 @@ fn build_settings_ui_snapshot(hwnd: HWND) -> Arc<SettingsUiSnapshot> {
 fn settings_ui_snapshot(hwnd: HWND) -> Arc<SettingsUiSnapshot> {
     if on_ui_thread() {
         return build_settings_ui_snapshot(hwnd);
+    }
+    // Freshness sharing: a snapshot built within the staleness window is
+    // served directly, so a burst of provider queries (one per property of
+    // one control) costs one UI-thread rebuild instead of one per query.
+    // Every answer still resolves against a complete build; the tolerance
+    // only bounds how far it can lag a settings change.
+    let built_recently = LAST_SNAPSHOT_BUILD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some_and(|t| t.elapsed() < SNAPSHOT_STALENESS);
+    if built_recently && snapshot_slot().is_some() {
+        return current_settings_ui_snapshot();
     }
     let wanted = snapshot_generation();
     let event = settings_snapshot_event();
