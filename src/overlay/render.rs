@@ -1043,6 +1043,29 @@ pub(super) fn draw_art_scaled(
         return;
     }
     let radius = size as f32 * 0.2;
+    // Filter in premultiplied space: the source is straight RGBA, and
+    // bilinear-averaging straight RGB across a transparent neighbor bleeds
+    // that neighbor's zero RGB into the result — a dark fringe just inside
+    // the rounded mask on downscaled art. Premultiply, filter, then
+    // un-premultiply, matching the premultiplied filtering the settle-bounce
+    // resample performs.
+    let premultiply = |p: usize| -> [f32; 4] {
+        let a = art[p + 3] as f32;
+        [
+            art[p] as f32 * a / 255.0,
+            art[p + 1] as f32 * a / 255.0,
+            art[p + 2] as f32 * a / 255.0,
+            a,
+        ]
+    };
+    let mix4 = |a: [f32; 4], b: [f32; 4], t: f32| -> [f32; 4] {
+        [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+            a[3] + (b[3] - a[3]) * t,
+        ]
+    };
     for dy in 0..size {
         for dx in 0..size {
             let coverage = round_rect_coverage(dx as f32, dy as f32, size as f32, size as f32, radius);
@@ -1061,23 +1084,25 @@ pub(super) fn draw_art_scaled(
             let p10 = (y0 * base + x1) * 4;
             let p01 = (y1 * base + x0) * 4;
             let p11 = (y1 * base + x1) * 4;
-            let r = lerp(lerp(art[p00], art[p10], fx), lerp(art[p01], art[p11], fx), fy);
-            let g = lerp(
-                lerp(art[p00 + 1], art[p10 + 1], fx),
-                lerp(art[p01 + 1], art[p11 + 1], fx),
+            let filtered = mix4(
+                mix4(premultiply(p00), premultiply(p10), fx),
+                mix4(premultiply(p01), premultiply(p11), fx),
                 fy,
             );
-            let b = lerp(
-                lerp(art[p00 + 2], art[p10 + 2], fx),
-                lerp(art[p01 + 2], art[p11 + 2], fx),
-                fy,
-            );
-            let a = lerp(
-                lerp(art[p00 + 3], art[p10 + 3], fx),
-                lerp(art[p01 + 3], art[p11 + 3], fx),
-                fy,
-            );
-            let alpha = (a as f32 * content_alpha * coverage) as u32;
+            let a = filtered[3];
+            // Un-premultiply for the straight-RGB `composite` input; a fully
+            // transparent filter result carries no color by definition.
+            let un = |c: f32| -> u8 {
+                if a <= 0.0 {
+                    0
+                } else {
+                    (c * 255.0 / a).round().clamp(0.0, 255.0) as u8
+                }
+            };
+            let r = un(filtered[0]);
+            let g = un(filtered[1]);
+            let b = un(filtered[2]);
+            let alpha = (a * content_alpha * coverage) as u32;
             composite(pixels, width, x + dx, y + dy, [r, g, b], alpha);
         }
     }
@@ -1814,6 +1839,10 @@ pub(super) fn draw_pill_text_rows(
                 &title_narrow,
                 font_title,
                 h_title,
+                // The user-configured title color is deliberately not
+                // contrast-corrected: the config owner picks it against
+                // their own background color, and forcing it would defeat
+                // the setting. The palette-derived rows below are checked.
                 dim_color(pill_text_color(appearance), content_alpha * unveil),
                 scale,
                 Some(MarqueeCtx {
@@ -2138,6 +2167,19 @@ pub(super) fn draw_expanded_pill_text(
                     let artist_rect = next_band(fs_artist * 0.85 * ROW_HEIGHT);
                     let unveil = row_unveil_alpha(body_bottom, rest_body_bottom, artist_rect.bottom);
                     if unveil > 0.0 {
+                        // Same visual slot as a real artist row: the
+                        // contrast-checked muted tier, not a fixed gray
+                        // that could sit below AA against a light fill.
+                        // Computed before the call: the scratch borrows
+                        // `state` mutably.
+                        let fallback_color = dim_color(
+                            ensure_contrast(
+                                muted_accent(pill_accent_base(state, &state.config.appearance)),
+                                pill_fill_bg(state),
+                                TEXT_CONTRAST_AA,
+                            ),
+                            content_alpha * unveil,
+                        );
                         draw_text_line_pixels(
                             &mut state.text_scratch,
                             &mut state.scratch_utf16,
@@ -2147,7 +2189,7 @@ pub(super) fn draw_expanded_pill_text(
                             &artist_rect,
                             font_artist,
                             h_artist,
-                            dim_color([0xCC, 0xCC, 0xCC, 0xFF], content_alpha * unveil),
+                            fallback_color,
                             scale,
                             None,
                             layer,
@@ -2988,10 +3030,11 @@ pub(super) fn composite_marquee_strip(
             let src_b = (src_row[sp + 2] as f32 * fade).round() as u32;
             let inv = 255 - alpha;
             let dp = x as usize * 4;
-            dst_row[dp] = (src_r + dst_row[dp] as u32 * inv / 255) as u8;
-            dst_row[dp + 1] = (src_g + dst_row[dp + 1] as u32 * inv / 255) as u8;
-            dst_row[dp + 2] = (src_b + dst_row[dp + 2] as u32 * inv / 255) as u8;
-            dst_row[dp + 3] = (alpha + dst_row[dp + 3] as u32 * inv / 255) as u8;
+            // Rounded divisions (see `composite_pm`).
+            dst_row[dp] = (src_r + (dst_row[dp] as u32 * inv + 127) / 255) as u8;
+            dst_row[dp + 1] = (src_g + (dst_row[dp + 1] as u32 * inv + 127) / 255) as u8;
+            dst_row[dp + 2] = (src_b + (dst_row[dp + 2] as u32 * inv + 127) / 255) as u8;
+            dst_row[dp + 3] = (alpha + (dst_row[dp + 3] as u32 * inv + 127) / 255) as u8;
         }
     }
 }
@@ -3172,10 +3215,13 @@ pub(super) fn composite_pm(pixels: &mut [u8], width: usize, x: usize, y: usize, 
     let offset = (y * width + x) * 4;
     let alpha = alpha.min(255);
     let inv = 255 - alpha;
-    pixels[offset] = (rgb[2] as u32 + pixels[offset] as u32 * inv / 255) as u8;
-    pixels[offset + 1] = (rgb[1] as u32 + pixels[offset + 1] as u32 * inv / 255) as u8;
-    pixels[offset + 2] = (rgb[0] as u32 + pixels[offset + 2] as u32 * inv / 255) as u8;
-    pixels[offset + 3] = (alpha + pixels[offset + 3] as u32 * inv / 255) as u8;
+    // The +127 rounds each /255 division instead of truncating it, so
+    // layered source-over steps do not accumulate a consistent darkening
+    // bias; for valid premultiplied inputs the sum stays within u8.
+    pixels[offset] = (rgb[2] as u32 + (pixels[offset] as u32 * inv + 127) / 255) as u8;
+    pixels[offset + 1] = (rgb[1] as u32 + (pixels[offset + 1] as u32 * inv + 127) / 255) as u8;
+    pixels[offset + 2] = (rgb[0] as u32 + (pixels[offset + 2] as u32 * inv + 127) / 255) as u8;
+    pixels[offset + 3] = (alpha + (pixels[offset + 3] as u32 * inv + 127) / 255) as u8;
 }
 
 /// Converts the worker's premultiplied BGRA artwork (square, fixed
@@ -3215,10 +3261,12 @@ pub(super) fn composite(pixels: &mut [u8], width: usize, x: usize, y: usize, rgb
     let offset = (y * width + x) * 4;
     let alpha = alpha.min(255);
     let inv = 255 - alpha;
-    pixels[offset] = ((rgb[2] as u32 * alpha + pixels[offset] as u32 * inv) / 255) as u8;
-    pixels[offset + 1] = ((rgb[1] as u32 * alpha + pixels[offset + 1] as u32 * inv) / 255) as u8;
-    pixels[offset + 2] = ((rgb[0] as u32 * alpha + pixels[offset + 2] as u32 * inv) / 255) as u8;
-    pixels[offset + 3] = (alpha + pixels[offset + 3] as u32 * inv / 255) as u8;
+    // Rounded divisions (see `composite_pm`): the +127 sits inside each
+    // /255 so valid premultiplied inputs stay within u8.
+    pixels[offset] = ((rgb[2] as u32 * alpha + pixels[offset] as u32 * inv + 127) / 255) as u8;
+    pixels[offset + 1] = ((rgb[1] as u32 * alpha + pixels[offset + 1] as u32 * inv + 127) / 255) as u8;
+    pixels[offset + 2] = ((rgb[0] as u32 * alpha + pixels[offset + 2] as u32 * inv + 127) / 255) as u8;
+    pixels[offset + 3] = (alpha + (pixels[offset + 3] as u32 * inv + 127) / 255) as u8;
 }
 
 /// Bilinearly scales a premultiplied BGRA icon and composites it into the

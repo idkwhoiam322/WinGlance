@@ -466,6 +466,11 @@ struct SettingsColors {
     /// `accent_fill_text`, whose contrast Windows itself guarantees against
     /// it).
     accent_fill: [u8; 4],
+    /// The idle fill of the small outline buttons (Reset, Preview, logs,
+    /// config): the fixed dark-theme value normally; under a high-contrast
+    /// theme the system window color, so idle buttons stop being dark
+    /// islands on a light system surface.
+    small_fill: [u8; 4],
     /// The label color drawn on an `accent_fill` backdrop: `COLOR_HIGHLIGHTTEXT`
     /// under a high-contrast theme (the standard HC button pairing), unused by
     /// the normal theme (which draws active labels in the surface text color).
@@ -501,6 +506,7 @@ fn settings_colors_for(prefs: &crate::winutil::SystemPreferences) -> SettingsCol
             // guarantees against the highlight.
             accent_fill: sys_color_rgba(COLOR_HIGHLIGHT),
             accent_fill_text: sys_color_rgba(COLOR_HIGHLIGHTTEXT),
+            small_fill: surface,
             high_contrast: true,
             surface,
             text,
@@ -520,6 +526,8 @@ fn settings_colors_for(prefs: &crate::winutil::SystemPreferences) -> SettingsCol
             accent: SETTINGS_TEXT,
             accent_fill: SETTINGS_TEXT,
             accent_fill_text: SETTINGS_TEXT,
+            // The shipped dark-theme small-button fill, unchanged.
+            small_fill: [0x12, 0x12, 0x12, 0xFF],
             high_contrast: false,
         }
     }
@@ -1588,10 +1596,9 @@ impl MainWindowState {
         // (a settings repaint previously created ~40 brushes).
         self.black_brush = OwnedBrush::new(unsafe { CreateSolidBrush(COLORREF(0)) });
         self.sidebar_bg_brush = OwnedBrush::new(unsafe { CreateSolidBrush(COLORREF(0x0A0A0A)) });
-        // The settings brushes (surface/border/hover/focus) come from the
-        // effective color set — see `rebuild_settings_appearance`.
+        // The settings brushes (surface/border/hover/focus/small-fill) come
+        // from the effective color set — see `rebuild_settings_appearance`.
         self.rebuild_settings_appearance();
-        self.settings_small_fill_brush = OwnedBrush::new(unsafe { CreateSolidBrush(COLORREF(0x00121212)) });
         // History-row brushes: a fixed four-color set, created once instead of
         // per owner-draw row (every scroll tick repaints every visible row).
         self.history_header_brush = OwnedBrush::new(unsafe { CreateSolidBrush(COLORREF(0x00141414)) });
@@ -2061,6 +2068,10 @@ impl MainWindowState {
         self.settings_surface_brush = solid(colors.surface);
         self.settings_hover_brush = solid(colors.hover);
         self.settings_focus_brush = solid(colors.focus);
+        // The small outline buttons follow the theme like every other
+        // settings surface — a hardcoded dark fill left them as near-black
+        // islands under a light high-contrast theme.
+        self.settings_small_fill_brush = solid(colors.small_fill);
     }
 
     /// Pushes the effective pill duration to the overlay: the
