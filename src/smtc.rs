@@ -127,6 +127,13 @@ struct LogicalState {
     /// Used to inherit the type across poll reads (which never report it
     /// freshly) and to suppress `Image` content wholesale.
     playback_type: PlaybackType,
+    /// Whether a timeline read for the CURRENT identity has ever reported a
+    /// position. Reset when the identity changes and seeded only by a
+    /// successful read, so a flaky first read (timeline error, no position)
+    /// cannot make the next good read look like a position appearance —
+    /// which the seek detector would treat as a seek and re-emit an
+    /// unchanged track.
+    position_seen: bool,
     /// When the first read was deferred waiting for artwork: the pill shows
     /// anyway once this timestamp is older than `ARTWORK_TIMEOUT`.
     deferred_at: Option<Instant>,
@@ -1191,8 +1198,17 @@ impl ListenerState {
                     // the previous position (see `merge_track`), and storing
                     // the raw None would erase that baseline — the next good
                     // read would then look like a position appearance and
-                    // re-emit an unchanged track.
-                    next.last_position_secs = merged.position_secs.map(|s| s as u64);
+                    // re-emit an unchanged track. On an identity change the
+                    // baseline is seeded only from a successful read (and
+                    // `position_seen` gates the appearance arm), so a flaky
+                    // first read for a new track cannot duplicate either.
+                    if read.title == prev.title && read.artist == prev.artist {
+                        next.last_position_secs = merged.position_secs.map(|s| s as u64);
+                        next.position_seen = prev.position_seen || merged.position_secs.is_some();
+                    } else {
+                        next.last_position_secs = read.position_secs.map(|s| s as u64);
+                        next.position_seen = read.position_secs.is_some();
+                    }
                     // Push a lightweight progress update so the overlay bar tracks
                     // live position and seeks directly, without waiting for a
                     // TrackChanged re-emit (which only fires on a content change
@@ -1283,6 +1299,38 @@ impl ListenerState {
                         let label = track_label(&merged);
                         debug!("track emit forced | reason=artwork-timeout | {label}");
                     }
+                    // Per-source session-recreation dedup: a source that
+                    // recreates its session (e.g. YouTube Music ~60s and on
+                    // every song change) re-reports the same track on a new
+                    // session key. Since the new session starts with a default
+                    // LogicalState, content_differ always sees a change. Compare
+                    // against the last track actually emitted per source
+                    // (title + artist + artwork-presence); a genuine artwork
+                    // gain still surfaces because is_some() changes. When the
+                    // read did not read artwork (the 2s poll: read_artwork=false),
+                    // the artwork clause is skipped — the poll always produces
+                    // artwork=None, which would otherwise mismatch the last emit's
+                    // Some and escape dedup as a duplicate pill (see the Bleed It
+                    // Out case: same session key, duration drift, poll read art=None
+                    // vs last emit art=Some). Cached artwork injection (above) makes
+                    // event reads for recreated sessions also see Some==Some.
+                    // Suppression applies only while the pill already on screen
+                    // belongs to this source (the overlay's now-showing cell): after
+                    // another app's pill, the identical re-report is a switch-back
+                    // that must re-emit — the overlay's cache for this source may
+                    // already be evicted, so the pill needs the fresh track (with
+                    // injected art) to come back itself. The verdict is computed
+                    // here, before the artwork-changed force below, so a re-report
+                    // the gate would suppress never pays the force's palette
+                    // invalidation and "forced" log first.
+                    let shown_source = self.shown_source();
+                    let session_recreation = should_suppress_recreation(
+                        self.last_track_per_source.get(&merged.source_app),
+                        &merged,
+                        read_artwork,
+                        shown_source.as_deref(),
+                        self.budget_stripped_art.contains(&merged.source_app),
+                    );
                     // Same song, different cover: some sources swap album art
                     // for the same title+artist (e.g. a video vs audio
                     // version). content_differ only compares text fields, so
@@ -1292,8 +1340,12 @@ impl ListenerState {
                     // thumbnail within ~1s of a change and can return
                     // different bytes for the same cover, which would
                     // otherwise fire a duplicate pill for the same song.
+                    // Skipped when the recreation gate above would suppress
+                    // the emit anyway (stripped-cache re-report of the same
+                    // identity): forcing it would only be eaten below.
                     if !emit
                         && read_artwork
+                        && !session_recreation
                         && let Some(prev_track) = self.last_track_per_source.get(&merged.source_app)
                         && prev_track.title == merged.title
                         && prev_track.artist == merged.artist
@@ -1341,38 +1393,6 @@ impl ListenerState {
                             }
                         }
                     }
-                    // Per-source session-recreation dedup: a source that
-                    // recreates its session (e.g. YouTube Music ~60s and on
-                    // every song change) re-reports the same track on a new
-                    // session key. Since the new session starts with a default
-                    // LogicalState, content_differ always sees a change. Compare
-                    // against the last track actually emitted per source
-                    // (title + artist + artwork-presence); a genuine artwork
-                    // gain still surfaces because is_some() changes. When the
-                    // read did not read artwork (the 2s poll: read_artwork=false),
-                    // the artwork clause is skipped — the poll always produces
-                    // artwork=None, which would otherwise mismatch the last emit's
-                    // Some and escape dedup as a duplicate pill (see the Bleed It
-                    // Out case: same session key, duration drift, poll read art=None
-                    // vs last emit art=Some). Cached artwork injection (above) makes
-                    // event reads for recreated sessions also see Some==Some.
-                    // Suppression applies only while the pill already on screen
-                    // belongs to this source (the overlay's now-showing cell): after another
-                    // app's pill, the identical re-report is a switch-back that
-                    // must re-emit — the overlay's cache for this source may
-                    // already be evicted, so the pill needs the fresh track
-                    // (with injected art) to come back itself. The suppression
-                    // is only reported when an emit would actually have fired
-                    // (see the emit gate below): an unchanged re-read cannot be
-                    // "suppressed" and must not be logged as one.
-                    let shown_source = self.shown_source();
-                    let session_recreation = should_suppress_recreation(
-                        self.last_track_per_source.get(&merged.source_app),
-                        &merged,
-                        read_artwork,
-                        shown_source.as_deref(),
-                        self.budget_stripped_art.contains(&merged.source_app),
-                    );
                     // A recreated session starts from a default LogicalState, so
                     // its first read reports the new session's default playback
                     // state (e.g. Paused while the user never touched anything)
@@ -1965,10 +1985,19 @@ impl ListenerState {
         let key = session_key(session);
         // The source may have entered the churn cool-down (or been filtered
         // out) since this session was subscribed; the retry must not emit
-        // events for it any more than the normal refresh path would.
+        // events for it any more than the normal refresh path would. The
+        // same goes for image content: the refresh path persists the
+        // suppressed playback type (see the Image early return in
+        // `refresh_session`), and without this check a fresh image session
+        // with a readable thumbnail would push its pill through the retry's
+        // artwork-gain emit — the exact suppression the refresh enforces.
         if !self.should_follow_session(session)
             || !self.session_source_allowed(session)
             || !should_poll_artwork(self.states.get(&key))
+            || self
+                .states
+                .get(&key)
+                .is_some_and(|state| state.playback_type == PlaybackType::Image)
         {
             return Ok(());
         }
@@ -1977,7 +2006,7 @@ impl ListenerState {
         // would (see `snapshot_playback_state`) — without it, the surfaced
         // track reports `playback_state: None` and the pill infers playing
         // even when the source is paused.
-        let (playback, rate) = match session.GetPlaybackInfo() {
+        let (playback, rate, playback_type) = match session.GetPlaybackInfo() {
             Ok(playback_info) => {
                 let status = match playback_info.PlaybackStatus() {
                     Ok(status) => status,
@@ -2000,6 +2029,15 @@ impl ListenerState {
                 (
                     snapshot_playback_state(status),
                     playback_info.PlaybackRate().ok().and_then(|r| r.Value().ok()),
+                    // The playback type comes off the info already fetched:
+                    // calling session_playback_type here would issue a third
+                    // GetPlaybackInfo for the same data.
+                    playback_info
+                        .PlaybackType()
+                        .ok()
+                        .and_then(|ty| ty.Value().ok())
+                        .map(map_playback_type)
+                        .unwrap_or(PlaybackType::Unknown),
                 )
             }
             Err(error) => {
@@ -2011,18 +2049,17 @@ impl ListenerState {
                 return Err(error.into());
             }
         };
-        let read =
-            match self.read_track_or_exclude_wedged(session, true, playback, rate, session_playback_type(session)) {
-                Ok(read) => read,
-                Err(error) => {
-                    // Count a failed read against the budget too: a session whose
-                    // reads keep failing must not be retried forever.
-                    if let Some(state) = self.states.get_mut(&key) {
-                        state.artwork_attempts += 1;
-                    }
-                    return Err(error);
+        let read = match self.read_track_or_exclude_wedged(session, true, playback, rate, playback_type) {
+            Ok(read) => read,
+            Err(error) => {
+                // Count a failed read against the budget too: a session whose
+                // reads keep failing must not be retried forever.
+                if let Some(state) = self.states.get_mut(&key) {
+                    state.artwork_attempts += 1;
                 }
-            };
+                return Err(error);
+            }
+        };
         let prev = self.states.get(&key).cloned().unwrap_or_default();
         let mut merged = merge_track(&prev, &read, true);
         // The stale-thumbnail guard from the refresh path applies here too:
@@ -2059,6 +2096,10 @@ impl ListenerState {
             let label = track_label(&merged);
             info!("track changed | {label}");
             self.store_last_emitted_track(merged.source_app.clone(), merged.clone());
+            // Stamp the artwork-change gate here too: without this, a
+            // byte-different re-read within 3s of a retry-driven emit would
+            // fire a duplicate pill (the other emit sites already stamp).
+            self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
             let mut emitted = with_decoded_art(merged.clone(), crate::events::ARTWORK_DECODE as usize);
             emitted.palette = self.palette_for_identity(&merged, emitted.decoded_art.as_deref());
             self.emit(MediaEvent::TrackChanged(emitted));
@@ -3381,19 +3422,23 @@ fn emit_track(prev: &LogicalState, merged: &TrackInfo, read_artwork: bool) -> (b
     // the cover would then swap in under it. Established sessions have
     // `defer_first == false`, so their seek re-emits are unaffected.
     let rate = merged.playback_rate.unwrap_or(1.0).max(1.0);
-    // A position APPEARING re-bases the bar. A position DISAPPEARING does
-    // not: a transiently failing timeline read reports no position, and
-    // treating that as a seek re-emitted a completely unchanged track (a
-    // duplicate pill from one flaky COM call). Transient losses are
-    // invisible end to end — `merge_track` inherits the last position on
-    // the same identity and the state keeps it, so the next good read
-    // compares like against like. The accepted residual is a source that
-    // PERMANENTLY stops reporting position while playing: the bar keeps
-    // interpolating from its last anchor until the next content change,
-    // because the worker never emits a clearing ProgressChanged.
+    // A position APPEARING re-bases the bar — but only when a timeline read
+    // for this identity has reported a position before (`position_seen`):
+    // a flaky first read for a new track stores no baseline, and treating
+    // the next good read's position as an appearance re-emitted an
+    // unchanged track. A position DISAPPEARING never seeks: a transiently
+    // failing timeline read reports no position, and treating that as a
+    // seek re-emitted a completely unchanged track (a duplicate pill from
+    // one flaky COM call). Transient losses are invisible end to end —
+    // `merge_track` inherits the last position on the same identity and
+    // the state keeps it, so the next good read compares like against
+    // like. The accepted residual is a source that PERMANENTLY stops
+    // reporting position while playing: the bar keeps interpolating from
+    // its last anchor until the next content change, because the worker
+    // never emits a clearing ProgressChanged.
     let seek = match (merged.position_secs, prev.last_position_secs) {
         (Some(rp), Some(pp)) => (rp - pp as f64).abs() > SEEK_DELTA_SECS * rate,
-        (Some(_), None) => true,
+        (Some(_), None) => prev.position_seen,
         (None, Some(_)) | (None, None) => false,
     };
     (
@@ -3742,9 +3787,11 @@ fn read_track_info(
         // Accumulate only while under the display cap: a hostile
         // genre list previously materialized the full join before
         // `cap_meta` truncated it. Each entry is also bounded to the
-        // remaining budget before pushing, so one multi-megabyte genre
-        // name cannot blow the joined string past the cap (the final
-        // `cap_meta` keeps the emitted string identical).
+        // remaining budget before pushing, so the JOINED string cannot
+        // grow past the cap (the per-entry HSTRING is still
+        // materialized whole by the OS marshal — bounded by what the
+        // source reports for one genre — and the final `cap_meta`
+        // keeps the emitted string identical either way).
         let mut joined = String::new();
         for g in properties.Genres()?.into_iter() {
             if joined.len() >= MAX_META_CHARS {
@@ -6054,12 +6101,21 @@ mod tests {
         assert!(emit_track(&prev, &make(Some(50.0)), false).0);
         // A normal ~1 s advance is not a seek → no emit (content unchanged).
         assert!(!emit_track(&prev, &make(Some(11.0)), false).0);
-        // Presence flip (position appeared) → re-emit.
+        // Presence flip (position appeared) → re-emit, but only when this
+        // identity has reported a position before: a flaky first read for a
+        // NEW track stores no baseline and must not trip the appearance arm.
         let prev_none = LogicalState {
             last_position_secs: None,
+            position_seen: true,
             ..prev.clone()
         };
         assert!(emit_track(&prev_none, &make(Some(5.0)), false).0);
+        let prev_unseen = LogicalState {
+            last_position_secs: None,
+            position_seen: false,
+            ..prev.clone()
+        };
+        assert!(!emit_track(&prev_unseen, &make(Some(5.0)), false).0);
         // Position vanished → NOT a seek: a transiently failing timeline
         // read reports no position, and re-emitting an unchanged track for
         // it produced duplicate pills. The bar clears through the progress
