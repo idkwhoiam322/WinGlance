@@ -59,10 +59,8 @@ pub fn init_logging(logs_dir: &Path, preserve: bool) {
             // not depend on the live log existing. One bounded line; if
             // even that fails (same environmental cause), it is silently
             // dropped, which changes nothing.
-            let _ = crate::winutil::append_verified_bounded(
-                &logs_dir.join("crash.log"),
+            crate::crash_log_append(
                 format!("live log could not be opened ({error}); this run writes no log-Live.log\n").as_bytes(),
-                crate::CRASH_LOG_CAP,
             );
             eprintln!("log file open failed ({live_path:?}): {error}");
             None
@@ -138,61 +136,51 @@ impl Log for FileLogger {
             record.target(),
             record.args()
         );
-        if let Ok(mut files) = self.files.lock()
-            && let Some(files) = files.as_mut()
-        {
-            // The cap counter advances only on a successful write:
-            // phantom bytes from failed writes would trip the reset while
-            // the disk still holds the old body. No per-line flush: the OS
-            // page cache keeps the write durable across a process crash,
-            // which is what the log is for. Flushing every Debug line would
-            // stall the SMTC worker under churn; only a power loss can lose
-            // the last few lines.
-            let write_result = files.live.write_all(line.as_bytes());
-            let write_ok = write_result.is_ok();
-            if write_ok {
-                files.written += line.len() as u64;
-            } else {
-                // The live log just became untrustworthy: surface the
-                // failure through crash.log — the channel that works
-                // independently of the live log — rate-limited so a
-                // persistent disk-full condition cannot spam it past its
-                // own cap. Diagnostics-only: the log line itself is
-                // dropped either way. Control falls through to the console
-                // echo, which in debug builds is the only channel left
-                // when the file write failed.
-                let report = {
-                    let mut last = self
-                        .write_failure_last
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let due = last.is_none_or(|t| t.elapsed() >= WRITE_FAILURE_REPORT_INTERVAL);
-                    if due {
-                        *last = Some(Instant::now());
+        match self.files.lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(files) => {
+                    // The cap counter advances only on a successful write:
+                    // phantom bytes from failed writes would trip the reset while
+                    // the disk still holds the old body. No per-line flush: the OS
+                    // page cache keeps the write durable across a process crash,
+                    // which is what the log is for. Flushing every Debug line would
+                    // stall the SMTC worker under churn; only a power loss can lose
+                    // the last few lines.
+                    if let Err(error) = files.live.write_all(line.as_bytes()) {
+                        // The live log just became untrustworthy: surface the
+                        // failure through crash.log — the channel that works
+                        // independently of the live log — rate-limited so a
+                        // persistent disk-full condition cannot spam it past its
+                        // own cap. Diagnostics-only: the log line itself is
+                        // dropped either way. Control falls through to the console
+                        // echo, which in debug builds is the only channel left
+                        // when the file write failed.
+                        self.report_write_failure(&error.to_string());
+                    } else {
+                        files.written += line.len() as u64;
                     }
-                    due
-                };
-                if report {
-                    let error = write_result.as_ref().unwrap_err();
-                    let _ = crate::winutil::append_verified_bounded(
-                        &crate::config::Config::default().logs_dir().join("crash.log"),
-                        format!("live-log write failed ({error}); log lines are being dropped\n").as_bytes(),
-                        crate::CRASH_LOG_CAP,
-                    );
+                    if files.written >= LIVE_LOG_CAP {
+                        // Start the log fresh instead of growing without bound; the
+                        // file is diagnostic scratch, not user data. If the truncate
+                        // itself fails (a full disk again), keep appending past the
+                        // stale cursor rather than resetting it: overwriting live
+                        // bytes with a wrong offset would garble what is still
+                        // readable.
+                        if files.live.set_len(0).is_ok() {
+                            let _ = files.live.seek(SeekFrom::Start(0));
+                            files.written = 0;
+                        }
+                    }
                 }
-            }
-            if files.written >= LIVE_LOG_CAP {
-                // Start the log fresh instead of growing without bound; the
-                // file is diagnostic scratch, not user data. If the truncate
-                // itself fails (a full disk again), keep appending past the
-                // stale cursor rather than resetting it: overwriting live
-                // bytes with a wrong offset would garble what is still
-                // readable.
-                if files.live.set_len(0).is_ok() {
-                    let _ = files.live.seek(SeekFrom::Start(0));
-                    files.written = 0;
-                }
-            }
+                // The live log never opened (the logs directory was unwritable
+                // at startup): the whole run is blind. Surface that through
+                // crash.log at the same rate the write-failure path reports,
+                // instead of dropping every line in total silence.
+                None => self.report_write_failure("the live log is not open"),
+            },
+            // A poisoned lock means a panic while holding it: the line is
+            // diagnostics-only and is dropped, but the loss stays visible.
+            Err(_) => self.report_write_failure("the live-log lock is poisoned"),
         }
         // Echo to the console in debug builds only: the packaged exe is
         // `windows_subsystem = "windows"` with no console, so every eprint!
@@ -203,6 +191,33 @@ impl Log for FileLogger {
     }
 
     fn flush(&self) {}
+}
+
+impl FileLogger {
+    /// Rate-limited crash.log report for a live-log write that could not
+    /// land (the file write failed, or the file never opened): one line per
+    /// window instead of one per log call, so a persistent disk-full
+    /// condition cannot spam crash.log past its own cap. Routed through the
+    /// one shared crash-log accounting path (`main::crash_log_append`), so
+    /// this writer can never strand the vectored handler's cap counter.
+    fn report_write_failure(&self, detail: &str) {
+        let report = {
+            let mut last = self
+                .write_failure_last
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let due = last.is_none_or(|t| t.elapsed() >= WRITE_FAILURE_REPORT_INTERVAL);
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        };
+        if report {
+            crate::crash_log_append(
+                format!("live-log write failed ({detail}); log lines are being dropped\n").as_bytes(),
+            );
+        }
+    }
 }
 
 #[cfg(test)]

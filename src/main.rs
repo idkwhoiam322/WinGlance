@@ -290,8 +290,7 @@ fn install_crash_handler(logs_dir: &Path) {
 /// panic looks like the app "stopped running randomly". The file is appended
 /// to under the shared `CRASH_LOG_CAP`, so a panic loop cannot grow it
 /// without bound.
-fn install_panic_hook(logs_dir: &Path) {
-    let dir = logs_dir.to_path_buf();
+fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
             (*s).to_string()
@@ -305,14 +304,10 @@ fn install_panic_hook(logs_dir: &Path) {
         // sessions (the vectored handler records uptime-ms instead — it
         // must stay allocation-free).
         let message = format!("PANIC {} {payload} at {location}\n", Local::now().to_rfc3339());
-        if !crash_log_write_retained(message.as_bytes()) {
-            // No retained handle (the startup install failed): fall back to
-            // an open-append-bounded write so panics stay diagnosable. The
-            // shared counter does not track this path, but nothing else
-            // writes through it either.
-            let path = dir.join("crash.log");
-            let _ = crate::winutil::append_verified_bounded(&path, message.as_bytes(), CRASH_LOG_CAP);
-        }
+        // One shared accounting path with the vectored handler: the
+        // retained handle advances the shared cap counter, so the two
+        // writers can never desync (see `crash_log_append`).
+        crash_log_append(message.as_bytes());
     }));
 }
 
@@ -451,10 +446,18 @@ fn winglance_instance_running_retried() -> bool {
     false
 }
 
-/// Appends a diagnostic line to `crash.log` — the only log available before
-/// `logging::init_logging` runs. Append-only like the panic hook: the file is
-/// never truncated.
-fn append_crash_log_line(message: &[u8]) {
+/// The single accounting path for every non-vectored crash.log write. The
+/// retained verified handle is preferred: it advances the shared byte
+/// counter, so its cap-stop and the vectored handler's accounting can never
+/// desync (a counter stranded at the cap would silently drop every later
+/// crash record while reporting success). Only when the startup install
+/// failed — no retained handle — does this fall back to an open-append
+/// bounded write; in that mode no counter is active, so there is nothing to
+/// strand.
+pub(crate) fn crash_log_append(message: &[u8]) {
+    if crash_log_write_retained(message) {
+        return;
+    }
     if let Some(dir) = config::Config::data_dir().ok().map(|d| d.join("logs")) {
         let _ = crate::winutil::append_verified_bounded(&dir.join("crash.log"), message, CRASH_LOG_CAP);
     }
@@ -465,7 +468,7 @@ fn append_crash_log_line(message: &[u8]) {
 /// launch exits with no feedback anywhere; without this line the app would
 /// silently refuse to start.
 fn report_suspected_squat() {
-    append_crash_log_line(
+    crash_log_append(
         b"suspected single-instance mutex squat: 'WinGlanceSingleInstance' is held by a live process that is not a running WinGlance instance; this launch exits without starting\n",
     );
 }
@@ -537,7 +540,7 @@ fn harden_named_object(handle: HANDLE, security: &SingletonSecurity) {
     unsafe {
         let descriptor = security.descriptor();
         if !IsValidSecurityDescriptor(descriptor).as_bool() {
-            append_crash_log_line(
+            crash_log_append(
                 b"singleton hardening: the descriptor is invalid; the singleton objects run with default security\n",
             );
             return;
@@ -551,7 +554,7 @@ fn harden_named_object(handle: HANDLE, security: &SingletonSecurity) {
         let dacl_ok = GetSecurityDescriptorDacl(descriptor, &mut dacl_present, &mut dacl, &mut dacl_defaulted);
         let sacl_ok = GetSecurityDescriptorSacl(descriptor, &mut sacl_present, &mut sacl, &mut sacl_defaulted);
         if dacl_ok.is_err() || sacl_ok.is_err() || !dacl_present.as_bool() || !sacl_present.as_bool() {
-            append_crash_log_line(b"singleton hardening: reading the descriptor's DACL/label failed; the singleton objects run with default security\n");
+            crash_log_append(b"singleton hardening: reading the descriptor's DACL/label failed; the singleton objects run with default security\n");
             return;
         }
         let error = SetSecurityInfo(
@@ -568,7 +571,7 @@ fn harden_named_object(handle: HANDLE, security: &SingletonSecurity) {
                 "singleton hardening: SetSecurityInfo failed (error {}); the singleton objects run with default security\n",
                 error.0
             );
-            append_crash_log_line(message.as_bytes());
+            crash_log_append(message.as_bytes());
         }
     }
 }
@@ -653,14 +656,14 @@ fn acquire_singleton(restart_nonce: Option<&str>) -> anyhow::Result<Option<Singl
                                         // diagnosable when the old process is already
                                         // gone. Logging is not initialized yet, so
                                         // crash.log it is.
-                                        append_crash_log_line(
+                                        crash_log_append(
                                             b"restart handoff timed out waiting for the single-instance mutex; the old process either kept the singleton or a concurrent launch acquired it; this launch exits without starting\n",
                                         );
                                         Ok(None)
                                     }
                                     WAIT_FAILED if !wait_failed_once => {
                                         wait_failed_once = true;
-                                        append_crash_log_line(
+                                        crash_log_append(
                                             b"restart handoff: waiting on the single-instance mutex failed; retrying once\n",
                                         );
                                         continue;
@@ -943,13 +946,7 @@ fn main() -> Result<()> {
             // first is running. Logging is not initialized yet, so record the
             // failure in crash.log and exit. Verified append (parent
             // identity checked, no reparse follow).
-            if let Some(dir) = config::Config::data_dir().ok().map(|d| d.join("logs")) {
-                let _ = crate::winutil::append_verified_bounded(
-                    &dir.join("crash.log"),
-                    format!("could not acquire the single-instance mutex: {error:#}\n").as_bytes(),
-                    CRASH_LOG_CAP,
-                );
-            }
+            crash_log_append(format!("could not acquire the single-instance mutex: {error:#}\n").as_bytes());
             return Err(error);
         }
     };
@@ -965,7 +962,7 @@ fn main() -> Result<()> {
     // from the built-in defaults, never from the user's file (which may be
     // exactly what is failing).
     install_crash_handler(&config::Config::default().logs_dir());
-    install_panic_hook(&config::Config::default().logs_dir());
+    install_panic_hook();
     // Remove orphaned config-save temps left by a previous hard
     // crash, before anything recreates them. Data-dir only; app-pattern
     // only; best-effort.
@@ -980,10 +977,8 @@ fn main() -> Result<()> {
             // reason in crash.log — the one channel independent of both the
             // live log and config.toml — before exiting. Best-effort
             // append; if even this fails the exit is as silent as before.
-            let _ = crate::winutil::append_verified_bounded(
-                &config::Config::default().logs_dir().join("crash.log"),
+            crash_log_append(
                 format!("config.toml could not be loaded; WinGlance cannot start: {error:#}\n").as_bytes(),
-                crate::CRASH_LOG_CAP,
             );
             return Err(error);
         }
@@ -1295,7 +1290,16 @@ fn main() -> Result<()> {
                         match worker.join() {
                             Ok(()) => {}
                             Err(panic) => {
-                                let payload = panic.downcast_ref::<&str>().copied().unwrap_or("unknown panic");
+                                // Decode both payload shapes (a
+                                // format!-based panic message is a String)
+                                // so the log names the actual panic.
+                                let payload = if let Some(s) = panic.downcast_ref::<&str>() {
+                                    (*s).to_string()
+                                } else if let Some(s) = panic.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
                                 error!("SMTC worker panicked: {payload}");
                             }
                         }
@@ -1328,12 +1332,22 @@ fn main() -> Result<()> {
     // arrive through WM_SETTINGCHANGE.
     let prefs = winutil::refresh_system_preferences();
     debug!("sampled system preferences at startup: {prefs:?}");
-    let overlay_hwnd = overlay::create_window(
+    let overlay_hwnd = match overlay::create_window(
         config.clone(),
         overlay_queue.clone(),
         overlay_wake.clone(),
         now_showing.clone(),
-    )?;
+    ) {
+        Ok(hwnd) => hwnd,
+        Err(error) => {
+            // The supervisor is already running: tell it to stop spawning
+            // workers before the error propagates, so a failed startup does
+            // not keep replacing SMTC workers until process exit reaps
+            // everything.
+            shutdown.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
     let main_hwnd = match main_window::create_window(
         shared_config.clone(),
         main_queue.clone(),
@@ -1350,7 +1364,8 @@ fn main() -> Result<()> {
             // runs the full teardown — hook unhook, timer delete, name-cell
             // null, box free — before the error propagates. No forwarder
             // exists yet, so nothing can post to the overlay after this
-            // point.
+            // point. The supervisor is told to stop first (see above).
+            shutdown.store(true, Ordering::SeqCst);
             unsafe {
                 let _ = DestroyWindow(overlay_hwnd);
             }
@@ -1361,7 +1376,7 @@ fn main() -> Result<()> {
     // Clones of the queues stay behind for the shutdown-stranded count
     //: how many buffered events die with the process is part of the
     // post-mortem.
-    let forwarder_handle = spawn_event_forwarder(
+    let forwarder_handle = match spawn_event_forwarder(
         main_hwnd,
         overlay_hwnd,
         main_queue.clone(),
@@ -1372,7 +1387,17 @@ fn main() -> Result<()> {
         supervisor_rx,
         forwarder_shutdown,
         forwarder_art,
-    )?;
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            // Both windows exist: the normal shutdown path cannot run (it
+            // lives below), so stop the producers here — the supervisor
+            // exits within ~1 s of the flag, and its senders drop with
+            // main's return.
+            shutdown.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
 
     let message_result = message_loop();
     debug!("message loop exited; shutting down");
