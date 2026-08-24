@@ -2791,7 +2791,6 @@ pub(super) fn draw_text_line_pixels(
                     rh,
                     font,
                     font_height,
-                    color,
                     y,
                     text_w,
                 );
@@ -2820,7 +2819,7 @@ pub(super) fn draw_text_line_pixels(
                     } else {
                         (fade_w, fade_w)
                     };
-                    composite_marquee_strip(pixels, width, rect, strip, off, total, fade_left, fade_right);
+                    composite_marquee_strip(pixels, width, rect, strip, color, off, total, fade_left, fade_right);
                 }
                 return;
             }
@@ -2863,12 +2862,14 @@ pub(super) fn draw_text_line_pixels(
     );
 }
 
-/// Rasterizes the scrolling line once at its natural width and caches it,
-/// premultiplied with the row's color. A cache hit (same text, rect, font,
-/// color) is a no-op; a miss re-runs the GDI text draw into the scratch —
-/// which may grow from the row's width to the text's width — and premultiplies
-/// the coverage into the strip. On any GDI failure the strip is dropped so a
-/// stale raster can never be shown for different content.
+/// Rasterizes the scrolling line once at its natural width and caches it as
+/// pure glyph coverage (white premultiplied by coverage — every channel
+/// equals the alpha). A cache hit (same text, rect, font) is a no-op; a miss
+/// re-runs the GDI text draw into the scratch — which may grow from the
+/// row's width to the text's width — and extracts the coverage. The row
+/// color is applied at composite time, so animation-driven color dimming
+/// does not invalidate the strip. On any GDI failure the strip is dropped so
+/// a stale raster can never be shown for different content.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_marquee_strip(
     strip: &mut Option<MarqueeStrip>,
@@ -2879,7 +2880,6 @@ pub(super) fn build_marquee_strip(
     rh: i32,
     font: HFONT,
     font_height: i32,
-    color: [u8; 4],
     y: i32,
     text_w: i32,
 ) {
@@ -2891,7 +2891,6 @@ pub(super) fn build_marquee_strip(
                 && cached.rh == rh
                 && cached.font.0 == font.0
                 && cached.font_height == font_height
-                && cached.color == color
                 && cached.text_w == text_w
     );
     if cache_hit {
@@ -2944,7 +2943,9 @@ pub(super) fn build_marquee_strip(
     }
     let mut pixels = vec![0u8; text_w as usize * rh as usize * 4];
     // No edge mask: the strip keeps the full raster, and the fade is applied
-    // relative to the visible band at composite time.
+    // relative to the visible band at composite time. White premultiplies to
+    // pure coverage: every channel equals the alpha, which is exactly what
+    // the color-applying composite consumes.
     composite_glyphs(
         &mut pixels,
         text_w as usize,
@@ -2954,7 +2955,7 @@ pub(super) fn build_marquee_strip(
         sw as usize,
         text_w as usize,
         rh as usize,
-        color,
+        [255, 255, 255, 255],
     );
     *strip = Some(MarqueeStrip {
         value: value.to_owned(),
@@ -2962,7 +2963,6 @@ pub(super) fn build_marquee_strip(
         rh,
         font,
         font_height,
-        color,
         text_w,
         pixels,
     });
@@ -2972,16 +2972,19 @@ pub(super) fn build_marquee_strip(
 /// and composites it into the frame, replicating the old two-copy GDI draw:
 /// copy 1 of the loop covers [x1, x1+text_w), copy 2 covers
 /// [x1+total, x1+total+text_w) with x1 = -off. Pixels between the copies are
-/// background and stay untouched. The strip holds premultiplied pixels, so
-/// the composite is the same source-over math as `composite_pm`. `fade_left`
-/// and `fade_right` are the horizontal edge-fade widths in pixels; 0 disables
-/// that edge's mask (the pre-scroll hold fades only the trailing edge).
+/// background and stay untouched. The strip holds pure glyph coverage (every
+/// channel equals the alpha), so this fn applies the row's — possibly
+/// per-frame dimmed — color here; that is what lets the strip cache ignore
+/// color entirely. `fade_left` and `fade_right` are the horizontal edge-fade
+/// widths in pixels; 0 disables that edge's mask (the pre-scroll hold fades
+/// only the trailing edge).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn composite_marquee_strip(
     pixels: &mut [u8],
     width: usize,
     rect: &RECT,
     strip: &MarqueeStrip,
+    color: [u8; 4],
     off: i32,
     total: i32,
     fade_left: f32,
@@ -3006,14 +3009,15 @@ pub(super) fn composite_marquee_strip(
                 continue;
             };
             let sp = sx as usize * 4;
-            let alpha = src_row[sp + 3] as u32;
-            if alpha == 0 {
+            // The strip stores pure coverage (every channel equals the
+            // alpha), so the coverage is the glyph's shape mask.
+            let cov = src_row[sp + 3] as u32;
+            if cov == 0 {
                 continue;
             }
-            // The strip is premultiplied, so the fade must scale the
-            // premultiplied RGB together with the alpha, or a fading glyph
-            // would keep its color while its coverage falls. The mask is
-            // relative to the visible row `[rect.left, rect.right)`.
+            // The fade must scale the coverage, or a fading glyph would keep
+            // its color while its coverage falls. The mask is relative to
+            // the visible row `[rect.left, rect.right)`.
             let fade = edge_fade_factor(
                 (rect.left + x) as f32,
                 rect.left as f32,
@@ -3021,19 +3025,24 @@ pub(super) fn composite_marquee_strip(
                 fade_left,
                 fade_right,
             );
-            let alpha = ((alpha as f32) * fade).round() as u32;
+            // Apply the row's (possibly per-frame dimmed) color here: the
+            // source alpha becomes color-alpha-scaled coverage, and the
+            // premultiplied RGB is the color scaled by the same factor, so
+            // the source stays a valid premultiplied pixel. The color is
+            // RGBA and the destination BGRA.
+            let alpha = (((cov as f32) * fade).round() as u32) * color[3] as u32 / 255;
             if alpha == 0 {
                 continue;
             }
-            let src_r = (src_row[sp] as f32 * fade).round() as u32;
-            let src_g = (src_row[sp + 1] as f32 * fade).round() as u32;
-            let src_b = (src_row[sp + 2] as f32 * fade).round() as u32;
+            let src_b = color[2] as u32 * alpha / 255;
+            let src_g = color[1] as u32 * alpha / 255;
+            let src_r = color[0] as u32 * alpha / 255;
             let inv = 255 - alpha;
             let dp = x as usize * 4;
             // Rounded divisions (see `composite_pm`).
-            dst_row[dp] = (src_r + (dst_row[dp] as u32 * inv + 127) / 255) as u8;
+            dst_row[dp] = (src_b + (dst_row[dp] as u32 * inv + 127) / 255) as u8;
             dst_row[dp + 1] = (src_g + (dst_row[dp + 1] as u32 * inv + 127) / 255) as u8;
-            dst_row[dp + 2] = (src_b + (dst_row[dp + 2] as u32 * inv + 127) / 255) as u8;
+            dst_row[dp + 2] = (src_r + (dst_row[dp + 2] as u32 * inv + 127) / 255) as u8;
             dst_row[dp + 3] = (alpha + (dst_row[dp + 3] as u32 * inv + 127) / 255) as u8;
         }
     }

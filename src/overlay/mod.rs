@@ -275,12 +275,14 @@ struct MarqueeCtx<'a> {
     strip: &'a mut Option<MarqueeStrip>,
 }
 
-/// The overflowing line rasterized once at its natural width, premultiplied
-/// with the row's color. Every overflow frame — the pre-scroll hold included
-/// — samples the visible window from this strip (two contiguous runs)
-/// instead of re-running GDI text rendering (ExtTextOutW + GdiFlush) at
-/// animation cadence. Rasterization occurs on a cache miss: the strip is
-/// rebuilt when content, size, font, or color changes, and a cache hit keeps
+/// The overflowing line rasterized once at its natural width, cached as pure
+/// glyph coverage (every channel equals the alpha). Every overflow frame —
+/// the pre-scroll hold included — samples the visible window from this strip
+/// (two contiguous runs) instead of re-running GDI text rendering
+/// (ExtTextOutW + GdiFlush) at animation cadence; the row's — possibly
+/// per-frame dimmed — color is applied by the composite, which is why the
+/// cache does not key on it. Rasterization occurs on a cache miss: the strip
+/// is rebuilt when content, size, or font changes, and a cache hit keeps
 /// every later frame a pure composite.
 struct MarqueeStrip {
     value: String,
@@ -288,7 +290,6 @@ struct MarqueeStrip {
     rh: i32,
     font: HFONT,
     font_height: i32,
-    color: [u8; 4],
     text_w: i32,
     pixels: Vec<u8>,
 }
@@ -8457,9 +8458,10 @@ mod tests {
             rh: 20,
             font: HFONT(std::ptr::null_mut()),
             font_height: 10,
-            color: [0, 0, 255, 255],
             text_w: 10,
-            pixels: [255u8, 0, 0, 255].repeat(10 * 20), // solid premultiplied blue (BGRA)
+            // Pure coverage (every channel equals the alpha): solid coverage
+            // that the composite tints with the row color.
+            pixels: [255u8, 255, 255, 255].repeat(10 * 20),
         };
         let mut pixels = vec![0u8; 40 * 20 * 4];
         let rect = RECT {
@@ -8468,7 +8470,7 @@ mod tests {
             right: 40,
             bottom: 20,
         };
-        composite_marquee_strip(&mut pixels, 40, &rect, &strip, 2, 30, 0.0, 0.0);
+        composite_marquee_strip(&mut pixels, 40, &rect, &strip, [0, 0, 255, 255], 2, 30, 0.0, 0.0);
         for (i, p) in pixels.chunks(4).enumerate() {
             let x = i % 40;
             let in_tail = (0..8).contains(&x); // x1 = -2, x1 + text_w = 8
@@ -8798,18 +8800,17 @@ mod tests {
     #[test]
     fn marquee_strip_composite_fades_the_visible_edges() {
         // The scrolling path must fade glyphs near both visible boundaries
-        // while the row interior keeps full opacity. The strip holds
-        // premultiplied pixels, so the fade must scale RGB with alpha: a
-        // faded pixel keeps its hue while its coverage falls.
+        // while the row interior keeps full opacity. The strip holds pure
+        // coverage and the composite applies the row color, so a faded pixel
+        // keeps its hue while its coverage falls.
         let strip = MarqueeStrip {
             value: "x".into(),
             rw: 40,
             rh: 20,
             font: HFONT(std::ptr::null_mut()),
             font_height: 10,
-            color: [0, 0, 255, 255],
             text_w: 40,
-            pixels: [255u8, 0, 0, 255].repeat(40 * 20), // solid premultiplied blue (BGRA)
+            pixels: vec![255u8; 40 * 20 * 4], // solid coverage
         };
         let mut pixels = vec![0u8; 40 * 20 * 4];
         let rect = RECT {
@@ -8818,7 +8819,17 @@ mod tests {
             right: 40,
             bottom: 20,
         };
-        composite_marquee_strip(&mut pixels, 40, &rect, &strip, 2, 70, MARQUEE_FADE, MARQUEE_FADE);
+        composite_marquee_strip(
+            &mut pixels,
+            40,
+            &rect,
+            &strip,
+            [0, 0, 255, 255],
+            2,
+            70,
+            MARQUEE_FADE,
+            MARQUEE_FADE,
+        );
         let px = |x: usize| -> [u8; 4] {
             let p = &pixels[x * 4..x * 4 + 4];
             [p[0], p[1], p[2], p[3]]
@@ -11916,7 +11927,6 @@ mod tests {
             rh: 20,
             font: HFONT(0x8 as *mut c_void),
             font_height: 16,
-            color: [255, 255, 255, 255],
             text_w: 90,
             pixels: vec![0; 100 * 20 * 4],
         });
