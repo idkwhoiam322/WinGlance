@@ -1,5 +1,6 @@
 use chrono::Local;
 use log::{LevelFilter, Log, Metadata, Record};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
@@ -84,6 +85,39 @@ pub fn init_logging(logs_dir: &Path, preserve: bool) {
 /// handoff can reseat the live-log cursor without going through the `log`
 /// facade.
 static LOGGER: OnceLock<FileLogger> = OnceLock::new();
+
+/// Last time each tagged log line was allowed through, keyed by a
+/// caller-chosen static tag. Bounded: when the map reaches its cap, entries
+/// older than any caller's interval are dropped first (a steady stream of
+/// distinct tags cycles; a flood of one tag reuses its own entry).
+static LAST_LOGGED: Mutex<Option<HashMap<&'static str, Instant>>> = Mutex::new(None);
+const THROTTLED_KEY_CAP: usize = 64;
+
+/// Returns whether the line tagged `key` may log now: the first call always
+/// true, then at most once per `interval`. For failure paths that can fire
+/// at animation-tick rate (a persistent render or blit failure would
+/// otherwise drown everything else in log-Live.log). The tag classifies,
+/// not the message — two different errors sharing a key suppress each other
+/// for the interval, which is the accepted trade for bounded output.
+pub(crate) fn should_log(key: &'static str, interval: Duration) -> bool {
+    let mut guard = LAST_LOGGED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    let now = Instant::now();
+    match map.get(key) {
+        Some(last) if now.duration_since(*last) < interval => false,
+        _ => {
+            if map.len() >= THROTTLED_KEY_CAP {
+                map.retain(|_, last| now.duration_since(*last) >= interval);
+                if map.len() >= THROTTLED_KEY_CAP {
+                    // Pathological key churn: drop everything and start over.
+                    map.clear();
+                }
+            }
+            map.insert(key, now);
+            true
+        }
+    }
+}
 
 /// Moves the live log's write cursor to EOF: called by the restart
 /// handoff right before the old process releases the singleton. The

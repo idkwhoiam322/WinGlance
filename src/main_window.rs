@@ -4949,15 +4949,10 @@ fn history_cell_texts(track: &TrackInfo, at_label: &str, state: PlaybackState) -
     ]
 }
 
-/// Last time a persistent artwork-blit failure was logged, so a broken blit
-/// cannot flood the log at repaint rate: one line per 30 s of continuous
-/// failure instead.
-static LAST_STRETCH_LOG: Mutex<Option<Instant>> = Mutex::new(None);
-
 fn log_art_blit_failure() {
-    let mut last = LAST_STRETCH_LOG.lock().unwrap_or_else(|p| p.into_inner());
-    if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
-        *last = Some(Instant::now());
+    // A broken blit fails at repaint rate; one line per interval keeps the
+    // diagnosis without flooding log-Live.log (shared throttle helper).
+    if crate::logging::should_log("artwork-blit-failure", Duration::from_secs(30)) {
         error!("artwork blit failed");
     }
 }

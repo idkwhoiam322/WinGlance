@@ -3401,7 +3401,12 @@ impl OverlayState {
         );
         self.content = Some(content);
         if let Err(error) = result {
-            error!("rendering overlay: {error:#}");
+            // A persistent failure would otherwise re-log at animation-tick
+            // rate and drown everything else in log-Live.log; one line per
+            // interval keeps the diagnosis without the flood.
+            if crate::logging::should_log("overlay-render-error", Duration::from_secs(10)) {
+                error!("rendering overlay: {error:#}");
+            }
         }
     }
 
