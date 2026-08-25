@@ -4769,6 +4769,11 @@ const HISTORY_COLUMNS: [HistoryColumn; 9] = [
     },
 ];
 
+/// The column count as a type-level constant, so `history_column_rects` can
+/// return its rects by value — the owner-draw paint re-derives them per
+/// visible row, and a fixed-size array keeps that allocation-free.
+const HISTORY_COLUMN_COUNT: usize = HISTORY_COLUMNS.len();
+
 const HISTORY_COL_TIME: usize = 0;
 const HISTORY_COL_STATE: usize = 1;
 // Indices into HISTORY_COLUMNS for the remaining columns, so a reorder
@@ -4787,13 +4792,16 @@ const HISTORY_COL_SOURCE: usize = 8;
 /// share-less column. Every column is floored at its header-fit `min_w`
 /// (fixed widths are max(fixed_w, min_w) scaled); the tooltip hit-test
 /// consumes the same result, so paint and hit-test can never disagree.
-fn history_column_rects(row: &RECT, scale: f32) -> Vec<RECT> {
+fn history_column_rects(row: &RECT, scale: f32) -> [RECT; HISTORY_COLUMN_COUNT] {
     let pad = (8.0 * scale) as i32;
     let gap = (4.0 * scale) as i32;
     let inner_left = row.left + pad;
     let inner_right = (row.right - pad).max(inner_left);
 
-    let mut widths = vec![0i32; HISTORY_COLUMNS.len()];
+    // Returned by value: the owner-draw paint re-derives these per visible
+    // row on every repaint, so the two Vec allocations this used to make
+    // (widths, rects) ran at row-count × repaint rate.
+    let mut widths = [0i32; HISTORY_COLUMN_COUNT];
     // Only genuinely fixed columns reserve space up front; the flexible
     // shares divide what remains, then each is floored at its own minimum
     // (a floor can exceed its share on a narrow window — the rects clamp
@@ -4823,23 +4831,21 @@ fn history_column_rects(row: &RECT, scale: f32) -> Vec<RECT> {
     }
 
     let mut x = inner_left;
-    widths
-        .into_iter()
-        .map(|w| {
-            // Clamp both edges into the row's padded interior: fixed-width
-            // columns can overrun a narrower-than-needed row, and an
-            // unclamped left edge would invert the rect (right < left).
-            let left = x.min(inner_right);
-            let rect = RECT {
-                left,
-                top: row.top,
-                right: (x + w).min(inner_right),
-                bottom: row.bottom,
-            };
-            x += w + gap;
-            rect
-        })
-        .collect()
+    let mut rects = [RECT::default(); HISTORY_COLUMN_COUNT];
+    for (index, w) in widths.into_iter().enumerate() {
+        // Clamp both edges into the row's padded interior: fixed-width
+        // columns can overrun a narrower-than-needed row, and an
+        // unclamped left edge would invert the rect (right < left).
+        let left = x.min(inner_right);
+        rects[index] = RECT {
+            left,
+            top: row.top,
+            right: (x + w).min(inner_right),
+            bottom: row.bottom,
+        };
+        x += w + gap;
+    }
+    rects
 }
 
 /// The header line shown in the row-0 tooltip, derived from the shared
