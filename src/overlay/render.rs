@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use log::debug;
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, COLOR_HIGHLIGHT, COLOR_WINDOWTEXT, CreateCompatibleDC, DIB_RGB_COLORS,
@@ -1709,6 +1709,35 @@ pub(crate) fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
 
 /// Brightens `text` toward white until its contrast against `bg` reaches
 /// `target`, or returns it unchanged when it already passes. The palette
+/// Contrast-corrects `text` against `bg`, memoized: the underlying check is
+/// a 24-step bisection over luminance ratios, and its inputs (the
+/// palette-derived row color, the fill backdrop, the AA threshold) are
+/// stable within a track — so without the memo the same bisection re-ran
+/// several times per frame and every frame thereafter. Direct-mapped,
+/// Fibonacci-hashed, mutex-guarded; only the UI render thread calls this,
+/// so the lock is uncontended. Alpha is not part of the key because the
+/// check ignores it (the input's alpha passes through unchanged).
+pub(crate) fn ensure_contrast(text: [u8; 4], bg: [u8; 4], target: f32) -> [u8; 4] {
+    let fg = u32::from(text[0]) | u32::from(text[1]) << 8 | u32::from(text[2]) << 16;
+    let background = u32::from(bg[0]) | u32::from(bg[1]) << 8 | u32::from(bg[2]) << 16;
+    let key = ((fg as u64) << 32) | background as u64 | ((target.to_bits() >> 24) as u64) << 56;
+    let slot = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 57) as usize;
+    let mut table = CONTRAST_MEMO.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((stored, color)) = table[slot]
+        && stored == key
+    {
+        return color;
+    }
+    let color = ensure_contrast_uncached(text, bg, target);
+    table[slot] = Some((key, color));
+    color
+}
+
+/// One memo slot: the exact input key and the corrected color.
+type ContrastSlot = Option<(u64, [u8; 4])>;
+
+static CONTRAST_MEMO: Mutex<[ContrastSlot; 128]> = Mutex::new([None; 128]);
+
 /// guard validates candidate colors against the pill's two fixed colors
 /// only; at render time the same primary does double duty — the fill blends
 /// 16% toward it (`pill_fill_bg`) while the text rows draw in the raw or
@@ -1718,7 +1747,7 @@ pub(crate) fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
 /// strictly raises luminance, so a bisection in the blend weight finds the
 /// smallest lift that passes. Even pure white is returned as the best
 /// effort when it cannot pass (a near-white fill).
-pub(crate) fn ensure_contrast(text: [u8; 4], bg: [u8; 4], target: f32) -> [u8; 4] {
+fn ensure_contrast_uncached(text: [u8; 4], bg: [u8; 4], target: f32) -> [u8; 4] {
     let text_rgb = [text[0], text[1], text[2]];
     let bg_rgb = [bg[0], bg[1], bg[2]];
     if contrast_ratio(text_rgb, bg_rgb) >= target {
