@@ -69,10 +69,10 @@ pub(crate) fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
         None => Cow::Borrowed(rgba),
     };
     let shift = 8 - CHANNEL_BITS;
-    // Heap-allocated: 4096 ~32-byte buckets (~128 KiB) would be a large single
-    // stack frame on the UI thread's render path (under ensure_art), and the
-    // worker threads already run on deliberately small stacks.
-    let mut buckets = vec![Bucket::default(); BUCKET_COUNT];
+    // Heap-allocated as Box: 4096 ~32-byte buckets (~128 KiB) would be a large
+    // single stack frame on the UI thread's render path (under ensure_art), and
+    // the worker threads already run on deliberately small stacks.
+    let mut buckets = Box::new([Bucket::default(); BUCKET_COUNT]);
     for px in sampled.chunks_exact(4) {
         let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
         if a < 32 {
