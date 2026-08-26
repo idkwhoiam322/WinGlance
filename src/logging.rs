@@ -43,6 +43,9 @@ fn open_live_log(live_path: &Path, preserve: bool) -> std::io::Result<(File, u64
             )
             .as_bytes(),
         )?;
+        // Best-effort flush of the restart boundary so a crash before the
+        // next log line does not leave the boundary buffered.
+        let _ = file.sync_all();
     }
     let written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     Ok((file, written))
@@ -201,6 +204,11 @@ impl Log for FileLogger {
                         // bytes with a wrong offset would garble what is still
                         // readable.
                         if files.live.set_len(0).is_ok() {
+                            // Best-effort durability: file metadata flushed so a
+                            // power loss after the cap reset does not leave a
+                            // stale directory entry. Directory flush is done
+                            // via the handle's sync (FlushFileBuffers).
+                            let _ = files.live.sync_all();
                             let _ = files.live.seek(SeekFrom::Start(0));
                             files.written = 0;
                         }

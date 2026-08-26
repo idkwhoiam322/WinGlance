@@ -44,7 +44,7 @@ use windows::Win32::Security::{
     DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, IsValidSecurityDescriptor,
     LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
-use windows::Win32::Storage::FileSystem::{SetFilePointer, WriteFile};
+use windows::Win32::Storage::FileSystem::{FlushFileBuffers, SetFilePointer, WriteFile};
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
 };
@@ -121,8 +121,10 @@ fn crash_log_write_retained(data: &[u8]) -> bool {
         // appends automatically).
         let _ = SetFilePointer(handle, 0, None, windows::Win32::Storage::FileSystem::FILE_END);
         let mut written: u32 = 0;
-        let _ = WriteFile(handle, Some(data), Some(&mut written as *mut _), None);
-        CRASH_LOG_BYTES.store((written_so_far + written as u64).min(CRASH_LOG_CAP), Ordering::SeqCst);
+        if WriteFile(handle, Some(data), Some(&mut written as *mut _), None).is_ok() && written > 0 {
+            let _ = FlushFileBuffers(handle);
+            CRASH_LOG_BYTES.store((written_so_far + written as u64).min(CRASH_LOG_CAP), Ordering::SeqCst);
+        }
     }
     true
 }

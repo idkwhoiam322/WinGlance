@@ -1233,7 +1233,14 @@ pub(crate) fn open_verified_file(path: &Path, truncate: bool) -> io::Result<File
         unsafe {
             let _ = SetFilePointer(handle, 0, None, windows::Win32::Storage::FileSystem::FILE_BEGIN);
             let _ = SetEndOfFile(handle);
+            let _ = FlushFileBuffers(handle);
         }
+    }
+    // Best-effort durability of a newly created directory entry (first-ever
+    // log file) and of the truncate size — file flush above covers content,
+    // dir flush covers the new entry.
+    if let Some(g) = _guard.as_ref() {
+        let _ = unsafe { FlushFileBuffers(g.handle) };
     }
     // SAFETY: `handle` is a real, owned, non-null kernel handle with no other
     // owner; the returned File closes it on drop.
@@ -1260,6 +1267,17 @@ pub(crate) fn append_verified_bounded(path: &Path, data: &[u8], cap: u64) -> io:
     // before every append.
     file.seek(std::io::SeekFrom::End(0))?;
     file.write_all(data)?;
+    // Best-effort durability without allocation: crash frequency is low, so
+    // the extra syscall is unobservable vs. the verified open.
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let _ = unsafe {
+            windows::Win32::Storage::FileSystem::FlushFileBuffers(windows::Win32::Foundation::HANDLE(
+                file.as_raw_handle(),
+            ))
+        };
+    }
     Ok(())
 }
 
