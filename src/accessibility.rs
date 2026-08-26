@@ -24,7 +24,7 @@
 
 use crate::winapi::post_message;
 use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Com::SAFEARRAY;
 use windows::Win32::System::Ole::{SafeArrayCreateVector, SafeArrayDestroy, SafeArrayPutElement};
@@ -198,237 +198,274 @@ impl SettingsProvider {
     }
 }
 
+/// Maps a panic inside a UIA COM vtable method to `E_FAIL`, distinct from
+/// `Error::empty()` (“no value”). A panic is never a normal “no pattern” answer.
+#[inline]
+fn catch_uia<T>(ctx: &str, body: impl FnOnce() -> windows::core::Result<T>) -> windows::core::Result<T> {
+    match crate::winutil::catch_callback_panic(ctx, body) {
+        Ok(v) => v,
+        Err(_) => Err(Error::from_hresult(E_FAIL)),
+    }
+}
+
 impl IRawElementProviderSimple_Impl for SettingsProvider_Impl {
     fn ProviderOptions(&self) -> windows::core::Result<windows::Win32::UI::Accessibility::ProviderOptions> {
-        Ok(ProviderOptions_ServerSideProvider)
+        catch_uia("settings UIA ProviderOptions", || {
+            Ok(ProviderOptions_ServerSideProvider)
+        })
     }
 
     fn GetPatternProvider(&self, patternid: UIA_PATTERN_ID) -> windows::core::Result<IUnknown> {
-        let this = &self.this;
-        let ProviderKind::Child { row_index, sub } = &this.kind else {
-            return Err(Error::empty());
-        };
-        let Some(child) = this.resolve() else {
-            return Err(Error::empty());
-        };
-        if child.toggle.is_some() && patternid == UIA_TogglePatternId {
-            let p: IToggleProvider = this
-                .make(ProviderKind::Child {
-                    row_index: *row_index,
-                    sub: *sub,
-                })
-                .into();
-            return p.cast::<IUnknown>();
-        }
-        if child.toggle.is_none() && patternid == UIA_InvokePatternId {
-            let p: IInvokeProvider = this
-                .make(ProviderKind::Child {
-                    row_index: *row_index,
-                    sub: *sub,
-                })
-                .into();
-            return p.cast::<IUnknown>();
-        }
-        Err(Error::empty())
+        catch_uia("settings UIA GetPatternProvider", || {
+            let this = &self.this;
+            let ProviderKind::Child { row_index, sub } = &this.kind else {
+                return Err(Error::empty());
+            };
+            let Some(child) = this.resolve() else {
+                return Err(Error::empty());
+            };
+            if child.toggle.is_some() && patternid == UIA_TogglePatternId {
+                let p: IToggleProvider = this
+                    .make(ProviderKind::Child {
+                        row_index: *row_index,
+                        sub: *sub,
+                    })
+                    .into();
+                return p.cast::<IUnknown>();
+            }
+            if child.toggle.is_none() && patternid == UIA_InvokePatternId {
+                let p: IInvokeProvider = this
+                    .make(ProviderKind::Child {
+                        row_index: *row_index,
+                        sub: *sub,
+                    })
+                    .into();
+                return p.cast::<IUnknown>();
+            }
+            Err(Error::empty())
+        })
     }
 
     fn GetPropertyValue(&self, propertyid: UIA_PROPERTY_ID) -> windows::core::Result<VARIANT> {
-        let this = &self.this;
-        if propertyid == UIA_NamePropertyId {
-            return Ok(VARIANT::from(BSTR::from(this.name())));
-        }
-        if propertyid == windows::Win32::UI::Accessibility::UIA_ControlTypePropertyId {
-            return Ok(VARIANT::from(this.control_type().0));
-        }
-        if propertyid == UIA_IsEnabledPropertyId {
-            // A child that no longer resolves against the live snapshot is
-            // gone: reporting it enabled would let a client activate or
-            // target a control that no longer exists. The root stays
-            // enabled — it is the pane surface itself.
-            let enabled = match &this.kind {
-                ProviderKind::Root => true,
-                ProviderKind::Child { .. } => this.resolve().is_some(),
-            };
-            return Ok(VARIANT::from(enabled));
-        }
-        if propertyid == UIA_IsKeyboardFocusablePropertyId {
-            let focusable = matches!(&this.kind, ProviderKind::Child { .. }) && this.resolve().is_some();
-            return Ok(VARIANT::from(focusable));
-        }
-        if propertyid == UIA_HasKeyboardFocusPropertyId {
-            return Ok(VARIANT::from(this.has_keyboard_focus()));
-        }
-        // BoundingRectangle is answered through IRawElementProviderFragment.
-        Ok(VARIANT::default())
+        catch_uia("settings UIA GetPropertyValue", || {
+            let this = &self.this;
+            if propertyid == UIA_NamePropertyId {
+                return Ok(VARIANT::from(BSTR::from(this.name())));
+            }
+            if propertyid == windows::Win32::UI::Accessibility::UIA_ControlTypePropertyId {
+                return Ok(VARIANT::from(this.control_type().0));
+            }
+            if propertyid == UIA_IsEnabledPropertyId {
+                // A child that no longer resolves against the live snapshot is
+                // gone: reporting it enabled would let a client activate or
+                // target a control that no longer exists. The root stays
+                // enabled — it is the pane surface itself.
+                let enabled = match &this.kind {
+                    ProviderKind::Root => true,
+                    ProviderKind::Child { .. } => this.resolve().is_some(),
+                };
+                return Ok(VARIANT::from(enabled));
+            }
+            if propertyid == UIA_IsKeyboardFocusablePropertyId {
+                let focusable = matches!(&this.kind, ProviderKind::Child { .. }) && this.resolve().is_some();
+                return Ok(VARIANT::from(focusable));
+            }
+            if propertyid == UIA_HasKeyboardFocusPropertyId {
+                return Ok(VARIANT::from(this.has_keyboard_focus()));
+            }
+            // BoundingRectangle is answered through IRawElementProviderFragment.
+            Ok(VARIANT::default())
+        })
     }
 
     fn HostRawElementProvider(&self) -> windows::core::Result<IRawElementProviderSimple> {
-        // The fragment root attaches to the HWND's default provider, which
-        // carries the window-level semantics (title, window control type).
-        // Child fragments are never queried for a host.
-        let this = &self.this;
-        if matches!(this.kind, ProviderKind::Root) && !this.hwnd.0.is_null() {
-            unsafe { UiaHostProviderFromHwnd(this.hwnd) }
-        } else {
-            Err(Error::empty())
-        }
+        catch_uia("settings UIA HostRawElementProvider", || {
+            // The fragment root attaches to the HWND's default provider, which
+            // carries the window-level semantics (title, window control type).
+            // Child fragments are never queried for a host.
+            let this = &self.this;
+            if matches!(this.kind, ProviderKind::Root) && !this.hwnd.0.is_null() {
+                unsafe { UiaHostProviderFromHwnd(this.hwnd) }
+            } else {
+                Err(Error::empty())
+            }
+        })
     }
 }
 
 impl IRawElementProviderFragment_Impl for SettingsProvider_Impl {
     fn Navigate(&self, direction: NavigateDirection) -> windows::core::Result<IRawElementProviderFragment> {
-        let this = &self.this;
-        match &this.kind {
-            ProviderKind::Root => {
-                let children = crate::main_window::settings_accessibility_children(this.hwnd);
-                if direction == NavigateDirection_FirstChild
-                    && let Some(first) = children.first()
-                {
-                    return Ok(this.child_fragment(first.row_index, first.sub));
+        catch_uia("settings UIA Navigate", || {
+            let this = &self.this;
+            match &this.kind {
+                ProviderKind::Root => {
+                    let children = crate::main_window::settings_accessibility_children(this.hwnd);
+                    if direction == NavigateDirection_FirstChild
+                        && let Some(first) = children.first()
+                    {
+                        return Ok(this.child_fragment(first.row_index, first.sub));
+                    }
+                    if direction == NavigateDirection_LastChild
+                        && let Some(last) = children.last()
+                    {
+                        return Ok(this.child_fragment(last.row_index, last.sub));
+                    }
                 }
-                if direction == NavigateDirection_LastChild
-                    && let Some(last) = children.last()
-                {
-                    return Ok(this.child_fragment(last.row_index, last.sub));
+                ProviderKind::Child { row_index, sub } => {
+                    if direction == NavigateDirection_Parent {
+                        return Ok(this.root_fragment());
+                    }
+                    // Sibling order is resolved against the CURRENT snapshot, so
+                    // after a scroll or layout change a retained provider
+                    // navigates the live tree, not the enumeration it was built
+                    // from.
+                    let children = crate::main_window::settings_accessibility_children(this.hwnd);
+                    let index = children.iter().position(|c| c.row_index == *row_index && c.sub == *sub);
+                    if direction == NavigateDirection_NextSibling
+                        && let Some(index) = index
+                        && let Some(next) = children.get(index + 1)
+                    {
+                        return Ok(this.child_fragment(next.row_index, next.sub));
+                    }
+                    if direction == NavigateDirection_PreviousSibling
+                        && let Some(index) = index
+                        && index > 0
+                        && let Some(prev) = children.get(index - 1)
+                    {
+                        return Ok(this.child_fragment(prev.row_index, prev.sub));
+                    }
                 }
             }
-            ProviderKind::Child { row_index, sub } => {
-                if direction == NavigateDirection_Parent {
-                    return Ok(this.root_fragment());
-                }
-                // Sibling order is resolved against the CURRENT snapshot, so
-                // after a scroll or layout change a retained provider
-                // navigates the live tree, not the enumeration it was built
-                // from.
-                let children = crate::main_window::settings_accessibility_children(this.hwnd);
-                let index = children.iter().position(|c| c.row_index == *row_index && c.sub == *sub);
-                if direction == NavigateDirection_NextSibling
-                    && let Some(index) = index
-                    && let Some(next) = children.get(index + 1)
-                {
-                    return Ok(this.child_fragment(next.row_index, next.sub));
-                }
-                if direction == NavigateDirection_PreviousSibling
-                    && let Some(index) = index
-                    && index > 0
-                    && let Some(prev) = children.get(index - 1)
-                {
-                    return Ok(this.child_fragment(prev.row_index, prev.sub));
-                }
-            }
-        }
-        Err(Error::empty())
+            Err(Error::empty())
+        })
     }
 
     fn GetRuntimeId(&self) -> windows::core::Result<*mut SAFEARRAY> {
-        match &self.this.kind {
+        catch_uia("settings UIA GetRuntimeId", || match &self.this.kind {
             // For the root, UIA derives the runtime id from the HWND; a null
             // array is the documented "no custom id" answer.
             ProviderKind::Root => Ok(std::ptr::null_mut()),
             ProviderKind::Child { row_index, sub } => {
                 runtime_id_array(crate::main_window::setting_runtime_id(*row_index, *sub))
             }
-        }
+        })
     }
 
     fn BoundingRectangle(&self) -> windows::core::Result<UiaRect> {
-        let this = &self.this;
-        let client = match &this.kind {
-            ProviderKind::Root => Some(crate::main_window::settings_content_rect(this.hwnd)),
-            ProviderKind::Child { .. } => this.resolve().map(|c| c.rect),
-        };
-        Ok(client.map_or(UiaRect::default(), |client| this.screen_rect(client)))
+        catch_uia("settings UIA BoundingRectangle", || {
+            let this = &self.this;
+            let client = match &this.kind {
+                ProviderKind::Root => Some(crate::main_window::settings_content_rect(this.hwnd)),
+                ProviderKind::Child { .. } => this.resolve().map(|c| c.rect),
+            };
+            Ok(client.map_or(UiaRect::default(), |client| this.screen_rect(client)))
+        })
     }
 
     fn GetEmbeddedFragmentRoots(&self) -> windows::core::Result<*mut SAFEARRAY> {
-        // No embedded roots: a null array means "none".
-        Ok(std::ptr::null_mut())
+        catch_uia("settings UIA GetEmbeddedFragmentRoots", || {
+            // No embedded roots: a null array means "none".
+            Ok(std::ptr::null_mut())
+        })
     }
 
     fn SetFocus(&self) -> windows::core::Result<()> {
-        if let ProviderKind::Child { row_index, sub } = &self.this.kind {
-            // `focus_setting_at` validates the pair against the live layout
-            // before committing, so a stale provider cannot focus a control
-            // that no longer exists.
-            crate::main_window::focus_setting_at(self.this.hwnd, *row_index, *sub);
-        }
-        Ok(())
+        catch_uia("settings UIA SetFocus", || {
+            if let ProviderKind::Child { row_index, sub } = &self.this.kind {
+                // `focus_setting_at` validates the pair against the live layout
+                // before committing, so a stale provider cannot focus a control
+                // that no longer exists.
+                crate::main_window::focus_setting_at(self.this.hwnd, *row_index, *sub);
+            }
+            Ok(())
+        })
     }
 
     fn FragmentRoot(&self) -> windows::core::Result<IRawElementProviderFragmentRoot> {
-        Ok(self.this.root_fragment_root())
+        catch_uia("settings UIA FragmentRoot", || Ok(self.this.root_fragment_root()))
     }
 }
 
 impl IRawElementProviderFragmentRoot_Impl for SettingsProvider_Impl {
     fn ElementProviderFromPoint(&self, x: f64, y: f64) -> windows::core::Result<IRawElementProviderFragment> {
-        let this = &self.this;
-        if this.hwnd.0.is_null() {
-            return Ok(this.root_fragment());
-        }
-        // Hit-test against the live layout with the exact control rectangles:
-        // scrolling may have moved every control since enumeration, and the
-        // bounds now equal the clickable targets.
-        let children = crate::main_window::settings_accessibility_children(this.hwnd);
-        let mut p = POINT {
-            x: x as i32,
-            y: y as i32,
-        };
-        if !unsafe { ScreenToClient(this.hwnd, &mut p) }.as_bool() {
-            return Ok(this.root_fragment());
-        }
-        for child in &children {
-            if p.x >= child.rect.left && p.x < child.rect.right && p.y >= child.rect.top && p.y < child.rect.bottom {
-                return Ok(SettingsProvider {
-                    hwnd: this.hwnd,
-                    kind: ProviderKind::Child {
-                        row_index: child.row_index,
-                        sub: child.sub,
-                    },
-                }
-                .into());
+        catch_uia("settings UIA ElementProviderFromPoint", || {
+            let this = &self.this;
+            if this.hwnd.0.is_null() {
+                return Ok(this.root_fragment());
             }
-        }
-        Ok(this.root_fragment())
+            // Hit-test against the live layout with the exact control rectangles:
+            // scrolling may have moved every control since enumeration, and the
+            // bounds now equal the clickable targets.
+            let children = crate::main_window::settings_accessibility_children(this.hwnd);
+            let mut p = POINT {
+                x: x as i32,
+                y: y as i32,
+            };
+            if !unsafe { ScreenToClient(this.hwnd, &mut p) }.as_bool() {
+                return Ok(this.root_fragment());
+            }
+            for child in &children {
+                if p.x >= child.rect.left && p.x < child.rect.right && p.y >= child.rect.top && p.y < child.rect.bottom
+                {
+                    return Ok(SettingsProvider {
+                        hwnd: this.hwnd,
+                        kind: ProviderKind::Child {
+                            row_index: child.row_index,
+                            sub: child.sub,
+                        },
+                    }
+                    .into());
+                }
+            }
+            Ok(this.root_fragment())
+        })
     }
 
     fn GetFocus(&self) -> windows::core::Result<IRawElementProviderFragment> {
-        let Some((row, sub)) = crate::main_window::settings_focus(self.this.hwnd) else {
-            return Err(Error::empty());
-        };
-        let children = crate::main_window::settings_accessibility_children(self.this.hwnd);
-        if !children.iter().any(|c| c.row_index == row && c.sub == sub) {
-            return Err(Error::empty());
-        }
-        Ok(SettingsProvider {
-            hwnd: self.this.hwnd,
-            kind: ProviderKind::Child { row_index: row, sub },
-        }
-        .into())
+        catch_uia("settings UIA GetFocus", || {
+            let Some((row, sub)) = crate::main_window::settings_focus(self.this.hwnd) else {
+                return Err(Error::empty());
+            };
+            let children = crate::main_window::settings_accessibility_children(self.this.hwnd);
+            if !children.iter().any(|c| c.row_index == row && c.sub == sub) {
+                return Err(Error::empty());
+            }
+            Ok(SettingsProvider {
+                hwnd: self.this.hwnd,
+                kind: ProviderKind::Child { row_index: row, sub },
+            }
+            .into())
+        })
     }
 }
 
 impl IInvokeProvider_Impl for SettingsProvider_Impl {
     fn Invoke(&self) -> windows::core::Result<()> {
-        self.this.activate();
-        Ok(())
+        catch_uia("settings UIA Invoke", || {
+            self.this.activate();
+            Ok(())
+        })
     }
 }
 
 impl IToggleProvider_Impl for SettingsProvider_Impl {
     fn Toggle(&self) -> windows::core::Result<()> {
-        self.this.activate();
-        Ok(())
+        catch_uia("settings UIA Toggle", || {
+            self.this.activate();
+            Ok(())
+        })
     }
 
     fn ToggleState(&self) -> windows::core::Result<windows::Win32::UI::Accessibility::ToggleState> {
-        // Resolved through the CURRENT snapshot: after the toggle flipped, a
-        // retained provider reports the new state; after teardown it reports
-        // the unavailable `Off` rather than a stale value.
-        if let Some(on) = self.this.resolve().and_then(|c| c.toggle) {
-            return Ok(if on { ToggleState_On } else { ToggleState_Off });
-        }
-        Ok(ToggleState_Off)
+        catch_uia("settings UIA ToggleState", || {
+            // Resolved through the CURRENT snapshot: after the toggle flipped, a
+            // retained provider reports the new state; after teardown it reports
+            // the unavailable `Off` rather than a stale value.
+            if let Some(on) = self.this.resolve().and_then(|c| c.toggle) {
+                return Ok(if on { ToggleState_On } else { ToggleState_Off });
+            }
+            Ok(ToggleState_Off)
+        })
     }
 }
 
@@ -468,50 +505,56 @@ struct PillNameProvider {
 
 impl IRawElementProviderSimple_Impl for PillNameProvider_Impl {
     fn ProviderOptions(&self) -> windows::core::Result<windows::Win32::UI::Accessibility::ProviderOptions> {
-        Ok(ProviderOptions_ServerSideProvider)
+        catch_uia("pill UIA ProviderOptions", || Ok(ProviderOptions_ServerSideProvider))
     }
 
     fn GetPatternProvider(&self, _patternid: UIA_PATTERN_ID) -> windows::core::Result<IUnknown> {
-        // No patterns at all: the pill is passive by architecture, so a
-        // screen reader must never be able to activate, toggle, or select
-        // anything on it. An empty error is the "no provider" answer.
-        Err(Error::empty())
+        catch_uia("pill UIA GetPatternProvider", || {
+            // No patterns at all: the pill is passive by architecture, so a
+            // screen reader must never be able to activate, toggle, or select
+            // anything on it. An empty error is the "no provider" answer.
+            Err(Error::empty())
+        })
     }
 
     fn GetPropertyValue(&self, propertyid: UIA_PROPERTY_ID) -> windows::core::Result<VARIANT> {
-        let this = &self.this;
-        if propertyid == UIA_NamePropertyId {
-            let name = this
-                .name
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-                .unwrap_or_default();
-            return Ok(VARIANT::from(BSTR::from(name)));
-        }
-        if propertyid == windows::Win32::UI::Accessibility::UIA_ControlTypePropertyId {
-            return Ok(VARIANT::from(UIA_TextControlTypeId.0));
-        }
-        if propertyid == UIA_IsEnabledPropertyId {
-            return Ok(VARIANT::from(true));
-        }
-        if propertyid == UIA_IsKeyboardFocusablePropertyId {
-            // The pill never takes focus and never activates; a screen reader
-            // must not be able to focus it.
-            return Ok(VARIANT::from(false));
-        }
-        Ok(VARIANT::default())
+        catch_uia("pill UIA GetPropertyValue", || {
+            let this = &self.this;
+            if propertyid == UIA_NamePropertyId {
+                let name = this
+                    .name
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .unwrap_or_default();
+                return Ok(VARIANT::from(BSTR::from(name)));
+            }
+            if propertyid == windows::Win32::UI::Accessibility::UIA_ControlTypePropertyId {
+                return Ok(VARIANT::from(UIA_TextControlTypeId.0));
+            }
+            if propertyid == UIA_IsEnabledPropertyId {
+                return Ok(VARIANT::from(true));
+            }
+            if propertyid == UIA_IsKeyboardFocusablePropertyId {
+                // The pill never takes focus and never activates; a screen reader
+                // must not be able to focus it.
+                return Ok(VARIANT::from(false));
+            }
+            Ok(VARIANT::default())
+        })
     }
 
     fn HostRawElementProvider(&self) -> windows::core::Result<IRawElementProviderSimple> {
-        // Merge with the window's own default provider (it carries the
-        // window-level semantics — control type, window title) so the pill
-        // is exposed as a readable element of the overlay window, not a
-        // detached fragment.
-        if self.this.hwnd.0.is_null() {
-            return Err(Error::empty());
-        }
-        unsafe { UiaHostProviderFromHwnd(self.this.hwnd) }
+        catch_uia("pill UIA HostRawElementProvider", || {
+            // Merge with the window's own default provider (it carries the
+            // window-level semantics — control type, window title) so the pill
+            // is exposed as a readable element of the overlay window, not a
+            // detached fragment.
+            if self.this.hwnd.0.is_null() {
+                return Err(Error::empty());
+            }
+            unsafe { UiaHostProviderFromHwnd(self.this.hwnd) }
+        })
     }
 }
 
