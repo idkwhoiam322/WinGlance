@@ -116,6 +116,11 @@ pub struct TrackInfo {
     /// the read did not capture a state; callers fall back to the remembered
     /// per-source state, then Playing.
     pub playback_state: Option<PlaybackState>,
+    /// Monotonic per-source artwork generation, bumped only when distinct
+    /// decoded bytes are attached. Lets the overlay drop late decodes that
+    /// reordered behind a newer track of the same source across a worker
+    /// restart (B→A→B flash). 0 means "no version yet".
+    pub art_generation: u64,
     /// Monotonic instant captured by the worker at read time; the UI thread
     /// estimates the live position from it. None when position is unknown.
     pub position_updated_at: Option<Instant>,
@@ -275,6 +280,7 @@ impl TrackInfo {
         if incoming.playback_state.is_some() {
             self.playback_state = incoming.playback_state;
         }
+        self.art_generation = self.art_generation.max(incoming.art_generation);
     }
 
     /// Consumes a track snapshot and returns the text-only form the session

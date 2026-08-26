@@ -467,6 +467,10 @@ struct ListenerState {
     /// Bounded LRU of 64.
     icon_cache: HashMap<String, Option<Arc<[u8]>>>,
     icon_cache_order: VecDeque<String>,
+    /// Per-source monotonic artwork generation, bumped only when distinct
+    /// decoded bytes are attached. Carried in `TrackInfo.art_generation` for
+    /// the overlay to drop reordered late decodes.
+    artwork_generations: HashMap<String, u64>,
     /// When the last overflow warning fired. Bounds the admission-rejection log
     /// to one line per `OVERFLOW_WARN_INTERVAL` during a hostile session storm,
     /// instead of one WARN per rejected session.
@@ -697,6 +701,7 @@ impl ListenerState {
             debounce: debounce_duration_ms(seed.debounce_ms),
             icon_cache: HashMap::new(),
             icon_cache_order: VecDeque::new(),
+            artwork_generations: HashMap::new(),
             cached_allowed: Some((
                 seed.media_sources.clone(),
                 seed.media_sources
@@ -1013,6 +1018,7 @@ impl ListenerState {
             merged.artwork = Some(cached);
         }
         let mut emitted = with_decoded_art(merged.clone(), crate::events::ARTWORK_DECODE as usize);
+        emitted.art_generation = next_art_generation(self, &merged.source_app, emitted.decoded_art.as_deref());
         emitted.palette = self.palette_for_identity(&merged, emitted.decoded_art.as_deref());
         // `read_track_info` carried the live playback snapshot above onto the
         // track, so the pill does not infer a state from a lagging cache.
@@ -1459,6 +1465,8 @@ impl ListenerState {
                         let label = track_label(&merged);
                         info!("track changed | {label}");
                         let mut emitted = with_decoded_art(merged.clone(), crate::events::ARTWORK_DECODE as usize);
+                        emitted.art_generation =
+                            next_art_generation(self, &merged.source_app, emitted.decoded_art.as_deref());
                         // Attach the identity-stable palette so the overlay does
                         // not recompute (and drift) from re-encoded thumbnails.
                         emitted.palette = self.palette_for_identity(&merged, emitted.decoded_art.as_deref());
@@ -2119,6 +2127,7 @@ impl ListenerState {
             // fire a duplicate pill (the other emit sites already stamp).
             self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
             let mut emitted = with_decoded_art(merged.clone(), crate::events::ARTWORK_DECODE as usize);
+            emitted.art_generation = next_art_generation(self, &merged.source_app, emitted.decoded_art.as_deref());
             emitted.palette = self.palette_for_identity(&merged, emitted.decoded_art.as_deref());
             self.emit(MediaEvent::TrackChanged(emitted));
             if let Some(state) = self.states.get_mut(&key) {
@@ -3058,6 +3067,26 @@ fn retained_art_bytes(last_track: &HashMap<String, TrackInfo>) -> usize {
         .sum()
 }
 
+/// Returns the next per-source artwork generation for a newly decoded cover.
+/// Bump only when distinct decoded bytes are attached (re-encoded same cover
+/// where bytes are byte-identical via `artwork_same` does not bump, so a
+/// re-encode storm does not churn the generation).
+fn next_art_generation(state: &mut ListenerState, source: &str, decoded: Option<&[u8]>) -> u64 {
+    let Some(bytes) = decoded else {
+        return state.artwork_generations.get(source).copied().unwrap_or(0);
+    };
+    let last = state
+        .last_track_per_source
+        .get(source)
+        .and_then(|t| t.decoded_art.as_deref());
+    if crate::events::artwork_same(last, Some(bytes)) {
+        return state.artwork_generations.get(source).copied().unwrap_or(0);
+    }
+    let generation = state.artwork_generations.entry(source.to_string()).or_insert(0);
+    *generation += 1;
+    *generation
+}
+
 /// Inserts (or replaces) a source's last-emitted track, enforcing the retained
 /// artwork budget: if the new artwork would push the total past
 /// `MAX_RETAINED_ARTWORK_BYTES`, the artwork bytes are dropped (metadata
@@ -3361,6 +3390,7 @@ fn merge_track(prev: &LogicalState, read: &TrackInfo, read_artwork: bool) -> Tra
         },
         playback_state: read.playback_state,
         position_updated_at: read.position_updated_at,
+        art_generation: 0,
         // The identity-stable palette is attached at emit time (after the
         // decode), never merged here: the merge inherits the previous track's
         // identity fields, and a stale palette must not carry over.
@@ -3848,6 +3878,7 @@ fn read_track_info(
         playback_type,
         playback_state,
         position_updated_at: Some(position_updated_at),
+        art_generation: 0,
         track_number,
         track_count,
         genre,

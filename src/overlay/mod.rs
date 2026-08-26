@@ -728,6 +728,9 @@ struct OverlayState {
     /// never surface again until it emits a new event). Bounded by
     /// `LEDGER_STATE_CAP`, evicting Stopped entries first.
     source_state: HashMap<String, PlaybackState>,
+    /// Per-source monotonic artwork generation watermark; late decodes whose
+    /// generation is older than the watermark are dropped (receive_events).
+    artwork_gen: HashMap<String, u64>,
     /// Recency order of `track_cache` keys (front = oldest). Kept in sync by
     /// `cache_track`.
     track_cache_order: VecDeque<String>,
@@ -1158,6 +1161,7 @@ impl OverlayState {
             current_source: None,
             track_cache: HashMap::new(),
             source_state: HashMap::new(),
+            artwork_gen: HashMap::new(),
             track_cache_order: VecDeque::new(),
             pill_text: None,
             text_scratch: None,
@@ -1481,6 +1485,22 @@ impl OverlayState {
         // never copies the event; recover the owned event here (zero-copy
         // when this window is the last holder, a clone otherwise).
         for event in batch.into_iter().map(media_event_into_owned) {
+            // Monotonic artwork generation: drop late decodes that reordered
+            // behind a newer track of the same source across a worker restart.
+            if let MediaEvent::TrackChanged(track) = &event {
+                let cur = self.artwork_gen.get(&track.source_app).copied().unwrap_or(0);
+                if track.art_generation != 0 && track.art_generation < cur {
+                    log::debug!(
+                        "track dropped | stale gen {} < {} | source={}",
+                        track.art_generation,
+                        cur,
+                        track.source_app
+                    );
+                    continue;
+                }
+                self.artwork_gen
+                    .insert(track.source_app.clone(), track.art_generation.max(cur));
+            }
             // Playback-state ledger: remember the last known state per source
             // so successor selection only ever announces sources that are
             // actually playing (see `best_successor`). Updated even while
