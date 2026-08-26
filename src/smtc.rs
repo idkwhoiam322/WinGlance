@@ -462,9 +462,11 @@ struct ListenerState {
     /// row, so a hand edit needs a restart anyway; a control command would
     /// only add a write path nothing ever uses.
     debounce: Duration,
-    /// Cached app icons keyed by source_app label (derived from AUMID via
-    /// `source_app_label`). Populated on first encounter of a source.
+    /// Cached app icons keyed by normalized source_app label (lowercased via
+    /// `normalize_for_match`, so `Spotify` vs `spotify` does not cache twice).
+    /// Bounded LRU of 64.
     icon_cache: HashMap<String, Option<Arc<[u8]>>>,
+    icon_cache_order: VecDeque<String>,
     /// When the last overflow warning fired. Bounds the admission-rejection log
     /// to one line per `OVERFLOW_WARN_INTERVAL` during a hostile session storm,
     /// instead of one WARN per rejected session.
@@ -694,6 +696,7 @@ impl ListenerState {
             // with `SetAllowedSources` from here on.
             debounce: debounce_duration_ms(seed.debounce_ms),
             icon_cache: HashMap::new(),
+            icon_cache_order: VecDeque::new(),
             cached_allowed: Some((
                 seed.media_sources.clone(),
                 seed.media_sources
@@ -1255,13 +1258,28 @@ impl ListenerState {
                     // The AUMID is read from the live session; the icon is
                     // attached to the track so the overlay can render it.
                     if merged.app_icon.is_none() {
-                        if let Some(cached_icon) = self.icon_cache.get(&merged.source_app) {
-                            merged.app_icon = cached_icon.clone();
+                        let icon_key = normalize_for_match(&merged.source_app);
+                        if let Some(cached_icon) = self.icon_cache.get(&icon_key).cloned() {
+                            // Move to back for LRU
+                            if let Some(pos) = self.icon_cache_order.iter().position(|k| k == &icon_key) {
+                                self.icon_cache_order.remove(pos);
+                                self.icon_cache_order.push_back(icon_key.clone());
+                            }
+                            merged.app_icon = cached_icon;
                         } else if let Ok(aumid) = session.SourceAppUserModelId() {
                             let aumid_str = aumid.to_string();
                             let extracted = crate::icon::extract_app_icon(&aumid_str, 24);
                             let cached = extracted.as_ref().map(|p| Arc::from(p.as_slice()));
-                            self.icon_cache.insert(merged.source_app.clone(), cached.clone());
+                            self.icon_cache.insert(icon_key.clone(), cached.clone());
+                            self.icon_cache_order.push_back(icon_key.clone());
+                            const ICON_CACHE_CAP: usize = 64;
+                            while self.icon_cache.len() > ICON_CACHE_CAP {
+                                if let Some(old) = self.icon_cache_order.pop_front() {
+                                    self.icon_cache.remove(&old);
+                                } else {
+                                    break;
+                                }
+                            }
                             merged.app_icon = cached;
                         }
                     }

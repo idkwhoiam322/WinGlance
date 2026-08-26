@@ -234,7 +234,7 @@ const PENDING_CAP: usize = 4;
 /// once inserted — a source's last track stays available as a successor
 /// while its playback state says it is still playing — so the cap alone
 /// bounds the memory (per entry: pill text + one 256² decoded cover).
-const TRACK_CACHE_CAP: usize = 3;
+const TRACK_CACHE_CAP: usize = 8;
 
 /// Bound on the per-source playback-state ledger (`OverlayState.source_state`).
 /// Live sources are capped at the worker's admission limits (32 sources), so
