@@ -780,6 +780,65 @@ impl Drop for DirGuard {
     }
 }
 
+/// RAII for transient kernel `HANDLE`s (`CreateToolhelp32Snapshot`,
+/// `OpenProcess`, `CreateEventW`, `CreateMutexW`). Sentinel `NULL` or
+/// `INVALID_HANDLE_VALUE` is never closed; only valid handles are.
+pub(crate) struct HandleGuard(pub(crate) HANDLE);
+
+impl HandleGuard {
+    pub(crate) fn new(handle: HANDLE) -> Option<Self> {
+        if handle.is_invalid() { None } else { Some(Self(handle)) }
+    }
+
+    pub(crate) fn get(&self) -> HANDLE {
+        self.0
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn into_raw(self) -> HANDLE {
+        let h = self.0;
+        std::mem::forget(self);
+        h
+    }
+}
+
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// RAII for a GDI device context — `DeleteDC` on drop.
+pub(crate) struct DcGuard(pub(crate) windows::Win32::Graphics::Gdi::HDC);
+
+impl Drop for DcGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::DeleteDC(self.0);
+            }
+        }
+    }
+}
+
+/// RAII for a GDI bitmap — `DeleteObject` on drop.
+#[allow(dead_code)]
+pub(crate) struct BitmapGuard(pub(crate) windows::Win32::Graphics::Gdi::HBITMAP);
+
+impl Drop for BitmapGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.0.0));
+            }
+        }
+    }
+}
+
 /// Opens `dir`, pinned and verified, as the root for a write transaction.
 /// Rejects: a missing directory (caller creates it first), a reparse point,
 /// a non-directory, or a final handle path that differs from the expected
@@ -923,8 +982,11 @@ fn orphan_temp_pid_alive(pid: u32) -> bool {
     unsafe {
         match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
             Ok(handle) => {
-                let wait = WaitForSingleObject(handle, 0);
-                let _ = CloseHandle(handle);
+                let _guard = match HandleGuard::new(handle) {
+                    Some(g) => g,
+                    None => return true,
+                };
+                let wait = WaitForSingleObject(_guard.get(), 0);
                 // WAIT_TIMEOUT is the live signature; WAIT_FAILED is treated
                 // as alive too — every ambiguous answer errs toward keeping
                 // an in-flight temp, which is the guard's whole point.

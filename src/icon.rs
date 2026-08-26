@@ -7,7 +7,7 @@ use std::sync::{Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::Duration;
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, GetDIBits, HBITMAP, HDC,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, GetDIBits, HBITMAP, HDC,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, IBindCtx};
 use windows::Win32::UI::Shell::{IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY};
@@ -121,18 +121,18 @@ fn extract_from_factory(factory: &IShellItemImageFactory, size: usize) -> Option
     };
     let hbitmap = unsafe { factory.GetImage(size_pt, SIIGBF_ICONONLY).ok() }?;
     let hdc = unsafe { CreateCompatibleDC(None) };
-    if hdc.0.is_null() {
+    if hdc.is_invalid() {
         unsafe {
             let _ = delete_object(hbitmap);
         }
         return None;
     }
+    let _dc = crate::winutil::DcGuard(hdc);
     // GetDIBits requires the bitmap NOT to be selected into a device context
     // (Microsoft's documented contract); the DC merely supplies the format.
     let result = hbitmap_to_bgra_premul(hdc, hbitmap, size);
     unsafe {
         let _ = delete_object(hbitmap);
-        let _ = DeleteDC(hdc);
     }
     result
 }

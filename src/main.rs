@@ -397,6 +397,11 @@ fn winglance_instance_running() -> bool {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return false;
         };
+        let _guard = match crate::winutil::HandleGuard::new(snapshot) {
+            Some(g) => g,
+            None => return false,
+        };
+        let snapshot = _guard.get();
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         let mut running = false;
@@ -411,7 +416,6 @@ fn winglance_instance_running() -> bool {
                 }
             }
         }
-        let _ = CloseHandle(snapshot);
         running
     }
 }

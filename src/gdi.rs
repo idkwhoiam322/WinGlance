@@ -7,8 +7,8 @@ use std::sync::Mutex;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER,
-    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DrawTextW, FF_DONTCARE, GetTextMetricsW, HDC,
-    HFONT, OUT_DEFAULT_PRECIS, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
+    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DrawTextW, FF_DONTCARE, GetTextMetricsW, HDC, HFONT,
+    OUT_DEFAULT_PRECIS, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
 };
 use windows::core::PCWSTR;
 
@@ -85,14 +85,14 @@ impl FontProvider {
         if !font.0.is_null() {
             unsafe {
                 let hdc = CreateCompatibleDC(None);
-                if !hdc.0.is_null() {
+                if !hdc.is_invalid() {
+                    let _dc = crate::winutil::DcGuard(hdc);
                     let old_font = select_object(hdc, font);
                     let mut tm = TEXTMETRICW::default();
                     if GetTextMetricsW(hdc, &mut tm).as_bool() {
                         tm_height = tm.tmHeight;
                     }
                     select_object(hdc, old_font);
-                    let _ = DeleteDC(hdc);
                 }
             }
             guard.insert(key, (font, tm_height));
