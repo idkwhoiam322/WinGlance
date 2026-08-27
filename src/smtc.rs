@@ -512,16 +512,26 @@ pub(crate) struct ListenerSeed {
     pub(crate) debounce_ms: u64,
 }
 
-/// Exclusion map (churn cool-downs + wedged-read exclusions) shared across
-/// worker generations: created in `main` and handed to every worker the
-/// supervisor spawns, so a replacement worker does not re-pay a fresh
-/// `READ_ASYNC_TIMEOUT` read for every source its predecessor already
-/// excluded — the exclusion survives the restart it exists to bound.
-pub(crate) type SharedExclusions = Arc<Mutex<HashMap<String, Instant>>>;
+/// Exclusion maps shared across worker generations: created in `main` and
+/// handed to every worker the supervisor spawns, so a replacement worker does
+/// not re-pay a fresh `READ_ASYNC_TIMEOUT` read for every source its
+/// predecessor already excluded — the exclusion survives the restart it exists
+/// to bound. Split: churn cool-downs are per-source (one hostile source mutes
+/// all its sessions), wedged reads are per-session (one wedged tab must not
+/// mute a good tab of the same app).
+pub(crate) struct ExclusionMaps {
+    pub(crate) per_source: HashMap<String, Instant>,
+    pub(crate) per_session: HashMap<usize, Instant>,
+}
 
-/// Creates the process-wide shared exclusion map (see `SharedExclusions`).
+pub(crate) type SharedExclusions = Arc<Mutex<ExclusionMaps>>;
+
+/// Creates the process-wide shared exclusion maps (see `SharedExclusions`).
 pub(crate) fn shared_exclusions() -> SharedExclusions {
-    Arc::new(Mutex::new(HashMap::new()))
+    Arc::new(Mutex::new(ExclusionMaps {
+        per_source: HashMap::new(),
+        per_session: HashMap::new(),
+    }))
 }
 
 pub struct SmtcListener {
@@ -1911,10 +1921,15 @@ impl ListenerState {
         // reappearance is reported again.
         self.rejected_seen.retain(|key| alive.contains(key));
         self.ignored_seen.retain(|key| alive.contains(key));
-        self.excluded_sources
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|_, until| *until > Instant::now());
+        {
+            let now = Instant::now();
+            let mut maps = self
+                .excluded_sources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            maps.per_source.retain(|_, until| *until > now);
+            maps.per_session.retain(|k, until| *until > now && alive.contains(k));
+        }
         // Keep the picker's candidate list in sync with what is actually
         // open, including apps whose sessions were rejected: checking them
         // is how the user adds them to the allow-list. Dedup and cap it
@@ -2216,15 +2231,20 @@ impl ListenerState {
     /// every source.
     fn exclude_wedged_source(&mut self, session: &GlobalSystemMediaTransportControlsSession) {
         let source = read_source_app(session);
-        self.excluded_sources
+        let key = session_key(session);
+        // Per-session exclusion: one wedged tab must not mute a good tab of
+        // the same app. Guard against double WARN within the cool-down.
+        let mut maps = self
+            .excluded_sources
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                source.clone(),
-                Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
-            );
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if maps.per_session.get(&key).is_some_and(|until| *until > Instant::now()) {
+            return;
+        }
+        maps.per_session
+            .insert(key, Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS));
         warn!(
-            "source {source} did not answer an SMTC read within {READ_ASYNC_TIMEOUT:?}; excluding it from tracking for {CHURN_COOLDOWN_MS}ms"
+            "source {source} session {key:#x} did not answer an SMTC read within {READ_ASYNC_TIMEOUT:?}; excluding session from tracking for {CHURN_COOLDOWN_MS}ms"
         );
     }
 
@@ -2294,13 +2314,24 @@ impl ListenerState {
     /// label, after normalizing word-boundary characters) are allowed;
     /// everything else is excluded.
     fn session_source_allowed(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> bool {
+        let key = session_key(session);
         let aumid = session
             .SourceAppUserModelId()
             .map(|value| value.to_string())
             .unwrap_or_default();
         let label = source_app_label(&aumid);
-        if self.source_on_cooldown(&label) {
-            return false;
+        {
+            let maps = self
+                .excluded_sources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = Instant::now();
+            if maps.per_session.get(&key).is_some_and(|until| *until > now) {
+                return false;
+            }
+            if maps.per_source.get(&label).is_some_and(|until| *until > now) {
+                return false;
+            }
         }
         // The allow list is seeded at worker startup and replaced by
         // `SetAllowedSources` pushes from the settings UI, so the cached copy
@@ -2320,13 +2351,26 @@ impl ListenerState {
             .any(|np| !np.is_empty() && (naumid.contains(np) || nlabel.contains(np)))
     }
 
-    /// True while a source app is excluded from tracking (churn cool-down or
-    /// wedged-read exclusion).
+    /// True while a source app is excluded from tracking (churn cool-down).
+    /// Per-session wedged exclusions are checked via `session_source_allowed`
+    /// and deliberately not here — terminal `Stopped`/`SourceGone` hygiene must
+    /// not be silenced by a single wedged tab.
     fn source_on_cooldown(&self, source: &str) -> bool {
         self.excluded_sources
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .per_source
             .get(source)
+            .is_some_and(|until| *until > Instant::now())
+    }
+
+    #[allow(dead_code)]
+    fn session_is_wedged(&self, key: usize) -> bool {
+        self.excluded_sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .per_session
+            .get(&key)
             .is_some_and(|until| *until > Instant::now())
     }
 
@@ -2352,6 +2396,7 @@ impl ListenerState {
             self.excluded_sources
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .per_source
                 .insert(source.to_string(), now + Duration::from_millis(CHURN_COOLDOWN_MS));
             warn!(
                 "source {source} is churning sessions ({CHURN_THRESHOLD}+ new sessions in {CHURN_WINDOW_MS}ms); excluding it from tracking for {CHURN_COOLDOWN_MS}ms"
@@ -5128,7 +5173,7 @@ mod tests {
             0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(HashMap::new())),
+            shared_exclusions(),
             Arc::new(Mutex::new(ControlMailbox::default())),
         );
         let (raw, normalized) = state.cached_allowed.as_ref().expect("seed cached");
@@ -5164,7 +5209,7 @@ mod tests {
             0,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(HashMap::new())),
+            shared_exclusions(),
             Arc::new(Mutex::new(ControlMailbox::default())),
         );
         state
@@ -5370,6 +5415,7 @@ mod tests {
                 .excluded_sources
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .per_source
                 .len(),
             1,
             "one exclusion per source"
@@ -5390,6 +5436,7 @@ mod tests {
             .excluded_sources
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .per_source
             .insert(
                 "spotify".to_string(),
                 Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
@@ -5415,7 +5462,7 @@ mod tests {
                 .excluded_sources
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            map.insert(
+            map.per_source.insert(
                 "spotify".to_string(),
                 Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
             );
@@ -5443,6 +5490,7 @@ mod tests {
             .excluded_sources
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .per_source
             .insert(
                 "spotify".to_string(),
                 Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
@@ -5452,6 +5500,7 @@ mod tests {
             .excluded_sources
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .per_source
             .insert("spotify".to_string(), Instant::now() - Duration::from_millis(1));
         assert!(
             !state.source_on_cooldown("spotify"),
