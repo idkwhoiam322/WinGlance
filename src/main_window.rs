@@ -6914,6 +6914,16 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
         WM_NCDESTROY => {
+            // Explicit timer kills before the handle becomes invalid — OS
+            // auto-kills on DestroyWindow, but explicit makes teardown
+            // reviewable and suppresses one stray fire.
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_LOGS_ID);
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_TOOLTIPS_ID);
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), IDLE_ART_TIMER_ID);
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_OPENED_ID);
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TRAY_RETRY_TIMER_ID);
+            }
             // Slot clear first, box second — the canonical order every window
             // applies via the shared helper.
             release_window_state(hwnd, state_ptr);

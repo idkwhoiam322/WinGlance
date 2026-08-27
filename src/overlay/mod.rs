@@ -4410,6 +4410,10 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 }
                 OVERLAY_FG_HWND.store(0, Ordering::SeqCst);
                 state.delete_anim_timer();
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_DEBOUNCE);
+                    let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), IDLE_BUFFER_TIMER_ID);
+                }
                 // Null the shared accessible-name cell last: a provider that
                 // outlives the window must read an empty name, not the last
                 // track (see `null_pill_name_cell`). Placed after the hook

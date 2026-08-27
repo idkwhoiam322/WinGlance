@@ -1117,7 +1117,7 @@ fn main() -> Result<()> {
         // used by `leak_budget_exhausted`.
         let mut leaked_at: Vec<Instant> = Vec::new();
             loop {
-                if supervisor_shutdown.load(Ordering::SeqCst) {
+                if supervisor_shutdown.load(Ordering::Acquire) {
                     break;
                 }
                 if worker_budget_exhausted(consecutive_restarts) {
@@ -1216,7 +1216,7 @@ fn main() -> Result<()> {
                     continue;
                 };
                 let exit = loop {
-                    if supervisor_shutdown.load(Ordering::SeqCst) {
+                    if supervisor_shutdown.load(Ordering::Acquire) {
                         // Bounded shutdown join: a responsive worker
                         // finishes — COM cleanup included — within the grace
                         // and is joined; a stuck one is detached only after
@@ -1353,7 +1353,7 @@ fn main() -> Result<()> {
             // workers before the error propagates, so a failed startup does
             // not keep replacing SMTC workers until process exit reaps
             // everything.
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.store(true, Ordering::Release);
             return Err(error);
         }
     };
@@ -1374,7 +1374,7 @@ fn main() -> Result<()> {
             // null, box free — before the error propagates. No forwarder
             // exists yet, so nothing can post to the overlay after this
             // point. The supervisor is told to stop first (see above).
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.store(true, Ordering::Release);
             unsafe {
                 let _ = DestroyWindow(overlay_hwnd);
             }
@@ -1403,7 +1403,7 @@ fn main() -> Result<()> {
             // lives below), so stop the producers here — the supervisor
             // exits within ~1 s of the flag, and its senders drop with
             // main's return.
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.store(true, Ordering::Release);
             return Err(error);
         }
     };
@@ -1415,7 +1415,7 @@ fn main() -> Result<()> {
     // not post to an HWND that teardown is about to free. The supervisor
     // exits within ~1s of the flag; a stalled worker is left for process
     // exit (it may be blocked inside COM and cannot be joined).
-    shutdown.store(true, Ordering::SeqCst);
+    shutdown.store(true, Ordering::Release);
     let _ = forwarder_handle.join();
     let _ = supervisor_handle.join();
 
@@ -1486,7 +1486,7 @@ const EVENT_QUEUE_CAP: usize = 256;
 /// supervisor can be joined promptly on exit.
 fn sleep_interruptible(duration: Duration, shutdown: &AtomicBool) {
     let mut remaining = duration;
-    while remaining > Duration::ZERO && !shutdown.load(Ordering::SeqCst) {
+    while remaining > Duration::ZERO && !shutdown.load(Ordering::Acquire) {
         let step = remaining.min(Duration::from_millis(200));
         std::thread::sleep(step);
         remaining -= step;
@@ -1602,7 +1602,7 @@ fn spawn_event_forwarder(
             // budget already dominates exit latency, so the longer wait
             // does not slow shutdown down.
             let mut quiet_cycles: u32 = 0;
-            while !shutdown.load(Ordering::SeqCst) {
+            while !shutdown.load(Ordering::Acquire) {
                 // One-shot status events from the supervisor (at most one
                 // WorkerFailed per session, then it gives up). History-only:
                 // never wake the pill or occupy its queue.
@@ -1696,7 +1696,7 @@ fn enforce_queue_cap(queue: &mut VecDeque<Arc<MediaEvent>>, name: &str) {
 /// post): leaving the queue populated without a wake message in flight
 /// would strand those events until some unrelated future event reposts.
 fn clear_and_account(queue: &EventQueue, wake: &AtomicBool, name: &str) {
-    wake.store(false, Ordering::SeqCst);
+    wake.store(false, Ordering::Release);
     let dropped = queue
         .lock()
         .map(|mut q| {
@@ -1726,7 +1726,7 @@ fn push_and_wake(queue: &EventQueue, wake: &AtomicBool, event: Arc<MediaEvent>, 
     };
     q.push_back(event);
     enforce_queue_cap(&mut q, name);
-    if !wake.swap(true, Ordering::SeqCst)
+    if !wake.swap(true, Ordering::AcqRel)
         && unsafe { post_message(hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
     {
         drop(q);
@@ -1741,7 +1741,7 @@ fn push_and_wake(queue: &EventQueue, wake: &AtomicBool, event: Arc<MediaEvent>, 
 pub(crate) fn repost_if_pending(queue: &EventQueue, wake: &AtomicBool, hwnd: HWND, name: &str) {
     let more = queue.lock().map(|q| !q.is_empty()).unwrap_or(false);
     if more
-        && !wake.swap(true, Ordering::SeqCst)
+        && !wake.swap(true, Ordering::AcqRel)
         && unsafe { post_message(hwnd, MEDIA_EVENT_MSG, WPARAM(0), LPARAM(0)) }.is_err()
     {
         clear_and_account(queue, wake, name);
@@ -2319,7 +2319,7 @@ mod tests {
             "a failed post must not leave events stranded"
         );
         assert!(
-            !wake.load(Ordering::SeqCst),
+            !wake.load(Ordering::Acquire),
             "a failed post must leave the wake flag clear"
         );
     }
@@ -2345,7 +2345,7 @@ mod tests {
             "a failed repost must not strand pending events"
         );
         assert!(
-            !wake.load(Ordering::SeqCst),
+            !wake.load(Ordering::Acquire),
             "a failed repost must leave the wake flag clear"
         );
     }

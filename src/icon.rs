@@ -296,7 +296,7 @@ pub(crate) fn extract_app_icon(aumid: &str, target_size: usize) -> Option<Vec<u8
     // A tripped breaker means the worker is (likely) stuck in a hung shell
     // call: skip submitting — the job would only time out anyway, and the
     // queue must not pile up behind a worker that cannot drain it.
-    if ICON_WORKER_TRIPPED.load(Ordering::SeqCst) {
+    if ICON_WORKER_TRIPPED.load(Ordering::Acquire) {
         return None;
     }
     if !icon_worker_started() {
@@ -342,12 +342,12 @@ pub(crate) fn extract_app_icon(aumid: &str, target_size: usize) -> Option<Vec<u8
             // may be hung), so it neither resets nor adds a strike; the
             // caller simply goes without an icon.
             if outcome.from_worker {
-                ICON_WORKER_STRIKES.store(0, Ordering::SeqCst);
+                ICON_WORKER_STRIKES.store(0, Ordering::Release);
             }
             outcome.icon
         }
         Err(_) => {
-            let strikes = ICON_WORKER_STRIKES.fetch_add(1, Ordering::SeqCst) + 1;
+            let strikes = ICON_WORKER_STRIKES.fetch_add(1, Ordering::AcqRel) + 1;
             if strikes >= ICON_BREAKER_STRIKES
                 && ICON_WORKER_TRIPPED
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
