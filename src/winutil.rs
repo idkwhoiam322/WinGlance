@@ -630,8 +630,7 @@ use std::io::{self, Seek, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
@@ -909,17 +908,20 @@ pub(crate) fn open_pinned_parent(dir: &Path) -> io::Result<DirGuard> {
     Ok(DirGuard { handle })
 }
 
-/// Randomized temp name: pid + sequence + subsecond clock, so no fixed name
-/// can be pre-armed (CREATE_NEW + OPEN_REPARSE_POINT defeat a guessed link
-/// anyway).
-fn temp_name() -> String {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    format!("wg-{:x}-{:x}-{:x}.tmp", std::process::id(), seq, nanos)
+/// Randomized temp name: 32 hex chars from `BCryptGenRandom` (128-bit), so no
+/// fixed name can be pre-armed (CREATE_NEW + OPEN_REPARSE_POINT defeat a
+/// guessed link anyway). On BCrypt failure the save is aborted — no
+/// predictable fallback.
+fn temp_name() -> io::Result<String> {
+    use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
+    let mut buf = [0u8; 16];
+    let status = unsafe { BCryptGenRandom(None, &mut buf, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+    if status.is_err() {
+        log::error!("BCryptGenRandom failed: {:#x}", status.0);
+        return Err(io::Error::other(format!("BCryptGenRandom failed: {:#x}", status.0)));
+    }
+    let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("wg-{hex}.tmp"))
 }
 
 /// Deletes the temp through its own handle (disposition-delete) and closes
@@ -1044,7 +1046,7 @@ pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<(
     let guard = open_pinned_parent(parent)?;
 
     for _ in 0..4 {
-        let tmp_name = temp_name();
+        let tmp_name = temp_name()?;
         let tmp_path = parent.join(&tmp_name);
         let wide = tmp_path
             .as_os_str()

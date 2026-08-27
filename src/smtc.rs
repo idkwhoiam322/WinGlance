@@ -3746,9 +3746,17 @@ fn display_unsafe(c: char) -> bool {
     let code = c as u32;
     (0x0000..=0x001F).contains(&code)
         || (0x007F..=0x009F).contains(&code)
+        || code == 0x00AD
+        || code == 0x061C
+        || code == 0x180E
+        || code == 0x200B
+        || code == 0x200C // keep strip ZWNJ; keep 0x200D ZWJ for emoji
+        || code == 0x200E
+        || code == 0x200F
+        || code == 0xFEFF
         || (0x2028..=0x2029).contains(&code)
         || (0x202A..=0x202E).contains(&code)
-        || (0x2066..=0x2069).contains(&code)
+        || (0x2060..=0x206F).contains(&code)
 }
 
 const MAX_META_CHARS: usize = 256;
