@@ -4,6 +4,8 @@ Research date: 2026-08. Goal: find similar "now playing" overlays for Windows an
 extract ideas for improving WinGlance. Sources: GitHub, the ModernFlyouts wiki and its
 GSMTC support matrix.
 
+> **Note (2026-08):** The scope constraint below originally said no progress bar — that half is superseded (a bounded SMTC progress bar shipped and is documented in `docs/configuration.md`). The pill remains click-through with no transport controls; that half is still current.
+
 ## Apps analyzed
 
 ### ModernFlyouts (4.1k stars, archived Nov 2025)
