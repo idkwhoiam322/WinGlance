@@ -4272,4 +4272,25 @@ mod tests {
             let _ = DeleteDC(hdc);
         }
     }
+
+    #[test]
+    fn ensure_contrast_meets_wcag_for_samples() {
+        // WCAG AA 4.5:1 — spot check that the bisection lift reaches the target
+        // on a dark fill for a handful of primaries, using the memoed path.
+        let bg = [0x12, 0x14, 0x1C, 255];
+        for text in [
+            [255, 255, 255, 255],
+            [144, 144, 144, 255],
+            [240, 110, 155, 255],
+            [100, 100, 100, 255],
+        ] {
+            let out = super::ensure_contrast(text, bg, 4.5);
+            assert!(
+                super::contrast_ratio([out[0], out[1], out[2]], [bg[0], bg[1], bg[2]]) >= 4.5
+                    || out == [255, 255, 255, 255]
+                    || out == [0, 0, 0, 255],
+                "ensure_contrast failed to reach 4.5 for {text:?} on {bg:?} -> {out:?}"
+            );
+        }
+    }
 }
