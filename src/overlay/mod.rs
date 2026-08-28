@@ -15,7 +15,7 @@ use crate::winapi::{delete_object, kill_timer, post_message, select_object, set_
 use crate::winutil::{StateClaim, release_window_state, set_window_state, wide, window_state};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1503,7 +1503,83 @@ impl OverlayState {
         // The queue carries Arc<MediaEvent> so the fan-out to both windows
         // never copies the event; recover the owned event here (zero-copy
         // when this window is the last holder, a clone otherwise).
-        for event in batch.into_iter().map(media_event_into_owned) {
+        // Coalesce ProgressChanged into TrackChanged when the only difference
+        // is seek position: prevents showing a pill at the old position and
+        // then jumping the bar 100-300ms later when the timeline arrives.
+        let owned_batch: Vec<MediaEvent> = batch.into_iter().map(media_event_into_owned).collect();
+        #[allow(clippy::type_complexity)]
+        let progress_by_source: HashMap<String, (Option<f64>, Option<u64>, Option<f64>)> = owned_batch
+            .iter()
+            .filter_map(|ev| {
+                if let MediaEvent::ProgressChanged {
+                    source_app,
+                    position_secs,
+                    duration_secs,
+                    playback_rate,
+                } = ev
+                {
+                    Some((source_app.clone(), (*position_secs, *duration_secs, *playback_rate)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let has_track_for_source: HashSet<String> = owned_batch
+            .iter()
+            .filter_map(|ev| {
+                if let MediaEvent::TrackChanged(t) = ev {
+                    Some(t.source_app.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Last Track per source — only it gets the Progress merge (L3). Rapid
+        // skip `A@5s` + `B@0s` + `Progress@50s` would otherwise give `A` wrong 50s.
+        let mut last_track_idx: HashMap<String, usize> = HashMap::new();
+        for (idx, ev) in owned_batch.iter().enumerate() {
+            if let MediaEvent::TrackChanged(t) = ev {
+                last_track_idx.insert(t.source_app.clone(), idx);
+            }
+        }
+        let mut coalesced: Vec<MediaEvent> = Vec::with_capacity(owned_batch.len());
+        for (idx, ev) in owned_batch.into_iter().enumerate() {
+            match ev {
+                MediaEvent::ProgressChanged { source_app, .. } if has_track_for_source.contains(&source_app) => {
+                    // Merged into the (last) TrackChanged for this source in the same batch
+                    continue;
+                }
+                MediaEvent::TrackChanged(mut track) if progress_by_source.contains_key(&track.source_app) => {
+                    // Only the last Track for this source in the batch gets the merge (L3)
+                    if last_track_idx.get(&track.source_app) == Some(&idx)
+                        && let Some((pos, dur, rate)) = progress_by_source.get(&track.source_app)
+                    {
+                        // Always refresh duration/rate (L2) — pos only when it moved
+                        track.duration_secs = *dur;
+                        track.playback_rate = *rate;
+                        let should_merge_pos = match (track.position_secs, *pos) {
+                            (Some(a), Some(b)) => (a - b).abs() > 0.01,
+                            (None, Some(_)) => true,
+                            _ => false,
+                        };
+                        if should_merge_pos {
+                            track.position_secs = *pos;
+                            track.position_updated_at = Some(Instant::now());
+                        }
+                    }
+                    coalesced.push(MediaEvent::TrackChanged(track));
+                }
+                other => coalesced.push(other),
+            }
+        }
+        // Ensure Progress is applied before pills in the same batch: a
+        // seek+pause arriving together would otherwise show the pill at the old
+        // bar position and jump 16ms later. Ordering keeps first frame correct.
+        let (mut progress_events, mut other_events): (Vec<MediaEvent>, Vec<MediaEvent>) = coalesced
+            .into_iter()
+            .partition(|e| matches!(e, MediaEvent::ProgressChanged { .. }));
+        progress_events.append(&mut other_events);
+        for event in progress_events {
             // Monotonic artwork generation: drop late decodes that reordered
             // behind a newer track of the same source across a worker restart.
             if let MediaEvent::TrackChanged(track) = &event {
