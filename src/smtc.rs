@@ -250,6 +250,23 @@ pub(crate) const SIGNAL_QUEUE_CAP: usize = 256;
 const MAX_TRACKED_SESSIONS: usize = 64;
 const MAX_TRACKED_SOURCES: usize = 32;
 
+/// How long a dedup tombstone (evicted `last_track_per_source` identity) survives
+/// after its source leaves `active`: the recreation predicate consults it to
+/// suppress a stale re-report of the same title/artist that would otherwise
+/// duplicate the pill after a switch-back. 60 s covers the YouTube Music ~60s
+/// recreation + a few switch-backs while keeping tombstones bounded.
+const DEDUP_TOMBSTONE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Metadata-only tombstone: no artwork bytes, only the identity the dedup gate
+/// needs plus the budget-strip flag and insertion time for windowing.
+#[derive(Debug, Clone)]
+struct DedupTombstone {
+    title: String,
+    artist: String,
+    art_was_stripped: bool,
+    when: Instant,
+}
+
 /// Largest single thumbnail the worker will read from an SMTC session, and the
 /// total retained raw-artwork budget across `last_track_per_source`. The
 /// per-source cap keeps one absurd thumbnail from consuming the whole budget;
@@ -438,6 +455,13 @@ struct ListenerState {
     /// title/artist is treated as the same media instead of a cover swap.
     /// Cleared for a source the next time its store keeps the artwork.
     budget_stripped_art: HashSet<String>,
+    /// Metadata-only tombstone for dedup after `last_track_per_source` is pruned:
+    /// when a source's session disappears past `TERMINAL_STOP_GRACE` its artwork
+    /// cache is evicted, but a 60s tombstone (no artwork bytes, only identity +
+    /// stripped flag) keeps the recreation predicate able to suppress a stale
+    /// re-report of the same title/artist that would otherwise duplicate the
+    /// pill after a switch-back. Bounded by `MAX_TRACKED_SOURCES` and a window.
+    dedup_tombstones: HashMap<String, DedupTombstone>,
     /// Last playback state each source app reported, surviving session-key
     /// changes. A recreated session (new key, default state) re-reports the
     /// source's current playback; comparing it against this value tells the
@@ -705,6 +729,7 @@ impl ListenerState {
             terminal_pending: HashMap::new(),
             last_track_per_source: HashMap::new(),
             budget_stripped_art: HashSet::new(),
+            dedup_tombstones: HashMap::new(),
             last_known_playback_per_source: HashMap::new(),
             now_showing,
             // Seed the allow list once; the settings UI keeps it current
@@ -905,6 +930,13 @@ impl ListenerState {
     /// worker restarts, so a push made just before a restart is applied by
     /// the replacement worker.
     fn drain_control(&mut self) -> Result<()> {
+        // Fast-path: a superseded worker that lost the generation race
+        // never contends for the mailbox lock. The inner check remains the
+        // verified-take: the supervisor bumps the generation under this same
+        // lock, so a command pushed for the successor stays in the mailbox.
+        if !self.is_current_generation() {
+            return Ok(());
+        }
         // Verify-take under the mailbox lock: the supervisor bumps the
         // generation under this same lock when it restarts the worker, so a
         // superseded worker cannot drain commands pushed for its successor —
@@ -1360,13 +1392,34 @@ impl ListenerState {
                     // the gate would suppress never pays the force's palette
                     // invalidation and "forced" log first.
                     let shown_source = self.shown_source();
-                    let session_recreation = should_suppress_recreation(
+                    let mut session_recreation = should_suppress_recreation(
                         self.last_track_per_source.get(&merged.source_app),
                         &merged,
                         read_artwork,
                         shown_source.as_deref(),
                         self.budget_stripped_art.contains(&merged.source_app),
                     );
+                    // Tombstone fallback: after `sync_subscriptions` evicts the
+                    // artwork cache (>TERMINAL_STOP_GRACE), a switch-back that
+                    // recreates the session would otherwise duplicate the pill.
+                    // No artwork bytes held, only the window keeps it bounded.
+                    if !session_recreation
+                        && !self.last_track_per_source.contains_key(&merged.source_app)
+                        && let Some(tomb) = self.dedup_tombstones.get(&merged.source_app)
+                    {
+                        let same_identity = tomb.title == merged.title && tomb.artist == merged.artist;
+                        let within_window = Instant::now().duration_since(tomb.when) < DEDUP_TOMBSTONE_WINDOW;
+                        let shown_matches = shown_source.as_deref() == Some(merged.source_app.as_str());
+                        // Same derived rule as the primary gate: stripped
+                        // cache cannot prove cover is same, so art-gained
+                        // re-report of same identity stays suppressed.
+                        let stripped_suppress =
+                            tomb.art_was_stripped && same_identity && read_artwork && merged.artwork.is_some();
+                        let recreation_via_tomb = same_identity && within_window && shown_matches;
+                        if stripped_suppress || recreation_via_tomb {
+                            session_recreation = true;
+                        }
+                    }
                     // Same song, different cover: some sources swap album art
                     // for the same title+artist (e.g. a video vs audio
                     // version). content_differ only compares text fields, so
@@ -1972,6 +2025,17 @@ impl ListenerState {
             .retain(|source, _| active.contains(source) || self.terminal_pending.contains_key(source));
         self.last_emit_at
             .retain(|source, _| active.contains(source) || self.terminal_pending.contains_key(source));
+        // Dedup tombstones survive active prune for a window so a switch-back
+        // after eviction does not duplicate the pill (B-02). No artwork bytes
+        // held, only the bounded window keeps it.
+        {
+            let now = Instant::now();
+            self.dedup_tombstones.retain(|source, tomb| {
+                active.contains(source)
+                    || self.terminal_pending.contains_key(source)
+                    || now.duration_since(tomb.when) < DEDUP_TOMBSTONE_WINDOW
+            });
+        }
         // Churn counts for departed sources are worthless and would otherwise
         // accumulate one deque per distinct source ever seen.
         self.churn.retain(|source, _| active.contains(source));
@@ -2132,6 +2196,23 @@ impl ListenerState {
             }
             let label = track_label(&merged);
             debug!("track emit deferred | reason=stale-art-drop (retry) | {label}");
+        }
+        // Stale-retry identity gate: the retry was scheduled for an earlier
+        // identity (e.g. SongA with no art). If a newer track (SongB) already
+        // emitted after the deferral, the retry must not re-emit the old
+        // identity — that would flash B→A→B. Abort when the last emitted
+        // identity for the source differs from the retry's merged identity.
+        // Same-identity reordered decodes are already dropped by the overlay's
+        // art_generation watermark; the worker relies on that for generation
+        // filtering so this gate stays allocation-free.
+        if let Some(last) = self.last_track_per_source.get(&merged.source_app)
+            && (last.title != merged.title || last.artist != merged.artist)
+        {
+            debug!(
+                "track emit suppressed | reason=stale-retry-identity-superseded | retry={} — {} last={} — {}",
+                merged.title, merged.artist, last.title, last.artist
+            );
+            return Ok(());
         }
         // The retry only surfaces artwork the normal path missed: no artwork
         // found, or a recreated session re-reporting a track whose cover is
@@ -2295,16 +2376,45 @@ impl ListenerState {
     /// identical identity is the same media, not a cover swap (see
     /// `should_suppress_recreation`).
     fn store_last_emitted_track(&mut self, source: String, track: TrackInfo) {
+        // Tombstone captures the identity for dedup after the artwork cache is
+        // pruned (>TERMINAL_STOP_GRACE). No artwork bytes held, only the window
+        // keeps it bounded.
+        let tomb_title = track.title.clone();
+        let tomb_artist = track.artist.clone();
         let kept = store_last_track(
             &mut self.last_track_per_source,
             source.clone(),
             track,
             MAX_RETAINED_ARTWORK_BYTES,
         );
-        if kept {
-            self.budget_stripped_art.remove(&source);
+        let was_stripped = !kept;
+        if was_stripped {
+            self.budget_stripped_art.insert(source.clone());
         } else {
-            self.budget_stripped_art.insert(source);
+            self.budget_stripped_art.remove(&source);
+        }
+        self.dedup_tombstones.insert(
+            source,
+            DedupTombstone {
+                title: tomb_title,
+                artist: tomb_artist,
+                art_was_stripped: was_stripped,
+                when: Instant::now(),
+            },
+        );
+        // Bound tombstones like other source-level caches: keep only active
+        // + terminal + window; excess pruned in sync_subscriptions, and hard
+        // cap to MAX_TRACKED_SOURCES via LRU on overflow.
+        if self.dedup_tombstones.len() > MAX_TRACKED_SOURCES * 2 {
+            // Evict oldest by time
+            if let Some(oldest) = self
+                .dedup_tombstones
+                .iter()
+                .min_by_key(|(_, t)| t.when)
+                .map(|(k, _)| k.clone())
+            {
+                self.dedup_tombstones.remove(&oldest);
+            }
         }
     }
 
