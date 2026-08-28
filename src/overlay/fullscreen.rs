@@ -122,7 +122,7 @@ pub(crate) struct DisplayInfo {
     pub name: String,
 }
 
-/// Cached display enumeration: returns the snapshot if it is less than 1 second
+/// Cached display enumeration: returns the snapshot if it is less than 2 seconds
 /// old, otherwise re-enumerates and stores the result. Eliminates the
 /// per-animation-frame `EnumDisplayMonitors` + `GetMonitorInfoW` calls that
 /// `enumerate_displays()` issues. Invalidated by `invalidate_display_cache()`
@@ -135,7 +135,7 @@ pub(crate) struct DisplayInfo {
 pub(crate) fn enumerate_displays_cached() -> Arc<[DisplayInfo]> {
     let mut guard = DISPLAY_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some((at, displays)) = guard.0.as_ref()
-        && at.elapsed() < Duration::from_secs(1)
+        && at.elapsed() < Duration::from_secs(2)
     {
         return Arc::clone(displays);
     }

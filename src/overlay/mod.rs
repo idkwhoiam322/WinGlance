@@ -1202,9 +1202,28 @@ impl OverlayState {
     /// with.
     fn refresh_fonts(&mut self, raw_dpi: u32) {
         if needs_font_rebuild(self.fonts.dpi(), raw_dpi) {
+            let old_dpi = self.fonts.dpi();
             self.fonts = FontProvider::new(raw_dpi);
             self.reset_scroll();
             self.marquee_strips = [None, None, None, None];
+            // Shrink DIB if it was allocated for a much larger DPI (e.g., 144→96 drag).
+            // Compare against new bound *1.3 with hysteresis to avoid thrash on 96↔120
+            // toggle (1.25x) while still shrinking after a 144→96 visit (1.5x).
+            if let Some(dib) = &self.dib {
+                let (bound_w, bound_h) = crate::overlay::render::backing_upper_bound(&self.config, raw_dpi);
+                if dib.width > bound_w * 13 / 10 || dib.height > bound_h * 13 / 10 {
+                    log::debug!(
+                        "dib shrink {}x{} → {}x{} on dpi {}→{}",
+                        dib.width,
+                        dib.height,
+                        bound_w,
+                        bound_h,
+                        old_dpi,
+                        raw_dpi
+                    );
+                    self.dib = None;
+                }
+            }
         }
     }
 
@@ -4322,7 +4341,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             // A display was added, removed, or reordered (or its resolution
             // changed). Invalidate the display snapshot FIRST: a monitor that
             // was just removed or reordered must not resolve against the
-            // up-to-1-second-old cache, or the pill could be placed onto a
+            // up-to-2-second-old cache, or the pill could be placed onto a
             // stale handle. The per-frame target resolution picks the new
             // layout up on its own; here, a visible pill is moved onto the
             // re-resolved target immediately instead of waiting for the next
