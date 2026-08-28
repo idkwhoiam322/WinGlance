@@ -2375,16 +2375,6 @@ impl ListenerState {
             .is_some_and(|until| *until > Instant::now())
     }
 
-    #[allow(dead_code)]
-    fn session_is_wedged(&self, key: usize) -> bool {
-        self.excluded_sources
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .per_session
-            .get(&key)
-            .is_some_and(|until| *until > Instant::now())
-    }
-
     /// Counts a newly-created content-free session for its source; trips the
     /// cool-down once the threshold is exceeded within the window, logging a
     /// WARN so the log explains the exclusion without manual analysis. Called

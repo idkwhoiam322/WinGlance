@@ -44,7 +44,7 @@ use windows::Win32::Security::{
     DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, IsValidSecurityDescriptor,
     LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
-use windows::Win32::Storage::FileSystem::{FlushFileBuffers, SetFilePointer, WriteFile};
+use windows::Win32::Storage::FileSystem::{FlushFileBuffers, WriteFile};
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, RtlCaptureStackBackTrace,
 };
@@ -101,32 +101,55 @@ static CRASH_LOG_BYTES: AtomicU64 = AtomicU64::new(0);
 /// appends stop (earliest records survive a crash loop). Returns false only
 /// when no handle was retained at startup — callers without a handle fall
 /// back to their own open-append path. Allocation-free, so the vectored
-/// exception handler can call it under heap corruption.
+/// exception handler can call it under heap corruption. The handle is
+/// append-only (`FILE_APPEND_DATA` without `FILE_WRITE_DATA`) so the OS
+/// appends atomically without a `SetFilePointer` dance.
 fn crash_log_write_retained(data: &[u8]) -> bool {
     let raw = CRASH_LOG_HANDLE.load(Ordering::SeqCst);
     if raw == 0 {
         return false;
     }
-    let written_so_far = CRASH_LOG_BYTES.load(Ordering::SeqCst);
-    if written_so_far >= CRASH_LOG_CAP {
-        // Cap reached: drop the record. The earliest records survive,
-        // which is where a loop's signature lives.
-        return true;
-    }
-    let handle = HANDLE(raw as *mut c_void);
-    unsafe {
-        // Position at EOF first so the record is always APPENDED, never
-        // written over earlier records (the handle carries both
-        // FILE_APPEND_DATA and FILE_WRITE_DATA, so the OS does not force
-        // appends automatically).
-        let _ = SetFilePointer(handle, 0, None, windows::Win32::Storage::FileSystem::FILE_END);
-        let mut written: u32 = 0;
-        if WriteFile(handle, Some(data), Some(&mut written as *mut _), None).is_ok() && written > 0 {
-            let _ = FlushFileBuffers(handle);
-            CRASH_LOG_BYTES.store((written_so_far + written as u64).min(CRASH_LOG_CAP), Ordering::SeqCst);
+    // Reserve bytes against the cap before writing: compare-exchange reserves
+    // the exact slice that will be written, so two concurrent writers cannot
+    // both pass a stale `load >= CAP` check and exceed the cap. The reserve
+    // is the truncated slice that fits within the remaining budget; the write
+    // then appends exactly that slice via the atomic-append handle.
+    let mut cur = CRASH_LOG_BYTES.load(Ordering::SeqCst);
+    loop {
+        if cur >= CRASH_LOG_CAP {
+            return true;
+        }
+        let remaining = (CRASH_LOG_CAP - cur) as usize;
+        let to_write_len = data.len().min(remaining);
+        if to_write_len == 0 {
+            return true;
+        }
+        let to_write = &data[..to_write_len];
+        match CRASH_LOG_BYTES.compare_exchange(cur, cur + to_write_len as u64, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => {
+                let handle = HANDLE(raw as *mut c_void);
+                unsafe {
+                    let mut written: u32 = 0;
+                    if WriteFile(handle, Some(to_write), Some(&mut written as *mut _), None).is_ok() && written > 0 {
+                        let _ = FlushFileBuffers(handle);
+                        // If the OS wrote short (partial), reclaim the over-reserved tail
+                        // so the counter matches the file length; over-reserve is
+                        // conservative, under-reserve never exceeds the cap.
+                        if (written as usize) < to_write_len {
+                            let over = (to_write_len - written as usize) as u64;
+                            CRASH_LOG_BYTES.fetch_sub(over, Ordering::SeqCst);
+                        }
+                    } else if to_write_len > 0 {
+                        // Write failed after reservation: roll back the reservation
+                        // so the next record can use the budget.
+                        CRASH_LOG_BYTES.fetch_sub(to_write_len as u64, Ordering::SeqCst);
+                    }
+                }
+                return true;
+            }
+            Err(actual) => cur = actual,
         }
     }
-    true
 }
 
 /// Writes literal bytes into the stack buffer, truncating if the buffer is full.
@@ -273,8 +296,9 @@ fn install_crash_handler(logs_dir: &Path) {
     // identity-validated before the open returned). An empty crash.log may
     // appear at startup — that is the point: it pins the verified object. If
     // the open fails the handler degrades to skipping the crash log, exactly
-    // as it did when the per-crash open failed.
-    if let Ok(file) = crate::winutil::open_verified_file(&logs_dir.join("crash.log"), false) {
+    // as it did when the per-crash open failed. Append-only so NT appends
+    // atomically without a seek.
+    if let Ok(file) = crate::winutil::open_verified_file_append(&logs_dir.join("crash.log")) {
         // Seed the byte counter with the file's existing length, so the cap
         // bounds the whole file and not just this run's additions.
         let existing = file.metadata().map(|meta| meta.len()).unwrap_or(0);
@@ -294,12 +318,23 @@ fn install_crash_handler(logs_dir: &Path) {
 /// without bound.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
-        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+        let raw_payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
             (*s).to_string()
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
             s.clone()
         } else {
             "unknown payload".to_string()
+        };
+        // Bound the payload: a hostile SMTC title (up to MAX_META_CHARS or a
+        // 100 KiB injected string that reached a panic! site) must not make
+        // this single crash.log line unbounded. Truncate to 512 chars with an
+        // omission note so the loop signature survives.
+        let payload = if raw_payload.chars().count() > 512 {
+            let keep: String = raw_payload.chars().take(512).collect();
+            let omitted = raw_payload.chars().count() - 512;
+            format!("{keep}…[truncated {omitted} chars omitted]")
+        } else {
+            raw_payload
         };
         let location = info.location().map(|l| l.to_string()).unwrap_or_default();
         // Wall-clock timestamp so a record correlates with the live log's
@@ -713,7 +748,11 @@ fn acquire_singleton(restart_nonce: Option<&str>) -> anyhow::Result<Option<Singl
                     // a duplicate launch is a user whose tray icon is
                     // missing (failed add, lost Explorer restart) trying to
                     // get the app back — ping it to show its window before
-                    // this duplicate exits.
+                    // this duplicate exits. No balloon from the duplicate
+                    // itself: AGENTS.md forbids pop-ups on plain launch and
+                    // the duplicate has no tray icon to balloon from; the
+                    // ping + silent exit is the contract, squat vs duplicate
+                    // distinction stays in crash.log.
                     ping_running_instance_to_show();
                 } else {
                     report_suspected_squat();
@@ -1812,10 +1851,10 @@ mod tests {
             crash_log.display()
         );
         // The retained handle is a real append-capable handle: appending
-        // through it lands in crash.log.
+        // through it lands in crash.log (NT ignores the file pointer for
+        // append-only handles, so no SetFilePointer dance).
         let handle = HANDLE(raw as *mut c_void);
         unsafe {
-            let _ = SetFilePointer(handle, 0, None, windows::Win32::Storage::FileSystem::FILE_END);
             let mut written: u32 = 0;
             let _ = WriteFile(handle, Some(b"test crash record\n"), Some(&mut written as *mut _), None);
         }

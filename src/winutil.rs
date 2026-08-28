@@ -792,13 +792,6 @@ impl HandleGuard {
     pub(crate) fn get(&self) -> HANDLE {
         self.0
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn into_raw(self) -> HANDLE {
-        let h = self.0;
-        std::mem::forget(self);
-        h
-    }
 }
 
 impl Drop for HandleGuard {
@@ -819,20 +812,6 @@ impl Drop for DcGuard {
         if !self.0.is_invalid() {
             unsafe {
                 let _ = windows::Win32::Graphics::Gdi::DeleteDC(self.0);
-            }
-        }
-    }
-}
-
-/// RAII for a GDI bitmap — `DeleteObject` on drop.
-#[allow(dead_code)]
-pub(crate) struct BitmapGuard(pub(crate) windows::Win32::Graphics::Gdi::HBITMAP);
-
-impl Drop for BitmapGuard {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe {
-                let _ = windows::Win32::Graphics::Gdi::DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.0.0));
             }
         }
     }
@@ -1308,6 +1287,104 @@ pub(crate) fn open_verified_file(path: &Path, truncate: bool) -> io::Result<File
     }
     // SAFETY: `handle` is a real, owned, non-null kernel handle with no other
     // owner; the returned File closes it on drop.
+    Ok(unsafe { File::from_raw_handle(handle.0) })
+}
+
+/// Opens `path` under the verified-write discipline for **append-only**
+/// crash-log use. Unlike `open_verified_file` (which grants both
+/// `FILE_APPEND_DATA` and `FILE_WRITE_DATA` so truncation and seeks work),
+/// this opens with `FILE_APPEND_DATA` only: NT then forces every `WriteFile`
+/// to EOF regardless of the file pointer, making `WriteFile` atomic without
+/// a `SetFilePointer(FILE_END)` dance (which is two syscalls and races under
+/// concurrency). The retained crash-log handle uses this so the vectored
+/// handler and the panic hook can append without interleaving. No truncation
+/// is performed here — the cap is enforced by the retained counter in
+/// `crash_log_write_retained`.
+pub(crate) fn open_verified_file_append(path: &Path) -> io::Result<File> {
+    let parent = path.parent();
+    if let Some(parent) = parent
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _guard = match parent {
+        Some(parent) => Some(open_pinned_parent(parent)?),
+        None => None,
+    };
+    #[cfg(test)]
+    test_hooks::fire_open_probe();
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        create_file(
+            windows::core::PCWSTR(wide.as_ptr()),
+            (FILE_APPEND_DATA | FILE_READ_ATTRIBUTES).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            HANDLE::default(),
+        )
+    }
+    .map_err(to_io)?;
+
+    let reject = |message: &str| {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        Err(io::Error::other(message))
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if let Err(error) = unsafe { GetFileInformationByHandle(handle, &mut info) } {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Err(to_io(error));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return reject(&format!(
+            "refusing to open a reparse point as a log file ({} resolves to a link)",
+            path.display()
+        ));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+        return reject(&format!(
+            "refusing to open a directory as a log file ({})",
+            path.display()
+        ));
+    }
+    let final_path = match final_path_of_raw(handle) {
+        Ok(path) => path,
+        Err(error) => {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err(error);
+        }
+    };
+    let expected_path = match long_extended_path(path) {
+        Ok(path) => path,
+        Err(error) => {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err(error);
+        }
+    };
+    if !paths_equal(&final_path, &expected_path) {
+        return reject(&format!(
+            "open target final path does not match the expected path (resolved to {})",
+            final_path.display()
+        ));
+    }
+
+    if let Some(g) = _guard.as_ref() {
+        let _ = unsafe { FlushFileBuffers(g.handle) };
+    }
     Ok(unsafe { File::from_raw_handle(handle.0) })
 }
 
