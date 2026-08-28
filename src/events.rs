@@ -426,14 +426,21 @@ pub const ARTWORK_DECODE: u32 = 256;
 /// Artwork only ever displays at ~200px, so refusing anything larger than
 /// this defeats decompression bombs (a header can claim huge dimensions
 /// while the compressed payload is tiny) without affecting real album art.
-/// 2048² bounds the transient decode to ~16 MB RGBA; real covers are ≤1024²
-/// anyway. The cap runs on the SMTC worker (decode happens there, once per
-/// emitted track).
+/// 2048² bounds the transient decode to ~16 MB RGBA (once per emitted track
+/// on the worker, not per animation frame; unique covers only via the
+/// generation cache); real covers are ≤1024² anyway. An oversized header
+/// claiming >2048 is rejected via `image::Limits` before allocating the
+/// decoded buffer; the residual 16 MiB for an exactly-2048 hostile image is
+/// accepted as bounded per-track cost. The cap runs on the SMTC worker
+/// (decode happens there, once per emitted track). JPEG/PNG only (`image`
+/// features `jpeg,png`); other formats (incl. WebP) return `None` and the
+/// pill renders a placeholder — no new dep, safe fallback.
 const ART_MAX_DIM: u32 = 2048;
 
 /// Decodes artwork bytes with a hard cap on source dimensions. The `image`
 /// crate's dimension limits are strict, so an oversized image fails here
-/// instead of allocating a huge buffer.
+/// instead of allocating a huge buffer. JPEG/PNG only — WebP/Avif decode
+/// returns `None` (placeholder), intentionally not decoded.
 fn decode_limited(data: &[u8]) -> Option<image::DynamicImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
         .with_guessed_format()

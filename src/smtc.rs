@@ -2802,6 +2802,16 @@ impl ListenerState {
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 self.clear_pending_output();
+                // Channel's queued Arcs will be dropped by the channel
+                // destruct, but the shared counter still holds their artwork
+                // bytes. Reclaim them so a dead forwarder cannot strand the
+                // 64 MiB budget and make every later cover a placeholder.
+                let reclaimed = self.in_flight_art.swap(0, Ordering::Relaxed);
+                if reclaimed != 0 {
+                    warn!(
+                        "in-flight artwork counter reclaimed | reason=channel-disconnected | reclaimed={reclaimed} bytes"
+                    );
+                }
                 debug!("signal dropped | kind=MediaEvent | reason=closed");
             }
         }
@@ -2814,6 +2824,12 @@ impl ListenerState {
     fn flush_output(&mut self) {
         if drain_pending_to_channel(&mut self.pending_output, &self.output) {
             self.clear_pending_output();
+            let reclaimed = self.in_flight_art.swap(0, Ordering::Relaxed);
+            if reclaimed != 0 {
+                warn!(
+                    "in-flight artwork counter reclaimed | reason=channel-disconnected (flush) | reclaimed={reclaimed} bytes"
+                );
+            }
         }
     }
 
