@@ -494,9 +494,10 @@ struct ListenerState {
     /// colors stable for the identity. Cleared when a real cover swap is
     /// detected (the artwork-changed force), so a genuinely new cover
     /// recomputes its palette. Keyed by `palette_cache_key`; bounded by
-    /// `PALETTE_CACHE_CAP` and pruned of departed sources in
-    /// `sync_subscriptions`.
+    /// `PALETTE_CACHE_CAP` (256) with LRU order and pruned of departed sources
+    /// in `sync_subscriptions`.
     palette_per_identity: HashMap<String, Palette>,
+    palette_cache_order: VecDeque<String>,
 }
 
 /// The worker's config values, sampled once by the supervisor at each spawn.
@@ -721,6 +722,7 @@ impl ListenerState {
             )),
             last_emit_at: HashMap::new(),
             palette_per_identity: HashMap::new(),
+            palette_cache_order: VecDeque::new(),
             last_overflow_warn: None,
             heartbeat,
             live_generation,
@@ -1983,6 +1985,10 @@ impl ListenerState {
             let source = palette_key_source(key);
             active.contains(source) || self.terminal_pending.contains_key(source)
         });
+        self.palette_cache_order.retain(|key| {
+            let source = palette_key_source(key);
+            active.contains(source) || self.terminal_pending.contains_key(source)
+        });
     }
 
     /// YouTube Music and similar browser clients can leave several sessions
@@ -2014,7 +2020,12 @@ impl ListenerState {
     /// `ListenerState`, co-located with the prune in `sync_subscriptions`
     /// and the cap in `palette_for_identity`.
     fn palette_for_identity(&mut self, merged: &TrackInfo, decoded_art: Option<&[u8]>) -> Option<Palette> {
-        palette_for_identity(&mut self.palette_per_identity, merged, decoded_art)
+        palette_for_identity(
+            &mut self.palette_per_identity,
+            &mut self.palette_cache_order,
+            merged,
+            decoded_art,
+        )
     }
 
     /// Re-reads a session's artwork on the poll path (read_artwork=true), then
@@ -2823,13 +2834,17 @@ fn coalesce_pending_event(
     if let Some(index) = queue.iter().position(|queued| event_coalesce_key(queued) == key)
         && let Some(superseded) = queue.remove(index)
     {
-        in_flight.fetch_sub(artwork_bytes(&superseded), Ordering::Relaxed);
+        let _ = in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+            Some(x.saturating_sub(artwork_bytes(&superseded)))
+        });
     }
     queue.push_back(event);
     let mut dropped = 0;
     while queue.len() > cap {
         if let Some(oldest) = queue.pop_front() {
-            in_flight.fetch_sub(artwork_bytes(&oldest), Ordering::Relaxed);
+            let _ = in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+                Some(x.saturating_sub(artwork_bytes(&oldest)))
+            });
             if matches!(oldest.as_ref(), MediaEvent::ArtworkBudgetExceeded) {
                 // The queued one-shot budget warning was discarded undelivered
                 // by the over-cap pop: reset its latch so a later strip
@@ -2858,7 +2873,9 @@ fn mailbox_holds_budget_warning(queue: &VecDeque<Arc<MediaEvent>>) -> bool {
 /// output channel disconnects and nothing queued can ever be delivered.
 fn release_pending_bytes(queue: &mut VecDeque<Arc<MediaEvent>>, in_flight: &AtomicU64) {
     while let Some(event) = queue.pop_front() {
-        in_flight.fetch_sub(artwork_bytes(&event), Ordering::Relaxed);
+        let _ = in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+            Some(x.saturating_sub(artwork_bytes(&event)))
+        });
     }
 }
 
@@ -3220,24 +3237,29 @@ fn palette_key_source(key: &str) -> &str {
 
 fn palette_for_identity(
     cache: &mut HashMap<String, Palette>,
+    order: &mut VecDeque<String>,
     merged: &TrackInfo,
     decoded_art: Option<&[u8]>,
 ) -> Option<Palette> {
     let key = palette_cache_key(&merged.source_app, &merged.title, &merged.artist);
-    if let Some(palette) = cache.get(&key) {
-        return Some(*palette);
+    if let Some(palette) = cache.get(&key).copied() {
+        // Move to back for LRU
+        if let Some(pos) = order.iter().position(|k| k == &key) {
+            order.remove(pos);
+            order.push_back(key.clone());
+        }
+        return Some(palette);
     }
     let palette = decoded_art
         .and_then(crate::overlay::pm_bgra_to_rgba)
         .and_then(|rgba| palette_from_rgba(&rgba));
     if let Some(palette) = palette {
-        if cache.len() >= PALETTE_CACHE_CAP {
-            // Dropping an arbitrary entry is fine: palettes are recomputable
-            // from `decoded_art` on the next miss.
-            if let Some(stale) = cache.keys().next().cloned() {
-                cache.remove(&stale);
-            }
+        if cache.len() >= PALETTE_CACHE_CAP
+            && let Some(old) = order.pop_front()
+        {
+            cache.remove(&old);
         }
+        order.push_back(key.clone());
         cache.insert(key, palette);
     }
     palette
@@ -5663,6 +5685,7 @@ mod tests {
     #[test]
     fn palette_for_identity_reuses_the_cached_palette_across_byte_changes() {
         let mut cache = HashMap::new();
+        let mut order = VecDeque::new();
         // A plausible solid RGBA cover (all white) at the palette grid size:
         // derives a monochrome palette.
         let cover: Vec<u8> = vec![255u8; 16 * 16 * 4];
@@ -5672,14 +5695,14 @@ mod tests {
             source_app: "youtube-music".into(),
             ..TrackInfo::default()
         };
-        let palette =
-            palette_for_identity(&mut cache, &first, Some(&cover)).expect("a valid cover must yield a palette");
+        let palette = palette_for_identity(&mut cache, &mut order, &first, Some(&cover))
+            .expect("a valid cover must yield a palette");
         assert_eq!(cache.len(), 1);
         // The same identity re-encoded (different bytes, same cover): the
         // cache serves the original palette instead of recomputing — this is
         // the guarantee that keeps the pill's accent stable.
         let reencoded: Vec<u8> = vec![254u8; 16 * 16 * 4];
-        let again = palette_for_identity(&mut cache, &first, Some(&reencoded));
+        let again = palette_for_identity(&mut cache, &mut order, &first, Some(&reencoded));
         assert_eq!(again, Some(palette));
         assert_eq!(cache.len(), 1, "a re-encode must not replace the cached palette");
         // A different identity derives and caches its own palette.
@@ -5689,26 +5712,30 @@ mod tests {
             source_app: "youtube-music".into(),
             ..TrackInfo::default()
         };
-        let other_palette = palette_for_identity(&mut cache, &other, Some(&cover));
+        let other_palette = palette_for_identity(&mut cache, &mut order, &other, Some(&cover));
         assert!(other_palette.is_some());
         assert_eq!(cache.len(), 2);
         // A cached identity without fresh decoded art still serves its
         // palette; an identity that never had art stays None and caches
         // nothing.
-        assert_eq!(palette_for_identity(&mut cache, &first, None), Some(palette));
+        assert_eq!(
+            palette_for_identity(&mut cache, &mut order, &first, None),
+            Some(palette)
+        );
         let artless = TrackInfo {
             title: "Artless".into(),
             artist: "Artist".into(),
             source_app: "youtube-music".into(),
             ..TrackInfo::default()
         };
-        assert_eq!(palette_for_identity(&mut cache, &artless, None), None);
+        assert_eq!(palette_for_identity(&mut cache, &mut order, &artless, None), None);
         assert_eq!(cache.len(), 2);
     }
 
     #[test]
     fn palette_cache_is_capped_at_the_constant() {
         let mut cache = HashMap::new();
+        let mut order = VecDeque::new();
         let cover: Vec<u8> = vec![255u8; 16 * 16 * 4];
         // More distinct identities than the cap, from one long-lived source:
         // the bound must hold and every miss must still derive a palette.
@@ -5719,7 +5746,7 @@ mod tests {
                 artist: "Artist".into(),
                 ..TrackInfo::default()
             };
-            let palette = palette_for_identity(&mut cache, &track, Some(&cover));
+            let palette = palette_for_identity(&mut cache, &mut order, &track, Some(&cover));
             assert!(palette.is_some(), "identity {i} must derive a palette");
         }
         assert_eq!(cache.len(), PALETTE_CACHE_CAP);
@@ -5738,6 +5765,7 @@ mod tests {
     #[test]
     fn palette_cache_prunes_departed_sources_like_sync_subscriptions() {
         let mut cache = HashMap::new();
+        let mut order = VecDeque::new();
         let cover: Vec<u8> = vec![255u8; 16 * 16 * 4];
         let track = |source: &str, title: &str| TrackInfo {
             source_app: source.into(),
@@ -5746,7 +5774,7 @@ mod tests {
             ..TrackInfo::default()
         };
         for (source, title) in [("alpha", "A"), ("alpha", "B"), ("zeta", "Z")] {
-            let _ = palette_for_identity(&mut cache, &track(source, title), Some(&cover));
+            let _ = palette_for_identity(&mut cache, &mut order, &track(source, title), Some(&cover));
         }
         assert_eq!(cache.len(), 3);
         // The exact retain the production sync uses: departed source gone,

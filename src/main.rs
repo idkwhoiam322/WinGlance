@@ -1290,6 +1290,8 @@ fn main() -> Result<()> {
                         if reset_budget_warning_on_stall(&supervisor_budget_warned) {
                             warn!("budget-warning latch reset | reason=stalled-worker-leak");
                         }
+                        supervisor_art.store(0, Ordering::Relaxed);
+                        warn!("in-flight-art counter reset | reason=stalled-worker-leak");
                         let delay = worker_restart_delay(consecutive_restarts);
                         error!("SMTC worker stalled; restarting it in {}s", delay.as_secs());
                         sleep_interruptible(delay, &supervisor_shutdown);
@@ -1624,7 +1626,9 @@ fn spawn_event_forwarder(
                         // window queues share the same `Arc` allocations and
                         // are separately count-capped, so freeing at the pop
                         // keeps the counter at the distinct live allocations.
-                        in_flight_art.fetch_sub(artwork_bytes(&event), Ordering::Relaxed);
+                        let _ = in_flight_art.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+                            Some(x.saturating_sub(artwork_bytes(&event)))
+                        });
                         event
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
