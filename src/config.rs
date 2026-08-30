@@ -623,13 +623,24 @@ impl Config {
             let mut config = Config::default();
             config.normalize();
             let bytes = config.serialized()?;
-            Self::write_temp_and_rename(config_path, &bytes)?;
-            config.revision = Some(ConfigRevision::captured(bytes));
-            // The creating launch is the first run: the window layer shows
-            // the tracking window once (see `first_run`).
-            config.first_run = true;
-            info!("no config at {config_path:?}; wrote defaults (first run)");
-            return Ok(config);
+            match crate::winutil::atomic_create_new_file(config_path, &bytes) {
+                Ok(()) => {
+                    config.revision = Some(ConfigRevision::captured(bytes));
+                    // The creating launch is the first run: the window layer shows
+                    // the tracking window once (see `first_run`).
+                    config.first_run = true;
+                    info!("no config at {config_path:?}; wrote defaults (first run)");
+                    return Ok(config);
+                }
+                Err(error) if error.raw_os_error() == Some(183) || error.raw_os_error() == Some(80) => {
+                    // Lost the first-run race — another process created the file
+                    // between `exists()` and the atomic create. Fall through to
+                    // normal load path and treat it as an existing file (not
+                    // first_run, revision captured from existing bytes).
+                    info!("first-run create raced; loading existing config at {config_path:?}");
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         if Self::exceeds_size_bound(config_path) {
             return Ok(Self::defaults_in_memory(&format!(
@@ -702,6 +713,22 @@ impl Config {
                 "config.toml is not persistable this run (it was invalid or unreadable and was left untouched); settings apply until the app exits"
             );
             return Ok(SaveOutcome::PersistenceDisabled);
+        };
+        // Hold the parent pinned across verify→write so a reparse-point swap
+        // of the parent between the revision check and the rename cannot
+        // redirect the write. The guard is kept alive until after
+        // `write_temp_and_rename` returns.
+        let _save_guard = match config_path.parent() {
+            Some(parent) if parent.exists() => match crate::winutil::open_pinned_parent(parent) {
+                Ok(g) => Some(g),
+                Err(error) => {
+                    warn!(
+                        "config.toml parent is not a verified directory ({error}); keeping the change in memory and NOT saving"
+                    );
+                    return Ok(SaveOutcome::Conflict);
+                }
+            },
+            _ => None,
         };
         // Re-read the current file (bounded, retried like load). A re-read
         // failure means the file could not be verified — treat it as a

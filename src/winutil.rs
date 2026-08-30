@@ -887,10 +887,12 @@ pub(crate) fn open_pinned_parent(dir: &Path) -> io::Result<DirGuard> {
     Ok(DirGuard { handle })
 }
 
-/// Randomized temp name: 32 hex chars from `BCryptGenRandom` (128-bit), so no
-/// fixed name can be pre-armed (CREATE_NEW + OPEN_REPARSE_POINT defeat a
-/// guessed link anyway). On BCrypt failure the save is aborted — no
-/// predictable fallback.
+/// Randomized temp name: `wg-{pid:x}-{32hex}.tmp` from `BCryptGenRandom`
+/// (128-bit). No fixed name can be pre-armed (CREATE_NEW + OPEN_REPARSE_POINT
+/// defeat a guessed link anyway). The pid prefix lets `sweep_orphan_temps`
+/// keep a live in-flight temp during a restart handoff (`main` sweeps while
+/// old instance still holds its handle). On BCrypt failure the save is aborted
+/// — no predictable fallback.
 fn temp_name() -> io::Result<String> {
     use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
     let mut buf = [0u8; 16];
@@ -900,7 +902,7 @@ fn temp_name() -> io::Result<String> {
         return Err(io::Error::other(format!("BCryptGenRandom failed: {:#x}", status.0)));
     }
     let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(format!("wg-{hex}.tmp"))
+    Ok(format!("wg-{:x}-{hex}.tmp", std::process::id()))
 }
 
 /// Deletes the temp through its own handle (disposition-delete) and closes
@@ -1044,7 +1046,7 @@ pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<(
             )
         } {
             Ok(handle) => handle,
-            Err(error) if is_win32_code(&error, 183) => continue, // ERROR_ALREADY_EXISTS: name collision, retry
+            Err(error) if is_win32_code(&error, 183) || is_win32_code(&error, 80) => continue, // ERROR_ALREADY_EXISTS / FILE_EXISTS: name collision, retry
             Err(error) => return Err(to_io(error)),
         };
 
@@ -1163,6 +1165,149 @@ pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<(
         if let Err(error) = unsafe { FlushFileBuffers(guard.handle) } {
             log::warn!(
                 "config save: post-commit directory flush failed (data is written): {}",
+                to_io(error)
+            );
+        }
+        return Ok(());
+    }
+    Err(io::Error::other("could not create a unique temp file after 4 attempts"))
+}
+
+/// Atomically creates `target` with `content` **only if it does not already
+/// exist** — `MoveFileExW` without `REPLACE_EXISTING`, so a concurrent creator
+/// wins and this returns `AlreadyExists`/`FileExists` instead of overwriting.
+/// Used for first-run `config.toml` creation (`F-02`).
+pub(crate) fn atomic_create_new_file(target: &Path, content: &[u8]) -> io::Result<()> {
+    let name = target
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no file name"))?;
+    let name_units = name.encode_wide().collect::<Vec<u16>>();
+    if name_units.is_empty()
+        || name_units.len() > 255
+        || name_units.contains(&0)
+        || name_units.contains(&(b'\\' as u16))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target name is not a single path component",
+        ));
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no parent directory"))?;
+    if !parent.exists() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let guard = open_pinned_parent(parent)?;
+
+    for _ in 0..4 {
+        let tmp_name = temp_name()?;
+        let tmp_path = parent.join(&tmp_name);
+        let wide = tmp_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let temp_handle = match unsafe {
+            create_file(
+                windows::core::PCWSTR(wide.as_ptr()),
+                FILE_GENERIC_WRITE.0 | DELETE_ACCESS,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                HANDLE::default(),
+            )
+        } {
+            Ok(handle) => handle,
+            Err(error) if is_win32_code(&error, 183) || is_win32_code(&error, 80) => continue,
+            Err(error) => return Err(to_io(error)),
+        };
+
+        let temp_expected = match long_extended_path(&tmp_path) {
+            Ok(path) => path,
+            Err(error) => {
+                delete_temp(temp_handle);
+                return Err(error);
+            }
+        };
+        let fail = move |message: &str, handle: HANDLE| {
+            delete_temp(handle);
+            Err(io::Error::other(message))
+        };
+        let temp_final = match final_path_of_raw(temp_handle) {
+            Ok(path) => path,
+            Err(error) => {
+                delete_temp(temp_handle);
+                return Err(error);
+            }
+        };
+        if !paths_equal(&temp_final, &temp_expected) {
+            return fail(
+                &format!(
+                    "temp file resolved outside the verified parent ({} vs {})",
+                    temp_final.display(),
+                    temp_expected.display()
+                ),
+                temp_handle,
+            );
+        }
+
+        if let Err(error) = unsafe { WriteFile(temp_handle, Some(content), None, None) } {
+            delete_temp(temp_handle);
+            return Err(to_io(error));
+        }
+        if let Err(error) = unsafe { FlushFileBuffers(temp_handle) } {
+            delete_temp(temp_handle);
+            return Err(to_io(error));
+        }
+
+        let _ = unsafe { CloseHandle(temp_handle) };
+        let src_units = extended_path(&tmp_path)
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        let dst_units = extended_path(target)
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        const BACKOFF_MS: [u64; 3] = [2, 16, 64];
+        let mut move_err: Option<io::Error> = None;
+        for attempt in 0..BACKOFF_MS.len() + 1 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt - 1]));
+            }
+            match unsafe {
+                MoveFileExW(
+                    windows::core::PCWSTR(src_units.as_ptr()),
+                    windows::core::PCWSTR(dst_units.as_ptr()),
+                    MOVEFILE_WRITE_THROUGH,
+                )
+            } {
+                Ok(()) => {
+                    move_err = None;
+                    break;
+                }
+                Err(error) => {
+                    if is_win32_code(&error, 183) || is_win32_code(&error, 80) {
+                        // Target already exists — first-run lost the race, do not overwrite.
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err(io::Error::from_raw_os_error(183)); // ERROR_ALREADY_EXISTS
+                    }
+                    move_err = Some(to_io(error));
+                }
+            }
+        }
+        if let Some(error) = move_err {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(io::Error::other(format!("rename commit failed: {error}")));
+        }
+
+        if let Err(error) = unsafe { FlushFileBuffers(guard.handle) } {
+            log::warn!(
+                "config create: post-commit directory flush failed (data is written): {}",
                 to_io(error)
             );
         }
