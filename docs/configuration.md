@@ -11,17 +11,7 @@ the file itself is not rewritten (see `docs/architecture.md`).
 > editing the file by hand. Settings changed from the tray menu or the
 > Settings pane are applied immediately and persisted.
 
-> **Strict whole-file parsing.** Every documented range above is clamped
-> with a warning per field. A file that cannot be *parsed*, though — a
-> value whose type doesn't match its field, a color component outside
-> 0–255, a wrong array length, or an integer too large for the field — is
-> rejected as a whole: defaults apply for that run, the file is left
-> untouched, and persistence is disabled (the Settings pane shows a banner)
-> until the file is fixed. Every rejection is logged at startup. A
-> misspelled key is not a parse error: it is an unknown key (preserved and
-> warned about, see below). Files larger than 1 MiB are likewise rejected
-> without being read, and a file that grows past that bound is treated as
-> an external edit: settings changes stay in memory and refuse to save.
+> **Staged parsing — syntax errors vs. field errors.** Every documented range above is clamped with a warning per field. Files larger than 1 MiB are rejected without being read (and a file that grows past that bound is treated as an external edit: settings changes stay in memory and refuse to save). A file that cannot be *parsed* — truncated TOML, an unclosed string or table, `overlay = "not-a-table"` — is rejected as a whole: defaults apply for that run, the file is left untouched, and persistence is disabled (the Settings pane shows a banner). A file that *parses* but holds a single bad value inside one section — e.g. `layout = "bogus"` or `duration_ms = "fast"` under `[overlay]` — only resets that section to its defaults: sibling sections (`[behavior]`, `[appearance]`) and top-level unknown keys survive, and the file remains persistable. The bad section is `warn!`ed per section (`config [overlay] invalid …; using defaults for [overlay]`) and is corrected to the canonical defaults on the next successful save. A misspelled key is not a parse error: it is an unknown key (preserved and warned about, see below). Every rejection or staged fallback is logged at startup. Within a single section the fallback is atomic — one bad field resets the whole section, not just that field.
 
 > **Saves are canonical.** A settings change rewrites the file in canonical
 > form: unknown fields and their values are preserved (each is warned about

@@ -661,15 +661,48 @@ impl Config {
                 "exceeds the {MAX_CONFIG_BYTES} byte size bound"
             )));
         }
-        match toml::from_str::<Config>(&content) {
-            Ok(mut config) => {
+        // Staged parse: top-level syntax errors still fall back to
+        // `defaults_in_memory` (invalid TOML), but a single bad enum/value
+        // inside one section only resets that section — sibling sections and
+        // top-level unknowns survive with a `warn!` per failed section.
+        #[derive(Deserialize)]
+        struct RawConfig {
+            overlay: Option<toml::Table>,
+            behavior: Option<toml::Table>,
+            appearance: Option<toml::Table>,
+            #[serde(flatten)]
+            unknown: toml::Table,
+        }
+        match toml::from_str::<RawConfig>(&content) {
+            Err(error) => Ok(Self::defaults_in_memory(&format!("is not valid TOML ({error})"))),
+            Ok(raw) => {
+                let mut config = Config {
+                    unknown: raw.unknown,
+                    ..Default::default()
+                };
+                if let Some(tbl) = raw.overlay {
+                    match tbl.try_into::<OverlayConfig>() {
+                        Ok(o) => config.overlay = o,
+                        Err(e) => warn!("config [overlay] invalid ({}); using defaults for [overlay]", e),
+                    }
+                }
+                if let Some(tbl) = raw.behavior {
+                    match tbl.try_into::<BehaviorConfig>() {
+                        Ok(b) => config.behavior = b,
+                        Err(e) => warn!("config [behavior] invalid ({}); using defaults for [behavior]", e),
+                    }
+                }
+                if let Some(tbl) = raw.appearance {
+                    match tbl.try_into::<AppearanceConfig>() {
+                        Ok(a) => config.appearance = a,
+                        Err(e) => warn!("config [appearance] invalid ({}); using defaults for [appearance]", e),
+                    }
+                }
                 // The revision snapshots the exact bytes this load was based
                 // on, so `save_checked` can prove the file was not edited
                 // between now and the next save.
                 config.revision = Some(ConfigRevision::captured(content.into_bytes()));
-                // Report anything normalize() clamped: a value the user's
-                // config.toml declares must never differ from the value in
-                // effect without a visible log line.
+                // Report anything normalize() clamped.
                 let before = config.clone();
                 config.normalize();
                 for change in Self::normalized_changes(&before, &config) {
@@ -678,7 +711,6 @@ impl Config {
                 debug!("config loaded from {config_path:?}");
                 Ok(config)
             }
-            Err(error) => Ok(Self::defaults_in_memory(&format!("is not valid TOML ({error})"))),
         }
     }
 
