@@ -247,25 +247,23 @@ const LEDGER_STATE_CAP: usize = 64;
 /// Per-line marquee state for the pill's text rows. The offset advances on the
 /// 16ms animation tick; a short hold before the first movement reads better.
 #[derive(Default, Clone, Copy)]
+#[repr(C)]
 struct LineScroll {
-    offset: f32,
     started_at: Option<Instant>,
-    /// Whether the last rendered frame overflowed this line (text wider than
-    /// its band). The animation tick only repaints a fully-shown pill while at
-    /// least one line is scrolling; static text needs no per-frame redraw.
-    scrolling: bool,
-    /// Cached natural (DT_CALCRECT) width of this row's current text, valid
-    /// only while `measured_font` is the font the row draws with AND
-    /// `measured_text` is the hash of the text the row draws — the same
-    /// keying discipline as the marquee strip. Spares every animation tick a
-    /// GDI measure pass for unchanged text; reset with the content.
-    measured_w: i32,
     measured_font: HFONT,
     /// Hash of the text the cached width was measured for (see above): a
     /// content change that misses `reset_scroll` must not inherit the old
     /// measurement, and GDI may recycle font handle values, so the font
     /// handle alone is not a complete key.
     measured_text: u64,
+
+    offset: f32,
+    /// Cached natural (DT_CALCRECT) width of this row's current text, valid
+    /// only while `measured_font` is the font the row draws with AND
+    /// `measured_text` is the hash of the text the row draws — the same
+    /// keying discipline as the marquee strip. Spares every animation tick a
+    /// GDI measure pass for unchanged text; reset with the content.
+    measured_w: i32,
     /// The integer pixel offset this line was last rendered at. The tick
     /// renders a scrolling line only when its integer offset moved — the
     /// marquee advances 40 logical px/s, so roughly a third of the 60 Hz
@@ -273,6 +271,10 @@ struct LineScroll {
     /// `i32::MIN` forces the next tick to render (set on a scroll-state
     /// flip, where the background must be rebuilt or re-composited once).
     rendered_offset: i32,
+    /// Whether the last rendered frame overflowed this line (text wider than
+    /// its band). The animation tick only repaints a fully-shown pill while at
+    /// least one line is scrolling; static text needs no per-frame redraw.
+    scrolling: bool,
 }
 
 /// Bundles the scroll state of one line with the cached raster of that line,
@@ -610,25 +612,10 @@ mod pure_stage_tests {
     }
 }
 
+#[repr(C)]
 struct OverlayState {
+    // Animation/render fields are physically first: repr(C) makes this source order the Win64 layout contract.
     hwnd: HWND,
-    config: Config,
-    queue: EventQueue,
-    /// Notifications waiting to be shown, in arrival order. Distinct events
-    /// from different sources show one after another instead of clobbering
-    /// each other; the pill on screen is never replaced early. A newer event
-    /// for a source already waiting supersedes the older one, so a burst of
-    /// same-source events (play/pause spam) collapses to the latest.
-    pending: VecDeque<MediaEvent>,
-    enabled: bool,
-    content: Option<MediaEvent>,
-    /// The identity-stable palette the SMTC worker attached to the current
-    /// track, if any. `palette` is derived from it (when present) instead of
-    /// a fresh per-frame derivation, so a source that re-encodes its
-    /// thumbnail between reads — different bytes, same cover — can never
-    /// shift the pill's accent colors mid-session.
-    content_palette: Option<Palette>,
-    last_track: Option<TrackInfo>,
     phase: Phase,
     dismiss_at: Option<Instant>,
     /// When the cursor hovers over the pill, the dismiss deadline is
@@ -642,13 +629,6 @@ struct OverlayState {
     /// expanded pill after the animation; `hide`, a fresh show, and a layout
     /// push clear it.
     hover_expand: Option<HoverExpand>,
-    /// Whether the pill already expanded via hover during this showing. With
-    /// `dismiss_on_hover` enabled, the first hover over the compact pill
-    /// expands and later hovers dismiss instead (the second hover
-    /// dismisses); while dismiss-on-hover is off the flag is ignored and
-    /// every hover re-expands. Reset on every show, so each notification
-    /// gets its own expansion.
-    hover_expanded_once: bool,
     /// When the cursor left the pill, while the leave is still within the
     /// debounce window (see `LEAVE_DEBOUNCE`). A leave is only acted on once
     /// it has held for the window, so boundary jitter cannot cancel a morph
@@ -657,19 +637,46 @@ struct OverlayState {
     /// The in-place content cross-fade, while one is in flight (see
     /// `ContentFade`).
     content_fade: Option<ContentFade>,
-    /// Dimensions of the last rendered frame — the cross-fade snapshots the
-    /// frame buffer at exactly this size.
-    last_frame_w: usize,
-    last_frame_h: usize,
-    /// Geometry of the last layered-window upload. `UpdateLayeredWindow`
-    /// already applies the position and size, so when nothing moved the
-    /// follow-up topmost reassert runs with `SWP_NOMOVE | SWP_NOSIZE` and
-    /// skips the redundant geometry work. `i32::MIN` sentinels force the
-    /// first frame after creation to apply full geometry.
-    last_upload_x: i32,
-    last_upload_y: i32,
-    last_upload_w: i32,
-    last_upload_h: i32,
+    content: Option<MediaEvent>,
+    /// The identity-stable palette the SMTC worker attached to the current
+    /// track, if any. `palette` is derived from it (when present) instead of
+    /// a fresh per-frame derivation, so a source that re-encodes its
+    /// thumbnail between reads — different bytes, same cover — can never
+    /// shift the pill's accent colors mid-session.
+    content_palette: Option<Palette>,
+    /// The layout actually applied to the current pill. `Auto` is already
+    /// resolved to Expanded/Compact from the foreground (see
+    /// `refresh_layout`/`tick_layout_check`), so every consumer just reads
+    /// this.
+    layout: LayoutMode,
+    /// When the running sweep anchored to `orbit_base`.
+    orbit_started_at: Instant,
+    /// (anchor instant, anchor position) the estimate integrates from.
+    progress_anchor: Option<(Instant, f64)>,
+    /// Timestamp of the previous animation tick, for time-based marquee
+    /// scrolling.
+    last_tick: Instant,
+    /// Last time the topmost z-order was re-asserted. While the pill is fully
+    /// shown (static), the re-assert is throttled to 1 Hz instead of running
+    /// on every animation tick.
+    last_reassert: Option<Instant>,
+    /// Cached monitor refresh period (ms), re-sampled at most once per
+    /// second. `sync_anim_timer` runs on every animation tick; the underlying
+    /// DWM/display-mode queries are far more expensive than the tick itself.
+    period_cache: Option<(Instant, u32)>,
+    /// Estimated live playback position (seconds), advanced each animation
+    /// tick from `progress_anchor`. None when the source reports no position.
+    estimated_position_secs: Option<f64>,
+    /// Total duration (seconds) of the current track. None when not reported.
+    progress_duration_secs: Option<u64>,
+    /// Playback rate for position estimation. None when not reported.
+    progress_rate: Option<f64>,
+    /// Last SMTC-reported position seen by `apply_progress`. Used to detect
+    /// stale samples: when the OS has not advanced the position since the last
+    /// read (apps that refresh SMTC position every few seconds, not every poll),
+    /// the bar must keep interpolating instead of snapping back to the stale
+    /// value. A genuinely fresh backward jump (seek / new track) is still adopted.
+    last_progress_position_secs: Option<f64>,
     /// The aura comet sweep's displayed angle in radians (atan2 convention:
     /// 0 = right of the pill center, positive = clockwise on screen),
     /// derived from the wall-clock anchor below while `orbiting`. Frozen
@@ -683,20 +690,101 @@ struct OverlayState {
     /// the position stays true to wall clock even when ticks are delayed or
     /// coalesced instead of accumulating clamped deltas.
     orbit_base: f32,
-    /// When the running sweep anchored to `orbit_base`.
-    orbit_started_at: Instant,
+    /// Bar fraction painted on the last frame, so a settled pill can skip a
+    /// static-tick repaint when the bar did not move by at least a pixel.
+    last_bar_fraction: Option<f32>,
+    /// Dimensions of the last rendered frame — the cross-fade snapshots the
+    /// frame buffer at exactly this size.
+    last_frame_w: usize,
+    last_frame_h: usize,
+    /// Bumped whenever `content` is replaced or cleared, so the chrome cache is
+    /// invalidated across content swaps. Palette/art travel with the content, so
+    /// this also covers cover changes.
+    content_rev: u64,
+    /// Geometry of the last layered-window upload. `UpdateLayeredWindow`
+    /// already applies the position and size, so when nothing moved the
+    /// follow-up topmost reassert runs with `SWP_NOMOVE | SWP_NOSIZE` and
+    /// skips the redundant geometry work. `i32::MIN` sentinels force the
+    /// first frame after creation to apply full geometry.
+    last_upload_x: i32,
+    last_upload_y: i32,
+    last_upload_w: i32,
+    last_upload_h: i32,
+    /// Animation tick period in ms, capped to `config.overlay.max_tick_hz`
+    /// (default 60 Hz). Re-detected on every show; the timer is recreated only
+    /// when it changes.
+    tick_period: u32,
+    /// Whether the pill already expanded via hover during this showing. With
+    /// `dismiss_on_hover` enabled, the first hover over the compact pill
+    /// expands and later hovers dismiss instead (the second hover
+    /// dismisses); while dismiss-on-hover is off the flag is ignored and
+    /// every hover re-expands. Reset on every show, so each notification
+    /// gets its own expansion.
+    hover_expanded_once: bool,
     /// Whether the previous tick saw the sweep live; a false→true edge
     /// re-anchors the base at the last displayed angle.
     orbit_was_on: bool,
+    /// Whether the current content is playing (drives freeze/resume).
+    progress_playing: bool,
+    /// The layer the current render pass should draw (set by `render_layered`
+    /// before the text draw). Read by the text-drawing helpers so the marquee
+    /// `Foreground` pass only re-composites the scrolling rows.
+    render_layer: render::RenderLayer,
+    /// Whether the persistent-compact pill is currently in the faded (idle)
+    /// state. The alpha drops to the idle level (0.25 * 255 = 64) after the
+    /// dismiss timeout. Reset on hover, track change, or playback change.
+    persistent_faded: bool,
+    /// When true (PersistentCompact + hide_for_auto_compact_sources, foreground
+    /// is fullscreen/listed), the pill collapses to fully hidden on its normal
+    /// dismiss instead of fading to idle opacity. Set in `show_with_duration`
+    /// and re-evaluated by `on_foreground_change` on every foreground switch;
+    /// a flip to fullscreen while the pill is still inside its display window
+    /// defers the collapse to that deadline instead of hiding instantly.
+    persistent_collapse_on_dismiss: bool,
+    /// Cached result of `is_cursor_over_pill()` from the last animation tick,
+    /// so `held_expanded()` (called from `receive_events` between ticks) can
+    /// skip the display enumeration the cursor poll triggers. Updated every
+    /// tick; stale by at most one tick period (250 ms static, ~16 ms animated).
+    last_cursor_over_pill: bool,
+    /// Per-row marquee state for the four track lines (title/subtitle/meta/app).
+    scroll: [LineScroll; 4],
+    /// Per-row cached marquee rasters (parallel to `scroll`), see `MarqueeStrip`.
+    marquee_strips: [Option<MarqueeStrip>; 4],
+    /// Cached DIB (DC + bitmap) reused across frames of the same size.
+    dib: Option<DibCache>,
+    /// Tightly-packed per-frame scratch buffer (stride == the requested
+    /// frame width), reused and grown but never shrunk across frames. The
+    /// real DIB backing buffer (`dib`) is allocated to a generous upper
+    /// bound and reused across animation frames, so its scanline stride
+    /// does not match the requested per-frame size; `draw_pixels` and
+    /// `draw_text_pixels` render into this buffer instead, at the stride
+    /// they have always assumed, and `render_layered` blits the result into
+    /// the real DIB at its real stride right before the GDI call. See
+    /// `render_layered` for why: drawing straight into the oversized DIB at
+    /// the requested width as its stride was tried once and produced a
+    /// torn image, because the two strides only match when the pill is at
+    /// its fully expanded size.
+    frame_scratch: Vec<u8>,
+    /// Retained static-background raster (chrome + non-scrolling text) for the
+    /// current content, used to skip the expensive per-frame chrome re-render
+    /// while a marquee line scrolls. `None` until the first background pass;
+    /// invalidated by any `ChromeKey` change (see `chrome_cache_key`).
+    chrome_cache: Option<ChromeCache>,
+    // Colder control, discovery, accessibility, and retained-cache state follows.
+    config: Config,
+    queue: EventQueue,
+    /// Notifications waiting to be shown, in arrival order. Distinct events
+    /// from different sources show one after another instead of clobbering
+    /// each other; the pill on screen is never replaced early. A newer event
+    /// for a source already waiting supersedes the older one, so a burst of
+    /// same-source events (play/pause spam) collapses to the latest.
+    pending: VecDeque<MediaEvent>,
+    enabled: bool,
+    last_track: Option<TrackInfo>,
     position: OverlayPos,
     /// The compact pill's resolved placement (independent of `position` only
     /// while `compact_position_separate` is on; see `active_pos`).
     compact_position: OverlayPos,
-    /// The layout actually applied to the current pill. `Auto` is already
-    /// resolved to Expanded/Compact from the foreground (see
-    /// `refresh_layout`/`tick_layout_check`), so every consumer just reads
-    /// this.
-    layout: LayoutMode,
     /// Foreground HWND the cached executable identity (`layout_fg_exe`)
     /// belongs to. The process table is only re-enumerated when this
     /// changes; a static foreground is served from the cache.
@@ -719,19 +807,11 @@ struct OverlayState {
     /// `tick_hidden_watchdog`. False while the pill is visible or hidden
     /// without a hold.
     hidden_watchdog: bool,
-    /// Per-row marquee state for the four track lines (title/subtitle/meta/app).
-    scroll: [LineScroll; 4],
-    /// Per-row cached marquee rasters (parallel to `scroll`), see `MarqueeStrip`.
-    marquee_strips: [Option<MarqueeStrip>; 4],
     /// High-resolution timer driving the pill animation.
     /// Animation timer from the timer queue; when creation fails, a plain
     /// window timer with `ANIM_TIMER_ID` drives the animation instead.
     anim_timer: HANDLE,
     anim_timer_fallback: bool,
-    /// Animation tick period in ms, capped to `config.overlay.max_tick_hz`
-    /// (default 60 Hz). Re-detected on every show; the timer is recreated only
-    /// when it changes.
-    tick_period: u32,
     /// Cached decoded artwork for the current track (RGBA8 at the full art
     /// size), so animation frames never re-decode or re-convert the cover.
     decoded_art: Option<Vec<u8>>,
@@ -745,26 +825,6 @@ struct OverlayState {
     /// artwork re-decodes): the aura gradient and the accent recoloring read
     /// from here, so they always match the cover that is actually displayed.
     palette: Option<Palette>,
-    /// Estimated live playback position (seconds), advanced each animation
-    /// tick from `progress_anchor`. None when the source reports no position.
-    estimated_position_secs: Option<f64>,
-    /// Total duration (seconds) of the current track. None when not reported.
-    progress_duration_secs: Option<u64>,
-    /// Playback rate for position estimation. None when not reported.
-    progress_rate: Option<f64>,
-    /// (anchor instant, anchor position) the estimate integrates from.
-    progress_anchor: Option<(Instant, f64)>,
-    /// Whether the current content is playing (drives freeze/resume).
-    progress_playing: bool,
-    /// Last SMTC-reported position seen by `apply_progress`. Used to detect
-    /// stale samples: when the OS has not advanced the position since the last
-    /// read (apps that refresh SMTC position every few seconds, not every poll),
-    /// the bar must keep interpolating instead of snapping back to the stale
-    /// value. A genuinely fresh backward jump (seek / new track) is still adopted.
-    last_progress_position_secs: Option<f64>,
-    /// Bar fraction painted on the last frame, so a settled pill can skip a
-    /// static-tick repaint when the bar did not move by at least a pixel.
-    last_bar_fraction: Option<f32>,
     /// Identity (source, title, artist) of the track the progress state was
     /// seeded from by `apply_track_progress`. A re-show of the SAME track
     /// (held-content resume, dedup re-emit) must not re-seed the bar from the
@@ -772,45 +832,6 @@ struct OverlayState {
     /// overlay maintains via `ProgressChanged` and the tick crawl stay
     /// authoritative. A different identity re-seeds.
     progress_track_key: Option<(String, String, String)>,
-    /// Cached DIB (DC + bitmap) reused across frames of the same size.
-    dib: Option<DibCache>,
-    /// Tightly-packed per-frame scratch buffer (stride == the requested
-    /// frame width), reused and grown but never shrunk across frames. The
-    /// real DIB backing buffer (`dib`) is allocated to a generous upper
-    /// bound and reused across animation frames, so its scanline stride
-    /// does not match the requested per-frame size; `draw_pixels` and
-    /// `draw_text_pixels` render into this buffer instead, at the stride
-    /// they have always assumed, and `render_layered` blits the result into
-    /// the real DIB at its real stride right before the GDI call. See
-    /// `render_layered` for why: drawing straight into the oversized DIB at
-    /// the requested width as its stride was tried once and produced a
-    /// torn image, because the two strides only match when the pill is at
-    /// its fully expanded size.
-    frame_scratch: Vec<u8>,
-    /// Retained static-background raster (chrome + non-scrolling text) for the
-    /// current content, used to skip the expensive per-frame chrome re-render
-    /// while a marquee line scrolls. `None` until the first background pass;
-    /// invalidated by any `ChromeKey` change (see `chrome_cache_key`).
-    chrome_cache: Option<ChromeCache>,
-    /// Bumped whenever `content` is replaced or cleared, so the chrome cache is
-    /// invalidated across content swaps. Palette/art travel with the content, so
-    /// this also covers cover changes.
-    content_rev: u64,
-    /// The layer the current render pass should draw (set by `render_layered`
-    /// before the text draw). Read by the text-drawing helpers so the marquee
-    /// `Foreground` pass only re-composites the scrolling rows.
-    render_layer: render::RenderLayer,
-    /// Timestamp of the previous animation tick, for time-based marquee
-    /// scrolling.
-    last_tick: Instant,
-    /// Last time the topmost z-order was re-asserted. While the pill is fully
-    /// shown (static), the re-assert is throttled to 1 Hz instead of running
-    /// on every animation tick.
-    last_reassert: Option<Instant>,
-    /// Cached monitor refresh period (ms), re-sampled at most once per
-    /// second. `sync_anim_timer` runs on every animation tick; the underlying
-    /// DWM/display-mode queries are far more expensive than the tick itself.
-    period_cache: Option<(Instant, u32)>,
     /// Wake flag for the event queue: `true` while a `MEDIA_EVENT_MSG` is in
     /// flight. The forwarder and this window only post when the flag was
     /// clear, so an event burst collapses into one wake message per drain.
@@ -829,10 +850,6 @@ struct OverlayState {
     /// extra move, never a misplacement, since every reposition recomputes the
     /// anchor from scratch.
     last_anchor_edge: Option<RECT>,
-    /// Whether the persistent-compact pill is currently in the faded (idle)
-    /// state. The alpha drops to the idle level (0.25 * 255 = 64) after the
-    /// dismiss timeout. Reset on hover, track change, or playback change.
-    persistent_faded: bool,
     /// The persistent pill's content snapshot taken when it auto-hid because
     /// a fullscreen or listed (`auto_compact_sources`) foreground is active.
     /// Saved here before `hide()` clears `content`, so
@@ -854,18 +871,6 @@ struct OverlayState {
     /// ever reads this cell. `None` in tests (no provider is ever built for
     /// a test state).
     pill_name: Option<Arc<Mutex<Option<String>>>>,
-    /// When true (PersistentCompact + hide_for_auto_compact_sources, foreground
-    /// is fullscreen/listed), the pill collapses to fully hidden on its normal
-    /// dismiss instead of fading to idle opacity. Set in `show_with_duration`
-    /// and re-evaluated by `on_foreground_change` on every foreground switch;
-    /// a flip to fullscreen while the pill is still inside its display window
-    /// defers the collapse to that deadline instead of hiding instantly.
-    persistent_collapse_on_dismiss: bool,
-    /// Cached result of `is_cursor_over_pill()` from the last animation tick,
-    /// so `held_expanded()` (called from `receive_events` between ticks) can
-    /// skip the display enumeration the cursor poll triggers. Updated every
-    /// tick; stale by at most one tick period (250 ms static, ~16 ms animated).
-    last_cursor_over_pill: bool,
     /// Source app of the last TrackChanged shown, used as the label fallback
     /// in state pills for current-session playback states so the pill always
     /// names the app that owns the media — never another app's last track.
@@ -1241,6 +1246,25 @@ pub(crate) fn source_matches_pin(source: &str, pin: &str) -> bool {
 /// also counts as "must render".
 fn needs_font_rebuild(fonts_dpi: u32, target_dpi: u32) -> bool {
     fonts_dpi != target_dpi
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod overlay_layout_regression_tests {
+    use super::*;
+    use std::mem::{align_of, size_of};
+
+    #[test]
+    fn hot_overlay_layout_stays_bounded() {
+        assert_eq!(size_of::<LineScroll>(), 48);
+        assert_eq!(align_of::<LineScroll>(), 8);
+        assert_eq!(align_of::<OverlayState>(), 8);
+        let overlay_size = size_of::<OverlayState>();
+        eprintln!(
+            "OVERLAY_LAYOUT size={overlay_size} line_scroll={}",
+            size_of::<LineScroll>()
+        );
+        assert!(overlay_size <= 3328, "OverlayState grew to {overlay_size} bytes");
+    }
 }
 
 impl OverlayState {
