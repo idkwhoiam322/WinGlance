@@ -564,6 +564,26 @@ fn read_config_with_retry(config_path: &Path) -> std::io::Result<String> {
     Err(error.unwrap_or_else(|| std::io::Error::other("read retries exhausted")))
 }
 
+fn read_config_with_retry_verified(config_path: &Path) -> std::io::Result<(String, crate::winutil::FileIdentity)> {
+    let mut error = None;
+    for attempt in 0..Config::READ_RETRIES {
+        match crate::winutil::read_verified_file_bounded(config_path, MAX_CONFIG_BYTES) {
+            Ok((bytes, identity)) => {
+                let content = String::from_utf8(bytes)
+                    .map_err(|error| std::io::Error::other(format!("config is not valid UTF-8: {error}")))?;
+                return Ok((content, identity));
+            }
+            Err(err) => {
+                error = Some(err);
+                if attempt + 1 < Config::READ_RETRIES {
+                    std::thread::sleep(Config::READ_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    Err(error.unwrap_or_else(|| std::io::Error::other("read retries exhausted")))
+}
+
 /// One bounded read attempt: buffers at most `MAX_CONFIG_BYTES + 1` bytes,
 /// then decodes them as UTF-8. The callers' post-read length check treats the
 /// result as oversized when it exceeds `MAX_CONFIG_BYTES`, so a hostile file
@@ -773,8 +793,8 @@ impl Config {
             );
             return Ok(SaveOutcome::Conflict);
         }
-        let current = match read_config_with_retry(config_path) {
-            Ok(content) => content,
+        let (current, current_identity) = match read_config_with_retry_verified(config_path) {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 warn!(
                     "could not verify config.toml before writing ({error}); keeping the change in memory and NOT saving"
@@ -789,7 +809,15 @@ impl Config {
             return Ok(SaveOutcome::Conflict);
         }
         let bytes = self.serialized()?;
-        Self::write_temp_and_rename(config_path, &bytes)?;
+        match Self::write_temp_and_rename_checked(config_path, &bytes, current.as_bytes(), current_identity)? {
+            crate::winutil::AtomicReplaceOutcome::Replaced => {}
+            crate::winutil::AtomicReplaceOutcome::Conflict => {
+                warn!(
+                    "config.toml changed identity or bytes while the save was prepared; keeping the change in memory and NOT saving"
+                );
+                return Ok(SaveOutcome::Conflict);
+            }
+        }
         let saved = ConfigRevision::captured(bytes);
         self.revision = Some(saved.clone());
         Ok(SaveOutcome::Saved(saved))
@@ -808,6 +836,7 @@ impl Config {
     /// rename relative to the held parent handle, and the parent directory
     /// flush makes the exchange durable. Any pre-commit failure deletes the
     /// temp and leaves the existing file byte-identical.
+    #[cfg(test)]
     fn write_temp_and_rename(config_path: &Path, content: &[u8]) -> anyhow::Result<()> {
         #[cfg(test)]
         {
@@ -819,6 +848,28 @@ impl Config {
         }
         crate::winutil::atomic_replace_file(config_path, content)?;
         Ok(())
+    }
+
+    fn write_temp_and_rename_checked(
+        config_path: &Path,
+        content: &[u8],
+        expected_current: &[u8],
+        expected_identity: crate::winutil::FileIdentity,
+    ) -> anyhow::Result<crate::winutil::AtomicReplaceOutcome> {
+        #[cfg(test)]
+        {
+            if test_hooks::take_fail_next_save(config_path) {
+                return Err(anyhow::anyhow!(
+                    "injected save failure (simulated disk-full/permission error)"
+                ));
+            }
+        }
+        Ok(crate::winutil::atomic_replace_file_checked(
+            config_path,
+            content,
+            expected_current,
+            expected_identity,
+        )?)
     }
 
     /// The on-disk location of `config.toml`, resolved the same way `save()`
@@ -1401,6 +1452,27 @@ nested_appearance = [1, 2, 3]
             "overlay.duration_ms = 9000\n"
         );
         assert_eq!(sibling_names(&guard.dir), vec!["config.toml"]);
+    }
+
+    #[test]
+    fn save_checked_conflicts_if_target_is_replaced_with_identical_bytes_during_commit() {
+        let guard = TempDir::new("conflict-identity");
+        let config_path = guard.dir.join("config.toml");
+        let displaced = guard.dir.join("config-old.toml");
+        let original = "overlay.duration_ms = 4000\n";
+        std::fs::write(&config_path, original).unwrap();
+        let mut config = Config::load_from_path(&config_path).unwrap();
+        config.overlay.duration_ms = 5000;
+        let probe_path = config_path.clone();
+        let probe_displaced = displaced.clone();
+        crate::winutil::test_hooks::arm_replace_probe(move || {
+            std::fs::rename(&probe_path, &probe_displaced).unwrap();
+            std::fs::write(&probe_path, original).unwrap();
+        });
+
+        assert_eq!(config.save_checked_to(&config_path).unwrap(), SaveOutcome::Conflict);
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&displaced).unwrap(), original);
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub(crate) mod test_hooks {
 
     thread_local! {
         static OPEN_PROBE: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+        static REPLACE_PROBE: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
     }
 
     /// Arms the probe for the next `open_verified_file` on this thread.
@@ -38,6 +39,20 @@ pub(crate) mod test_hooks {
     /// Runs and disarms the probe; a no-op when none is armed.
     pub(crate) fn fire_open_probe() {
         let probe = OPEN_PROBE.with(|slot| slot.borrow_mut().take());
+        if let Some(mut probe) = probe {
+            probe();
+        }
+    }
+
+    /// Arms a one-shot probe immediately before a checked atomic replace
+    /// re-verifies the current target. Test-only: production has no hook.
+    pub(crate) fn arm_replace_probe(probe: impl FnMut() + 'static) {
+        REPLACE_PROBE.with(|slot| *slot.borrow_mut() = Some(Box::new(probe)));
+    }
+
+    /// Runs and disarms the checked-replace probe.
+    pub(crate) fn fire_replace_probe() {
+        let probe = REPLACE_PROBE.with(|slot| slot.borrow_mut().take());
         if let Some(mut probe) = probe {
             probe();
         }
@@ -626,7 +641,7 @@ pub(crate) fn copy_wide_terminated(buffer: &mut [u16], value: &str) {
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Seek, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
@@ -635,11 +650,11 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_DISPOSITION_FLAG_DELETE, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FlushFileBuffers,
-    GetFileInformationByHandle, GetFinalPathNameByHandleW, GetLongPathNameW, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, SetEndOfFile, SetFileInformationByHandle,
-    SetFilePointer, WriteFile,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+    FlushFileBuffers, GetFileInformationByHandle, GetFinalPathNameByHandleW, GetLongPathNameW,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, SetEndOfFile,
+    SetFileInformationByHandle, SetFilePointer, WriteFile,
 };
 
 /// The Win32 DELETE access right (0x0001_0000); `windows` 0.58 does not export
@@ -777,6 +792,126 @@ impl Drop for DirGuard {
             let _ = CloseHandle(self.handle);
         }
     }
+}
+
+/// Stable identity of an opened file. The volume serial + 64-bit file index
+/// belongs to the object named by the handle, not to a path that can be
+/// replaced after the handle is opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    volume_serial: u32,
+    file_index: u64,
+}
+
+impl FileIdentity {
+    fn from_info(info: &BY_HANDLE_FILE_INFORMATION) -> Self {
+        Self {
+            volume_serial: info.dwVolumeSerialNumber,
+            file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        }
+    }
+}
+
+struct VerifiedRead {
+    bytes: Vec<u8>,
+    identity: FileIdentity,
+    file: File,
+}
+
+/// Opens and reads a plain file under the verified-write path discipline.
+/// `share_delete=false` additionally pins the target directory entry for the
+/// lifetime of the returned `file`, so it cannot be replaced while its bytes
+/// and identity are being checked.
+fn read_verified_file_bounded_inner(path: &Path, max_bytes: usize, share_delete: bool) -> io::Result<VerifiedRead> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no parent directory"))?;
+    let _parent_guard = open_pinned_parent(parent)?;
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let share = if share_delete {
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    } else {
+        FILE_SHARE_READ | FILE_SHARE_WRITE
+    };
+    let handle = unsafe {
+        create_file(
+            windows::core::PCWSTR(wide.as_ptr()),
+            (FILE_GENERIC_READ | FILE_READ_ATTRIBUTES).0,
+            share,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            HANDLE::default(),
+        )
+    }
+    .map_err(to_io)?;
+
+    let reject = |message: &str| {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        Err(io::Error::other(message))
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if let Err(error) = unsafe { GetFileInformationByHandle(handle, &mut info) } {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Err(to_io(error));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return reject(&format!("refusing to read a reparse point ({})", path.display()));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+        return reject(&format!("refusing to read a directory as a file ({})", path.display()));
+    }
+    let final_path = match final_path_of_raw(handle) {
+        Ok(path) => path,
+        Err(error) => {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err(error);
+        }
+    };
+    let expected_path = match long_extended_path(path) {
+        Ok(path) => path,
+        Err(error) => {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err(error);
+        }
+    };
+    if !paths_equal(&final_path, &expected_path) {
+        return reject(&format!(
+            "read target final path does not match the expected path (resolved to {})",
+            final_path.display()
+        ));
+    }
+
+    let identity = FileIdentity::from_info(&info);
+    let mut file = unsafe { File::from_raw_handle(handle.0) };
+    let limit = u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX);
+    let mut bytes = Vec::new();
+    {
+        let mut limited = (&mut file).take(limit);
+        limited.read_to_end(&mut bytes)?;
+    }
+    Ok(VerifiedRead { bytes, identity, file })
+}
+
+/// Returns a bounded byte snapshot and the identity of the exact object that
+/// supplied it. Used by config save to bind its revision check to a file
+/// identity before preparing the replacement.
+pub(crate) fn read_verified_file_bounded(path: &Path, max_bytes: usize) -> io::Result<(Vec<u8>, FileIdentity)> {
+    let VerifiedRead { bytes, identity, file } = read_verified_file_bounded_inner(path, max_bytes, true)?;
+    drop(file);
+    Ok((bytes, identity))
 }
 
 /// RAII for transient kernel `HANDLE`s (`CreateToolhelp32Snapshot`,
@@ -1003,7 +1138,37 @@ fn delete_temp(handle: HANDLE) {
 /// through the rename: the data is flushed, the directory entry is exchanged
 /// relative to the held parent, and the parent directory handle is flushed
 /// for the metadata change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AtomicReplaceOutcome {
+    Replaced,
+    Conflict,
+}
+
+#[cfg(test)]
 pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<()> {
+    match atomic_replace_file_impl(target, content, None)? {
+        AtomicReplaceOutcome::Replaced => Ok(()),
+        AtomicReplaceOutcome::Conflict => Err(io::Error::other("unchecked atomic replace reported a conflict")),
+    }
+}
+
+/// Atomically replaces `target` only if its current bytes and file identity
+/// still match the snapshot the caller verified. A mismatch is a logical
+/// conflict, never an overwrite and never a generic I/O failure.
+pub(crate) fn atomic_replace_file_checked(
+    target: &Path,
+    content: &[u8],
+    expected_current: &[u8],
+    expected_identity: FileIdentity,
+) -> io::Result<AtomicReplaceOutcome> {
+    atomic_replace_file_impl(target, content, Some((expected_current, expected_identity)))
+}
+
+fn atomic_replace_file_impl(
+    target: &Path,
+    content: &[u8],
+    expected: Option<(&[u8], FileIdentity)>,
+) -> io::Result<AtomicReplaceOutcome> {
     let name = target
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no file name"))?;
@@ -1022,6 +1187,9 @@ pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<(
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no parent directory"))?;
     if !parent.exists() {
+        if expected.is_some() {
+            return Ok(AtomicReplaceOutcome::Conflict);
+        }
         std::fs::create_dir_all(parent)?;
     }
     let guard = open_pinned_parent(parent)?;
@@ -1130,6 +1298,29 @@ pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<(
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt - 1]));
             }
+
+            if let Some((expected_bytes, expected_identity)) = expected {
+                #[cfg(test)]
+                test_hooks::fire_replace_probe();
+                let verified = match read_verified_file_bounded_inner(target, expected_bytes.len(), false) {
+                    Ok(verified) => verified,
+                    Err(error) => {
+                        debug!("config save target re-verification failed before commit: {error}");
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Ok(AtomicReplaceOutcome::Conflict);
+                    }
+                };
+                if verified.identity != expected_identity || verified.bytes.as_slice() != expected_bytes {
+                    drop(verified);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Ok(AtomicReplaceOutcome::Conflict);
+                }
+                // The no-share-delete handle pins the exact target while it
+                // is checked. Every retry re-opens and re-verifies after its
+                // backoff; drop only at the immediate rename boundary.
+                drop(verified);
+            }
+
             match unsafe {
                 MoveFileExW(
                     windows::core::PCWSTR(src_units.as_ptr()),
@@ -1168,7 +1359,7 @@ pub(crate) fn atomic_replace_file(target: &Path, content: &[u8]) -> io::Result<(
                 to_io(error)
             );
         }
-        return Ok(());
+        return Ok(AtomicReplaceOutcome::Replaced);
     }
     Err(io::Error::other("could not create a unique temp file after 4 attempts"))
 }
@@ -2011,6 +2202,29 @@ mod tests {
         atomic_replace_file(&target, b"new content").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new content");
         assert_eq!(sibling_names(&guard.dir), vec!["config.toml"], "no temp may remain");
+    }
+
+    #[test]
+    fn checked_replace_refuses_a_same_bytes_target_swap() {
+        let guard = TestDir::new("checked-swap");
+        let target = guard.dir.join("config.toml");
+        let displaced = guard.dir.join("config-old.toml");
+        std::fs::write(&target, b"old").unwrap();
+        let (expected, identity) = read_verified_file_bounded(&target, 16).unwrap();
+        let probe_target = target.clone();
+        let probe_displaced = displaced.clone();
+        test_hooks::arm_replace_probe(move || {
+            std::fs::rename(&probe_target, &probe_displaced).unwrap();
+            std::fs::write(&probe_target, b"old").unwrap();
+        });
+
+        assert_eq!(
+            atomic_replace_file_checked(&target, b"new content", &expected, identity).unwrap(),
+            AtomicReplaceOutcome::Conflict
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"old");
+        assert_eq!(sibling_names(&guard.dir), vec!["config-old.toml", "config.toml"]);
     }
 
     #[test]
