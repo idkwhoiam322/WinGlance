@@ -5671,37 +5671,182 @@ fn setting_sub_click_point(id: SettingId, sub: SettingSub, rect: &RECT, scale: f
     setting_sub_rect(id, sub, rect, scale).map(|r| ((r.left + r.right) / 2, (r.top + r.bottom) / 2))
 }
 
-/// Applies one settings row's action exactly as the mouse path does: `id` is
-/// activated for a click at client `(x, y)` within its `rect`. Shared by the
-/// real `WM_LBUTTONDOWN` hit-test and the UIA activation message, so both
-/// stay on a single dispatch.
-/// Single dispatch point for every way a settings row is activated (mouse
-/// click, UIA invoke, UIA toggle); the argument list mirrors the click data.
-#[allow(clippy::too_many_arguments)]
-fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: &RECT, x: i32, y: i32, scale: f32) {
-    // Modal-borrow discipline: this handler can open a modal (the custom-duration
-    // dialog), so it owns its window-state borrow itself instead of running
-    // under the caller's — the wndproc arm passes only the hwnd, and the
-    // borrow taken here is provably dead across the modal scope (the
-    // custom-duration arm re-fetches and returns before any later use).
+/// Semantic action produced by the pure Settings hit-test. Geometry is
+/// resolved before any config/Win32 work begins, so the executor below is a
+/// narrow impure shell rather than a second hit-test state machine.
+#[derive(Clone, Copy, PartialEq)]
+enum SettingAction {
+    ToggleNotifications,
+    ToggleStartOnLogin,
+    ToggleCloseToTray,
+    SetDuration(u64),
+    CustomDuration,
+    ToggleRespectSystemDuration,
+    SetLayout(LayoutMode),
+    ToggleDismissOnHover,
+    ToggleExpandCompactOnHover,
+    ToggleHideForAutoCompactSources,
+    ToggleFadePersistentPill,
+    ToggleSeparateCompact,
+    SetCompactAnchor(VerticalPosition, HorizontalPosition),
+    ResetCompactPosition,
+    AdjustCompactPosition,
+    OpenAutoCompactApps,
+    OpenPinnedSource,
+    SetAnchor(VerticalPosition, HorizontalPosition),
+    ResetPosition,
+    AdjustPosition,
+    ShowSample,
+    CycleMonitor,
+    OpenLogs,
+    CopyLogs,
+    OpenConfig,
+    Restart,
+    OpenAllowedApps,
+}
+
+fn anchor_for_index(index: usize) -> (VerticalPosition, HorizontalPosition) {
+    match index {
+        0 => (VerticalPosition::Top, HorizontalPosition::Left),
+        1 => (VerticalPosition::Top, HorizontalPosition::Center),
+        2 => (VerticalPosition::Top, HorizontalPosition::Right),
+        3 => (VerticalPosition::Bottom, HorizontalPosition::Left),
+        4 => (VerticalPosition::Bottom, HorizontalPosition::Center),
+        _ => (VerticalPosition::Bottom, HorizontalPosition::Right),
+    }
+}
+
+/// Pure row-local hit test: translates one settings row + point into a
+/// descriptive action. It does not read config, touch Win32, persist, or open
+/// a modal. Mouse and UIA activation both reuse this exact mapping.
+fn setting_action_at(id: SettingId, rect: &RECT, x: i32, y: i32, scale: f32) -> Option<SettingAction> {
+    let control = row_split(rect, scale).control;
+    match id {
+        SettingId::Notifications => Some(SettingAction::ToggleNotifications),
+        SettingId::StartOnLogin => Some(SettingAction::ToggleStartOnLogin),
+        SettingId::CloseToTray => Some(SettingAction::ToggleCloseToTray),
+        SettingId::Duration => {
+            let segments = segment_rects(&control, 5, (4.0 * scale) as i32);
+            let index = segments.iter().position(|s| x >= s.left && x < s.right)?;
+            match index {
+                0 => Some(SettingAction::SetDuration(2000)),
+                1 => Some(SettingAction::SetDuration(3000)),
+                2 => Some(SettingAction::SetDuration(5000)),
+                3 => Some(SettingAction::SetDuration(10000)),
+                _ => Some(SettingAction::CustomDuration),
+            }
+        }
+        SettingId::RespectSystemDuration => Some(SettingAction::ToggleRespectSystemDuration),
+        SettingId::Layout => {
+            let segments = segment_rects(&control, 4, (4.0 * scale) as i32);
+            let index = segments.iter().position(|s| x >= s.left && x < s.right)?;
+            let mode = [
+                LayoutMode::Expanded,
+                LayoutMode::Compact,
+                LayoutMode::Auto,
+                LayoutMode::PersistentCompact,
+            ][index];
+            Some(SettingAction::SetLayout(mode))
+        }
+        SettingId::DismissOnHover => Some(SettingAction::ToggleDismissOnHover),
+        SettingId::ExpandCompactOnHover => Some(SettingAction::ToggleExpandCompactOnHover),
+        SettingId::HideForAutoCompactSources => Some(SettingAction::ToggleHideForAutoCompactSources),
+        SettingId::FadePersistentPill => Some(SettingAction::ToggleFadePersistentPill),
+        SettingId::SeparateCompact => Some(SettingAction::ToggleSeparateCompact),
+        SettingId::CompactPosition | SettingId::Position => {
+            let parts = position_parts(rect, scale);
+            let compact = id == SettingId::CompactPosition;
+            if let Some(index) = parts
+                .anchors
+                .iter()
+                .position(|a| x >= a.left && x < a.right && y >= a.top && y < a.bottom)
+            {
+                let (vertical, horizontal) = anchor_for_index(index);
+                return Some(if compact {
+                    SettingAction::SetCompactAnchor(vertical, horizontal)
+                } else {
+                    SettingAction::SetAnchor(vertical, horizontal)
+                });
+            }
+            if x >= parts.reset.left && x < parts.reset.right && y >= parts.reset.top && y < parts.reset.bottom {
+                return Some(if compact {
+                    SettingAction::ResetCompactPosition
+                } else {
+                    SettingAction::ResetPosition
+                });
+            }
+            if x >= parts.adjust.left && x < parts.adjust.right && y >= parts.adjust.top && y < parts.adjust.bottom {
+                return Some(if compact {
+                    SettingAction::AdjustCompactPosition
+                } else {
+                    SettingAction::AdjustPosition
+                });
+            }
+            None
+        }
+        SettingId::AutoCompactApps => Some(SettingAction::OpenAutoCompactApps),
+        SettingId::PinnedSource => Some(SettingAction::OpenPinnedSource),
+        SettingId::ShowSample => Some(SettingAction::ShowSample),
+        SettingId::Monitor => Some(SettingAction::CycleMonitor),
+        SettingId::CopyLogs => {
+            let (open, copy) = halve(&control, (4.0 * scale) as i32);
+            if x >= open.left && x < open.right {
+                Some(SettingAction::OpenLogs)
+            } else if x >= copy.left && x < copy.right {
+                Some(SettingAction::CopyLogs)
+            } else {
+                None
+            }
+        }
+        SettingId::OpenConfig => {
+            let (open, restart) = halve(&control, (4.0 * scale) as i32);
+            if x >= open.left && x < open.right {
+                Some(SettingAction::OpenConfig)
+            } else if x >= restart.left && x < restart.right {
+                Some(SettingAction::Restart)
+            } else {
+                None
+            }
+        }
+        SettingId::AllowedApps => Some(SettingAction::OpenAllowedApps),
+    }
+}
+
+/// Pure Settings-pane hit test shared by the mouse path. Row indexing counts
+/// only interactive rows, matching UIA runtime ids and focus targets.
+fn hit_test_settings(
+    items: &[SettingsItem],
+    x: i32,
+    y: i32,
+    scale: f32,
+) -> Option<(SettingId, usize, RECT, SettingAction)> {
+    let mut row_index = 0usize;
+    for item in items {
+        if let SettingsItem::Row { id, rect } = item {
+            if y >= rect.top && y < rect.bottom {
+                let action = setting_action_at(*id, rect, x, y, scale)?;
+                return Some((*id, row_index, *rect, action));
+            }
+            row_index += 1;
+        }
+    }
+    None
+}
+
+/// Executes a pre-resolved Settings action. Persistence, Win32 calls, worker
+/// control and restart stay here; geometry and action selection stay pure.
+fn perform_setting_action(hwnd: HWND, id: SettingId, row_index: usize, rect: &RECT, action: SettingAction, scale: f32) {
     let state_ptr = window_state::<MainWindowState>(hwnd);
     if state_ptr.is_null() {
         return;
     }
     let state = unsafe { &mut *state_ptr };
     let control_rect = row_split(rect, scale).control;
-    let toggle_before = setting_toggle_on(*id, &state.cfg());
-    // Capture the row's UIA name before the click mutates the config, so a
-    // value change (toggle, segment, anchor, custom duration) can be
-    // announced after; a click that leaves the value unchanged
-    // (picker-opener, copy/open) no-ops.
-    let before_name = setting_row_name(*id, &state.cfg());
-    match id {
-        SettingId::Notifications => {
+    let toggle_before = setting_toggle_on(id, &state.cfg());
+    let before_name = setting_row_name(id, &state.cfg());
+    match action {
+        SettingAction::ToggleNotifications => {
             let new_value = !state.cfg().behavior.notifications_enabled;
-            // Flip the overlay first; persist only when
-            // the toggle reaches it, so the config and
-            // the pill can never desync.
             if unsafe { post_message(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0)) }.is_err() {
                 error!("posting the notifications toggle to the overlay failed");
             } else {
@@ -5714,152 +5859,97 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
             }
             state.invalidate();
         }
-        SettingId::StartOnLogin => {
+        SettingAction::ToggleStartOnLogin => {
             let new_value = !state.cfg().behavior.start_on_login;
             state.toggle_autostart(new_value);
             state.invalidate();
         }
-        SettingId::CloseToTray => {
+        SettingAction::ToggleCloseToTray => {
             let new_value = !state.cfg().behavior.close_to_tray;
             state.mutate_config(|cfg| cfg.behavior.close_to_tray = new_value);
             info!("close to tray {}", if new_value { "enabled" } else { "disabled" });
             state.invalidate();
         }
-        SettingId::Duration => {
-            let segments = segment_rects(&control_rect, 5, (4.0 * scale) as i32);
-            let values = [2000u64, 3000, 5000, 10000];
-            if let Some((i, _)) = segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right) {
-                // The Custom tile asks for a value; the
-                // chosen one is applied like a preset. The dialog runs its
-                // own modal loop: this frame's borrow must be dead across
-                // it, so the arm re-fetches and finishes the row (apply,
-                // invalidate, announce) on the fresh state and returns —
-                // the shared tail below would otherwise keep the borrow
-                // alive across the modal scope.
-                if i == 4 {
-                    let current_ms = state.cfg().overlay.duration_ms;
-                    let chosen = crate::duration_dialog::show_duration_dialog(hwnd, current_ms);
-                    let state_ptr = window_state::<MainWindowState>(hwnd);
-                    if !state_ptr.is_null() {
-                        let state = unsafe { &mut *state_ptr };
-                        if let Some(duration) = chosen {
-                            state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
-                            state.push_effective_duration();
-                            info!("custom overlay duration set to {duration} ms");
-                        }
-                        state.invalidate();
-                        raise_settings_name_changed(
-                            hwnd,
-                            row_index,
-                            &before_name,
-                            &setting_row_name(*id, &state.cfg()),
-                        );
-                    }
-                    return;
-                } else {
-                    let duration = values[i];
+        SettingAction::SetDuration(duration) => {
+            state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
+            state.push_effective_duration();
+            state.invalidate();
+        }
+        SettingAction::CustomDuration => {
+            let current_ms = state.cfg().overlay.duration_ms;
+            let chosen = crate::duration_dialog::show_duration_dialog(hwnd, current_ms);
+            let state_ptr = window_state::<MainWindowState>(hwnd);
+            if !state_ptr.is_null() {
+                let state = unsafe { &mut *state_ptr };
+                if let Some(duration) = chosen {
                     state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
                     state.push_effective_duration();
+                    info!("custom overlay duration set to {duration} ms");
                 }
                 state.invalidate();
+                raise_settings_name_changed(hwnd, row_index, &before_name, &setting_row_name(id, &state.cfg()));
             }
+            return;
         }
-        SettingId::RespectSystemDuration => {
+        SettingAction::ToggleRespectSystemDuration => {
             let new_value = !state.cfg().overlay.respect_system_message_duration;
             state.mutate_config(|cfg| cfg.overlay.respect_system_message_duration = new_value);
-            // The effective pill duration may change with
-            // the flag, so re-push it (and the Duration
-            // row's "(system Ns)" suffix updates on the
-            // repaint below).
             state.push_effective_duration();
             info!("respect system message duration set: {new_value}");
             state.invalidate();
         }
-        SettingId::Layout => {
-            let segments = segment_rects(&control_rect, 4, (4.0 * scale) as i32);
-            let values = [
-                LayoutMode::Expanded,
-                LayoutMode::Compact,
-                LayoutMode::Auto,
-                LayoutMode::PersistentCompact,
-            ];
-            if let Some((i, _)) = segments.iter().enumerate().find(|(_, s)| x >= s.left && x < s.right) {
-                let mode = values[i];
-                state.mutate_config(|cfg| cfg.overlay.layout = mode);
-                set_layout(state.overlay_hwnd, mode);
-                info!("layout mode set: {mode:?}");
-                state.invalidate();
-            }
+        SettingAction::SetLayout(mode) => {
+            state.mutate_config(|cfg| cfg.overlay.layout = mode);
+            set_layout(state.overlay_hwnd, mode);
+            info!("layout mode set: {mode:?}");
+            state.invalidate();
         }
-        SettingId::DismissOnHover => {
+        SettingAction::ToggleDismissOnHover => {
             let new_value = !state.cfg().overlay.dismiss_on_hover;
             state.mutate_config(|cfg| cfg.overlay.dismiss_on_hover = new_value);
             set_dismiss_on_hover(state.overlay_hwnd, new_value);
             info!("dismiss on hover set: {new_value}");
             state.invalidate();
         }
-        SettingId::ExpandCompactOnHover => {
+        SettingAction::ToggleExpandCompactOnHover => {
             let new_value = !state.cfg().overlay.expand_compact_on_hover;
             state.mutate_config(|cfg| cfg.overlay.expand_compact_on_hover = new_value);
             set_expand_compact_on_hover(state.overlay_hwnd, new_value);
             info!("expand compact on hover set: {new_value}");
             state.invalidate();
         }
-        SettingId::HideForAutoCompactSources => {
+        SettingAction::ToggleHideForAutoCompactSources => {
             let new_value = !state.cfg().behavior.hide_for_auto_compact_sources;
             state.mutate_config(|cfg| cfg.behavior.hide_for_auto_compact_sources = new_value);
             set_hide_for_auto_compact_sources(state.overlay_hwnd, new_value);
             info!("hide for auto compact sources set: {new_value}");
             state.invalidate();
         }
-        SettingId::FadePersistentPill => {
+        SettingAction::ToggleFadePersistentPill => {
             let new_value = !state.cfg().overlay.fade_persistent_pill;
             state.mutate_config(|cfg| cfg.overlay.fade_persistent_pill = new_value);
             set_fade_persistent_pill(state.overlay_hwnd, new_value);
             info!("fade persistent pill set: {new_value}");
             state.invalidate();
         }
-        SettingId::SeparateCompact => {
+        SettingAction::ToggleSeparateCompact => {
             let new_value = !state.cfg().overlay.compact_position_separate;
             state.set_compact_separate(new_value);
             state.invalidate();
         }
-        SettingId::CompactPosition => {
-            // Always editable: clicks land in the raw
-            // compact_* fields. While "follows
-            // Expanded" is ON the row mirrors the
-            // Expanded position and these edits are
-            // stored, taking visible effect once the
-            // follow toggle is OFF or the pill is
-            // actually compact.
-            let parts = position_parts(rect, scale);
-            if let Some((i, _)) = parts
-                .anchors
-                .iter()
-                .enumerate()
-                .find(|(_, a)| x >= a.left && x < a.right && y >= a.top && y < a.bottom)
-            {
-                let (v, h) = match i {
-                    0 => (VerticalPosition::Top, HorizontalPosition::Left),
-                    1 => (VerticalPosition::Top, HorizontalPosition::Center),
-                    2 => (VerticalPosition::Top, HorizontalPosition::Right),
-                    3 => (VerticalPosition::Bottom, HorizontalPosition::Left),
-                    4 => (VerticalPosition::Bottom, HorizontalPosition::Center),
-                    _ => (VerticalPosition::Bottom, HorizontalPosition::Right),
-                };
-                state.apply_compact_anchor(v, h);
-            } else if x >= parts.reset.left && x < parts.reset.right && y >= parts.reset.top && y < parts.reset.bottom {
-                state.reset_compact_position();
-            } else if x >= parts.adjust.left
-                && x < parts.adjust.right
-                && y >= parts.adjust.top
-                && y < parts.adjust.bottom
-            {
-                let _ = crate::positioner::open_compact(hwnd, state.overlay_hwnd);
-            }
+        SettingAction::SetCompactAnchor(vertical, horizontal) => {
+            state.apply_compact_anchor(vertical, horizontal);
             state.invalidate();
         }
-        SettingId::AutoCompactApps => {
+        SettingAction::ResetCompactPosition => {
+            state.reset_compact_position();
+            state.invalidate();
+        }
+        SettingAction::AdjustCompactPosition => {
+            let _ = crate::positioner::open_compact(hwnd, state.overlay_hwnd);
+            state.invalidate();
+        }
+        SettingAction::OpenAutoCompactApps => {
             if !process_picker::open(
                 hwnd,
                 &control_rect,
@@ -5869,9 +5959,6 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
                 AUTO_SOURCES_RESULT_MSG,
             ) {
                 debug!("auto-compact sources picker failed to open");
-                // The debug line alone leaves a click that visibly did
-                // nothing; the tray note is the one feedback surface
-                // that does not depend on the picker itself opening.
                 show_tray_note(
                     hwnd,
                     "WinGlance",
@@ -5880,15 +5967,7 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
                 );
             }
         }
-        SettingId::PinnedSource => {
-            // Single-select picker: the confirmed
-            // result holds at most one pattern. The
-            // stored pin (a single string) is passed
-            // as the current selection slice, and the
-            // row set is restricted to the user's
-            // Allowed Sources — a pin outside
-            // `media_sources` could never fire (the
-            // worker excludes non-allowed sessions).
+        SettingAction::OpenPinnedSource => {
             let current: Vec<String> = state.cfg().behavior.pinned_source.clone().into_iter().collect();
             if !process_picker::open(
                 hwnd,
@@ -5907,74 +5986,41 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
                 );
             }
         }
-        SettingId::Position => {
-            let parts = position_parts(rect, scale);
-            if let Some((i, _)) = parts
-                .anchors
-                .iter()
-                .enumerate()
-                .find(|(_, a)| x >= a.left && x < a.right && y >= a.top && y < a.bottom)
-            {
-                let (v, h) = match i {
-                    0 => (VerticalPosition::Top, HorizontalPosition::Left),
-                    1 => (VerticalPosition::Top, HorizontalPosition::Center),
-                    2 => (VerticalPosition::Top, HorizontalPosition::Right),
-                    3 => (VerticalPosition::Bottom, HorizontalPosition::Left),
-                    4 => (VerticalPosition::Bottom, HorizontalPosition::Center),
-                    _ => (VerticalPosition::Bottom, HorizontalPosition::Right),
-                };
-                state.apply_anchor(v, h);
-            } else if x >= parts.reset.left && x < parts.reset.right && y >= parts.reset.top && y < parts.reset.bottom {
-                state.reset_position();
-            } else if x >= parts.adjust.left
-                && x < parts.adjust.right
-                && y >= parts.adjust.top
-                && y < parts.adjust.bottom
-            {
-                let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
-            }
-            // Repaint in the same frame the anchor was
-            // clicked: the row's highlighted anchor and
-            // value changed, and — while the compact
-            // pill follows — the compact row's mirror
-            // must update without waiting for the next
-            // mouse move.
+        SettingAction::SetAnchor(vertical, horizontal) => {
+            state.apply_anchor(vertical, horizontal);
             state.invalidate();
         }
-        SettingId::ShowSample => {
-            show_sample(state.overlay_hwnd);
+        SettingAction::ResetPosition => {
+            state.reset_position();
+            state.invalidate();
         }
-        SettingId::Monitor => {
-            // One click steps to the next choice
-            // (Active window → Primary → Display 1 →
-            // … → back); the tray menu offers direct
-            // selection.
+        SettingAction::AdjustPosition => {
+            let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
+            state.invalidate();
+        }
+        SettingAction::ShowSample => show_sample(state.overlay_hwnd),
+        SettingAction::CycleMonitor => {
             let displays = enumerate_displays_cached();
             let next = next_monitor_mode(state.cfg().overlay.monitor, displays.len());
             state.apply_monitor(next);
             state.invalidate();
         }
-        SettingId::CopyLogs => {
-            let gap = (4.0 * scale) as i32;
-            let (open_rect, copy_rect) = halve(&control_rect, gap);
-            if x >= open_rect.left && x < open_rect.right {
-                // Feedback only on a real open: a failed
-                // ShellExecuteW must not paint "Opened ✓".
-                if state.open_logs() {
-                    state.logs_opened_at = Some(Instant::now());
-                    unsafe { set_timer(hwnd, TIMER_OPENED_ID, 2000, None) };
-                    state.invalidate();
-                } else {
-                    // A silent click teaches nothing: the tray note is the
-                    // one channel that reaches a hidden window.
-                    show_tray_note(
-                        hwnd,
-                        "WinGlance",
-                        "Opening the log file failed. The file lives in the diagnostics row's folder.",
-                        NIIF_ERROR,
-                    );
-                }
-            } else if x >= copy_rect.left && x < copy_rect.right && !state.copy_logs() {
+        SettingAction::OpenLogs => {
+            if state.open_logs() {
+                state.logs_opened_at = Some(Instant::now());
+                unsafe { set_timer(hwnd, TIMER_OPENED_ID, 2000, None) };
+                state.invalidate();
+            } else {
+                show_tray_note(
+                    hwnd,
+                    "WinGlance",
+                    "Opening the log file failed. The file lives in the diagnostics row's folder.",
+                    NIIF_ERROR,
+                );
+            }
+        }
+        SettingAction::CopyLogs => {
+            if !state.copy_logs() {
                 show_tray_note(
                     hwnd,
                     "WinGlance",
@@ -5983,27 +6029,22 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
                 );
             }
         }
-        SettingId::OpenConfig => {
-            let gap = (4.0 * scale) as i32;
-            let (open_rect, reload_rect) = halve(&control_rect, gap);
-            if x >= open_rect.left && x < open_rect.right {
-                if state.open_config() {
-                    state.config_opened_at = Some(Instant::now());
-                    unsafe { set_timer(hwnd, TIMER_OPENED_ID, 2000, None) };
-                    state.invalidate();
-                } else {
-                    show_tray_note(
-                        hwnd,
-                        "WinGlance",
-                        "Opening config.toml failed. The file lives in the diagnostics row's folder.",
-                        NIIF_ERROR,
-                    );
-                }
-            } else if x >= reload_rect.left && x < reload_rect.right {
-                state.reload_config();
+        SettingAction::OpenConfig => {
+            if state.open_config() {
+                state.config_opened_at = Some(Instant::now());
+                unsafe { set_timer(hwnd, TIMER_OPENED_ID, 2000, None) };
+                state.invalidate();
+            } else {
+                show_tray_note(
+                    hwnd,
+                    "WinGlance",
+                    "Opening config.toml failed. The file lives in the diagnostics row's folder.",
+                    NIIF_ERROR,
+                );
             }
         }
-        SettingId::AllowedApps => {
+        SettingAction::Restart => state.reload_config(),
+        SettingAction::OpenAllowedApps => {
             if !process_picker::open(
                 hwnd,
                 &control_rect,
@@ -6022,12 +6063,81 @@ fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: 
             }
         }
     }
-    if setting_is_toggle(*id) {
-        raise_settings_toggle_event(hwnd, row_index, toggle_before, setting_toggle_on(*id, &state.cfg()));
+    if setting_is_toggle(id) {
+        raise_settings_toggle_event(hwnd, row_index, toggle_before, setting_toggle_on(id, &state.cfg()));
     }
-    // Announce the row's new name when the click changed its value — the
-    // settings analogue of the pill's name-changed raise; a no-op otherwise.
-    raise_settings_name_changed(hwnd, row_index, &before_name, &setting_row_name(*id, &state.cfg()));
+    raise_settings_name_changed(hwnd, row_index, &before_name, &setting_row_name(id, &state.cfg()));
+}
+
+/// Compatibility entry for UIA activation: compute the same pure action from
+/// its resolved click point, then execute it.
+fn apply_settings_row_click(hwnd: HWND, id: &SettingId, row_index: usize, rect: &RECT, x: i32, y: i32, scale: f32) {
+    if let Some(action) = setting_action_at(*id, rect, x, y, scale) {
+        perform_setting_action(hwnd, *id, row_index, rect, action, scale);
+    }
+}
+
+#[cfg(test)]
+mod setting_action_tests {
+    use super::*;
+
+    fn row() -> RECT {
+        RECT {
+            left: 0,
+            top: 0,
+            right: 700,
+            bottom: 80,
+        }
+    }
+
+    #[test]
+    fn duration_hit_test_returns_typed_preset_and_custom_actions() {
+        let rect = row();
+        let control = row_split(&rect, 1.0).control;
+        let segments = segment_rects(&control, 5, 4);
+        let center = |r: RECT| ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        let (x0, y0) = center(segments[0]);
+        assert!(matches!(
+            setting_action_at(SettingId::Duration, &rect, x0, y0, 1.0),
+            Some(SettingAction::SetDuration(2000))
+        ));
+        let (x4, y4) = center(segments[4]);
+        assert!(matches!(
+            setting_action_at(SettingId::Duration, &rect, x4, y4, 1.0),
+            Some(SettingAction::CustomDuration)
+        ));
+    }
+
+    #[test]
+    fn position_hit_test_preserves_anchor_identity() {
+        let rect = row();
+        let parts = position_parts(&rect, 1.0);
+        let target = parts.anchors[5];
+        let x = (target.left + target.right) / 2;
+        let y = (target.top + target.bottom) / 2;
+        assert!(matches!(
+            setting_action_at(SettingId::Position, &rect, x, y, 1.0),
+            Some(SettingAction::SetAnchor(
+                VerticalPosition::Bottom,
+                HorizontalPosition::Right
+            ))
+        ));
+    }
+
+    #[test]
+    fn split_rows_resolve_each_side_without_effects() {
+        let rect = row();
+        let control = row_split(&rect, 1.0).control;
+        let (left, right) = halve(&control, 4);
+        assert!(matches!(
+            setting_action_at(SettingId::OpenConfig, &rect, (left.left + left.right) / 2, 10, 1.0),
+            Some(SettingAction::OpenConfig)
+        ));
+        assert!(matches!(
+            setting_action_at(SettingId::OpenConfig, &rect, (right.left + right.right) / 2, 10, 1.0),
+            Some(SettingAction::Restart)
+        ));
+    }
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -6544,23 +6654,14 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                         let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
                     }
                 } else if state.active_pane == Pane::Settings {
-                    // Hit-test against the same layout used by paint_settings.
-                    // Row index counts rows only, like `settings_hover_at`.
+                    // Resolve geometry into a semantic action before any
+                    // mutation/Win32 work begins.
                     let items = state
                         .settings_items(sidebar_w, client_w, pad, scale, state.settings_scroll_y)
                         .items;
-                    let mut row_index = 0usize;
-                    for item in &items {
-                        if let SettingsItem::Row { id, rect } = item
-                            && y >= rect.top
-                            && y < rect.bottom
-                        {
-                            apply_settings_row_click(hwnd, id, row_index, rect, x, y, scale);
-                            return LRESULT(0);
-                        }
-                        if matches!(item, SettingsItem::Row { .. }) {
-                            row_index += 1;
-                        }
+                    if let Some((id, row_index, rect, action)) = hit_test_settings(&items, x, y, scale) {
+                        perform_setting_action(hwnd, id, row_index, &rect, action, scale);
+                        return LRESULT(0);
                     }
                 }
             }
