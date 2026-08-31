@@ -450,6 +450,166 @@ struct PillText {
     meta: String,
 }
 
+struct ReducedOverlayBatch {
+    track_sources: Vec<String>,
+    events: Vec<MediaEvent>,
+}
+
+/// Pure normalization of one drained overlay batch: recover owned events,
+/// merge same-batch progress into the last TrackChanged for its source, and
+/// order remaining progress updates before display events. `now` is supplied
+/// by the impure shell so tests can pin the merged position timestamp.
+fn reduce_overlay_batch(batch: Vec<Arc<MediaEvent>>, now: Instant) -> ReducedOverlayBatch {
+    let track_sources: Vec<String> = batch
+        .iter()
+        .filter_map(|event| match event.as_ref() {
+            MediaEvent::TrackChanged(track) => Some(track.source_app.clone()),
+            _ => None,
+        })
+        .collect();
+    let owned: Vec<MediaEvent> = batch.into_iter().map(media_event_into_owned).collect();
+    #[allow(clippy::type_complexity)]
+    let progress_by_source: HashMap<String, (Option<f64>, Option<u64>, Option<f64>)> = owned
+        .iter()
+        .filter_map(|event| match event {
+            MediaEvent::ProgressChanged {
+                source_app,
+                position_secs,
+                duration_secs,
+                playback_rate,
+            } => Some((source_app.clone(), (*position_secs, *duration_secs, *playback_rate))),
+            _ => None,
+        })
+        .collect();
+    let has_track_for_source: HashSet<String> = owned
+        .iter()
+        .filter_map(|event| match event {
+            MediaEvent::TrackChanged(track) => Some(track.source_app.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut last_track_idx: HashMap<String, usize> = HashMap::new();
+    for (idx, event) in owned.iter().enumerate() {
+        if let MediaEvent::TrackChanged(track) = event {
+            last_track_idx.insert(track.source_app.clone(), idx);
+        }
+    }
+    let mut coalesced = Vec::with_capacity(owned.len());
+    for (idx, event) in owned.into_iter().enumerate() {
+        match event {
+            MediaEvent::ProgressChanged { source_app, .. } if has_track_for_source.contains(&source_app) => {}
+            MediaEvent::TrackChanged(mut track) if progress_by_source.contains_key(&track.source_app) => {
+                if last_track_idx.get(&track.source_app) == Some(&idx)
+                    && let Some((position, duration, rate)) = progress_by_source.get(&track.source_app)
+                {
+                    track.duration_secs = *duration;
+                    track.playback_rate = *rate;
+                    let moved = match (track.position_secs, *position) {
+                        (Some(a), Some(b)) => (a - b).abs() > 0.01,
+                        (None, Some(_)) => true,
+                        _ => false,
+                    };
+                    if moved {
+                        track.position_secs = *position;
+                        track.position_updated_at = Some(now);
+                    }
+                }
+                coalesced.push(MediaEvent::TrackChanged(track));
+            }
+            other => coalesced.push(other),
+        }
+    }
+    let (mut progress, mut other): (Vec<MediaEvent>, Vec<MediaEvent>) = coalesced
+        .into_iter()
+        .partition(|event| matches!(event, MediaEvent::ProgressChanged { .. }));
+    progress.append(&mut other);
+    ReducedOverlayBatch {
+        track_sources,
+        events: progress,
+    }
+}
+
+/// Pure render decision for the end of `tick`. Sampling/mutation happens in
+/// the tick shell; this predicate only says whether those sampled changes
+/// require a new raster/upload.
+fn should_render_this_tick(
+    layout_flipped: bool,
+    phase_animating: bool,
+    hover_morph: bool,
+    marquee_moved: bool,
+    bar_moved: bool,
+    persistent_fade: bool,
+    orbiting: bool,
+) -> bool {
+    layout_flipped || phase_animating || hover_morph || marquee_moved || bar_moved || persistent_fade || orbiting
+}
+
+#[cfg(test)]
+mod pure_stage_tests {
+    use super::*;
+
+    #[test]
+    fn render_predicate_stays_idle_until_one_stage_is_dirty() {
+        assert!(!should_render_this_tick(
+            false, false, false, false, false, false, false
+        ));
+        for index in 0..7 {
+            let mut flags = [false; 7];
+            flags[index] = true;
+            assert!(should_render_this_tick(
+                flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6]
+            ));
+        }
+    }
+
+    #[test]
+    fn batch_reducer_merges_progress_into_last_track_per_source() {
+        let now = Instant::now();
+        let mut first = TrackInfo {
+            source_app: "player".into(),
+            title: "A".into(),
+            position_secs: Some(1.0),
+            ..TrackInfo::default()
+        };
+        first.duration_secs = Some(100);
+        let second = TrackInfo {
+            source_app: "player".into(),
+            title: "B".into(),
+            position_secs: Some(2.0),
+            ..TrackInfo::default()
+        };
+        let batch = vec![
+            Arc::new(MediaEvent::TrackChanged(first)),
+            Arc::new(MediaEvent::TrackChanged(second)),
+            Arc::new(MediaEvent::ProgressChanged {
+                source_app: "player".into(),
+                position_secs: Some(25.0),
+                duration_secs: Some(200),
+                playback_rate: Some(1.0),
+            }),
+        ];
+        let reduced = reduce_overlay_batch(batch, now);
+        assert_eq!(reduced.track_sources, vec!["player", "player"]);
+        assert_eq!(reduced.events.len(), 2);
+        match &reduced.events[0] {
+            MediaEvent::TrackChanged(track) => {
+                assert_eq!(track.title, "A");
+                assert_eq!(track.position_secs, Some(1.0));
+            }
+            _ => panic!("first event should remain the first track"),
+        }
+        match &reduced.events[1] {
+            MediaEvent::TrackChanged(track) => {
+                assert_eq!(track.title, "B");
+                assert_eq!(track.position_secs, Some(25.0));
+                assert_eq!(track.duration_secs, Some(200));
+                assert_eq!(track.position_updated_at, Some(now));
+            }
+            _ => panic!("last track should receive the progress merge"),
+        }
+    }
+}
+
 struct OverlayState {
     hwnd: HWND,
     config: Config,
@@ -1481,104 +1641,10 @@ impl OverlayState {
         if let Ok(mut queue) = self.queue.lock() {
             batch.extend(queue.drain(..));
         }
-        // A PlaybackStateChanged that races a TrackChanged for the same
-        // source in the same batch is redundant: the state pill would render
-        // the source's *previously cached* track, and the track pill that
-        // follows in the same batch carries the change. The worker emits
-        // state-then-track per read, so the pairing is always ordered.
-        let track_sources: Vec<String> = batch
-            .iter()
-            .filter_map(|e| match e.as_ref() {
-                MediaEvent::TrackChanged(t) => Some(t.source_app.clone()),
-                _ => None,
-            })
-            .collect();
-        // Persistent-compact never collapses to Hidden on its own, so its
-        // pending queue (drained only while hidden) would hold events
-        // forever — nothing would ever show them. While such a pill is
-        // active — showing, or auto-hidden with held content — any event,
-        // same or cross-source, updates it in place, and the first event
-        // of a run shows directly. The queue remains for the notification
-        // layouts, where pills still collapse and drain it.
-        // The queue carries Arc<MediaEvent> so the fan-out to both windows
-        // never copies the event; recover the owned event here (zero-copy
-        // when this window is the last holder, a clone otherwise).
-        // Coalesce ProgressChanged into TrackChanged when the only difference
-        // is seek position: prevents showing a pill at the old position and
-        // then jumping the bar 100-300ms later when the timeline arrives.
-        let owned_batch: Vec<MediaEvent> = batch.into_iter().map(media_event_into_owned).collect();
-        #[allow(clippy::type_complexity)]
-        let progress_by_source: HashMap<String, (Option<f64>, Option<u64>, Option<f64>)> = owned_batch
-            .iter()
-            .filter_map(|ev| {
-                if let MediaEvent::ProgressChanged {
-                    source_app,
-                    position_secs,
-                    duration_secs,
-                    playback_rate,
-                } = ev
-                {
-                    Some((source_app.clone(), (*position_secs, *duration_secs, *playback_rate)))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let has_track_for_source: HashSet<String> = owned_batch
-            .iter()
-            .filter_map(|ev| {
-                if let MediaEvent::TrackChanged(t) = ev {
-                    Some(t.source_app.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        // Last Track per source — only it gets the Progress merge (L3). Rapid
-        // skip `A@5s` + `B@0s` + `Progress@50s` would otherwise give `A` wrong 50s.
-        let mut last_track_idx: HashMap<String, usize> = HashMap::new();
-        for (idx, ev) in owned_batch.iter().enumerate() {
-            if let MediaEvent::TrackChanged(t) = ev {
-                last_track_idx.insert(t.source_app.clone(), idx);
-            }
-        }
-        let mut coalesced: Vec<MediaEvent> = Vec::with_capacity(owned_batch.len());
-        for (idx, ev) in owned_batch.into_iter().enumerate() {
-            match ev {
-                MediaEvent::ProgressChanged { source_app, .. } if has_track_for_source.contains(&source_app) => {
-                    // Merged into the (last) TrackChanged for this source in the same batch
-                    continue;
-                }
-                MediaEvent::TrackChanged(mut track) if progress_by_source.contains_key(&track.source_app) => {
-                    // Only the last Track for this source in the batch gets the merge (L3)
-                    if last_track_idx.get(&track.source_app) == Some(&idx)
-                        && let Some((pos, dur, rate)) = progress_by_source.get(&track.source_app)
-                    {
-                        // Always refresh duration/rate (L2) — pos only when it moved
-                        track.duration_secs = *dur;
-                        track.playback_rate = *rate;
-                        let should_merge_pos = match (track.position_secs, *pos) {
-                            (Some(a), Some(b)) => (a - b).abs() > 0.01,
-                            (None, Some(_)) => true,
-                            _ => false,
-                        };
-                        if should_merge_pos {
-                            track.position_secs = *pos;
-                            track.position_updated_at = Some(Instant::now());
-                        }
-                    }
-                    coalesced.push(MediaEvent::TrackChanged(track));
-                }
-                other => coalesced.push(other),
-            }
-        }
-        // Ensure Progress is applied before pills in the same batch: a
-        // seek+pause arriving together would otherwise show the pill at the old
-        // bar position and jump 16ms later. Ordering keeps first frame correct.
-        let (mut progress_events, mut other_events): (Vec<MediaEvent>, Vec<MediaEvent>) = coalesced
-            .into_iter()
-            .partition(|e| matches!(e, MediaEvent::ProgressChanged { .. }));
-        progress_events.append(&mut other_events);
+        let ReducedOverlayBatch {
+            track_sources,
+            events: progress_events,
+        } = reduce_overlay_batch(batch, Instant::now());
         for event in progress_events {
             // Monotonic artwork generation: drop late decodes that reordered
             // behind a newer track of the same source across a worker restart.
@@ -3403,17 +3469,19 @@ impl OverlayState {
         // tick-cadence gap). The phase half of the condition stays on the
         // top-of-tick value, so a phase transition in this same tick still
         // renders its rest frame, exactly as before.
-        if layout_flipped
-            || animating
-            || self.hover_expand.is_some()
-            || self
-                .scroll
-                .iter()
-                .any(|line| line.scrolling && (line.offset as i32) != line.rendered_offset)
-            || bar_moved
-            || self.persistent_fade_active()
-            || self.orbiting()
-        {
+        let marquee_moved = self
+            .scroll
+            .iter()
+            .any(|line| line.scrolling && (line.offset as i32) != line.rendered_offset);
+        if should_render_this_tick(
+            layout_flipped,
+            animating,
+            self.hover_expand.is_some(),
+            marquee_moved,
+            bar_moved,
+            self.persistent_fade_active(),
+            self.orbiting(),
+        ) {
             self.render();
         }
         // Re-sync the timer to the phase: a static pill drops to the coarse

@@ -720,6 +720,24 @@ fn read_playback_snapshot_direct(session: &GlobalSystemMediaTransportControlsSes
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NormalizedPlayback {
+    closed: bool,
+    image: bool,
+    state: Option<PlaybackState>,
+}
+
+/// Pure interpretation of the isolated playback snapshot. Callers keep their
+/// different side effects (evict vs. simply return), while Closed/Image/state
+/// classification cannot drift between refresh and re-show paths.
+fn normalize_playback_snapshot(snapshot: &PlaybackSnapshot) -> NormalizedPlayback {
+    NormalizedPlayback {
+        closed: snapshot.status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed,
+        image: snapshot.playback_type == PlaybackType::Image,
+        state: snapshot_playback_state(snapshot.status),
+    }
+}
+
 #[derive(Debug)]
 struct SyncComTimeout {
     millis: u64,
@@ -1278,13 +1296,13 @@ impl ListenerState {
             return Ok(());
         }
         let playback_info = self.read_playback_or_exclude_wedged(&session)?;
-        let status = playback_info.status;
-        if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed {
+        let normalized = normalize_playback_snapshot(&playback_info);
+        if normalized.closed {
             return Ok(());
         }
-        let playback = snapshot_playback_state(status);
+        let playback = normalized.state;
         let playback_type = playback_info.playback_type;
-        if playback_type == PlaybackType::Image {
+        if normalized.image {
             return Ok(());
         }
         let mut merged =
@@ -1397,7 +1415,8 @@ impl ListenerState {
         }
         let playback_info = self.read_playback_or_exclude_wedged(session)?;
         let status = playback_info.status;
-        if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed {
+        let normalized = normalize_playback_snapshot(&playback_info);
+        if normalized.closed {
             // Closed does not go through the diff/emit path: it usually fires
             // as the app quits, right after a Stopped/Paused already told the
             // user what happened, so the entry is evicted immediately and
@@ -1412,7 +1431,7 @@ impl ListenerState {
             self.terminal_pending.insert(source, Instant::now());
             return Ok(());
         }
-        let playback = snapshot_playback_state(status);
+        let playback = normalized.state;
         let prev = self.states.get(&key).cloned().unwrap_or_default();
         let mut next = prev.clone();
         // True until the first successful read (the stored state is the
@@ -1424,7 +1443,7 @@ impl ListenerState {
         // PlaybackType comes off the same isolated playback snapshot; no
         // second synchronous COM call is issued on the heartbeat worker.
         let playback_type = playback_info.playback_type;
-        if playback_type == PlaybackType::Image {
+        if normalized.image {
             // Image content (slideshows, photo apps) is not "now playing": no
             // pill fires for it — neither the track nor the paired state
             // event. Return before the playback diff so an image session can
@@ -4695,6 +4714,29 @@ fn reshow_terminal_stopped_warranted(in_terminal_pending: bool, on_cooldown: boo
 /// absent for the full grace settles, retiring a genuine last-source quit.
 fn terminal_pending_keep(alive_in_snapshot: bool, absent_for: Duration, grace: Duration) -> bool {
     alive_in_snapshot || absent_for < grace
+}
+
+#[cfg(test)]
+mod playback_normalization_tests {
+    use super::*;
+
+    #[test]
+    fn playback_snapshot_normalization_preserves_terminal_and_image_flags() {
+        let closed = PlaybackSnapshot {
+            status: GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed,
+            rate: None,
+            playback_type: PlaybackType::Music,
+        };
+        assert!(normalize_playback_snapshot(&closed).closed);
+        let image = PlaybackSnapshot {
+            status: GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing,
+            rate: Some(1.0),
+            playback_type: PlaybackType::Image,
+        };
+        let normalized = normalize_playback_snapshot(&image);
+        assert!(normalized.image);
+        assert_eq!(normalized.state, Some(PlaybackState::Playing));
+    }
 }
 
 #[cfg(test)]
