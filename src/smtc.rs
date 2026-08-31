@@ -295,10 +295,12 @@ const OUTPUT_RETRY_CAP: usize = 256;
 /// that: when an event would push in-flight artwork past the budget, its
 /// payload is dropped at emit time — raw cover, decode and derived palette
 /// stripped, metadata kept, the pill renders a placeholder — the same trade
-/// `MAX_RETAINED_ARTWORK_BYTES` makes. The shared counter is decremented as
-/// the forwarder pops events and as the mailbox frees them, so a legitimate
-/// cover flow resumes as soon as the UI catches up. Matches the retained-art
-/// budget; normal operation (a few MiB of queued art at most) never
+/// `MAX_RETAINED_ARTWORK_BYTES` makes. The shared counter follows the
+/// admitted artwork's actual downstream lifetime: the reservation is carried
+/// by every `TrackInfo` clone and is returned only when the final artwork-
+/// bearing clone drops. A legitimate cover flow therefore resumes as soon as
+/// no queue or UI state still retains the old payload. Matches the retained-
+/// art budget; normal operation (a few MiB of live art at most) never
 /// approaches it.
 const MAX_IN_FLIGHT_ARTWORK_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -346,10 +348,10 @@ fn set_active_session_sources(sources: Vec<String>) {
 struct ListenerState {
     manager: GlobalSystemMediaTransportControlsSessionManager,
     output: SyncSender<Arc<MediaEvent>>,
-    /// Shared in-flight artwork byte counter. The worker adds the artwork
-    /// bytes of every event it queues (channel or mailbox) and the forwarder
-    /// subtracts them as it pops, so the counter tracks the distinct artwork
-    /// allocations held by the outbound queues. `emit` consults it against
+    /// Shared downstream artwork byte counter. The worker atomically
+    /// reserves bytes before admission; the reservation is attached to the
+    /// TrackInfo and released by a shared drop token only after the final
+    /// queue/UI clone disappears. `emit` consults it against
     /// `MAX_IN_FLIGHT_ARTWORK_BYTES` and drops the payload (metadata kept)
     /// when the budget would be exceeded; mailbox supersede/over-cap/clear
     /// drops free their bytes too. Shared with the forwarder across worker
@@ -364,8 +366,10 @@ struct ListenerState {
     /// Recoverable retry mailbox for events the bounded output channel could
     /// not accept immediately. Bounded; coalesced by (kind, source) with the
     /// newest superseding, drained in arrival order at every event-loop turn.
-    /// Never blocks the worker: overflow drops the oldest superseded event,
-    /// and the 2-second safety-net poll repairs state on top.
+    /// Never blocks the worker: overflow drops the oldest superseded event
+    /// holder (its shared artwork token releases only if that was the final
+    /// downstream holder), and the 2-second safety-net poll repairs state on
+    /// top.
     pending_output: VecDeque<Arc<MediaEvent>>,
     signal_tx: SyncSender<Signal>,
     /// Latest-value mailbox for main-window control commands. Drained at
@@ -2756,31 +2760,24 @@ impl ListenerState {
             return;
         }
         let mut event = event;
-        let in_flight = self.in_flight_art.load(Ordering::Relaxed);
-        let had_art = matches!(&event, MediaEvent::TrackChanged(track) if track.artwork.is_some());
-        let bytes = budget_artwork(&mut event, in_flight, MAX_IN_FLIGHT_ARTWORK_BYTES);
-        if had_art && matches!(&event, MediaEvent::TrackChanged(track) if track.artwork.is_none()) {
-            // Stripped: the bytes were not counted, so nothing is added. The
-            // event is still queued — the metadata (and thus the pill) is the
-            // authoritative state; only the cover is missing.
+        let had_art = artwork_bytes(&event) != 0;
+        let reservation = reserve_artwork(&mut event, &self.in_flight_art, MAX_IN_FLIGHT_ARTWORK_BYTES);
+        if had_art && let Err(in_flight) = reservation {
+            // Stripped: the bytes were not reserved. The event is still
+            // queued — metadata remains authoritative; only the cover is
+            // missing.
             if let MediaEvent::TrackChanged(track) = &event {
                 let label = track_label(track);
                 debug!(
                     "artwork dropped from queued event | reason=in-flight-byte-budget | \
-                     in_flight={in_flight} | {label}"
+                         in_flight={in_flight} | {label}"
                 );
             }
-            // One-shot user-facing warning: the budget tripped because the
-            // UI is not keeping up. The tray note fires once per app run (the
-            // latch is shared across worker restarts), not on every dropped
-            // cover. The warning travels through the normal event path, so it
-            // is delivered (via the retry mailbox) as soon as the forwarder
-            // drains.
+            // One-shot user-facing warning. The warning itself has no
+            // artwork and therefore needs no reservation.
             if !self.budget_warned.swap(true, Ordering::Relaxed) {
                 self.emit(MediaEvent::ArtworkBudgetExceeded);
             }
-        } else {
-            self.in_flight_art.fetch_add(bytes, Ordering::Relaxed);
         }
         match self.output.try_send(Arc::new(event)) {
             Ok(()) => {}
@@ -2789,7 +2786,6 @@ impl ListenerState {
                     &mut self.pending_output,
                     returned,
                     OUTPUT_RETRY_CAP,
-                    &self.in_flight_art,
                     &self.budget_warned,
                 );
                 if dropped > 0 && self.may_warn_overflow() {
@@ -2802,16 +2798,6 @@ impl ListenerState {
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 self.clear_pending_output();
-                // Channel's queued Arcs will be dropped by the channel
-                // destruct, but the shared counter still holds their artwork
-                // bytes. Reclaim them so a dead forwarder cannot strand the
-                // 64 MiB budget and make every later cover a placeholder.
-                let reclaimed = self.in_flight_art.swap(0, Ordering::Relaxed);
-                if reclaimed != 0 {
-                    warn!(
-                        "in-flight artwork counter reclaimed | reason=channel-disconnected | reclaimed={reclaimed} bytes"
-                    );
-                }
                 debug!("signal dropped | kind=MediaEvent | reason=closed");
             }
         }
@@ -2824,20 +2810,15 @@ impl ListenerState {
     fn flush_output(&mut self) {
         if drain_pending_to_channel(&mut self.pending_output, &self.output) {
             self.clear_pending_output();
-            let reclaimed = self.in_flight_art.swap(0, Ordering::Relaxed);
-            if reclaimed != 0 {
-                warn!(
-                    "in-flight artwork counter reclaimed | reason=channel-disconnected (flush) | reclaimed={reclaimed} bytes"
-                );
-            }
         }
     }
 
-    /// Drops every event still in the retry mailbox and frees its in-flight
-    /// artwork accounting. Called when the output channel disconnected (the
+    /// Drops every event still in the retry mailbox. Its shared artwork
+    /// reservation is returned only when that mailbox entry was the final
+    /// downstream holder. Called when the output channel disconnected (the
     /// forwarder is gone, so nothing queued can ever be delivered) and from
-    /// `Drop`, so a worker ending with a non-empty mailbox returns its bytes
-    /// to the shared counter instead of starving the next worker's budget.
+    /// `Drop`, so a worker ending with a non-empty mailbox cannot leave
+    /// mailbox-only artwork reservations starving the next worker's budget.
     ///
     /// If the discarded mailbox holds the one-shot budget warning, the
     /// `budget_warned` latch is reset: the warning was emitted but never
@@ -2855,7 +2836,7 @@ impl ListenerState {
             self.budget_warned.store(false, Ordering::Relaxed);
             debug!("budget-warning latch reset | reason=undelivered-warning-discarded");
         }
-        release_pending_bytes(&mut self.pending_output, &self.in_flight_art);
+        self.pending_output.clear();
     }
 
     fn is_current_generation(&self) -> bool {
@@ -2868,12 +2849,12 @@ impl Drop for ListenerState {
         // Return the artwork accounting of whatever is still in the retry
         // mailbox to the shared counter when this worker ends (clean exit,
         // shutdown join, or panic unwind). The counter survives into the
-        // replacement worker, and every mailbox event's bytes were counted
-        // at emit time and only freed when the event left the mailbox — so
-        // without this, a worker that dies with a non-empty mailbox (a full
-        // output channel at exit) would leave its bytes counted forever and
-        // the next worker would strip every cover, permanently, until the
-        // app restarts. The one path this cannot cover is a hard stall,
+        // replacement worker. Every admitted event carries a shared lifetime
+        // token, so clearing this mailbox drops only this worker's holders;
+        // the counter reaches zero for a payload only after its final queue/UI
+        // holder disappears. Without this clear, mailbox-only events from a
+        // worker that dies while the output channel is full would remain
+        // retained and counted forever. The one path this cannot cover is a hard stall,
         // where the worker thread is leaked mid-call and `drop` never runs:
         // those bytes stay counted (and their memory stays live), bounded by
         // the mailbox cap and documented as a residual in the threat model.
@@ -2901,25 +2882,34 @@ fn event_coalesce_key(event: &MediaEvent) -> (&'static str, Option<&str>) {
     }
 }
 
-/// Applies the in-flight artwork byte budget to an event about to be queued:
-/// when adding its artwork would exceed the budget, the payload is dropped —
-/// raw cover, decode and derived palette stripped — while the metadata is
-/// kept, so the pill renders a placeholder instead of pinning megabytes
-/// behind a queued event. Returns the artwork bytes the caller must add to
-/// the shared in-flight counter: the event's full artwork when it fits
-/// within the budget, or 0 when it was stripped (nothing was queued). Pure,
-/// so the budget decision is unit-testable without a live session manager.
-fn budget_artwork(event: &mut MediaEvent, in_flight: u64, budget: u64) -> u64 {
+/// Atomically reserves the downstream artwork budget for an event about
+/// to be queued. On success the reservation is attached to the TrackInfo as a
+/// shared lifetime token; every queue/UI clone carries that token and the
+/// final Drop releases the bytes. On failure the artwork payload is stripped
+/// while metadata is preserved. The returned Err contains the observed byte
+/// count that prevented admission.
+fn reserve_artwork(event: &mut MediaEvent, in_flight: &Arc<AtomicU64>, budget: u64) -> std::result::Result<u64, u64> {
     let bytes = artwork_bytes(event);
-    if bytes > 0 && in_flight.saturating_add(bytes) > budget {
-        if let MediaEvent::TrackChanged(track) = event {
-            track.artwork = None;
-            track.decoded_art = None;
-            track.palette = None;
+    if bytes == 0 {
+        return Ok(0);
+    }
+    match in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.checked_add(bytes).filter(|next| *next <= budget)
+    }) {
+        Ok(_) => {
+            if let MediaEvent::TrackChanged(track) = event {
+                track.attach_artwork_lifetime(in_flight.clone(), bytes);
+            }
+            Ok(bytes)
         }
-        0
-    } else {
-        bytes
+        Err(current) => {
+            if let MediaEvent::TrackChanged(track) = event {
+                track.artwork = None;
+                track.decoded_art = None;
+                track.palette = None;
+            }
+            Err(current)
+        }
     }
 }
 
@@ -2927,10 +2917,10 @@ fn budget_artwork(event: &mut MediaEvent, in_flight: u64, budget: u64) -> u64 {
 /// same coalesce key is superseded in place — the newest authoritative state
 /// wins — while events for different sources/kinds keep their arrival order.
 /// On over-cap the oldest queued event is dropped, never the newest; returns
-/// how many were dropped so the caller can report the overflow. Every event
-/// that leaves the mailbox (superseded or over-cap) had its artwork bytes
-/// counted when it was queued, so those bytes are freed from `in_flight`
-/// here — the counter tracks distinct live allocations, not queue slots.
+/// how many were dropped so the caller can report the overflow. Removing an
+/// event drops one holder of its shared artwork-lifetime token; the reservation
+/// returns to `in_flight` only if that was the final downstream holder, so the
+/// counter tracks live retained artwork rather than queue slots.
 ///
 /// The one-shot budget warning cannot leave the mailbox by supersession (a
 /// queued warning implies its latch is set, so no newer same-key warning can
@@ -2943,24 +2933,16 @@ fn coalesce_pending_event(
     queue: &mut VecDeque<Arc<MediaEvent>>,
     event: Arc<MediaEvent>,
     cap: usize,
-    in_flight: &AtomicU64,
     budget_warned: &AtomicBool,
 ) -> usize {
     let key = event_coalesce_key(&event);
     if let Some(index) = queue.iter().position(|queued| event_coalesce_key(queued) == key)
-        && let Some(superseded) = queue.remove(index)
-    {
-        let _ = in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
-            Some(x.saturating_sub(artwork_bytes(&superseded)))
-        });
-    }
+        && let Some(_superseded) = queue.remove(index)
+    {}
     queue.push_back(event);
     let mut dropped = 0;
     while queue.len() > cap {
         if let Some(oldest) = queue.pop_front() {
-            let _ = in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
-                Some(x.saturating_sub(artwork_bytes(&oldest)))
-            });
             if matches!(oldest.as_ref(), MediaEvent::ArtworkBudgetExceeded) {
                 // The queued one-shot budget warning was discarded undelivered
                 // by the over-cap pop: reset its latch so a later strip
@@ -2982,17 +2964,6 @@ fn mailbox_holds_budget_warning(queue: &VecDeque<Arc<MediaEvent>>) -> bool {
     queue
         .iter()
         .any(|event| matches!(event.as_ref(), MediaEvent::ArtworkBudgetExceeded))
-}
-
-/// Drops every event in a mailbox and frees its in-flight artwork accounting
-/// (the inverse of the queueing-time `fetch_add` in `emit`). Used when the
-/// output channel disconnects and nothing queued can ever be delivered.
-fn release_pending_bytes(queue: &mut VecDeque<Arc<MediaEvent>>, in_flight: &AtomicU64) {
-    while let Some(event) = queue.pop_front() {
-        let _ = in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
-            Some(x.saturating_sub(artwork_bytes(&event)))
-        });
-    }
 }
 
 /// Drains a retry mailbox into the output channel, oldest first. Stops at the
@@ -3531,6 +3502,7 @@ fn merge_track(prev: &LogicalState, read: &TrackInfo, read_artwork: bool) -> Tra
         subtitle: inherit(&read.subtitle, &prev.subtitle),
         artwork: if read_artwork { read.artwork.clone() } else { None },
         decoded_art: None,
+        artwork_lifetime: None,
         app_icon: read.app_icon.clone(),
         source_app: read.source_app.clone(),
         duration_secs: if same_identity {
@@ -4061,6 +4033,7 @@ fn read_track_info(
         subtitle,
         artwork,
         decoded_art: None,
+        artwork_lifetime: None,
         app_icon: None,
         source_app,
         duration_secs,
@@ -6719,20 +6692,8 @@ mod tests {
         let mut queue = VecDeque::new();
         let first = Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "src".into()));
         let second = Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "src".into()));
-        coalesce_pending_event(
-            &mut queue,
-            first,
-            OUTPUT_RETRY_CAP,
-            &AtomicU64::new(0),
-            &AtomicBool::new(false),
-        );
-        coalesce_pending_event(
-            &mut queue,
-            second.clone(),
-            OUTPUT_RETRY_CAP,
-            &AtomicU64::new(0),
-            &AtomicBool::new(false),
-        );
+        coalesce_pending_event(&mut queue, first, OUTPUT_RETRY_CAP, &AtomicBool::new(false));
+        coalesce_pending_event(&mut queue, second.clone(), OUTPUT_RETRY_CAP, &AtomicBool::new(false));
         assert_eq!(queue.len(), 1, "the superseded event must be removed");
         assert!(Arc::ptr_eq(&queue[0], &second), "the newest event must be the survivor");
         // Progress updates for one source coalesce the same way (latest position wins).
@@ -6746,7 +6707,6 @@ mod tests {
                 playback_rate: Some(1.0),
             }),
             OUTPUT_RETRY_CAP,
-            &AtomicU64::new(0),
             &AtomicBool::new(false),
         );
         coalesce_pending_event(
@@ -6758,7 +6718,6 @@ mod tests {
                 playback_rate: Some(1.0),
             }),
             OUTPUT_RETRY_CAP,
-            &AtomicU64::new(0),
             &AtomicBool::new(false),
         );
         assert_eq!(queue.len(), 1, "progress coalesces per source");
@@ -6779,20 +6738,8 @@ mod tests {
         tb.source_app = "src-b".into();
         let track_a = Arc::new(MediaEvent::TrackChanged(ta));
         let track_b = Arc::new(MediaEvent::TrackChanged(tb));
-        coalesce_pending_event(
-            &mut queue,
-            track_a.clone(),
-            OUTPUT_RETRY_CAP,
-            &AtomicU64::new(0),
-            &AtomicBool::new(false),
-        );
-        coalesce_pending_event(
-            &mut queue,
-            track_b.clone(),
-            OUTPUT_RETRY_CAP,
-            &AtomicU64::new(0),
-            &AtomicBool::new(false),
-        );
+        coalesce_pending_event(&mut queue, track_a.clone(), OUTPUT_RETRY_CAP, &AtomicBool::new(false));
+        coalesce_pending_event(&mut queue, track_b.clone(), OUTPUT_RETRY_CAP, &AtomicBool::new(false));
         assert_eq!(queue.len(), 2, "cross-source tracks keep arrival order");
         assert!(Arc::ptr_eq(&queue[0], &track_a), "first-arrived track stays first");
 
@@ -6803,21 +6750,18 @@ mod tests {
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "a".into())),
             2,
-            &AtomicU64::new(0),
             &AtomicBool::new(false),
         );
         coalesce_pending_event(
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "b".into())),
             2,
-            &AtomicU64::new(0),
             &AtomicBool::new(false),
         );
         coalesce_pending_event(
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "c".into())),
             2,
-            &AtomicU64::new(0),
             &AtomicBool::new(false),
         );
         assert_eq!(queue.len(), 2, "cap must hold");
@@ -6854,7 +6798,6 @@ mod tests {
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "b".into())),
             2,
-            &AtomicU64::new(0),
             &latch,
         );
         assert_eq!(dropped, 1, "the warning aged to the head and was popped");
@@ -6881,7 +6824,6 @@ mod tests {
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "b".into())),
             2,
-            &AtomicU64::new(0),
             &latch,
         );
         assert_eq!(dropped, 1, "the over-cap pop still ran");
@@ -6909,14 +6851,12 @@ mod tests {
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "src".into())),
             OUTPUT_RETRY_CAP,
-            &AtomicU64::new(0),
             &AtomicBool::new(false),
         );
         coalesce_pending_event(
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "src".into())),
             OUTPUT_RETRY_CAP,
-            &AtomicU64::new(0),
             &AtomicBool::new(false),
         );
         assert_eq!(queue.len(), 1, "the older Paused was superseded in the mailbox");
@@ -6945,14 +6885,12 @@ mod tests {
             &mut queue,
             Arc::new(MediaEvent::TrackChanged(track("A", "1"))),
             OUTPUT_RETRY_CAP,
-            &AtomicU64::new(0),
             &AtomicBool::new(false),
         );
         coalesce_pending_event(
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "a".into())),
             OUTPUT_RETRY_CAP,
-            &AtomicU64::new(0),
             &AtomicBool::new(false),
         );
         assert!(
@@ -6983,7 +6921,6 @@ mod tests {
             &mut queue,
             Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, "src".into())),
             OUTPUT_RETRY_CAP,
-            &AtomicU64::new(0),
             &AtomicBool::new(false),
         );
         drop(rx);
@@ -7021,142 +6958,88 @@ mod tests {
     }
 
     #[test]
-    fn budget_artwork_strips_only_when_the_budget_would_be_exceeded() {
-        // The G1 budget decision: an event whose artwork would push the
-        // in-flight bytes past the budget loses its payload (raw cover,
-        // decode and derived palette) while the metadata survives, so the
-        // pill still renders the track with a placeholder instead of pinning
-        // megabytes behind a queued event.
-        let art = |len: usize| TrackInfo {
-            title: "Song".into(),
-            artwork: Some(Arc::from(vec![0u8; len])),
-            decoded_art: Some(Arc::from(vec![0u8; 4])),
-            palette: Some(Palette {
-                primary: [0; 4],
-                secondary: [0; 4],
-            }),
+    fn reserve_artwork_is_atomic_and_releases_on_final_event_drop() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut first = MediaEvent::TrackChanged(TrackInfo {
+            artwork: Some(Arc::from([1u8; 4])),
+            decoded_art: Some(Arc::from([2u8; 8])),
+            source_app: "a".into(),
             ..TrackInfo::default()
-        };
-        // Fits: the full artwork is counted (raw + decode) and untouched.
-        let mut event = MediaEvent::TrackChanged(art(10));
-        assert_eq!(budget_artwork(&mut event, 0, 100), 14);
-        match &event {
-            MediaEvent::TrackChanged(track) => assert!(track.artwork.is_some()),
-            other => panic!("expected TrackChanged, got {other:?}"),
-        }
-        // Exactly at the budget still fits.
-        let mut event = MediaEvent::TrackChanged(art(96));
-        assert_eq!(budget_artwork(&mut event, 0, 100), 100);
-        // Over the budget: stripped, nothing counted, metadata kept.
-        let mut event = MediaEvent::TrackChanged(art(97));
-        assert_eq!(budget_artwork(&mut event, 0, 100), 0);
-        match event {
-            MediaEvent::TrackChanged(track) => {
-                assert!(track.artwork.is_none(), "the raw cover must be dropped");
-                assert!(track.decoded_art.is_none(), "the decode must be dropped too");
-                assert!(track.palette.is_none(), "the cover-derived palette must go with it");
-                assert_eq!(track.title, "Song", "the metadata must survive the strip");
-            }
-            other => panic!("expected TrackChanged, got {other:?}"),
-        }
-        // The budget counts against in-flight bytes, not per event: a second
-        // event that fits alone is still stripped when the first already
-        // consumed the budget. art(60) counts 64 (60 raw + 4 decode).
-        let mut first = MediaEvent::TrackChanged(art(60));
-        let mut second = MediaEvent::TrackChanged(art(60));
-        assert_eq!(budget_artwork(&mut first, 0, 100), 64);
-        assert_eq!(budget_artwork(&mut second, 64, 100), 0, "64 of 100 already in flight");
-        // Artless and non-track events are never counted or touched.
-        let mut artless = MediaEvent::TrackChanged(track("Song", "A"));
-        assert_eq!(budget_artwork(&mut artless, 100, 100), 0);
-        let mut playback = MediaEvent::PlaybackStateChanged(PlaybackState::Playing, "s".into());
-        assert_eq!(budget_artwork(&mut playback, u64::MAX, 1), 0);
+        });
+        assert_eq!(reserve_artwork(&mut first, &counter, 12), Ok(12));
+        assert_eq!(counter.load(Ordering::Relaxed), 12);
+        let shared = Arc::new(first);
+        let clone = shared.clone();
+        drop(shared);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            12,
+            "one surviving event clone keeps the budget"
+        );
+
+        let mut blocked = MediaEvent::TrackChanged(TrackInfo {
+            artwork: Some(Arc::from([3u8; 1])),
+            source_app: "b".into(),
+            ..TrackInfo::default()
+        });
+        assert_eq!(reserve_artwork(&mut blocked, &counter, 12), Err(12));
+        assert!(matches!(&blocked, MediaEvent::TrackChanged(track) if track.artwork.is_none()));
+        drop(clone);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "final clone releases the reservation"
+        );
     }
 
     #[test]
-    fn coalesce_pending_event_frees_bytes_for_dropped_events() {
-        // The mailbox accounting mirrors `emit`: queueing adds bytes, and
-        // every event that leaves the mailbox — superseded by a newer
-        // same-key event, or popped by the over-cap rule — frees them. The
-        // counter must track distinct live allocations, not queue slots.
-        // The source distinguishes coalesce keys (same source supersedes,
-        // different sources coexist).
-        let art = |len: usize, source: &str| {
-            Arc::new(MediaEvent::TrackChanged(TrackInfo {
+    fn mailbox_drops_release_artwork_lifetime_tokens() {
+        let make = |len: usize, source: &str, counter: &Arc<AtomicU64>| {
+            let mut event = MediaEvent::TrackChanged(TrackInfo {
                 title: "Song".into(),
                 source_app: source.into(),
                 artwork: Some(Arc::from(vec![0u8; len])),
                 ..TrackInfo::default()
-            }))
+            });
+            assert_eq!(reserve_artwork(&mut event, counter, u64::MAX), Ok(len as u64));
+            Arc::new(event)
         };
-        // Supersede: the older same-source event's bytes are freed.
-        let mut queue = VecDeque::new();
-        let counter = AtomicU64::new(0);
-        counter.fetch_add(10, Ordering::Relaxed); // emit counted art(10)
-        coalesce_pending_event(
-            &mut queue,
-            art(10, "src"),
-            OUTPUT_RETRY_CAP,
-            &counter,
-            &AtomicBool::new(false),
-        );
-        assert_eq!(counter.load(Ordering::Relaxed), 10, "queued bytes stay counted");
-        counter.fetch_add(20, Ordering::Relaxed); // emit counted art(20)
-        coalesce_pending_event(
-            &mut queue,
-            art(20, "src"),
-            OUTPUT_RETRY_CAP,
-            &counter,
-            &AtomicBool::new(false),
-        );
-        assert_eq!(
-            counter.load(Ordering::Relaxed),
-            20,
-            "the superseded 10-byte event is freed"
-        );
-        // Over-cap: the oldest event's bytes are freed, never the newest's.
-        let mut queue = VecDeque::new();
-        let counter = AtomicU64::new(0);
-        for (len, source) in [(10u64, "a"), (20, "b"), (30, "c")] {
-            counter.fetch_add(len, Ordering::Relaxed); // emit counted each
-            coalesce_pending_event(
-                &mut queue,
-                art(len as usize, source),
-                2,
-                &counter,
-                &AtomicBool::new(false),
-            );
-        }
-        assert_eq!(queue.len(), 2, "the cap must hold");
-        assert_eq!(
-            counter.load(Ordering::Relaxed),
-            50,
-            "the oldest 10-byte event was freed by the over-cap pop"
-        );
-    }
 
-    #[test]
-    fn release_pending_bytes_frees_every_queued_payload() {
-        // The disconnect path drops the whole mailbox; every queued payload's
-        // bytes must be freed so the counter ends where it started.
+        // Superseding the same source drops the old token, so only the newest
+        // event's bytes remain reserved.
+        let counter = Arc::new(AtomicU64::new(0));
         let mut queue = VecDeque::new();
-        let counter = AtomicU64::new(100);
-        let art = |len: usize| {
-            Arc::new(MediaEvent::TrackChanged(TrackInfo {
-                title: "Song".into(),
-                artwork: Some(Arc::from(vec![0u8; len])),
-                ..TrackInfo::default()
-            }))
-        };
-        queue.push_back(art(10));
-        queue.push_back(art(30));
-        queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
-            PlaybackState::Stopped,
-            "s".into(),
-        )));
-        release_pending_bytes(&mut queue, &counter);
-        assert!(queue.is_empty(), "the mailbox must be fully drained");
-        assert_eq!(counter.load(Ordering::Relaxed), 60, "the two payloads' bytes are freed");
+        coalesce_pending_event(
+            &mut queue,
+            make(10, "src", &counter),
+            OUTPUT_RETRY_CAP,
+            &AtomicBool::new(false),
+        );
+        coalesce_pending_event(
+            &mut queue,
+            make(20, "src", &counter),
+            OUTPUT_RETRY_CAP,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 20);
+        queue.clear();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "clearing the final clone releases it"
+        );
+
+        // Over-cap drops the oldest token automatically; distinct sources
+        // coexist, so a cap of two keeps 20 + 30 bytes after evicting 10.
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut queue = VecDeque::new();
+        for (len, source) in [(10usize, "a"), (20, "b"), (30, "c")] {
+            coalesce_pending_event(&mut queue, make(len, source, &counter), 2, &AtomicBool::new(false));
+        }
+        assert_eq!(queue.len(), 2);
+        assert_eq!(counter.load(Ordering::Relaxed), 50);
+        queue.clear();
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
     #[test]

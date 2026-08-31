@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
@@ -57,6 +58,22 @@ const _: () = {
     }
 };
 
+#[derive(Debug)]
+pub(crate) struct ArtworkLifetime {
+    bytes: u64,
+    in_flight: Arc<AtomicU64>,
+}
+
+impl Drop for ArtworkLifetime {
+    fn drop(&mut self) {
+        let _ = self
+            .in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(self.bytes))
+            });
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TrackInfo {
     pub title: String,
@@ -79,6 +96,11 @@ pub struct TrackInfo {
     /// on its UI thread. The raw bytes stay attached (above) for identity and
     /// fingerprinting.
     pub decoded_art: Option<Arc<[u8]>>,
+    /// Shared accounting token for artwork admitted to the downstream event
+    /// path. Every clone that can still retain the raw/decode buffers shares
+    /// this token; its final Drop returns the reservation to the global
+    /// in-flight budget. Worker-side cache snapshots never carry a token.
+    pub(crate) artwork_lifetime: Option<Arc<ArtworkLifetime>>,
     /// The two-color palette derived once per track identity (source + title +
     /// artist) by the SMTC worker at emit time, from the fixed-size decode.
     /// Cached by identity in the worker, so a source that re-encodes its
@@ -153,6 +175,16 @@ pub fn format_duration_secs(secs: u64) -> String {
 }
 
 impl TrackInfo {
+    /// Attaches the already-reserved downstream artwork budget to this
+    /// snapshot. The token is cloned with the track and releases exactly once
+    /// when the final artwork-bearing clone disappears.
+    pub(crate) fn attach_artwork_lifetime(&mut self, in_flight: Arc<AtomicU64>, bytes: u64) {
+        debug_assert!(self.artwork_lifetime.is_none());
+        if bytes != 0 {
+            self.artwork_lifetime = Some(Arc::new(ArtworkLifetime { bytes, in_flight }));
+        }
+    }
+
     /// Compact secondary info line: album (or subtitle/album-artist fallback) ·
     /// duration · track n/c · genre. Only the parts the app actually provided
     /// are included. When the album title is empty, the subtitle or album
@@ -249,6 +281,9 @@ impl TrackInfo {
         if incoming.decoded_art.is_some() {
             self.decoded_art = incoming.decoded_art.clone();
         }
+        if incoming.artwork.is_some() || incoming.decoded_art.is_some() {
+            self.artwork_lifetime = incoming.artwork_lifetime.clone();
+        }
         if incoming.app_icon.is_some() {
             self.app_icon = incoming.app_icon.clone();
         }
@@ -294,6 +329,7 @@ impl TrackInfo {
         TrackInfo {
             artwork: None,
             decoded_art: None,
+            artwork_lifetime: None,
             palette: None,
             app_icon: None,
             ..self
@@ -315,8 +351,9 @@ pub fn media_event_into_owned(event: Arc<MediaEvent>) -> MediaEvent {
 /// cached app icon (bounded by the per-app icon cache, shared across clones)
 /// are not counted — the raw cover (up to `MAX_THUMBNAIL_BYTES`) and the
 /// decode dominate and are exactly what a wedged forwarder would retain.
-/// Shared by both sides of the in-flight artwork byte budget: the SMTC
-/// worker counts the bytes it queues, the forwarder frees them as it pops.
+/// Used by the SMTC worker before admission. Once admitted, the same byte
+/// count is owned by `TrackInfo`'s shared artwork-lifetime token and is freed
+/// only when the final artwork-bearing clone disappears.
 pub(crate) fn artwork_bytes(event: &MediaEvent) -> u64 {
     match event {
         MediaEvent::TrackChanged(track) => {
@@ -689,6 +726,30 @@ mod tests {
         assert!(full.decoded_art.is_some());
         assert!(full.palette.is_some());
         assert!(full.app_icon.is_some());
+    }
+
+    #[test]
+    fn artwork_lifetime_releases_only_after_the_final_clone() {
+        let counter = Arc::new(AtomicU64::new(12));
+        let mut track = TrackInfo {
+            artwork: art(b"cover"),
+            decoded_art: art(&[0u8; 7]),
+            ..TrackInfo::default()
+        };
+        track.attach_artwork_lifetime(counter.clone(), 12);
+        let clone = track.clone();
+        drop(track);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            12,
+            "a surviving clone keeps the reservation"
+        );
+        drop(clone);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "the final clone releases the reservation"
+        );
     }
 
     #[test]

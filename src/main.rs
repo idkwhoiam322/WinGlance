@@ -63,7 +63,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, PCWSTR};
 
-use crate::events::{MEDIA_EVENT_MSG, MediaEvent, artwork_bytes};
+use crate::events::{MEDIA_EVENT_MSG, MediaEvent};
 use crate::overlay::EventQueue;
 use crate::winutil::wide;
 
@@ -1054,16 +1054,14 @@ fn main() -> Result<()> {
     }
 
     let (event_tx, event_rx) = mpsc::sync_channel::<Arc<MediaEvent>>(EVENT_CHANNEL_CAP);
-    // Shared in-flight artwork byte counter for the event path (see
-    // `smtc::MAX_IN_FLIGHT_ARTWORK_BYTES`): the SMTC worker adds the artwork
-    // bytes of every event it queues and drops the payload when the budget is
-    // exceeded; the forwarder frees the bytes as it pops, so the count tracks
-    // the distinct artwork allocations held by the outbound queues. Shared
-    // across worker restarts so events a replaced worker left queued stay
-    // accounted.
+    // Shared downstream artwork byte counter (see
+    // `smtc::MAX_IN_FLIGHT_ARTWORK_BYTES`): the SMTC worker reserves bytes
+    // atomically before queue admission and attaches that reservation to the
+    // TrackInfo's shared lifetime token. The final artwork-bearing clone — in
+    // any worker queue, window queue, or UI state — releases it. Shared across
+    // worker restarts so leaked/stalled generations remain honestly counted.
     let in_flight_art: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let supervisor_art = in_flight_art.clone();
-    let forwarder_art = in_flight_art.clone();
     // One-shot latch for the budget-drop tray warning: the worker sets it the
     // first time the in-flight artwork budget strips a cover payload, so the
     // user gets exactly one "the UI is not keeping up" note per app run, not
@@ -1329,8 +1327,6 @@ fn main() -> Result<()> {
                         if reset_budget_warning_on_stall(&supervisor_budget_warned) {
                             warn!("budget-warning latch reset | reason=stalled-worker-leak");
                         }
-                        supervisor_art.store(0, Ordering::Relaxed);
-                        warn!("in-flight-art counter reset | reason=stalled-worker-leak");
                         let delay = worker_restart_delay(consecutive_restarts);
                         error!("SMTC worker stalled; restarting it in {}s", delay.as_secs());
                         sleep_interruptible(delay, &supervisor_shutdown);
@@ -1436,7 +1432,6 @@ fn main() -> Result<()> {
         event_rx,
         supervisor_rx,
         forwarder_shutdown,
-        forwarder_art,
     ) {
         Ok(handle) => handle,
         Err(error) => {
@@ -1625,7 +1620,6 @@ fn spawn_event_forwarder(
     receiver: mpsc::Receiver<Arc<MediaEvent>>,
     supervisor_rx: mpsc::Receiver<Arc<MediaEvent>>,
     shutdown: Arc<AtomicBool>,
-    in_flight_art: Arc<AtomicU64>,
 ) -> anyhow::Result<std::thread::JoinHandle<()>> {
     // HWND is not Send; the raw handle value is all the forwarder needs to
     // post with.
@@ -1660,14 +1654,6 @@ fn spawn_event_forwarder(
                 let event = match receiver.recv_timeout(Duration::from_millis(200 * (1 + quiet_cycles.min(4) as u64))) {
                     Ok(event) => {
                         quiet_cycles = 0;
-                        // The event left the worker's outbound queue: its
-                        // artwork bytes are no longer in flight here. The
-                        // window queues share the same `Arc` allocations and
-                        // are separately count-capped, so freeing at the pop
-                        // keeps the counter at the distinct live allocations.
-                        let _ = in_flight_art.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
-                            Some(x.saturating_sub(artwork_bytes(&event)))
-                        });
                         event
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1701,12 +1687,13 @@ fn spawn_event_forwarder(
         .map_err(anyhow::Error::from)
 }
 
-/// Whether an event must survive queue overflow: one-shot signals whose
-/// loss is permanent for the whole run (the budget warning fires once per
-/// app run; a lost `SourceGone` lets the overlay's standby restore a dead
-/// source's track on re-enable; `WorkerFailed` is the terminal report).
-/// These travel the ordinary capped queues, so the overload that triggers
-/// them would otherwise evict exactly them.
+/// Whether an event should be preferred as a queue-overflow survivor:
+/// one-shot signals whose loss is permanent for the whole run (the budget
+/// warning fires once per app run; a lost `SourceGone` lets the overlay's
+/// standby restore a dead source's track on re-enable; `WorkerFailed` is the
+/// terminal report). Ordinary events are evicted before these; only an
+/// all-protected overload may shed the oldest protected signal to preserve
+/// the hard queue bound.
 fn is_one_shot_signal(event: &MediaEvent) -> bool {
     matches!(
         event,
@@ -1714,22 +1701,25 @@ fn is_one_shot_signal(event: &MediaEvent) -> bool {
     )
 }
 
-/// Applies the window-queue cap after a push: when the queue holds more than
-/// `EVENT_QUEUE_CAP` events, the oldest droppable event is dropped in favor
-/// of the newest. One-shot signals are skipped as victims: dropping them
-/// loses information that can never be re-emitted, while any other event is
-/// superseded by newer state anyway. If every queued event is protected, the
-/// queue may temporarily exceed the cap — bounded by the one-shot emission
-/// rate, which is tiny by construction.
+/// Applies the window-queue hard cap after a push: when the queue holds more
+/// than `EVENT_QUEUE_CAP` events, the oldest droppable event is dropped in
+/// favor of the newest. One-shot signals are preferred as survivors because
+/// losing them may hide terminal state, but the queue is never allowed to
+/// exceed the hard cap: if every queued event is protected, the oldest
+/// protected signal is shed as a last resort. A permanently stalled window
+/// cannot be given lossless delivery and bounded memory at the same time;
+/// newest state wins under that pathological overload.
 fn enforce_queue_cap(queue: &mut VecDeque<Arc<MediaEvent>>, name: &str) {
     while queue.len() > EVENT_QUEUE_CAP {
-        let victim = queue.iter().position(|event| !is_one_shot_signal(event));
-        match victim {
-            Some(index) => {
-                queue.remove(index);
-                warn!("the {name} event queue exceeded its cap of {EVENT_QUEUE_CAP}; dropping a buffered event");
-            }
-            None => break,
+        let victim = queue.iter().position(|event| !is_one_shot_signal(event)).unwrap_or(0);
+        let protected = is_one_shot_signal(&queue[victim]);
+        queue.remove(victim);
+        if protected {
+            warn!(
+                "the {name} event queue reached its hard cap of {EVENT_QUEUE_CAP}; dropping the oldest protected one-shot signal"
+            );
+        } else {
+            warn!("the {name} event queue exceeded its cap of {EVENT_QUEUE_CAP}; dropping a buffered event");
         }
     }
 }
@@ -1767,6 +1757,13 @@ fn push_and_wake(queue: &EventQueue, wake: &AtomicBool, event: Arc<MediaEvent>, 
         warn!("the {name} event queue is poisoned; dropping the event");
         return;
     };
+    if let MediaEvent::TrackChanged(incoming) = event.as_ref()
+        && let Some(index) = q.iter().position(|queued| {
+            matches!(queued.as_ref(), MediaEvent::TrackChanged(existing) if existing.source_app == incoming.source_app)
+        })
+    {
+        q.remove(index);
+    }
     q.push_back(event);
     enforce_queue_cap(&mut q, name);
     if !wake.swap(true, Ordering::AcqRel)
@@ -2276,6 +2273,32 @@ mod tests {
     }
 
     #[test]
+    fn window_queue_coalesces_track_changed_to_newest_per_source() {
+        let mut queue = VecDeque::new();
+        let old = Arc::new(MediaEvent::TrackChanged(crate::events::TrackInfo {
+            title: "old".into(),
+            source_app: "spotify".into(),
+            ..Default::default()
+        }));
+        let newest = Arc::new(MediaEvent::TrackChanged(crate::events::TrackInfo {
+            title: "new".into(),
+            source_app: "spotify".into(),
+            ..Default::default()
+        }));
+        queue.push_back(old);
+        if let MediaEvent::TrackChanged(incoming) = newest.as_ref()
+            && let Some(index) = queue.iter().position(|queued| {
+                matches!(queued.as_ref(), MediaEvent::TrackChanged(existing) if existing.source_app == incoming.source_app)
+            })
+        {
+            queue.remove(index);
+        }
+        queue.push_back(newest);
+        assert_eq!(queue.len(), 1);
+        assert!(matches!(queue[0].as_ref(), MediaEvent::TrackChanged(track) if track.title == "new"));
+    }
+
+    #[test]
     fn window_queue_under_cap_keeps_every_event() {
         let mut queue = VecDeque::new();
         for i in 0..EVENT_QUEUE_CAP {
@@ -2323,13 +2346,15 @@ mod tests {
                 .any(|e| matches!(e.as_ref(), MediaEvent::SourceGone { .. })),
             "the settle signal must survive overflow"
         );
-        // An all-protected queue may exceed the cap rather than lose them.
+        // If overload consists entirely of protected signals, they are still
+        // preferred over ordinary victims, but the resource bound remains
+        // absolute: the oldest protected signal is the last-resort victim.
         let mut protected = VecDeque::new();
         for _ in 0..EVENT_QUEUE_CAP + 5 {
             protected.push_back(Arc::new(MediaEvent::ArtworkBudgetExceeded));
             enforce_queue_cap(&mut protected, "test");
         }
-        assert_eq!(protected.len(), EVENT_QUEUE_CAP + 5);
+        assert_eq!(protected.len(), EVENT_QUEUE_CAP);
     }
 
     #[test]
@@ -2466,5 +2491,31 @@ mod tests {
         assert!(!is_our_instance(&padded("WinGlance"), 42, 1));
         assert!(!is_our_instance(&padded("WinGlance.exe "), 42, 1));
         assert!(!is_our_instance(&padded(""), 42, 1));
+    }
+    #[test]
+    fn event_queue_cap_stays_hard_when_every_event_is_protected() {
+        let mut queue = VecDeque::new();
+        for index in 0..EVENT_QUEUE_CAP + 5 {
+            queue.push_back(Arc::new(MediaEvent::SourceGone {
+                source_app: format!("source-{index}"),
+            }));
+            enforce_queue_cap(&mut queue, "test");
+        }
+        assert_eq!(queue.len(), EVENT_QUEUE_CAP, "the window queue cap is absolute");
+        match queue.front().map(Arc::as_ref) {
+            Some(MediaEvent::SourceGone { source_app }) => {
+                assert_eq!(
+                    source_app, "source-5",
+                    "oldest protected signals are the last-resort victims"
+                )
+            }
+            other => panic!("expected SourceGone at the queue head, got {other:?}"),
+        }
+        match queue.back().map(Arc::as_ref) {
+            Some(MediaEvent::SourceGone { source_app }) => {
+                assert_eq!(source_app, &format!("source-{}", EVENT_QUEUE_CAP + 4));
+            }
+            other => panic!("expected newest SourceGone to survive, got {other:?}"),
+        }
     }
 }
