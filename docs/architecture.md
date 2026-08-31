@@ -64,19 +64,20 @@ timeout, circuit breaker (fail-fast
 after one hung shell call)
 ```
 
-- The SMTC worker owns all COM state for its lifetime and initializes COM as
-  MTA. Async WinRT calls block on `IAsyncOperation::get()`; blocking the
-  worker is acceptable because no other code shares that thread.
+- The SMTC worker owns its WinRT session state for its lifetime and initializes
+  COM as MTA. App-controlled async reads are time-bounded; synchronous
+  `GetPlaybackInfo` is executed on a reusable isolated COM helper so a wedged
+  source cannot pin the worker heartbeat indefinitely.
 - The supervisor watches a shared worker heartbeat. A worker that stalls
   (30 s without a beat) or exits is restarted with an increasing backoff
   (5 s → 60 s); a worker that runs for two minutes resets the failure
   counter. After five consecutive failures of any kind — spawn, exit, or
   stall — the supervisor stops restarting, logs, and sends one `WorkerFailed`
   event (history row + tray note): media notifications will not resume until
-  the app restarts. A hung worker is never joined (it may be blocked inside
-  COM forever); the consecutive-failure cap bounds that leak per stretch, and a
-rolling window budget (`MAX_LEAKED_WORKERS` within `LEAK_WINDOW`) stops
-restarts entirely if hung workers keep accumulating.
+  the app restarts. A hung worker is never forcibly terminated or joined while
+  blocked in COM. Every abandoned worker is charged to a process-lifetime
+  `MAX_LEAKED_WORKERS` budget that never resets; once exhausted, SMTC remains
+  degraded until WinGlance restarts.
 - The event forwarder is a thin thread that drains the bounded event channel
   into the two window queues and pokes the UI thread with `PostMessageW`. It
   exists so the UI thread stays responsive even if several SMTC callbacks
@@ -89,8 +90,9 @@ restarts entirely if hung workers keep accumulating.
   waits there and is re-pushed on the next emit, superseding an older event
   with the same coalesce key so the newest authoritative state wins. The
   worker also budgets the artwork bytes in flight across channel + mailbox
-  (`MAX_IN_FLIGHT_ARTWORK_BYTES` = 64 MiB, a shared counter freed as events
-  pop): a cover that would exceed the budget is stripped from the event
+  (`MAX_IN_FLIGHT_ARTWORK_BYTES` = 64 MiB). The charge belongs to the shared
+  artwork-lifetime token and is released only when the final artwork-bearing
+  clone drops; a cover that would exceed the budget is stripped from the event
   (metadata kept, pill renders a placeholder), and the first such drop per
   app run emits a one-shot `ArtworkBudgetExceeded` that the main window
   surfaces as a tray note, so the user learns the UI fell behind instead of
@@ -245,7 +247,7 @@ even while notifications are disabled, capped at 64 entries, evicting Stopped
 entries first). Paused, stopped, or unknown sources never qualify: a settle
 with nothing actually playing hides the pill instead of announcing stale
 "now playing" content, and a live source re-shows the pill on its own next
-event. The track cache itself is cap-bounded (3 entries, text plus one
+event. The track cache itself is cap-bounded (8 entries, text plus one
 decoded cover each) with indefinite retention — a playing source's track is
 never evicted by time, only by newer inserts.
 

@@ -229,8 +229,8 @@ const PENDING_CAP: usize = 4;
 /// track's decoded cover (up to 256 KB at the cap; typically 64 KB at 100 %
 /// DPI) plus the pill text, and the worker evicts its own source-level
 /// caches when sessions close — the overlay has no session knowledge, so an
-/// LRU cache: three entries bound the retained cover memory while covering
-/// a realistic source mix (music + video + podcast). Retention is indefinite
+/// LRU cache: eight entries bound the retained cover memory while covering
+/// a realistic multi-source mix without retaining an unbounded cover set. Retention is indefinite
 /// once inserted — a source's last track stays available as a successor
 /// while its playback state says it is still playing — so the cap alone
 /// bounds the memory (per entry: pill text + one 256² decoded cover).

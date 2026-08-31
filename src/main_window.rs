@@ -76,8 +76,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TPM_RIGHTBUTTON, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_DRAWITEM, WM_ENDSESSION, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT,
-    WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
-    WS_POPUP, WS_VISIBLE, WS_VSCROLL, WindowFromPoint,
+    WM_SETREDRAW, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WM_VSCROLL, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOPMOST,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WS_VSCROLL, WindowFromPoint,
 };
 use windows::core::{BSTR, PCWSTR, PWSTR};
 
@@ -422,6 +422,26 @@ const SETTINGS_HOVER: [u8; 4] = [0x24, 0x24, 0x24, 0xFF];
 const SETTINGS_TEXT: [u8; 4] = [0xF0, 0xF0, 0xF0, 0xFF];
 const SETTINGS_MUTED: [u8; 4] = [0xC8, 0xC8, 0xC8, 0xFF];
 const SETTINGS_FAINT: [u8; 4] = [0x7A, 0x7A, 0x7A, 0xFF];
+/// Muted history text still carries normal-size information, so it must meet
+/// WCAG AA against both alternating dark history-row surfaces.
+const HISTORY_MUTED_TEXT: [u8; 4] = [0x88, 0x88, 0x88, 0xFF];
+#[cfg(test)]
+mod history_contrast_tests {
+    use super::*;
+
+    #[test]
+    fn muted_history_text_meets_aa_on_both_row_surfaces() {
+        let muted = [HISTORY_MUTED_TEXT[0], HISTORY_MUTED_TEXT[1], HISTORY_MUTED_TEXT[2]];
+        for background in [[0, 0, 0], [0x0E, 0x0E, 0x0E]] {
+            let ratio = crate::overlay::contrast_ratio(muted, background);
+            assert!(
+                ratio >= crate::overlay::TEXT_CONTRAST_AA,
+                "history muted contrast {ratio} is below AA on {background:?}"
+            );
+        }
+    }
+}
+
 /// Warm amber for the config-persistence warning banner.
 const SETTINGS_WARN: [u8; 4] = [0xFF, 0xB7, 0x4D, 0xFF];
 
@@ -2208,6 +2228,12 @@ impl MainWindowState {
         // Invalidation is deferred until after the batch: a burst of events
         // (session churn, a gapless album) redraws the current-activity area
         // once instead of once per event.
+        let history_redraw_suspended = batch.len() > 1 && !self.listbox.0.is_null();
+        if history_redraw_suspended {
+            unsafe {
+                let _ = send_message(self.listbox, WM_SETREDRAW, WPARAM(0), LPARAM(0));
+            }
+        }
         let mut dirty = false;
         for event in batch.into_iter().map(media_event_into_owned) {
             match event {
@@ -2253,6 +2279,12 @@ impl MainWindowState {
                 // history row; the active-source list follows the session
                 // snapshot, not events. Overlay-standby hygiene only.
                 MediaEvent::SourceGone { .. } => {}
+            }
+        }
+        if history_redraw_suspended {
+            unsafe {
+                let _ = send_message(self.listbox, WM_SETREDRAW, WPARAM(1), LPARAM(0));
+                let _ = invalidate_rect(self.listbox, None, false);
             }
         }
         if dirty {
@@ -4291,7 +4323,7 @@ impl MainWindowState {
             let (row_color, bold) = if entry.accepted {
                 (accent_color, true)
             } else {
-                ([0x66, 0x66, 0x66, 0xFF], false)
+                (HISTORY_MUTED_TEXT, false)
             };
             for (col, rect) in rects.iter().enumerate() {
                 // Zero-allocate: the cell strings were precomputed at push
