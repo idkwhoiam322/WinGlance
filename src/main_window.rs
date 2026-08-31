@@ -1055,6 +1055,10 @@ impl History {
 struct CurrentActivity {
     track: TrackInfo,
     state: PlaybackState,
+    /// Precomputed metadata row used by the Activity paint. Refreshed only
+    /// when TrackChanged replaces/refreshes `track`; WM_PAINT reads it without
+    /// rebuilding or allocating the derived string.
+    meta_line: String,
     /// Cached GDI source for AlphaBlend of the decoded artwork: a memory DC
     /// with the premultiplied pixels in a DIB section, built once per decode
     /// so repaints blend without per-paint DC/DIB allocation. Built directly
@@ -2403,6 +2407,7 @@ impl MainWindowState {
     /// window once after the whole batch — this method does not repaint.
     fn add_track(&mut self, track: TrackInfo) {
         let art_fingerprint = track.artwork.as_deref().map(fingerprint);
+        let meta_line = track.meta_line(false);
         // Metadata refresh for the same song (album/artwork arriving late):
         // update the current activity and the last history row in place
         // instead of appending a duplicate entry. Identity is the shared
@@ -2419,6 +2424,7 @@ impl MainWindowState {
                     free_art_blit(&mut current.icon_blit);
                 }
                 current.track = track.clone();
+                current.meta_line = meta_line.clone();
                 // The refresh's snapshot state is authoritative for what the
                 // pill displays (the worker suppresses the paired state event
                 // when a TrackChanged emits): without this, the Activity pane
@@ -2500,6 +2506,7 @@ impl MainWindowState {
         self.current = Some(CurrentActivity {
             track,
             state,
+            meta_line,
             // The blit is built lazily on first paint; the window starts
             // hidden (start_in_tray), so a track that never gets looked at
             // pays no GDI cost.
@@ -2753,7 +2760,7 @@ impl MainWindowState {
                     false,
                 );
             }
-            let extra = current.track.meta_line(false);
+            let extra = &current.meta_line;
             if !extra.is_empty() {
                 let mut extra_rect = RECT {
                     left: text_left,
@@ -2764,7 +2771,7 @@ impl MainWindowState {
                 draw_string(
                     &self.fonts,
                     hdc,
-                    &extra,
+                    extra,
                     &mut extra_rect,
                     (11.0 * scale) as i32,
                     [0x88, 0x88, 0x88, 0xFF],

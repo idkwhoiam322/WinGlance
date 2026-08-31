@@ -1,9 +1,7 @@
 use crate::winapi::{create_font, delete_object, select_object};
 use crate::winutil::wide;
-use log::warn;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER,
@@ -30,21 +28,20 @@ type FontKey = (u32, i32, bool);
 /// `on_dpi_changed` (`WM_DPICHANGED`). Replacing the provider drops the old one,
 /// whose `Drop` deletes the stale HFONTs for that DPI.
 ///
-/// The inner `Mutex` is uncontended — each owner is touched only from its own UI
-/// thread — and exists purely so `font_for` can be `&self`, letting the shared
-/// `draw_string` borrow the provider from `main_window` paint helpers that only
-/// have `&self`. Per-frame text rendering therefore performs no cross-thread
-/// synchronization, preserving the property the overlay's render path relied on.
+/// The cache is interior-mutable only to preserve the `&self` paint-helper API:
+/// each provider has exactly one UI-thread owner, so a mutex would add lock/
+/// poison machinery without protecting any cross-thread access. `RefCell`
+/// makes that single-thread ownership explicit and keeps the change local.
 pub(crate) struct FontProvider {
     dpi: u32,
-    cache: Mutex<HashMap<FontKey, (HFONT, i32)>>,
+    cache: RefCell<HashMap<FontKey, (HFONT, i32)>>,
 }
 
 impl FontProvider {
     pub(crate) fn new(dpi: u32) -> Self {
         Self {
             dpi,
-            cache: Mutex::new(HashMap::new()),
+            cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -55,10 +52,7 @@ impl FontProvider {
     /// until the provider is replaced on a DPI change, whose `Drop` frees them.
     pub(crate) fn font_for(&self, height: i32, bold: bool) -> (HFONT, i32) {
         let key = (self.dpi, height, bold);
-        let mut guard = self.cache.lock().unwrap_or_else(|poisoned| {
-            warn!("font cache lock was poisoned; recovering");
-            poisoned.into_inner()
-        });
+        let mut guard = self.cache.borrow_mut();
         if let Some((font, tm_height)) = guard.get(&key) {
             return (*font, *tm_height);
         }
@@ -108,10 +102,7 @@ impl FontProvider {
     /// explicitly when the DPI changes (via provider replacement) and in `Drop`
     /// at window destruction.
     fn flush(&self) {
-        let mut guard = self.cache.lock().unwrap_or_else(|poisoned| {
-            warn!("font cache lock was poisoned; recovering");
-            poisoned.into_inner()
-        });
+        let mut guard = self.cache.borrow_mut();
         for (_, (font, _)) in guard.drain() {
             unsafe {
                 let _ = delete_object(font);
