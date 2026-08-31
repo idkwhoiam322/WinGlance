@@ -63,7 +63,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, PCWSTR};
 
-use crate::events::{MEDIA_EVENT_MSG, MediaEvent};
+use crate::events::{MEDIA_EVENT_MSG, MediaEvent, RESTART_RESULT_MSG};
 use crate::overlay::EventQueue;
 use crate::winutil::wide;
 
@@ -365,10 +365,10 @@ const RESTART_REVERIFY_DELAY: Duration = Duration::from_millis(500);
 /// is closed exactly once: either by `release` during a successful restart
 /// handoff, or by the OS when the process ends (the guard is held in a
 /// `static`, which is never dropped by the runtime, so `Drop` covers the
-/// take-then-fail windows inside `relaunch_self` and nothing else). Stored
-/// as a raw `isize` because `HANDLE` is neither `Send` nor `Sync`; the guard
-/// is only ever touched on the main/UI thread, and the numeric value alone is
-/// shareable through the `SINGLETON_GUARD` slot the restart path reads.
+/// take-then-fail windows inside the restart helper and nothing else). Stored
+/// as a raw `isize` because `HANDLE` is neither `Send` nor `Sync`; moving the
+/// numeric handle owner into the one restart helper is safe because no other
+/// thread touches that guard while it is absent from `SINGLETON_GUARD`.
 struct SingletonGuard {
     raw: isize,
 }
@@ -399,10 +399,11 @@ impl Drop for SingletonGuard {
     }
 }
 
-/// The singleton guard's raw handle value, mirrored so the UI-thread restart
-/// path (`relaunch_self`) can hand the mutex to the successor process. The
-/// value is taken out of the slot for the handoff and put back on any
-/// failure, so `main` keeps exactly one live guard at all times.
+/// The singleton guard's raw handle value. The UI initiates restart work,
+/// then the dedicated handoff helper takes this guard out of the slot and owns
+/// it across the bounded ready wait/re-verification. Every failure puts it back
+/// before posting `RESTART_RESULT_MSG`, so `main` keeps exactly one live guard
+/// at all times and the UI thread never blocks on the handoff protocol.
 static SINGLETON_GUARD: Mutex<Option<SingletonGuard>> = Mutex::new(None);
 
 /// Whether a snapshot entry is a running instance of this app: the
@@ -837,16 +838,7 @@ fn handoff_survives_reverify(samples: [bool; 2]) -> bool {
 /// survives and the live log is preserved: the reloaded process appends to it
 /// and marks the boundary instead of truncating it. Only in-memory caches
 /// (icon/track/period) are lost, as they are on any restart.
-pub fn relaunch_self() {
-    // Take the guard out of the shared slot; every failure path puts it back.
-    let Some(mut guard) = SINGLETON_GUARD
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    else {
-        error!("restart: the single-instance guard is not held; refusing to restart");
-        return;
-    };
+fn relaunch_with_guard(mut guard: SingletonGuard) {
     let Ok(exe) = env::current_exe() else {
         error!("restart: resolving the current executable path failed; keeping this instance running");
         *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
@@ -961,6 +953,73 @@ pub fn relaunch_self() {
     process::exit(0);
 }
 
+/// Starts the restart handoff without blocking the UI thread. The helper is
+/// created *before* the singleton guard leaves the shared slot, so a thread-
+/// creation failure cannot accidentally drop/release the mutex. Once the
+/// helper exists, the guard is transferred through a one-item channel; the
+/// helper owns every blocking wait and either exits the process on success or
+/// restores the guard and posts `RESTART_RESULT_MSG` on failure. The helper
+/// never touches window state directly.
+pub fn spawn_handoff_thread(hwnd: HWND) {
+    // UI clicks are serialized, so an empty slot means a handoff is already
+    // active (or teardown owns the guard). Do not create another waiter.
+    if SINGLETON_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_none()
+    {
+        warn!("restart: handoff already in progress; ignoring duplicate request");
+        return;
+    }
+
+    let (guard_tx, guard_rx) = mpsc::sync_channel::<SingletonGuard>(1);
+    let hwnd_raw = hwnd.0 as isize;
+    let worker = thread::Builder::new()
+        .name("WinGlance-restart-handoff".to_string())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let Ok(guard) = guard_rx.recv() else {
+                return;
+            };
+            relaunch_with_guard(guard);
+            // Success never returns (`process::exit`). A return means every
+            // failure path restored the singleton guard; tell the UI thread
+            // only that the attempt completed so it can resume normal state
+            // ownership without this helper manipulating windows directly.
+            let hwnd = HWND(hwnd_raw as *mut c_void);
+            unsafe {
+                let _ = post_message(hwnd, RESTART_RESULT_MSG, WPARAM(0), LPARAM(0));
+            }
+        });
+    let Ok(worker) = worker else {
+        error!("restart: could not create the handoff helper; keeping this instance running");
+        return;
+    };
+
+    let guard = SINGLETON_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let Some(guard) = guard else {
+        // Another request won the slot between the pre-check and transfer.
+        // Dropping the sender lets this just-created helper exit immediately.
+        drop(guard_tx);
+        drop(worker);
+        warn!("restart: handoff already in progress; ignoring duplicate request");
+        return;
+    };
+    if let Err(error) = guard_tx.send(guard) {
+        // The helper exited before accepting ownership. Recover the guard from
+        // SendError rather than dropping it: dropping would release the mutex
+        // and leave the live UI unprotected.
+        *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.0);
+        error!("restart: handoff helper exited before accepting the singleton guard");
+    }
+    // Detached by design. On success it terminates the process; on failure it
+    // restores the guard and posts the private completion message.
+    drop(worker);
+}
+
 fn main() -> Result<()> {
     // Record the thread that owns the windows before anything can create one:
     // the UIA provider helpers use this to tell whether a call already runs on
@@ -979,7 +1038,7 @@ fn main() -> Result<()> {
         Ok(Some(guard)) => {
             // Mirror the guard into the shared slot so the Settings/restart
             // path can hand the mutex to a successor. The slot is the sole
-            // owner from here on; `relaunch_self` takes the guard out of it
+            // owner from here on; the handoff helper takes the guard out of it
             // for a handoff and puts it back if the handoff fails.
             *SINGLETON_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
         }

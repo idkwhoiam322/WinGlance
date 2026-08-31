@@ -1,8 +1,8 @@
 use crate::autostart;
 use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, SaveOutcome, VerticalPosition};
 use crate::events::{
-    COMPACT_POSITION_MSG, MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, TOGGLE_MSG, TrackInfo,
-    media_event_into_owned,
+    COMPACT_POSITION_MSG, MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, RESTART_RESULT_MSG, TOGGLE_MSG,
+    TrackInfo, media_event_into_owned,
 };
 use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
@@ -4520,13 +4520,12 @@ impl MainWindowState {
         }
     }
 
-    /// Relaunches the app so the on-disk `config.toml` is reloaded. The new
-    /// process re-acquires the single-instance mutex (released by
-    /// `crate::relaunch_self` before it spawns) and loads config from disk;
-    /// no app data is cleared, so any on-disk cache survives. See
-    /// `crate::relaunch_self`.
+    /// Relaunches the app so the on-disk `config.toml` is reloaded. The
+    /// restart handshake runs on a dedicated helper; this UI method only
+    /// initiates it, so the message loop keeps pumping during the bounded
+    /// ready wait and successor re-verification. No app data is cleared.
     fn reload_config(&self) {
-        crate::relaunch_self();
+        crate::spawn_handoff_thread(self.hwnd);
     }
 
     /// Toggles start-on-login with the registry and config kept consistent
@@ -6709,6 +6708,18 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         MEDIA_EVENT_MSG => {
             if !state_ptr.is_null() {
                 (*state_ptr).receive_events();
+            }
+            LRESULT(0)
+        }
+        RESTART_RESULT_MSG => {
+            // Success exits from the handoff helper immediately after the
+            // singleton transfer. Receiving this message therefore means the
+            // bounded background attempt failed and restored the guard. Keep
+            // the UI alive and responsive; the worker already logged the
+            // specific failure reason.
+            if !state_ptr.is_null() {
+                debug!("restart handoff completed without exit; current instance remains active");
+                (*state_ptr).invalidate();
             }
             LRESULT(0)
         }

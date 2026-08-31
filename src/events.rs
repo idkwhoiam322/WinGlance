@@ -20,6 +20,10 @@ pub const POSITION_MSG: u32 = WM_APP + 5;
 /// (`compact_position_x`/`compact_position_y`): posted by the compact-mode
 /// positioner, handled by the same single-owner rule.
 pub const COMPACT_POSITION_MSG: u32 = WM_APP + 9;
+/// Posted by the restart-handoff helper when a background handoff attempt
+/// returns without exiting the process (failure only). The UI thread handles
+/// the completion; the helper never manipulates window state directly.
+pub const RESTART_RESULT_MSG: u32 = WM_APP + 14;
 
 /// Every app-private window message id in the binary, as one inventory the
 /// compiler checks for collisions. Each message is currently posted only to
@@ -29,11 +33,12 @@ pub const COMPACT_POSITION_MSG: u32 = WM_APP + 9;
 /// too, so the assertion covers the newest message class as it grows.
 /// Maintenance contract: adding (or renumbering) any app-private message id
 /// must update this list — the compiler only checks ids it can see.
-pub(crate) const APP_PRIVATE_MESSAGE_IDS: [u32; 13] = [
+pub(crate) const APP_PRIVATE_MESSAGE_IDS: [u32; 14] = [
     MEDIA_EVENT_MSG,
     TOGGLE_MSG,
     POSITION_MSG,
     COMPACT_POSITION_MSG,
+    RESTART_RESULT_MSG,
     crate::main_window::WM_TRAY,
     crate::main_window::WM_SETTINGS_ACTIVATE_MSG,
     crate::main_window::WM_SETTINGS_SNAPSHOT_MSG,
