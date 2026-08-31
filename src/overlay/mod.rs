@@ -422,21 +422,34 @@ impl Drop for TextScratch {
 /// playing: …" is prefixed at the raise site), so all three can never
 /// drift apart.
 fn pill_accessible_name(text: &PillText) -> String {
-    let mut parts = Vec::new();
-    if !text.title.trim().is_empty() {
-        parts.push(text.title.trim().to_string());
+    let title = text.title.trim();
+    let artist = text.artist.trim();
+    if title.is_empty() && artist.is_empty() {
+        // Preserve the exact source fallback, including its original spacing:
+        // this is the pre-existing behavior when no track text is available.
+        return text.source_app.clone();
     }
-    if !text.artist.trim().is_empty() {
-        parts.push(text.artist.trim().to_string());
+
+    // At most title + artist + source are emitted. One capacity-planned String
+    // replaces the temporary Vec<String>, its cloned entries, join(), and the
+    // second format allocation used when a source suffix is present.
+    let source = text.source_app.trim();
+    let mut name = String::with_capacity(title.len() + artist.len() + source.len() + 7);
+    if !title.is_empty() {
+        name.push_str(title);
     }
-    let joined = parts.join(" — ");
-    if joined.is_empty() {
-        text.source_app.clone()
-    } else if !text.source_app.trim().is_empty() {
-        format!("{joined} ({})", text.source_app.trim())
-    } else {
-        joined
+    if !artist.is_empty() {
+        if !name.is_empty() {
+            name.push_str(" — ");
+        }
+        name.push_str(artist);
     }
+    if !source.is_empty() {
+        name.push_str(" (");
+        name.push_str(source);
+        name.push(')');
+    }
+    name
 }
 
 /// Pre-rendered text pieces of the pill currently on screen, built once per

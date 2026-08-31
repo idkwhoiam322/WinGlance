@@ -171,12 +171,21 @@ pub fn artwork_same(a: Option<&[u8]>, b: Option<&[u8]>) -> bool {
 /// so a 3661 s podcast reads "1:01:01" instead of the misleading "61:01".
 /// Shared by the meta line (whose callers prefix their own glyphs) and the
 /// history pane's DURATION column, so the two can never disagree.
-pub fn format_duration_secs(secs: u64) -> String {
+fn write_duration_secs(output: &mut String, secs: u64) {
+    use std::fmt::Write as _;
+
     if secs >= 3600 {
-        format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+        write!(output, "{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+            .expect("writing to a String cannot fail");
     } else {
-        format!("{}:{:02}", secs / 60, secs % 60)
+        write!(output, "{}:{:02}", secs / 60, secs % 60).expect("writing to a String cannot fail");
     }
+}
+
+pub fn format_duration_secs(secs: u64) -> String {
+    let mut output = String::new();
+    write_duration_secs(&mut output, secs);
+    output
 }
 
 impl TrackInfo {
@@ -195,35 +204,51 @@ impl TrackInfo {
     /// are included. When the album title is empty, the subtitle or album
     /// artist is shown instead so the line still carries useful context.
     pub fn meta_line(&self, include_album: bool) -> String {
-        let mut parts: Vec<String> = Vec::new();
+        use std::fmt::Write as _;
+
+        // This line has at most four components. Building it directly avoids
+        // allocating a Vec<String>, cloning borrowed album/genre strings, and
+        // then allocating again for join(). The returned String is the only
+        // aggregate buffer.
+        let mut line = String::new();
         if let Some(d) = self.duration_secs {
             // The stopwatch glyph labels the number as a duration; without it
             // "3:45" reads ambiguously in a line of text.
-            parts.push(format!("⏱ {}", format_duration_secs(d)));
+            line.push_str("⏱ ");
+            write_duration_secs(&mut line, d);
         }
         if include_album {
             let album_line = if !self.album.trim().is_empty() {
-                Some(self.album.clone())
+                Some(self.album.as_str())
             } else if !self.subtitle.trim().is_empty() {
-                Some(self.subtitle.clone())
+                Some(self.subtitle.as_str())
             } else if !self.album_artist.trim().is_empty() {
-                Some(self.album_artist.clone())
+                Some(self.album_artist.as_str())
             } else {
                 None
             };
-            if let Some(line) = album_line {
-                parts.push(line);
+            if let Some(part) = album_line {
+                if !line.is_empty() {
+                    line.push_str(" · ");
+                }
+                line.push_str(part);
             }
         }
         if let (Some(n), Some(c)) = (self.track_number, self.track_count) {
-            parts.push(format!("{n}/{c}"));
+            if !line.is_empty() {
+                line.push_str(" · ");
+            }
+            write!(&mut line, "{n}/{c}").expect("writing to a String cannot fail");
         }
-        if let Some(g) = &self.genre
-            && !g.trim().is_empty()
+        if let Some(genre) = &self.genre
+            && !genre.trim().is_empty()
         {
-            parts.push(g.clone());
+            if !line.is_empty() {
+                line.push_str(" · ");
+            }
+            line.push_str(genre);
         }
-        parts.join(" · ")
+        line
     }
 
     /// Splits the meta line for the overlay: whether a duration is present
