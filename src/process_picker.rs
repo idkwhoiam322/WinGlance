@@ -1260,7 +1260,7 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             };
             let _ = unsafe { SetBkMode(hdc, TRANSPARENT) };
             let _ = unsafe { SetTextColor(hdc, COLORREF(0x00F0F0F0)) };
-            let mut title = wide("Select apps (Enter=apply, Esc=cancel)");
+            let mut title = wide("Select apps (Enter=apply, Esc=cancel)").into_vec();
             let _ = unsafe {
                 DrawTextW(
                     hdc,
@@ -1281,7 +1281,7 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             let _ = unsafe { FillRect(hdc, &btn, if hover { close_hover_brush } else { close_brush }) };
 
             let _ = unsafe { SetTextColor(hdc, COLORREF(0x00F0F0F0)) };
-            let mut x_text = wide("\u{00D7}");
+            let mut x_text = wide("\u{00D7}").into_vec();
             let _ = unsafe {
                 DrawTextW(
                     hdc,
@@ -1347,7 +1347,7 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                 if draw.itemData == BST_CHECKED {
                     SetTextColor(draw.hDC, COLORREF(0x00F0F0F0));
                     SetBkMode(draw.hDC, TRANSPARENT);
-                    let mut tick = wide("X");
+                    let mut tick = wide("X").into_vec();
                     DrawTextW(
                         draw.hDC,
                         &mut tick,
@@ -1373,7 +1373,7 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     }),
                 );
                 SetBkMode(draw.hDC, TRANSPARENT);
-                let mut name = wide(&entry.display_name);
+                let mut name = wide(&entry.display_name).into_vec();
                 DrawTextW(
                     draw.hDC,
                     &mut name,

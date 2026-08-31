@@ -2059,7 +2059,7 @@ impl MainWindowState {
     /// the previous tooltip is already gone by the time the next request
     /// overwrites it.
     fn tooltip_text_buffer(buffer: &mut Vec<u16>, text: &str) -> PWSTR {
-        *buffer = wide(text);
+        *buffer = wide(text).into_vec();
         PWSTR(buffer.as_mut_ptr())
     }
 

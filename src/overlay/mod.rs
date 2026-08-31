@@ -8151,7 +8151,7 @@ mod tests {
             let old_font = select_object(hdc, font);
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, COLORREF(0x00FFFFFF));
-            let mut text = wide("Hello");
+            let mut text = wide("Hello").into_vec();
             let mut rect = RECT {
                 left: 0,
                 top: 0,

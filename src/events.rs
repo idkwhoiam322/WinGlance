@@ -464,6 +464,15 @@ pub enum MediaEvent {
 /// the palette's dominant-color pick between pill shows. Memory stays capped
 /// at 256 KB per cover.
 pub const ARTWORK_DECODE: u32 = 256;
+/// Bytes in the fixed decoded premultiplied-BGRA artwork buffer. Keep memory
+/// ceilings tied to the decode side instead of repeating a hand-computed size
+/// that can drift if `ARTWORK_DECODE` changes.
+pub const ARTWORK_DECODE_BYTES: usize = ARTWORK_DECODE as usize * ARTWORK_DECODE as usize * 4;
+/// A single fixed decode is intentionally capped at 256 KiB. Increasing the
+/// side without revisiting downstream cache/in-flight budgets is therefore a
+/// compile-time failure, not a silent retained-memory increase.
+const MAX_FIXED_ARTWORK_DECODE_BYTES: usize = 256 * 1024;
+const _: () = assert!(ARTWORK_DECODE_BYTES <= MAX_FIXED_ARTWORK_DECODE_BYTES);
 
 /// Artwork only ever displays at ~200px, so refusing anything larger than
 /// this defeats decompression bombs (a header can claim huge dimensions

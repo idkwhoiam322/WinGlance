@@ -485,7 +485,7 @@ unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                     };
                     let _ = SetBkMode(hdc, TRANSPARENT);
                     let _ = SetTextColor(hdc, COLORREF(0xCCCCCC));
-                    let mut text = wide("Drag to place the WinGlance");
+                    let mut text = wide("Drag to place the WinGlance").into_vec();
                     let _ = DrawTextW(hdc, &mut text, &mut text_rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
                     // Draw X button (cross lines — always perfectly

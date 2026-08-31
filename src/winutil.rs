@@ -564,11 +564,68 @@ where
     }
 }
 
-/// UTF-16-encodes `value` with a trailing NUL terminator suitable for the
-/// `PCWSTR` Win32 APIs. Single source of truth — used by `overlay`,
-/// `main_window`, `positioner`, `autostart`, `process_picker`, and `main`.
-pub(crate) fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
+/// Owned, immutable UTF-16 string for Win32 pointer APIs. Construction replaces
+/// interior NULs with U+FFFD and appends exactly one terminator, so a Rust
+/// `&str` can never be silently truncated when handed to a `PCWSTR`. Replacing
+/// rather than deleting malformed NULs is fail-safe for paths: the two sides
+/// can never be accidentally concatenated into a different valid target. The
+/// allocation owns the backing units for the whole scope in which callers use
+/// `as_ptr()`, making the pointer lifetime contract explicit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WideString(Vec<u16>);
+
+impl WideString {
+    fn new(value: &str) -> Self {
+        let mut units = Vec::with_capacity(value.encode_utf16().count() + 1);
+        units.extend(value.encode_utf16().map(|unit| if unit == 0 { 0xFFFD } else { unit }));
+        units.push(0);
+        Self(units)
+    }
+
+    /// Explicit escape hatch for Win32 bindings that require `&mut [u16]`
+    /// despite treating the string as input (for example `DrawTextW` without
+    /// `DT_MODIFYSTRING`) or for a window-owned buffer whose pointer must
+    /// remain writable. Pointer-only call sites keep the stronger wrapper.
+    pub(crate) fn into_vec(self) -> Vec<u16> {
+        self.0
+    }
+}
+
+impl std::ops::Deref for WideString {
+    type Target = [u16];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<[u16]> for WideString {
+    fn as_ref(&self) -> &[u16] {
+        &self.0
+    }
+}
+
+/// UTF-16-encodes `value` into an owned, NUL-safe Win32 string. Single source
+/// of truth — used by `overlay`, `main_window`, `positioner`, `autostart`,
+/// `process_picker`, and `main`.
+pub(crate) fn wide(value: &str) -> WideString {
+    WideString::new(value)
+}
+
+#[cfg(test)]
+mod wide_string_tests {
+    use super::*;
+
+    #[test]
+    fn wide_string_owns_one_terminator_and_replaces_interior_nuls() {
+        let value = wide("ab\0cd");
+        assert_eq!(
+            &*value,
+            &[b'a' as u16, b'b' as u16, 0xFFFD, b'c' as u16, b'd' as u16, 0]
+        );
+        assert_eq!(value.iter().filter(|unit| **unit == 0).count(), 1);
+        assert_eq!(value.last(), Some(&0));
+    }
 }
 
 /// Copies `value` into a fixed-size wide-string buffer, always leaving the
