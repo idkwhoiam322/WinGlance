@@ -3387,6 +3387,12 @@ impl OverlayState {
             if matches!(self.phase, Phase::Hidden) {
                 return;
             }
+        } else if fullscreen_changed && !layout_flipped {
+            // The content/layout is unchanged; only rcWork vs rcMonitor can
+            // have changed. Move the already-uploaded layered bitmap to its
+            // new anchor without rerasterizing or re-uploading identical
+            // pixels.
+            self.reposition_current_upload();
         }
         // The render gate must see the hover state as it stands AFTER this
         // tick's hover-detection code ran: `animating` was computed at the
@@ -3523,6 +3529,49 @@ impl OverlayState {
                 error!("rendering overlay: {error:#}");
             }
         }
+    }
+
+    /// Repositions the already-uploaded layered bitmap when only the target
+    /// work-area geometry changed. Returns without touching pixels when there
+    /// is no established upload or the monitor DPI changed enough that the
+    /// existing aura inset no longer matches; a later real render repairs that
+    /// case. This is the geometry-only half of the render gate.
+    fn reposition_current_upload(&mut self) {
+        if self.last_upload_w <= self.aura_inset * 2 || self.last_upload_h <= self.aura_inset * 2 {
+            return;
+        }
+        let Some(target) = self.target() else {
+            return;
+        };
+        let raw_dpi = monitor_dpi(target.handle);
+        let dpi = raw_dpi as f32 / 96.0;
+        let inset = (AURA_HALO_LOGICAL * dpi).round() as i32;
+        if inset != self.aura_inset {
+            return;
+        }
+        let width = self.last_upload_w - inset * 2;
+        let height = self.last_upload_h - inset * 2;
+        let edge = self.effective_work_area(&target);
+        let position = placement(edge, width, height, self.active_pos(), inset, dpi);
+        if position.x == self.last_upload_x && position.y == self.last_upload_y {
+            return;
+        }
+        unsafe {
+            if let Err(error) = set_window_pos(
+                self.hwnd,
+                HWND_TOPMOST,
+                position.x,
+                position.y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE,
+            ) {
+                debug!("pill geometry-only reposition failed: {error}");
+                return;
+            }
+        }
+        self.last_upload_x = position.x;
+        self.last_upload_y = position.y;
     }
 
     fn frame(&self) -> FrameState {

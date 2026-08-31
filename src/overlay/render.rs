@@ -80,6 +80,14 @@ pub(super) fn render_layered(
     let inset = state.aura_inset;
     let buf_w = (width + inset * 2).max(1);
     let buf_h = (height + inset * 2).max(1);
+    // Near rest, skip the full-frame bilinear pass and compose directly into
+    // the actual window dimensions. The bounce still owns the window geometry;
+    // only the imperceptible final resample is bypassed.
+    let scale_factor = if scale_frame_needs_resample(scale_factor) {
+        scale_factor
+    } else {
+        1.0
+    };
     // The settle-bounce renders the final layout at its true size and scales
     // the composed frame about the anchor into the window-sized buffer (see
     // `scale_frame_about`); the content's own pill size is the window size
@@ -448,6 +456,15 @@ pub(super) fn blit_packed_rows(dst: &mut [u8], dst_stride_bytes: usize, src: &[u
         let dst_off = row * dst_stride_bytes;
         dst[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
     }
+}
+
+/// Whether the settle-bounce needs a bilinear resample. Inside two percent of
+/// rest size the resample costs a full destination-sized four-tap pass for a
+/// sub-pixel/one-pixel visual difference; render directly at the current window
+/// dimensions instead. This is intentionally a visually-equivalent threshold,
+/// not a pixel-identity claim.
+pub(super) fn scale_frame_needs_resample(scale: f32) -> bool {
+    (scale - 1.0).abs() >= 0.02
 }
 
 /// Uniformly scales the composed frame into the window-sized DIB region, so the
@@ -3718,12 +3735,10 @@ pub(super) fn draw_aura(
 
     for y in 0..buf_h {
         let (wa, wb, wc, wd) = aura_row_windows(buf_w, inset, pill_w, pill_h, radius, margin, y);
-        for x in 0..buf_w {
-            // Side-band windows for straight rows; the merged/full fallback
-            // above makes the second window empty or covers the whole row.
-            if !(x >= wa && x < wb) && !(x >= wc && x < wd) {
-                continue;
-            }
+        // `aura_row_windows` merges overlapping bands, so chaining the two
+        // ranges visits each possible contributor exactly once and never scans
+        // the dead center/outside columns merely to reject them.
+        for x in (wa..wb).chain(wc..wd) {
             // Pixels farther than the margin from the pill's bounding box are
             // certainly farther than the margin from the rounded pill itself
             // (the box contains the pill), so they can never contribute —
@@ -3852,10 +3867,7 @@ pub(super) fn draw_comet(
     let lut = &lut[..lut_len];
     for y in 0..buf_h {
         let (wa, wb, wc, wd) = aura_row_windows(buf_w, inset, pill_w, pill_h, radius, margin, y);
-        for x in 0..buf_w {
-            if !(x >= wa && x < wb) && !(x >= wc && x < wd) {
-                continue;
-            }
+        for x in (wa..wb).chain(wc..wd) {
             let px = x as f32 + 0.5;
             let py = y as f32 + 0.5;
             let d = round_rect_signed_dist(
@@ -4291,6 +4303,16 @@ mod tests {
                     || out == [0, 0, 0, 255],
                 "ensure_contrast failed to reach 4.5 for {text:?} on {bg:?} -> {out:?}"
             );
+        }
+    }
+    #[cfg(test)]
+    mod scale_bypass_tests {
+        use super::*;
+        #[test]
+        fn near_rest_scale_skips_resample() {
+            assert!(!scale_frame_needs_resample(1.0));
+            assert!(!scale_frame_needs_resample(1.019));
+            assert!(scale_frame_needs_resample(1.021));
         }
     }
 }
