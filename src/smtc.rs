@@ -3,7 +3,7 @@ use crate::palette::{Palette, palette_from_rgba};
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -17,7 +17,6 @@ use windows::Media::Control::{
 use windows::Media::MediaPlaybackType;
 use windows::Storage::Streams::{Buffer, DataReader, IRandomAccessStreamReference, InputStreamOptions};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
-use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
 use windows::core::Interface;
 use windows_future::AsyncStatus;
 
@@ -182,10 +181,10 @@ const CHURN_COOLDOWN_MS: u64 = 30_000;
 /// comfortably below the 30 s `WORKER_STALL_THRESHOLD`: a timed-out read
 /// must never push the heartbeat age toward a supervisor stall, and every
 /// legitimate SMTC read (a few MiB of local thumbnail at most, system-
-/// mediated metadata) completes in a fraction of this. Synchronous WinRT
-/// calls (`GetPlaybackInfo`, `GetTimelineProperties`, `GetSessions`) are
-/// COM calls that no timeout can bound; a hang there remains covered by the
-/// supervisor restart and the global cap (documented residual).
+/// mediated metadata) completes in a fraction of this. `GetPlaybackInfo`,
+/// which has no WinRT async form, is isolated behind a reusable helper with
+/// this same deadline; manager/timeline/session-list calls that have no
+/// cancellable form remain covered by the supervisor's hard lifetime cap.
 const READ_ASYNC_TIMEOUT: Duration = Duration::from_secs(10);
 /// A position jump larger than this (seconds) between reads is treated as a
 /// user seek, not ordinary playback advance, and re-emits the track so the
@@ -396,11 +395,6 @@ struct ListenerState {
     /// Debounce deadline for pending dirty keys and session bursts.
     pending_deadline: Option<Instant>,
     /// Last time the periodic safety-net poll ran.
-    /// Last time the process heap was compacted. The worker and the UI
-    /// thread share that heap, and HeapCompact takes its lock, so the
-    /// compaction is throttled hard to keep UI-thread allocations
-    /// stall-free.
-    last_heap_compact: Instant,
     last_session_check: Instant,
     /// Session-creation counts per source app within a rolling window, for the
     /// churn cool-down.
@@ -414,6 +408,12 @@ struct ListenerState {
     /// (see `SharedExclusions`): a supervisor restart must not reset the
     /// exclusions the previous worker paid a 10 s read for.
     excluded_sources: SharedExclusions,
+    /// Process-lifetime cap for isolated synchronous COM helpers, shared
+    /// across worker generations so a hung helper can never reset its budget.
+    sync_com_budget: SyncComBudget,
+    /// Reusable helper for `GetPlaybackInfo`; dropped and replaced after a
+    /// timeout, leaving a genuinely stuck helper accounted by its lease.
+    playback_executor: Option<PlaybackExecutor>,
     /// Keys of rejected sessions already reported to the history, so a
     /// rejected session is logged once per appearance instead of on every
     /// re-sync (the 2-second poll re-lists all sessions). Bounded by
@@ -563,6 +563,212 @@ pub(crate) fn shared_exclusions() -> SharedExclusions {
     }))
 }
 
+/// Maximum number of isolated synchronous-COM helper threads that may exist
+/// at once. Normal operation uses one reusable helper. A `GetPlaybackInfo`
+/// call that never returns strands that helper, so its lease remains counted;
+/// after five such helpers the breaker opens and media notifications fail
+/// closed until restart instead of leaking helper threads forever.
+const MAX_SYNC_COM_HELPERS: usize = 5;
+
+#[derive(Default)]
+struct SyncComBudgetInner {
+    outstanding: AtomicUsize,
+    breaker_open: AtomicBool,
+}
+
+/// Process-lifetime budget shared by every SMTC worker generation. A helper
+/// owns one lease for its whole thread lifetime, not merely for a request, so
+/// abandoning a helper on timeout leaves an honest count until that thread
+/// actually returns and exits.
+#[derive(Clone)]
+pub(crate) struct SyncComBudget {
+    inner: Arc<SyncComBudgetInner>,
+    limit: usize,
+}
+
+pub(crate) fn sync_com_budget() -> SyncComBudget {
+    SyncComBudget::with_limit(MAX_SYNC_COM_HELPERS)
+}
+
+impl SyncComBudget {
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            inner: Arc::new(SyncComBudgetInner::default()),
+            limit,
+        }
+    }
+
+    fn reserve(&self) -> Option<SyncComLease> {
+        self.inner
+            .outstanding
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.limit).then_some(current + 1)
+            })
+            .ok()?;
+        Some(SyncComLease {
+            inner: self.inner.clone(),
+        })
+    }
+
+    fn trip(&self) {
+        self.inner.breaker_open.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn breaker_open(&self) -> bool {
+        self.inner.breaker_open.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn outstanding(&self) -> usize {
+        self.inner.outstanding.load(Ordering::Acquire)
+    }
+}
+
+struct SyncComLease {
+    inner: Arc<SyncComBudgetInner>,
+}
+
+impl Drop for SyncComLease {
+    fn drop(&mut self) {
+        self.inner.outstanding.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlaybackSnapshot {
+    status: GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+    rate: Option<f64>,
+    playback_type: PlaybackType,
+}
+
+struct PlaybackRequest {
+    session: GlobalSystemMediaTransportControlsSession,
+    reply: SyncSender<Result<PlaybackSnapshot>>,
+}
+
+/// One reusable MTA helper for synchronous `GetPlaybackInfo`. The worker
+/// sends at most one request at a time and waits with a 10-second deadline.
+/// On timeout the worker drops this executor; a genuinely stuck helper keeps
+/// its lease and is never joined/terminated, while the next request gets a
+/// fresh helper only if the process-lifetime budget still has room.
+#[derive(Debug)]
+struct PlaybackExecutor {
+    tx: mpsc::Sender<PlaybackRequest>,
+}
+
+impl PlaybackExecutor {
+    fn spawn(budget: SyncComBudget) -> Result<Self> {
+        let Some(lease) = budget.reserve() else {
+            budget.trip();
+            return Err(anyhow::Error::new(SyncComBudgetExhausted));
+        };
+        let (tx, rx) = mpsc::channel::<PlaybackRequest>();
+        std::thread::Builder::new()
+            .name("WinGlance-smtc-com".to_string())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let _lease = lease;
+                if let Err(error) = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() } {
+                    warn!("SMTC sync-COM helper could not initialize COM: {error}");
+                    return;
+                }
+                while let Ok(request) = rx.recv() {
+                    let result = read_playback_snapshot_direct(&request.session);
+                    let _ = request.reply.send(result);
+                }
+                unsafe { CoUninitialize() };
+            })?;
+        Ok(Self { tx })
+    }
+
+    fn read(&self, session: &GlobalSystemMediaTransportControlsSession, timeout: Duration) -> Result<PlaybackSnapshot> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(PlaybackRequest {
+                session: session.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::Error::new(SyncComTransportFailure::BeforeAccept))?;
+        wait_sync_com_reply(reply_rx, timeout)
+    }
+}
+
+fn wait_sync_com_reply<T>(reply_rx: Receiver<Result<T>>, timeout: Duration) -> Result<T> {
+    match reply_rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::Error::new(SyncComTimeout {
+            millis: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+        })),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::Error::new(SyncComTransportFailure::NoReply)),
+    }
+}
+
+fn read_playback_snapshot_direct(session: &GlobalSystemMediaTransportControlsSession) -> Result<PlaybackSnapshot> {
+    let playback_info = session.GetPlaybackInfo()?;
+    let status = playback_info.PlaybackStatus()?;
+    let rate = playback_info.PlaybackRate().ok().and_then(|r| r.Value().ok());
+    let playback_type = playback_info
+        .PlaybackType()
+        .ok()
+        .and_then(|ty| ty.Value().ok())
+        .map(map_playback_type)
+        .unwrap_or(PlaybackType::Unknown);
+    Ok(PlaybackSnapshot {
+        status,
+        rate,
+        playback_type,
+    })
+}
+
+#[derive(Debug)]
+struct SyncComTimeout {
+    millis: u64,
+}
+
+impl std::fmt::Display for SyncComTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SMTC synchronous COM read did not complete within {}ms", self.millis)
+    }
+}
+
+impl std::error::Error for SyncComTimeout {}
+
+#[derive(Debug)]
+enum SyncComTransportFailure {
+    BeforeAccept,
+    NoReply,
+}
+
+impl std::fmt::Display for SyncComTransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeAccept => f.write_str("SMTC sync-COM helper exited before accepting the request"),
+            Self::NoReply => f.write_str("SMTC sync-COM helper exited without returning a result"),
+        }
+    }
+}
+
+impl std::error::Error for SyncComTransportFailure {}
+
+#[derive(Debug)]
+struct SyncComBudgetExhausted;
+
+impl std::fmt::Display for SyncComBudgetExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SMTC synchronous COM isolation budget exhausted; restart WinGlance")
+    }
+}
+
+impl std::error::Error for SyncComBudgetExhausted {}
+
+fn is_sync_com_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SyncComTimeout>().is_some()
+}
+
+fn playback_executor_should_reset(error: &anyhow::Error) -> bool {
+    is_sync_com_timeout(error) || error.downcast_ref::<SyncComTransportFailure>().is_some()
+}
+
 pub struct SmtcListener {
     output: SyncSender<Arc<MediaEvent>>,
     /// Shared in-flight artwork byte counter (see `MAX_IN_FLIGHT_ARTWORK_BYTES`
@@ -610,6 +816,7 @@ pub struct SmtcListener {
     /// Survives worker restarts: exclusions a predecessor paid for carry
     /// into the replacement worker.
     excluded_sources: SharedExclusions,
+    sync_com_budget: SyncComBudget,
 }
 
 impl SmtcListener {
@@ -625,6 +832,7 @@ impl SmtcListener {
         shutdown: Arc<AtomicBool>,
         now_showing: Arc<Mutex<Option<String>>>,
         excluded_sources: SharedExclusions,
+        sync_com_budget: SyncComBudget,
         control_tx: SyncSender<Signal>,
         control_rx: Arc<Mutex<mpsc::Receiver<Signal>>>,
         control_mailbox: Arc<Mutex<ControlMailbox>>,
@@ -643,6 +851,7 @@ impl SmtcListener {
             shutdown,
             now_showing,
             excluded_sources,
+            sync_com_budget,
         }
     }
 
@@ -656,11 +865,16 @@ impl SmtcListener {
     }
 
     fn run_initialized(self) -> Result<()> {
-        // Manager creation is process-local and cannot be blamed on any
-        // source's sessions, so it keeps the unbounded wait (a hang here is
-        // a startup failure the supervisor's restart budget covers).
-        let manager = wait_async(&GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?, None)
-            .context("requesting the SMTC session manager")?;
+        // Manager creation is process-local rather than source-owned,
+        // but it is still an async operation and therefore does not need to
+        // consume a leaked worker if the OS never completes it. Bound it by
+        // the same read deadline; repeated startup failures are handled by
+        // the supervisor's ordinary restart budget.
+        let manager = wait_async(
+            &GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?,
+            Some(READ_ASYNC_TIMEOUT),
+        )
+        .context("requesting the SMTC session manager")?;
         let signal_tx = self.control_tx.clone();
         let sessions_token = register_sessions_handler(&manager, signal_tx.clone())?;
         let current_token = register_current_session_handler(&manager, signal_tx.clone())?;
@@ -677,6 +891,7 @@ impl SmtcListener {
             self.shutdown,
             self.now_showing,
             self.excluded_sources,
+            self.sync_com_budget,
             self.control_mailbox,
         );
 
@@ -708,6 +923,7 @@ impl ListenerState {
         shutdown: Arc<AtomicBool>,
         now_showing: Arc<Mutex<Option<String>>>,
         excluded_sources: SharedExclusions,
+        sync_com_budget: SyncComBudget,
         control_mailbox: Arc<Mutex<ControlMailbox>>,
     ) -> Self {
         Self {
@@ -724,10 +940,11 @@ impl ListenerState {
             dirty_seen: HashSet::new(),
             sessions_pending: false,
             pending_deadline: None,
-            last_heap_compact: Instant::now(),
             last_session_check: Instant::now(),
             churn: HashMap::new(),
             excluded_sources,
+            sync_com_budget,
+            playback_executor: None,
             rejected_seen: HashSet::new(),
             ignored_seen: HashSet::new(),
             terminal_pending: HashMap::new(),
@@ -769,6 +986,9 @@ impl ListenerState {
             if self.shutdown.load(Ordering::SeqCst) {
                 break;
             }
+            if self.sync_com_budget.breaker_open() {
+                anyhow::bail!("SMTC synchronous COM isolation budget exhausted; restart WinGlance");
+            }
             // A stalled worker is leaked, not joined, so this thread can
             // outlive the restart that superseded it. A superseded worker
             // must not take further turns: draining the control mailbox
@@ -789,21 +1009,6 @@ impl ListenerState {
             // mask a stall in its successor.
             if self.is_current_generation() {
                 *self.heartbeat.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
-            }
-            // The Windows heap keeps freed blocks (artwork decodes, thumbnail
-            // bytes) in its free lists instead of returning them to the OS,
-            // so RSS climbs as songs change. Compacting on a 60s cadence
-            // releases that free space back to the OS. The worker and the UI
-            // thread share this heap and HeapCompact takes its lock, so a
-            // shorter cadence would stall UI-thread allocations on every
-            // compact.
-            if self.last_heap_compact.elapsed() >= Duration::from_secs(60) {
-                self.last_heap_compact = Instant::now();
-                unsafe {
-                    if let Ok(heap) = GetProcessHeap() {
-                        let _ = HeapCompact(heap, HEAP_FLAGS(0));
-                    }
-                }
             }
             let timeout = self
                 .pending_deadline
@@ -1003,6 +1208,42 @@ impl ListenerState {
         Ok(())
     }
 
+    /// Reads `GetPlaybackInfo` on the isolated reusable COM helper. A timeout
+    /// abandons that helper (never `TerminateThread`), excludes the offending
+    /// session, and lets the heartbeat worker continue. The abandoned helper
+    /// remains charged to the process-lifetime budget until it actually exits.
+    fn read_playback_or_exclude_wedged(
+        &mut self,
+        session: &GlobalSystemMediaTransportControlsSession,
+    ) -> Result<PlaybackSnapshot> {
+        if self.playback_executor.is_none() {
+            self.playback_executor = Some(PlaybackExecutor::spawn(self.sync_com_budget.clone())?);
+        }
+        let result = self
+            .playback_executor
+            .as_ref()
+            .expect("playback executor was just initialized")
+            .read(session, READ_ASYNC_TIMEOUT);
+        match result {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                // Only timeout/transport failures invalidate the executor.
+                // A normal COM result error came back *through* a healthy
+                // helper and must keep that reusable thread: discarding it
+                // here would churn helpers for ordinary transient session
+                // errors and make the isolation budget measure errors rather
+                // than genuinely abandoned threads.
+                if playback_executor_should_reset(&error) {
+                    self.playback_executor.take();
+                }
+                if is_sync_com_timeout(&error) {
+                    self.exclude_wedged_source(session);
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Re-emits the current session's track on a notifications re-enable,
     /// bypassing the diff gate. `refresh_session` only emits on a content diff,
     /// so for an unchanged track there is nothing to re-announce and the pill
@@ -1036,23 +1277,18 @@ impl ListenerState {
             debug!("reshow skipped | reason=not-followed | source={label}");
             return Ok(());
         }
-        let playback_info = session.GetPlaybackInfo()?;
-        let status = playback_info.PlaybackStatus()?;
+        let playback_info = self.read_playback_or_exclude_wedged(&session)?;
+        let status = playback_info.status;
         if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed {
             return Ok(());
         }
         let playback = snapshot_playback_state(status);
-        let playback_type = session_playback_type(&session);
+        let playback_type = playback_info.playback_type;
         if playback_type == PlaybackType::Image {
             return Ok(());
         }
-        let mut merged = self.read_track_or_exclude_wedged(
-            &session,
-            true,
-            playback,
-            playback_info.PlaybackRate().ok().and_then(|r| r.Value().ok()),
-            playback_type,
-        )?;
+        let mut merged =
+            self.read_track_or_exclude_wedged(&session, true, playback, playback_info.rate, playback_type)?;
         if is_placeholder_like(&merged) {
             debug!("reshow skipped | reason=placeholder | source={}", merged.source_app);
             return Ok(());
@@ -1159,8 +1395,8 @@ impl ListenerState {
             );
             return Ok(());
         }
-        let playback_info = session.GetPlaybackInfo()?;
-        let status = playback_info.PlaybackStatus()?;
+        let playback_info = self.read_playback_or_exclude_wedged(session)?;
+        let status = playback_info.status;
         if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed {
             // Closed does not go through the diff/emit path: it usually fires
             // as the app quits, right after a Stopped/Paused already told the
@@ -1185,14 +1421,9 @@ impl ListenerState {
         let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
         let mut events: Vec<MediaEvent> = Vec::new();
 
-        // PlaybackType comes off the already-fetched playback info — a second
-        // GetPlaybackInfo call here doubled the COM traffic on every read.
-        let playback_type = playback_info
-            .PlaybackType()
-            .ok()
-            .and_then(|ty| ty.Value().ok())
-            .map(map_playback_type)
-            .unwrap_or(PlaybackType::Unknown);
+        // PlaybackType comes off the same isolated playback snapshot; no
+        // second synchronous COM call is issued on the heartbeat worker.
+        let playback_type = playback_info.playback_type;
         if playback_type == PlaybackType::Image {
             // Image content (slideshows, photo apps) is not "now playing": no
             // pill fires for it — neither the track nor the paired state
@@ -1238,13 +1469,8 @@ impl ListenerState {
         // Content is only diffed while the session is not stopped; a stopped
         // session keeps its stored content (the pill shows the last track).
         if status != GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped {
-            match self.read_track_or_exclude_wedged(
-                session,
-                read_artwork,
-                playback,
-                playback_info.PlaybackRate().ok().and_then(|r| r.Value().ok()),
-                playback_type,
-            ) {
+            match self.read_track_or_exclude_wedged(session, read_artwork, playback, playback_info.rate, playback_type)
+            {
                 Ok(read) => {
                     let mut merged = merge_track(&prev, &read, read_artwork);
                     // Record the last reported position (whole seconds) for
@@ -1775,7 +2001,7 @@ impl ListenerState {
                 if note_appearance(&mut self.rejected_seen, *key) {
                     debug!("SMTC session rejected | key={key} | source={source}");
                     let (title, artist) = self.rejected_row_text(session, source);
-                    let state = read_session_state(session);
+                    let state = self.rejected_row_state(session);
                     self.emit(MediaEvent::SessionRejected {
                         source_app: source.clone(),
                         title,
@@ -2126,49 +2352,25 @@ impl ListenerState {
         // would (see `snapshot_playback_state`) — without it, the surfaced
         // track reports `playback_state: None` and the pill infers playing
         // even when the source is paused.
-        let (playback, rate, playback_type) = match session.GetPlaybackInfo() {
-            Ok(playback_info) => {
-                let status = match playback_info.PlaybackStatus() {
-                    Ok(status) => status,
-                    Err(error) => {
-                        // Count a failed status read against the retry budget
-                        // too, exactly like the failed prefetch below: a
-                        // session whose reads keep failing must not be
-                        // retried forever.
-                        if let Some(state) = self.states.get_mut(&key) {
-                            state.artwork_attempts += 1;
-                        }
-                        return Err(error.into());
-                    }
-                };
-                // A session that reported Closed has nothing to surface; the
-                // normal refresh path settles its terminal state.
-                if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed {
-                    return Ok(());
-                }
-                (
-                    snapshot_playback_state(status),
-                    playback_info.PlaybackRate().ok().and_then(|r| r.Value().ok()),
-                    // The playback type comes off the info already fetched:
-                    // calling session_playback_type here would issue a third
-                    // GetPlaybackInfo for the same data.
-                    playback_info
-                        .PlaybackType()
-                        .ok()
-                        .and_then(|ty| ty.Value().ok())
-                        .map(map_playback_type)
-                        .unwrap_or(PlaybackType::Unknown),
-                )
-            }
+        let playback_info = match self.read_playback_or_exclude_wedged(session) {
+            Ok(playback_info) => playback_info,
             Err(error) => {
                 // Count a failed prefetch against the retry budget too: a
                 // session whose reads keep failing must not be retried forever.
                 if let Some(state) = self.states.get_mut(&key) {
                     state.artwork_attempts += 1;
                 }
-                return Err(error.into());
+                return Err(error);
             }
         };
+        // A session that reported Closed has nothing to surface; the normal
+        // refresh path settles its terminal state.
+        if playback_info.status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Closed {
+            return Ok(());
+        }
+        let playback = snapshot_playback_state(playback_info.status);
+        let rate = playback_info.rate;
+        let playback_type = playback_info.playback_type;
         let read = match self.read_track_or_exclude_wedged(session, true, playback, rate, playback_type) {
             Ok(read) => read,
             Err(error) => {
@@ -2369,6 +2571,36 @@ impl ListenerState {
                     debug!("rejected-session metadata unreadable | source={source} | error={error:#}");
                 }
                 (source.to_string(), String::new())
+            }
+        }
+    }
+
+    /// Best-effort playback status for a rejected history row, through the
+    /// same isolated synchronous-COM path as tracked sessions. A failed or
+    /// timed-out read falls back to Playing for display compatibility; a
+    /// timeout has already excluded this session before the fallback.
+    fn rejected_row_state(&mut self, session: &GlobalSystemMediaTransportControlsSession) -> PlaybackState {
+        let key = session_key(session);
+        let already_excluded = {
+            let maps = self
+                .excluded_sources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            maps.per_session.get(&key).is_some_and(|until| *until > Instant::now())
+        };
+        if already_excluded {
+            return PlaybackState::Playing;
+        }
+        match self.read_playback_or_exclude_wedged(session) {
+            Ok(playback) => match playback.status {
+                GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing => PlaybackState::Playing,
+                GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused => PlaybackState::Paused,
+                GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped => PlaybackState::Stopped,
+                _ => PlaybackState::Playing,
+            },
+            Err(error) => {
+                debug!("rejected-session playback unreadable | error={error:#}");
+                PlaybackState::Playing
             }
         }
     }
@@ -3565,18 +3797,6 @@ fn map_playback_type(ty: MediaPlaybackType) -> PlaybackType {
     }
 }
 
-/// The session's reported content type; `Unknown` when the session is gone
-/// or the OS does not report one.
-fn session_playback_type(session: &GlobalSystemMediaTransportControlsSession) -> PlaybackType {
-    session
-        .GetPlaybackInfo()
-        .ok()
-        .and_then(|info| info.PlaybackType().ok())
-        .and_then(|ty| ty.Value().ok())
-        .map(map_playback_type)
-        .unwrap_or(PlaybackType::Unknown)
-}
-
 /// Whether any displayed content field differs from the stored state.
 fn content_differ(prev: &LogicalState, read: &TrackInfo) -> bool {
     read.title != prev.title
@@ -3709,6 +3929,78 @@ fn first_read_counts_toward_churn(is_first_read: bool, merged: &TrackInfo) -> bo
 fn contained_winrt_event(context: &str, body: impl FnOnce()) -> windows::core::Result<()> {
     crate::winutil::catch_callback_panic(context, body)
         .map_err(|_| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))
+}
+
+#[cfg(test)]
+mod sync_com_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn playback_executor_resets_only_for_timeout_or_transport_failure() {
+        let timeout = anyhow::Error::new(SyncComTimeout { millis: 10_000 });
+        assert!(playback_executor_should_reset(&timeout));
+
+        let transport = anyhow::Error::new(SyncComTransportFailure::NoReply);
+        assert!(playback_executor_should_reset(&transport));
+
+        let ordinary_com_error = anyhow::anyhow!("GetPlaybackInfo failed: hr=0x80004005");
+        assert!(
+            !playback_executor_should_reset(&ordinary_com_error),
+            "an ordinary COM result error came through a healthy helper and must reuse it"
+        );
+    }
+
+    #[test]
+    fn helper_budget_is_hard_and_process_lifetime() {
+        let budget = SyncComBudget::with_limit(2);
+        let first = budget.reserve().expect("first helper slot");
+        let second = budget.reserve().expect("second helper slot");
+        assert_eq!(budget.outstanding(), 2);
+        assert!(budget.reserve().is_none(), "a third helper must be refused");
+        drop(first);
+        assert_eq!(budget.outstanding(), 1);
+        let replacement = budget.reserve().expect("a returned helper slot can be reused");
+        assert_eq!(budget.outstanding(), 2);
+        drop(second);
+        drop(replacement);
+        assert_eq!(budget.outstanding(), 0);
+    }
+
+    #[test]
+    fn sync_com_wait_times_out_without_waiting_for_the_body() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release_worker = release.clone();
+        let worker = std::thread::spawn(move || {
+            let (lock, cvar) = &*release_worker;
+            let mut go = lock.lock().unwrap();
+            while !*go {
+                go = cvar.wait(go).unwrap();
+            }
+            let _ = tx.send(Ok::<_, anyhow::Error>(7u32));
+        });
+        let started = Instant::now();
+        let error = wait_sync_com_reply(rx, Duration::from_millis(20)).expect_err("the blocked call must time out");
+        assert!(is_sync_com_timeout(&error));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the heartbeat worker must return promptly"
+        );
+        let (lock, cvar) = &*release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_one();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn exhausted_helper_budget_opens_the_fail_closed_breaker() {
+        let budget = SyncComBudget::with_limit(1);
+        let _held = budget.reserve().expect("occupy the only helper slot");
+        assert!(!budget.breaker_open());
+        let error = PlaybackExecutor::spawn(budget.clone()).expect_err("no helper slot remains");
+        assert!(error.downcast_ref::<SyncComBudgetExhausted>().is_some());
+        assert!(budget.breaker_open(), "exhaustion must remain terminal until restart");
+    }
 }
 
 #[cfg(test)]
@@ -3905,18 +4197,6 @@ fn read_session_text(
         "",
     ));
     Ok((title, artist))
-}
-
-/// Best-effort playback status for a session's history row. Unknown statuses
-/// (Opened/Changing) are reported as Playing — a live session is assumed to
-/// be playing unless it explicitly says otherwise.
-fn read_session_state(session: &GlobalSystemMediaTransportControlsSession) -> PlaybackState {
-    match session.GetPlaybackInfo().and_then(|info| info.PlaybackStatus()) {
-        Ok(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing) => PlaybackState::Playing,
-        Ok(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused) => PlaybackState::Paused,
-        Ok(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Stopped) => PlaybackState::Stopped,
-        _ => PlaybackState::Playing,
-    }
 }
 
 /// A stopped session is "not playing" no matter what status arrives, so the
@@ -5265,6 +5545,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
             excluded_sources,
+            sync_com_budget(),
             Arc::new(Mutex::new(ControlMailbox::default())),
         )
     }
@@ -5293,6 +5574,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
             shared_exclusions(),
+            sync_com_budget(),
             Arc::new(Mutex::new(ControlMailbox::default())),
         );
         let (raw, normalized) = state.cached_allowed.as_ref().expect("seed cached");
@@ -5329,6 +5611,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
             shared_exclusions(),
+            sync_com_budget(),
             Arc::new(Mutex::new(ControlMailbox::default())),
         );
         state
@@ -5394,6 +5677,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
             shared_exclusions(),
+            sync_com_budget(),
             mailbox.clone(),
         );
         // Fill the queue exactly to capacity: the push that fails proves the
@@ -5445,6 +5729,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
             shared_exclusions(),
+            sync_com_budget(),
             mailbox.clone(),
         );
         mailbox
@@ -5496,6 +5781,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
             shared_exclusions(),
+            sync_com_budget(),
             mailbox.clone(),
         );
         live_generation.store(1, Ordering::SeqCst);

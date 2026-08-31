@@ -1129,6 +1129,12 @@ fn main() -> Result<()> {
     // restart it exists to bound.
     let exclusions = smtc::shared_exclusions();
     let exclusions_supervisor = exclusions.clone();
+    // Synchronous SMTC COM calls that have no WinRT async form run on one
+    // reusable isolated helper per worker. The helper budget is shared across
+    // generations: a call that never returns can leak its helper, but it can
+    // never reset the accounting by forcing a worker restart.
+    let sync_com_budget = smtc::sync_com_budget();
+    let supervisor_sync_com_budget = sync_com_budget.clone();
     // Supervisor: runs the SMTC worker and restarts it when it stalls (a WinRT
     // call can hang under heavy session churn, which would otherwise silently
     // stop all events and pills). The hung worker thread is leaked; a fresh
@@ -1150,11 +1156,27 @@ fn main() -> Result<()> {
             // hung thread plus its COM registrations, so the leak rate needs
             // a bound. A worker that runs for two minutes resets the counter.
             let mut consecutive_restarts: u32 = 0;
-        // Timestamps of leaked (stalled) workers inside the rolling window
-        // used by `leak_budget_exhausted`.
-        let mut leaked_at: Vec<Instant> = Vec::new();
+            // Process-lifetime count of workers abandoned while blocked in
+            // COM. Unlike the old rolling window this never resets after a
+            // healthy stretch: leaked threads remain live until process exit,
+            // so their accounting must live just as long.
+            let mut leaked_workers: usize = 0;
             loop {
                 if supervisor_shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                if supervisor_sync_com_budget.breaker_open() {
+                    let reason = "SMTC synchronous COM calls stopped responding repeatedly; media notifications are disabled until WinGlance restarts to bound leaked COM threads".to_string();
+                    error!("{reason}");
+                    let _ = supervisor_tx.send(Arc::new(MediaEvent::WorkerFailed { reason }));
+                    break;
+                }
+                if leaked_worker_budget_exhausted(leaked_workers) {
+                    let reason = format!(
+                        "SMTC workers have hung {MAX_LEAKED_WORKERS} times during this WinGlance run; media notifications are disabled until WinGlance restarts to bound leaked COM threads"
+                    );
+                    error!("{reason}");
+                    let _ = supervisor_tx.send(Arc::new(MediaEvent::WorkerFailed { reason }));
                     break;
                 }
                 if worker_budget_exhausted(consecutive_restarts) {
@@ -1190,6 +1212,7 @@ fn main() -> Result<()> {
                 let control_mailbox_worker = supervisor_control_mailbox.clone();
                 let now_showing_worker = now_showing_supervisor.clone();
                 let exclusions_worker = exclusions_supervisor.clone();
+                let sync_com_budget_worker = supervisor_sync_com_budget.clone();
                 let worker_started = Instant::now();
                 // A replacement worker starts with a fresh heartbeat:
                 // the supervisor may still be reading the previous worker's
@@ -1234,6 +1257,7 @@ fn main() -> Result<()> {
                             worker_shutdown,
                             now_showing_worker,
                             exclusions_worker,
+                            sync_com_budget_worker,
                             control_tx_worker,
                             control_rx_worker,
                             control_mailbox_worker,
@@ -1287,28 +1311,13 @@ fn main() -> Result<()> {
                     WorkerExit::Stalled => {
                         // Do not join: the worker may be blocked inside COM forever.
                         consecutive_restarts += 1;
-                        // Every stall leaks the hung thread (stack + COM
-                        // registrations). The consecutive-failure cap resets
-                        // after a healthy stretch, so a pathological
-                        // environment could leak one thread per cycle forever
-                        //: track leaks on a rolling window and stop
-                        // restarting once the window budget is gone.
-                        leaked_at.push(Instant::now());
-                        if leak_budget_exhausted(
-                            &mut leaked_at,
-                            LEAK_WINDOW,
-                            MAX_LEAKED_WORKERS,
-                            Instant::now(),
-                        ) {
-                            let reason = format!(
-                                "SMTC workers have hung {MAX_LEAKED_WORKERS} times within {} minutes; \
-                                 stopping to bound leaked threads",
-                                LEAK_WINDOW.as_secs() / 60
-                            );
-                            error!("{reason}");
-                            let _ = supervisor_tx.send(Arc::new(MediaEvent::WorkerFailed { reason }));
-                            break;
-                        }
+                        // Every hard stall leaks the worker thread (stack +
+                        // COM registrations). Count it for the whole process
+                        // lifetime: a later healthy stretch cannot reclaim a
+                        // thread that is still stuck, so it must not reclaim
+                        // the budget either. The next loop-top check refuses
+                        // to spawn another worker once the hard cap is reached.
+                        leaked_workers = leaked_workers.saturating_add(1);
                         // A hard-stalled worker is leaked mid-call, so its `Drop`
                         // never runs and the mailbox-clear latch reset (see
                         // `clear_pending_output`) cannot fire: an undelivered
@@ -1476,31 +1485,18 @@ fn main() -> Result<()> {
 /// 90 seconds forever.
 const MAX_WORKER_RESTARTS: u32 = 5;
 
-/// Rolling window for the leaked-worker budget: leaks older than this fall
-/// off and stop counting. Consecutive leaks are spaced at least
-/// `worker_restart_delay(1) + WORKER_STALL_THRESHOLD` apart (5 s + 30 s), so
-/// the window must hold several such gaps for `MAX_LEAKED_WORKERS` samples
-/// to actually accumulate — a 60 s window held at most two and the budget
-/// could never trip. Ten minutes admits the fourth leak at the real
-/// minimum spacing (105 s) with room for slower wedges. Accepted residual:
-/// a wedge recurring every 3–9 minutes (after each 2-minute healthy reset)
-/// leaks at most three threads per window forever without tripping — every
-/// tighter bound would punish legitimate occasional stalls.
-const LEAK_WINDOW: Duration = Duration::from_secs(600);
+/// Hard process-lifetime cap on SMTC workers abandoned while blocked in COM.
+/// A leaked thread is not reclaimed by a later healthy stretch, so neither is
+/// its budget. After five stalls the supervisor enters the degraded state and
+/// refuses to spawn a sixth worker until the user restarts WinGlance. This is
+/// deliberately independent of `MAX_WORKER_RESTARTS`, whose consecutive count
+/// may still reset after a healthy two-minute run.
+const MAX_LEAKED_WORKERS: usize = 5;
 
-/// How many hung-thread leaks inside `LEAK_WINDOW` the supervisor tolerates
-/// before stopping restarts. Bounds the one resource the consecutive-failure
-/// cap cannot bound by itself — a pathological environment that wedges at
-/// least once per healthy stretch.
-const MAX_LEAKED_WORKERS: usize = 4;
-
-/// Whether the leaked-worker window budget is exhausted: prunes
-/// samples older than `window`, then reports whether `max` leaks sit inside
-/// it. Pure over its inputs so the policy is unit-testable without real
-/// workers.
-fn leak_budget_exhausted(leaks: &mut Vec<Instant>, window: Duration, max: usize, now: Instant) -> bool {
-    leaks.retain(|t| now.duration_since(*t) <= window);
-    leaks.len() >= max
+/// Whether spawning another worker would exceed the process-lifetime leaked
+/// worker budget. Pure so the no-sixth-worker invariant is unit-testable.
+fn leaked_worker_budget_exhausted(leaked_workers: usize) -> bool {
+    leaked_workers >= MAX_LEAKED_WORKERS
 }
 
 /// Cap of the SMTC worker → forwarder event channel. The forwarder drains it
@@ -1864,39 +1860,22 @@ mod tests {
     }
 
     #[test]
-    fn leak_budget_trips_at_the_real_minimum_stall_spacing() {
-        // Consecutive leaks are spaced at least restart-delay + stall
-        // threshold apart (5 s + 30 s). The window must be wide enough for
-        // MAX_LEAKED_WORKERS samples to actually accumulate at that spacing,
-        // or the rolling budget can never trip and hung workers leak
-        // without bound — the exact failure a 60 s window had.
-        let now = Instant::now();
-        let spacing = worker_restart_delay(1) + WORKER_STALL_THRESHOLD;
-        let mut leaks: Vec<Instant> = (0..MAX_LEAKED_WORKERS).map(|i| now - spacing * i as u32).collect();
-        assert!(
-            leak_budget_exhausted(&mut leaks, LEAK_WINDOW, MAX_LEAKED_WORKERS, now),
-            "the budget must be reachable at the real minimum spacing ({spacing:?})"
-        );
-    }
-
-    #[test]
-    fn leak_budget_prunes_the_window_and_stops_at_max() {
-        // Old leaks fall off and stop counting; the budget trips only
-        // when MAX_LEAKED_WORKERS samples sit inside the window. The
-        // stale samples sit past LEAK_WINDOW (600 s).
-        let now = Instant::now();
-        let mut leaks = vec![now - Duration::from_secs(700), now - Duration::from_secs(610)];
-        assert!(
-            !leak_budget_exhausted(&mut leaks, LEAK_WINDOW, MAX_LEAKED_WORKERS, now),
-            "stale leaks must not count"
-        );
-        assert!(leaks.is_empty(), "pruning must drop out-of-window samples");
-        for i in 0..MAX_LEAKED_WORKERS - 1 {
-            leaks.push(now - Duration::from_secs(i as u64 + 1));
+    fn leaked_worker_budget_is_process_lifetime_and_refuses_a_sixth_worker() {
+        // Nothing ages out: five abandoned workers are still five live OS
+        // threads no matter how much healthy time passed between them. The
+        // first five workers may exist; once all five have wedged, the next
+        // loop iteration must refuse to spawn worker six.
+        for leaked in 0..MAX_LEAKED_WORKERS {
+            assert!(
+                !leaked_worker_budget_exhausted(leaked),
+                "{leaked} leaked workers must remain below the hard cap"
+            );
         }
-        assert!(!leak_budget_exhausted(&mut leaks, LEAK_WINDOW, MAX_LEAKED_WORKERS, now));
-        leaks.push(now);
-        assert!(leak_budget_exhausted(&mut leaks, LEAK_WINDOW, MAX_LEAKED_WORKERS, now));
+        assert!(
+            leaked_worker_budget_exhausted(MAX_LEAKED_WORKERS),
+            "five leaked workers make a sixth spawn terminal"
+        );
+        assert!(leaked_worker_budget_exhausted(MAX_LEAKED_WORKERS + 1));
     }
 
     #[test]
