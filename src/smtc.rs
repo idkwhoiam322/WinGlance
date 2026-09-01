@@ -928,6 +928,15 @@ impl SmtcListener {
     }
 }
 
+struct RefreshTrackPlan {
+    merged: TrackInfo,
+    emit: bool,
+    artwork_lost: bool,
+    placeholder: bool,
+    stale_dropped: bool,
+    session_recreation: bool,
+}
+
 impl ListenerState {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1394,6 +1403,439 @@ impl ListenerState {
         }
     }
 
+    /// Updates the refresh transaction's timeline baseline and queues the
+    /// non-content progress sample. Kept separate from notification policy so
+    /// seek/progress bookkeeping stays auditable without WinRT/cache branches.
+    fn update_refresh_timeline(
+        prev: &LogicalState,
+        next: &mut LogicalState,
+        read: &TrackInfo,
+        merged: &TrackInfo,
+        events: &mut Vec<MediaEvent>,
+    ) {
+        // Record the last reported position (whole seconds) for
+        // seek detection on the next read; position itself is
+        // carried to the overlay via TrackInfo, not LogicalState.
+        // The MERGED value is stored, not the raw read: on the
+        // same identity a transient empty timeline read inherits
+        // the previous position (see `merge_track`), and storing
+        // the raw None would erase that baseline — the next good
+        // read would then look like a position appearance and
+        // re-emit an unchanged track. On an identity change the
+        // baseline is seeded only from a successful read (and
+        // `position_seen` gates the appearance arm), so a flaky
+        // first read for a new track cannot duplicate either.
+        if read.title == prev.title && read.artist == prev.artist {
+            next.last_position_secs = merged.position_secs.map(|s| s as u64);
+            next.position_seen = prev.position_seen || merged.position_secs.is_some();
+        } else {
+            next.last_position_secs = read.position_secs.map(|s| s as u64);
+            next.position_seen = read.position_secs.is_some();
+        }
+        // Push a lightweight progress update so the overlay bar tracks
+        // live position and seeks directly, without waiting for a
+        // TrackChanged re-emit (which only fires on a content change
+        // or a detected seek).
+        if read.position_secs.is_some() {
+            events.push(MediaEvent::ProgressChanged {
+                source_app: read.source_app.clone(),
+                position_secs: read.position_secs,
+                duration_secs: read.duration_secs,
+                playback_rate: read.playback_rate,
+            });
+        }
+    }
+
+    /// Hydrates one merged track with identity-matched cached artwork and app
+    /// icon state, then applies the stale-thumbnail guard. Returns whether art
+    /// was deliberately dropped so the caller can preserve the existing defer.
+    fn hydrate_refresh_track(
+        &mut self,
+        session: &GlobalSystemMediaTransportControlsSession,
+        merged: &mut TrackInfo,
+        read_artwork: bool,
+    ) -> bool {
+        // Session-recreation recovery: when a source recreates its
+        // session (new key, default prev state) its first event-driven
+        // read often grabs an empty thumbnail stream (SMTC populates art
+        // ~500ms after title). Inject the cached artwork for the same
+        // title+artist identity so the dedup predicate sees present==
+        // present and suppresses the duplicate — the cover is already
+        // known, just not re-readable on this fresh session yet.
+        if read_artwork
+            && merged.artwork.is_none()
+            && let Some(cached) = self.cached_artwork_for(&merged.source_app, &merged.title, &merged.artist)
+        {
+            merged.artwork = Some(cached);
+        }
+        // Stale-thumbnail guard: a transition read can pair the NEW
+        // track identity with the PREVIOUS track's thumbnail bytes
+        // (SMTC updates the thumbnail stream after the text fields).
+        // Byte-equal cross-identity art is dropped here — attaching
+        // it would show the wrong cover and poison the identity-
+        // keyed artwork and palette caches. Same-identity reads
+        // always keep their art, so a legitimately shared cover
+        // within an album survives; the artwork-changed re-emit
+        // surfaces the real cover once the stream catches up.
+        let stale_dropped = read_artwork && stale_thumbnail(merged, self.last_track_per_source.get(&merged.source_app));
+        if stale_dropped {
+            merged.artwork = None;
+            let label = track_label(merged);
+            debug!("stale thumbnail dropped | reason=identity-switch | {label}");
+        }
+        // App icon extraction: one icon per stable source identity.
+        // Distinct AUMIDs that share a friendly label never share cache state.
+        // The AUMID is read from the live session; the icon is
+        // attached to the track so the overlay can render it.
+        if merged.app_icon.is_none() {
+            let icon_key = merged.source_app.clone();
+            if let Some(cached_icon) = self.icon_cache.get(&icon_key).cloned() {
+                // Move to back for LRU
+                if let Some(pos) = self.icon_cache_order.iter().position(|k| k == &icon_key) {
+                    self.icon_cache_order.remove(pos);
+                    self.icon_cache_order.push_back(icon_key.clone());
+                }
+                merged.app_icon = cached_icon;
+            } else if let Ok(aumid) = session.SourceAppUserModelId() {
+                let aumid_str = aumid.to_string();
+                let extracted = crate::icon::extract_app_icon(&aumid_str, 24);
+                let cached = extracted.as_ref().map(|p| Arc::from(p.as_slice()));
+                self.icon_cache.insert(icon_key.clone(), cached.clone());
+                self.icon_cache_order.push_back(icon_key.clone());
+                const ICON_CACHE_CAP: usize = 64;
+                while self.icon_cache.len() > ICON_CACHE_CAP {
+                    if let Some(old) = self.icon_cache_order.pop_front() {
+                        self.icon_cache.remove(&old);
+                    } else {
+                        break;
+                    }
+                }
+                merged.app_icon = cached;
+            }
+        }
+        stale_dropped
+    }
+
+    /// Classifies a same-source re-report as session-recreation noise using the
+    /// same live-track cache, shown-source cell and bounded tombstones as before.
+    fn refresh_is_session_recreation(&self, merged: &TrackInfo, read_artwork: bool) -> bool {
+        // Per-source session-recreation dedup: a source that
+        // recreates its session (e.g. YouTube Music ~60s and on
+        // every song change) re-reports the same track on a new
+        // session key. Since the new session starts with a default
+        // LogicalState, content_differ always sees a change. Compare
+        // against the last track actually emitted per source
+        // (title + artist + artwork-presence); a genuine artwork
+        // gain still surfaces because is_some() changes. When the
+        // read did not read artwork (the 2s poll: read_artwork=false),
+        // the artwork clause is skipped — the poll always produces
+        // artwork=None, which would otherwise mismatch the last emit's
+        // Some and escape dedup as a duplicate pill (see the Bleed It
+        // Out case: same session key, duration drift, poll read art=None
+        // vs last emit art=Some). Cached artwork injection (above) makes
+        // event reads for recreated sessions also see Some==Some.
+        // Suppression applies only while the pill already on screen
+        // belongs to this source (the overlay's now-showing cell): after
+        // another app's pill, the identical re-report is a switch-back
+        // that must re-emit — the overlay's cache for this source may
+        // already be evicted, so the pill needs the fresh track (with
+        // injected art) to come back itself. The verdict is computed
+        // here, before the artwork-changed force below, so a re-report
+        // the gate would suppress never pays the force's palette
+        // invalidation and "forced" log first.
+        let shown_source = self.shown_source();
+        let mut session_recreation = should_suppress_recreation(
+            self.last_track_per_source.get(&merged.source_app),
+            merged,
+            read_artwork,
+            shown_source.as_ref(),
+            self.budget_stripped_art.contains(&merged.source_app),
+        );
+        // Tombstone fallback: after `sync_subscriptions` evicts the
+        // artwork cache (>TERMINAL_STOP_GRACE), a switch-back that
+        // recreates the session would otherwise duplicate the pill.
+        // No artwork bytes held, only the window keeps it bounded.
+        if !session_recreation
+            && !self.last_track_per_source.contains_key(&merged.source_app)
+            && let Some(tomb) = self.dedup_tombstones.get(&merged.source_app)
+        {
+            let same_identity = tomb.title == merged.title && tomb.artist == merged.artist;
+            let within_window = Instant::now().duration_since(tomb.when) < DEDUP_TOMBSTONE_WINDOW;
+            let shown_matches = shown_source.as_ref() == Some(&merged.source_app);
+            // Same derived rule as the primary gate: stripped
+            // cache cannot prove cover is same, so art-gained
+            // re-report of same identity stays suppressed.
+            let stripped_suppress = tomb.art_was_stripped && same_identity && read_artwork && merged.artwork.is_some();
+            let recreation_via_tomb = same_identity && within_window && shown_matches;
+            if stripped_suppress || recreation_via_tomb {
+                session_recreation = true;
+            }
+        }
+        session_recreation
+    }
+
+    /// Applies the same-identity artwork-change policy without interleaving it
+    /// with session-recreation classification in the transaction coordinator.
+    fn reconcile_refresh_artwork_change(
+        &mut self,
+        merged: &TrackInfo,
+        read_artwork: bool,
+        session_recreation: bool,
+        events: &[MediaEvent],
+        emit: bool,
+    ) -> bool {
+        let mut emit = emit;
+        // Same song, different cover: some sources swap album art
+        // for the same title+artist (e.g. a video vs audio
+        // version). content_differ only compares text fields, so
+        // compare the artwork bytes against the last emitted
+        // track and surface the new cover as a refresh. Gated by
+        // ARTWORK_CHANGE_MIN_INTERVAL: SMTC re-reads the
+        // thumbnail within ~1s of a change and can return
+        // different bytes for the same cover, which would
+        // otherwise fire a duplicate pill for the same song.
+        // Skipped when the recreation gate above would suppress
+        // the emit anyway (stripped-cache re-report of the same
+        // identity): forcing it would only be eaten below.
+        if !emit
+            && read_artwork
+            && !session_recreation
+            && let Some(prev_track) = self.last_track_per_source.get(&merged.source_app)
+            && prev_track.title == merged.title
+            && prev_track.artist == merged.artist
+            && self
+                .last_emit_at
+                .get(&merged.source_app)
+                .is_none_or(|t| t.elapsed() >= ARTWORK_CHANGE_MIN_INTERVAL)
+        {
+            let art_changed = match (&prev_track.artwork, &merged.artwork) {
+                (Some(a), Some(b)) => !Arc::ptr_eq(a, b) && a.as_ref() != b.as_ref(),
+                (None, Some(_)) | (Some(_), None) => true,
+                (None, None) => false,
+            };
+            if art_changed {
+                // The user's real pause/play is already in the batch:
+                // YouTube Music re-encodes its thumbnail when it
+                // recreates the session on pause, so the same cover
+                // can re-read with different bytes. Forcing a
+                // TrackChanged here would make the batch rule below
+                // drop the state event, and the pill would show the
+                // track layout instead of the pause. Absorb the
+                // refresh instead: record the new bytes as the
+                // source's last emitted track so a later read dedups
+                // against them, and let the state event carry the
+                // pill. A later genuine cover swap still re-reads
+                // differently and emits normally.
+                if artwork_refresh_absorbed(events, merged) {
+                    self.store_last_emitted_track(merged.source_app.clone(), merged.clone());
+                    self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
+                    let label = track_label(merged);
+                    debug!("artwork refresh absorbed | reason=state-change-in-batch | {label}");
+                } else {
+                    emit = true;
+                    // Genuine cover change for the same identity:
+                    // invalidate the cached palette so the emit
+                    // recomputes from the new bytes instead of
+                    // carrying the old cover's accent colors.
+                    self.palette_per_identity.remove(&palette_cache_key(
+                        &merged.source_app,
+                        &merged.title,
+                        &merged.artist,
+                    ));
+                    let label = track_label(merged);
+                    debug!("track emit forced | reason=artwork-changed | {label}");
+                }
+            }
+        }
+        emit
+    }
+
+    /// Moves the final merged display fields into the logical state after all
+    /// emit/defer policy is settled. Taking `merged` by value preserves the
+    /// original move behavior instead of adding clones on the hot path.
+    fn commit_refresh_track_state(next: &mut LogicalState, prev: &LogicalState, merged: TrackInfo, read_artwork: bool) {
+        next.title = merged.title;
+        next.artist = merged.artist;
+        next.album = merged.album;
+        next.album_artist = merged.album_artist;
+        next.subtitle = merged.subtitle;
+        next.has_artwork = if read_artwork {
+            merged.artwork.is_some()
+        } else {
+            prev.has_artwork
+        };
+        next.source_app = merged.source_app;
+        next.duration_secs = merged.duration_secs;
+        next.track_number = merged.track_number;
+        next.track_count = merged.track_count;
+        next.genre = merged.genre;
+        next.playback_type = merged.playback_type;
+        // Marked fresh for the poll skip only on a successful
+        // read: a failed read must not suppress the poll, which
+        // is the safety net for exactly that case.
+        next.last_read_at = Some(Instant::now());
+    }
+
+    /// Stages a real playback-state transition without committing the
+    /// source ledger until the slow metadata read has been revalidated.
+    fn stage_refresh_playback(
+        &self,
+        session: &GlobalSystemMediaTransportControlsSession,
+        prev: &LogicalState,
+        next: &mut LogicalState,
+        playback: Option<PlaybackState>,
+        events: &mut Vec<MediaEvent>,
+    ) -> (Option<PlaybackState>, Option<(SourceIdentity, PlaybackState)>) {
+        if playback == prev.playback {
+            return (None, None);
+        }
+        let Some(state) = playback else {
+            return (None, None);
+        };
+        let source = read_source_app(session);
+        let known_playback = self.last_known_playback_per_source.get(&source).copied();
+        next.playback = Some(state);
+        info!("playback state changed | state={state:?} | source={source}");
+        events.push(MediaEvent::PlaybackStateChanged(state, source.clone()));
+        (known_playback, Some((source, state)))
+    }
+
+    /// Builds the notification policy inputs for one successful metadata read.
+    /// The returned plan contains no committed logical state; the caller still
+    /// owns the final revalidation and emit/defer decision.
+    fn prepare_refresh_track(
+        &mut self,
+        session: &GlobalSystemMediaTransportControlsSession,
+        prev: &LogicalState,
+        next: &mut LogicalState,
+        read: TrackInfo,
+        read_artwork: bool,
+        events: &mut Vec<MediaEvent>,
+    ) -> RefreshTrackPlan {
+        let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
+        let mut merged = merge_track(prev, &read, read_artwork);
+        Self::update_refresh_timeline(prev, next, &read, &merged, events);
+        let stale_dropped = self.hydrate_refresh_track(session, &mut merged, read_artwork);
+        let (mut emit, artwork_lost) = emit_track(prev, &merged, read_artwork);
+        let placeholder = is_placeholder_like(&merged);
+        if first_read_counts_toward_churn(is_first_read, &merged) {
+            self.record_churn(&merged.source_app);
+        }
+        if placeholder {
+            debug!("track emit skipped | reason=placeholder | source={}", merged.source_app);
+        }
+        if !emit && !placeholder && defer_expired(prev.deferred_at) && poll_force_allowed(prev) {
+            emit = true;
+            let label = track_label(&merged);
+            debug!("track emit forced | reason=artwork-timeout | {label}");
+        }
+        let session_recreation = self.refresh_is_session_recreation(&merged, read_artwork);
+        emit = self.reconcile_refresh_artwork_change(&merged, read_artwork, session_recreation, events, emit);
+        RefreshTrackPlan {
+            merged,
+            emit,
+            artwork_lost,
+            placeholder,
+            stale_dropped,
+            session_recreation,
+        }
+    }
+
+    /// Removes the synthetic first-state event produced by a recreated SMTC
+    /// session while preserving a genuine user-driven pause/play transition.
+    fn filter_recreated_playback(
+        plan: &mut RefreshTrackPlan,
+        prev: &LogicalState,
+        known_playback: Option<PlaybackState>,
+        playback: Option<PlaybackState>,
+        events: &mut Vec<MediaEvent>,
+    ) {
+        if plan.session_recreation
+            && prev.source_app.is_empty()
+            && prev.title.is_empty()
+            && spurious_recreated_playback(known_playback, playback)
+        {
+            events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
+            plan.merged.playback_state = None;
+        }
+    }
+
+    /// Applies the final track emit/defer/suppression policy and commits the
+    /// merged display fields into the pending logical state. Each branch is a
+    /// presentation outcome; slow reads and post-read revalidation stay in the
+    /// coordinator.
+    fn apply_refresh_track_emit(
+        &mut self,
+        prev: &LogicalState,
+        next: &mut LogicalState,
+        read_artwork: bool,
+        events: &mut Vec<MediaEvent>,
+        mut plan: RefreshTrackPlan,
+    ) {
+        let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
+        if plan.emit && plan.stale_dropped {
+            plan.emit = false;
+            next.deferred_at = Some(Instant::now());
+            next.deferred_for_stale_art = true;
+            events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
+            let label = track_label(&plan.merged);
+            debug!("track emit deferred | reason=stale-art-drop | {label}");
+        }
+
+        if plan.emit && !plan.placeholder && !plan.session_recreation {
+            let label = track_label(&plan.merged);
+            info!("track changed | {label}");
+            let mut emitted = with_decoded_art(plan.merged.clone(), crate::events::ARTWORK_DECODE as usize);
+            emitted.art_generation = next_art_generation(self, &plan.merged.source_app, emitted.decoded_art.as_deref());
+            emitted.palette = self.palette_for_identity(&plan.merged, emitted.decoded_art.as_deref());
+            events.push(MediaEvent::TrackChanged(emitted));
+            self.store_last_emitted_track(plan.merged.source_app.clone(), plan.merged.clone());
+            self.last_emit_at.insert(plan.merged.source_app.clone(), Instant::now());
+            next.deferred_at = None;
+            next.deferred_for_stale_art = false;
+        } else if plan.emit && plan.session_recreation {
+            let label = track_label(&plan.merged);
+            debug!("track emit suppressed | reason=session-recreation | {label}");
+        } else if plan.artwork_lost {
+            let label = track_label(&plan.merged);
+            debug!("track emit skipped | reason=artwork-removed | {label}");
+        } else if is_first_read
+            && read_artwork
+            && !is_placeholder_read(prev, &plan.merged)
+            && plan.merged.artwork.is_none()
+        {
+            events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
+            next.deferred_at = Some(Instant::now());
+            next.deferred_for_stale_art = false;
+            let label = track_label(&plan.merged);
+            debug!("track emit deferred | reason=awaiting-artwork | {label}");
+        } else if read_artwork && !plan.stale_dropped {
+            let label = track_label(&plan.merged);
+            debug!("track emit skipped | reason=duplicate | {label}");
+        }
+        Self::commit_refresh_track_state(next, prev, plan.merged, read_artwork);
+    }
+
+    /// Records one failed metadata read without mixing error classification into
+    /// the refresh coordinator. First-read failures still charge churn exactly
+    /// as before.
+    fn handle_refresh_track_error(
+        &mut self,
+        session: &GlobalSystemMediaTransportControlsSession,
+        key: usize,
+        prev: &LogicalState,
+        error: &anyhow::Error,
+    ) {
+        if is_session_gone(error) {
+            debug!("session torn down during read | key={key} | {error:#}");
+        } else {
+            debug!("track read failed | key={key} | {error:#}");
+        }
+        if prev.source_app.is_empty() && prev.title.is_empty() {
+            self.record_churn(&read_source_app(session));
+        }
+    }
+
     /// Reads a session's current state, merges it into the stored logical
     /// state, and emits an event for every field that actually changed.
     /// `read_artwork` is false for the periodic safety-net poll, which must
@@ -1436,10 +1878,6 @@ impl ListenerState {
         let playback = normalized.state;
         let prev = self.states.get(&key).cloned().unwrap_or_default();
         let mut next = prev.clone();
-        // True until the first successful read (the stored state is the
-        // default): used for the first-read artwork deferral and to charge
-        // churn only for brand-new content-free sessions.
-        let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
         let mut events: Vec<MediaEvent> = Vec::new();
 
         // PlaybackType comes off the same isolated playback snapshot; no
@@ -1462,30 +1900,8 @@ impl ListenerState {
             return Ok(());
         }
 
-        // Playback is a normal diffable field: Stopped goes through the same
-        // path as Playing/Paused and can produce a pill like any other real
-        // transition. Transitional statuses leave the stored state untouched.
-        let mut known_playback = None;
-        let mut deferred_playback: Option<(SourceIdentity, PlaybackState)> = None;
-        if playback != prev.playback
-            && let Some(state) = playback
-        {
-            // The last state this source reported, captured before this read
-            // overwrites it. The session-recreation guard below compares the
-            // fresh session's report against it: a state that actually changed
-            // is the user's own pause/play, not recreation noise.
-            let source = read_source_app(session);
-            known_playback = self.last_known_playback_per_source.get(&source).copied();
-            // The cache write is deferred to the post-read revalidation: a
-            // read that gets discarded (the session switched or the source
-            // was disallowed mid-read) must not record a state that never
-            // reached the overlay — later decisions consult this map as if
-            // it were what the user saw.
-            deferred_playback = Some((source.clone(), state));
-            next.playback = Some(state);
-            info!("playback state changed | state={state:?} | source={source}");
-            events.push(MediaEvent::PlaybackStateChanged(state, source.clone()));
-        }
+        let (known_playback, mut deferred_playback) =
+            self.stage_refresh_playback(session, &prev, &mut next, playback, &mut events);
 
         // Content is only diffed while the session is not stopped; a stopped
         // session keeps its stored content (the pill shows the last track).
@@ -1493,382 +1909,12 @@ impl ListenerState {
             match self.read_track_or_exclude_wedged(session, read_artwork, playback, playback_info.rate, playback_type)
             {
                 Ok(read) => {
-                    let mut merged = merge_track(&prev, &read, read_artwork);
-                    // Record the last reported position (whole seconds) for
-                    // seek detection on the next read; position itself is
-                    // carried to the overlay via TrackInfo, not LogicalState.
-                    // The MERGED value is stored, not the raw read: on the
-                    // same identity a transient empty timeline read inherits
-                    // the previous position (see `merge_track`), and storing
-                    // the raw None would erase that baseline — the next good
-                    // read would then look like a position appearance and
-                    // re-emit an unchanged track. On an identity change the
-                    // baseline is seeded only from a successful read (and
-                    // `position_seen` gates the appearance arm), so a flaky
-                    // first read for a new track cannot duplicate either.
-                    if read.title == prev.title && read.artist == prev.artist {
-                        next.last_position_secs = merged.position_secs.map(|s| s as u64);
-                        next.position_seen = prev.position_seen || merged.position_secs.is_some();
-                    } else {
-                        next.last_position_secs = read.position_secs.map(|s| s as u64);
-                        next.position_seen = read.position_secs.is_some();
-                    }
-                    // Push a lightweight progress update so the overlay bar tracks
-                    // live position and seeks directly, without waiting for a
-                    // TrackChanged re-emit (which only fires on a content change
-                    // or a detected seek).
-                    if read.position_secs.is_some() {
-                        events.push(MediaEvent::ProgressChanged {
-                            source_app: read.source_app.clone(),
-                            position_secs: read.position_secs,
-                            duration_secs: read.duration_secs,
-                            playback_rate: read.playback_rate,
-                        });
-                    }
-                    // Session-recreation recovery: when a source recreates its
-                    // session (new key, default prev state) its first event-driven
-                    // read often grabs an empty thumbnail stream (SMTC populates art
-                    // ~500ms after title). Inject the cached artwork for the same
-                    // title+artist identity so the dedup predicate sees present==
-                    // present and suppresses the duplicate — the cover is already
-                    // known, just not re-readable on this fresh session yet.
-                    if read_artwork
-                        && merged.artwork.is_none()
-                        && let Some(cached) = self.cached_artwork_for(&merged.source_app, &merged.title, &merged.artist)
-                    {
-                        merged.artwork = Some(cached);
-                    }
-                    // Stale-thumbnail guard: a transition read can pair the NEW
-                    // track identity with the PREVIOUS track's thumbnail bytes
-                    // (SMTC updates the thumbnail stream after the text fields).
-                    // Byte-equal cross-identity art is dropped here — attaching
-                    // it would show the wrong cover and poison the identity-
-                    // keyed artwork and palette caches. Same-identity reads
-                    // always keep their art, so a legitimately shared cover
-                    // within an album survives; the artwork-changed re-emit
-                    // surfaces the real cover once the stream catches up.
-                    let stale_dropped =
-                        read_artwork && stale_thumbnail(&merged, self.last_track_per_source.get(&merged.source_app));
-                    if stale_dropped {
-                        merged.artwork = None;
-                        let label = track_label(&merged);
-                        debug!("stale thumbnail dropped | reason=identity-switch | {label}");
-                    }
-                    // App icon extraction: one icon per stable source identity.
-                    // Distinct AUMIDs that share a friendly label never share cache state.
-                    // The AUMID is read from the live session; the icon is
-                    // attached to the track so the overlay can render it.
-                    if merged.app_icon.is_none() {
-                        let icon_key = merged.source_app.clone();
-                        if let Some(cached_icon) = self.icon_cache.get(&icon_key).cloned() {
-                            // Move to back for LRU
-                            if let Some(pos) = self.icon_cache_order.iter().position(|k| k == &icon_key) {
-                                self.icon_cache_order.remove(pos);
-                                self.icon_cache_order.push_back(icon_key.clone());
-                            }
-                            merged.app_icon = cached_icon;
-                        } else if let Ok(aumid) = session.SourceAppUserModelId() {
-                            let aumid_str = aumid.to_string();
-                            let extracted = crate::icon::extract_app_icon(&aumid_str, 24);
-                            let cached = extracted.as_ref().map(|p| Arc::from(p.as_slice()));
-                            self.icon_cache.insert(icon_key.clone(), cached.clone());
-                            self.icon_cache_order.push_back(icon_key.clone());
-                            const ICON_CACHE_CAP: usize = 64;
-                            while self.icon_cache.len() > ICON_CACHE_CAP {
-                                if let Some(old) = self.icon_cache_order.pop_front() {
-                                    self.icon_cache.remove(&old);
-                                } else {
-                                    break;
-                                }
-                            }
-                            merged.app_icon = cached;
-                        }
-                    }
-                    let (mut emit, artwork_lost) = emit_track(&prev, &merged, read_artwork);
-                    let placeholder = is_placeholder_like(&merged);
-                    // Session churn is charged on a session's first read and
-                    // only for content-free sessions: a newly-created session
-                    // whose title fell back to the source-app label carries no
-                    // track (the Riot signature). A legitimately recreated
-                    // session from a real skip always reports a title on its
-                    // first read and is never counted, so rapid skipping never
-                    // trips the cool-down. Charging here (not at admission,
-                    // where every new session counted) makes the guard match
-                    // what the source actually emitted.
-                    if first_read_counts_toward_churn(is_first_read, &merged) {
-                        self.record_churn(&merged.source_app);
-                    }
-                    // A metadata snapshot that is just the source-app fallback (empty
-                    // title + empty artist) carries no real track to announce: drop it
-                    // everywhere below so it can never flash as a "sample track". A
-                    // real MediaPropertiesChanged or the poll supersedes it once the
-                    // source populates its metadata.
-                    if placeholder {
-                        debug!("track emit skipped | reason=placeholder | source={}", merged.source_app);
-                    }
-                    // Safety net: a first pill deferred for artwork shows
-                    // anyway after ARTWORK_TIMEOUT, so a source that never
-                    // provides a thumbnail still gets its pill — but never for a
-                    // placeholder read (title is just the source-app fallback),
-                    // which must not be announced as a "sample track". A real
-                    // MediaPropertiesChanged or the poll will surface the actual
-                    // track when its metadata lands.
-                    if !emit && !placeholder && defer_expired(prev.deferred_at) && poll_force_allowed(&prev) {
-                        emit = true;
-                        let label = track_label(&merged);
-                        debug!("track emit forced | reason=artwork-timeout | {label}");
-                    }
-                    // Per-source session-recreation dedup: a source that
-                    // recreates its session (e.g. YouTube Music ~60s and on
-                    // every song change) re-reports the same track on a new
-                    // session key. Since the new session starts with a default
-                    // LogicalState, content_differ always sees a change. Compare
-                    // against the last track actually emitted per source
-                    // (title + artist + artwork-presence); a genuine artwork
-                    // gain still surfaces because is_some() changes. When the
-                    // read did not read artwork (the 2s poll: read_artwork=false),
-                    // the artwork clause is skipped — the poll always produces
-                    // artwork=None, which would otherwise mismatch the last emit's
-                    // Some and escape dedup as a duplicate pill (see the Bleed It
-                    // Out case: same session key, duration drift, poll read art=None
-                    // vs last emit art=Some). Cached artwork injection (above) makes
-                    // event reads for recreated sessions also see Some==Some.
-                    // Suppression applies only while the pill already on screen
-                    // belongs to this source (the overlay's now-showing cell): after
-                    // another app's pill, the identical re-report is a switch-back
-                    // that must re-emit — the overlay's cache for this source may
-                    // already be evicted, so the pill needs the fresh track (with
-                    // injected art) to come back itself. The verdict is computed
-                    // here, before the artwork-changed force below, so a re-report
-                    // the gate would suppress never pays the force's palette
-                    // invalidation and "forced" log first.
-                    let shown_source = self.shown_source();
-                    let mut session_recreation = should_suppress_recreation(
-                        self.last_track_per_source.get(&merged.source_app),
-                        &merged,
-                        read_artwork,
-                        shown_source.as_ref(),
-                        self.budget_stripped_art.contains(&merged.source_app),
-                    );
-                    // Tombstone fallback: after `sync_subscriptions` evicts the
-                    // artwork cache (>TERMINAL_STOP_GRACE), a switch-back that
-                    // recreates the session would otherwise duplicate the pill.
-                    // No artwork bytes held, only the window keeps it bounded.
-                    if !session_recreation
-                        && !self.last_track_per_source.contains_key(&merged.source_app)
-                        && let Some(tomb) = self.dedup_tombstones.get(&merged.source_app)
-                    {
-                        let same_identity = tomb.title == merged.title && tomb.artist == merged.artist;
-                        let within_window = Instant::now().duration_since(tomb.when) < DEDUP_TOMBSTONE_WINDOW;
-                        let shown_matches = shown_source.as_ref() == Some(&merged.source_app);
-                        // Same derived rule as the primary gate: stripped
-                        // cache cannot prove cover is same, so art-gained
-                        // re-report of same identity stays suppressed.
-                        let stripped_suppress =
-                            tomb.art_was_stripped && same_identity && read_artwork && merged.artwork.is_some();
-                        let recreation_via_tomb = same_identity && within_window && shown_matches;
-                        if stripped_suppress || recreation_via_tomb {
-                            session_recreation = true;
-                        }
-                    }
-                    // Same song, different cover: some sources swap album art
-                    // for the same title+artist (e.g. a video vs audio
-                    // version). content_differ only compares text fields, so
-                    // compare the artwork bytes against the last emitted
-                    // track and surface the new cover as a refresh. Gated by
-                    // ARTWORK_CHANGE_MIN_INTERVAL: SMTC re-reads the
-                    // thumbnail within ~1s of a change and can return
-                    // different bytes for the same cover, which would
-                    // otherwise fire a duplicate pill for the same song.
-                    // Skipped when the recreation gate above would suppress
-                    // the emit anyway (stripped-cache re-report of the same
-                    // identity): forcing it would only be eaten below.
-                    if !emit
-                        && read_artwork
-                        && !session_recreation
-                        && let Some(prev_track) = self.last_track_per_source.get(&merged.source_app)
-                        && prev_track.title == merged.title
-                        && prev_track.artist == merged.artist
-                        && self
-                            .last_emit_at
-                            .get(&merged.source_app)
-                            .is_none_or(|t| t.elapsed() >= ARTWORK_CHANGE_MIN_INTERVAL)
-                    {
-                        let art_changed = match (&prev_track.artwork, &merged.artwork) {
-                            (Some(a), Some(b)) => !Arc::ptr_eq(a, b) && a.as_ref() != b.as_ref(),
-                            (None, Some(_)) | (Some(_), None) => true,
-                            (None, None) => false,
-                        };
-                        if art_changed {
-                            // The user's real pause/play is already in the batch:
-                            // YouTube Music re-encodes its thumbnail when it
-                            // recreates the session on pause, so the same cover
-                            // can re-read with different bytes. Forcing a
-                            // TrackChanged here would make the batch rule below
-                            // drop the state event, and the pill would show the
-                            // track layout instead of the pause. Absorb the
-                            // refresh instead: record the new bytes as the
-                            // source's last emitted track so a later read dedups
-                            // against them, and let the state event carry the
-                            // pill. A later genuine cover swap still re-reads
-                            // differently and emits normally.
-                            if artwork_refresh_absorbed(&events, &merged) {
-                                self.store_last_emitted_track(merged.source_app.clone(), merged.clone());
-                                self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
-                                let label = track_label(&merged);
-                                debug!("artwork refresh absorbed | reason=state-change-in-batch | {label}");
-                            } else {
-                                emit = true;
-                                // Genuine cover change for the same identity:
-                                // invalidate the cached palette so the emit
-                                // recomputes from the new bytes instead of
-                                // carrying the old cover's accent colors.
-                                self.palette_per_identity.remove(&palette_cache_key(
-                                    &merged.source_app,
-                                    &merged.title,
-                                    &merged.artist,
-                                ));
-                                let label = track_label(&merged);
-                                debug!("track emit forced | reason=artwork-changed | {label}");
-                            }
-                        }
-                    }
-                    // A recreated session starts from a default LogicalState, so
-                    // its first read reports the new session's default playback
-                    // state (e.g. Paused while the user never touched anything)
-                    // as if it were a real transition. When the track identifies
-                    // the whole read as a session recreation, the paired
-                    // playback event is usually spurious too: drop it so a
-                    // source that re-creates its session while paused does not
-                    // fire pills. The exception is a state that actually changed
-                    // since the source last reported it — YouTube Music
-                    // recreates its session when the user presses pause/play,
-                    // so the fresh session's first state can be the real
-                    // transition and must be shown.
-                    if session_recreation
-                        && prev.source_app.is_empty()
-                        && prev.title.is_empty()
-                        && spurious_recreated_playback(known_playback, playback)
-                    {
-                        events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
-                        // The TrackChanged carrying this read must not re-introduce
-                        // the spurious state just dropped: `merge_track` copies the
-                        // snapshot state unconditionally, so null it here or the pill
-                        // would show a pause the user never made.
-                        merged.playback_state = None;
-                    }
-                    // Stale-art emit gate: this read's art was byte-equal to the
-                    // last emitted track and got dropped as stale — a genuinely
-                    // shared album cover, or a transition-window stale buffer.
-                    // Do not flash an artless pill here: the artwork retry
-                    // (~2s, bypasses the stale guard) delivers the cover, so
-                    // the pill appears once, with art. The paired playback
-                    // event is held back like the first-read deferral, so a
-                    // state pill does not render with the source's previous
-                    // track; the deferred track carries the change. A later
-                    // read past ARTWORK_TIMEOUT still forces the pill if the
-                    // thumbnail stream never recovers, preserving the "always
-                    // eventually shows something" guarantee.
-                    if emit && stale_dropped {
-                        emit = false;
-                        next.deferred_at = Some(Instant::now());
-                        next.deferred_for_stale_art = true;
-                        events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
-                        let label = track_label(&merged);
-                        debug!("track emit deferred | reason=stale-art-drop | {label}");
-                    }
-                    if emit && !placeholder && !session_recreation {
-                        let label = track_label(&merged);
-                        info!("track changed | {label}");
-                        let mut emitted = with_decoded_art(merged.clone(), crate::events::ARTWORK_DECODE as usize);
-                        emitted.art_generation =
-                            next_art_generation(self, &merged.source_app, emitted.decoded_art.as_deref());
-                        // Attach the identity-stable palette so the overlay does
-                        // not recompute (and drift) from re-encoded thumbnails.
-                        emitted.palette = self.palette_for_identity(&merged, emitted.decoded_art.as_deref());
-                        events.push(MediaEvent::TrackChanged(emitted));
-                        self.store_last_emitted_track(merged.source_app.clone(), merged.clone());
-                        self.last_emit_at.insert(merged.source_app.clone(), Instant::now());
-                        next.deferred_at = None;
-                        next.deferred_for_stale_art = false;
-                    } else if emit && session_recreation {
-                        // Only an emit that would actually fire is worth logging
-                        // as suppressed: the 2-second poll re-reads the current
-                        // track unchanged (emit=false) and must not be reported
-                        // as a suppressed recreation — it never would have
-                        // emitted in the first place. Gating the log on `emit`
-                        // keeps a steady-state source from flooding the log
-                        // with one "suppressed" line per poll pass.
-                        let label = track_label(&merged);
-                        debug!("track emit suppressed | reason=session-recreation | {label}");
-                    } else if artwork_lost {
-                        // Absence is already shown as a placeholder: store the
-                        // loss (a later reappearance re-emits) without
-                        // flashing the same track again.
-                        let label = track_label(&merged);
-                        debug!("track emit skipped | reason=artwork-removed | {label}");
-                    } else {
-                        if is_first_read
-                            && read_artwork
-                            && !is_placeholder_read(&prev, &merged)
-                            && merged.artwork.is_none()
-                        {
-                            // The paired playback event (already queued above)
-                            // would reach the overlay before the deferred
-                            // track and render a state pill with the source's
-                            // *previous* track. Hold it back: the deferred
-                            // track carries the change.
-                            events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
-                            next.deferred_at = Some(Instant::now());
-                            next.deferred_for_stale_art = false;
-                            let label = track_label(&merged);
-                            debug!("track emit deferred | reason=awaiting-artwork | {label}");
-                        } else if read_artwork && !stale_dropped {
-                            // Event-driven reads only: the 2-second poll re-reads
-                            // every session and must not log a duplicate per pass.
-                            // A stale-dropped read is already accounted by the
-                            // deferral above (reason=stale-art-drop), not a
-                            // duplicate of the last emitted track.
-                            let label = track_label(&merged);
-                            debug!("track emit skipped | reason=duplicate | {label}");
-                        }
-                    }
-                    next.title = merged.title;
-                    next.artist = merged.artist;
-                    next.album = merged.album;
-                    next.album_artist = merged.album_artist;
-                    next.subtitle = merged.subtitle;
-                    next.has_artwork = if read_artwork {
-                        merged.artwork.is_some()
-                    } else {
-                        prev.has_artwork
-                    };
-                    next.source_app = merged.source_app;
-                    next.duration_secs = merged.duration_secs;
-                    next.track_number = merged.track_number;
-                    next.track_count = merged.track_count;
-                    next.genre = merged.genre;
-                    next.playback_type = merged.playback_type;
-                    // Marked fresh for the poll skip only on a successful
-                    // read: a failed read must not suppress the poll, which
-                    // is the safety net for exactly that case.
-                    next.last_read_at = Some(Instant::now());
+                    let mut plan =
+                        self.prepare_refresh_track(session, &prev, &mut next, read, read_artwork, &mut events);
+                    Self::filter_recreated_playback(&mut plan, &prev, known_playback, playback, &mut events);
+                    self.apply_refresh_track_emit(&prev, &mut next, read_artwork, &mut events, plan);
                 }
-                Err(error) => {
-                    if is_session_gone(&error) {
-                        debug!("session torn down during read | key={key} | {error:#}");
-                    } else {
-                        debug!("track read failed | key={key} | {error:#}");
-                    }
-                    // A session that never yields a successful first read
-                    // carries no track by definition, so it is content-free:
-                    // charge churn here too, or a storm of sessions that die
-                    // before their first read completes dodges the cool-down
-                    // (they report nothing but still churn the session list).
-                    if is_first_read {
-                        self.record_churn(&read_source_app(session));
-                    }
-                }
+                Err(error) => self.handle_refresh_track_error(session, key, &prev, &error),
             }
         }
 

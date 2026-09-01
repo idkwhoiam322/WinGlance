@@ -6178,38 +6178,7 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
     // RegisterWindowMessageW returns 0 (WM_NULL), so never treat WM_NULL as
     // the TaskbarCreated broadcast.
     if message != 0 && message == taskbar_created_msg() {
-        debug!("Explorer restarted the notification area; re-adding the tray icon");
-        match install_tray_icon(hwnd) {
-            Ok(()) => {
-                // A success while the startup retry budget is still armed
-                // (e.g. the timer fired between Explorer's restart and this
-                // broadcast): clear it, or the timer's next NIM_ADD would
-                // target an already-installed (hwnd, uID) and march the
-                // budget to its give-up error line for nothing.
-                let state_ptr = window_state::<MainWindowState>(hwnd);
-                if !state_ptr.is_null() {
-                    let state = &mut *state_ptr;
-                    if state.tray_add_attempts != 0 {
-                        state.tray_add_attempts = 0;
-                        let _ = kill_timer(hwnd, TRAY_RETRY_TIMER_ID);
-                        info!("tray icon re-added after an Explorer restart; retry budget cleared");
-                    }
-                }
-            }
-            Err(error) => {
-                error!("re-adding the tray icon after an Explorer restart failed: {error}");
-                // Explorer will not broadcast again until its next restart,
-                // so a failed re-add must re-arm the retry budget rather
-                // than leave the app icon-less until then.
-                let state_ptr = window_state::<MainWindowState>(hwnd);
-                if !state_ptr.is_null() {
-                    let state = &mut *state_ptr;
-                    state.tray_add_attempts = 1;
-                    let _ = set_timer(hwnd, TRAY_RETRY_TIMER_ID, TRAY_RETRY_INTERVAL_MS, None);
-                }
-            }
-        }
-        return LRESULT(0);
+        return handle_taskbar_created(hwnd);
     }
     // Session end (logoff/shutdown): consent through DefWindowProcW, but
     // remove the tray icon first so no ghost icon lingers in a session that
@@ -6238,6 +6207,89 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
     }
 
     let state_ptr = window_state::<MainWindowState>(hwnd);
+    match message {
+        WM_CREATE | WM_PAINT | WM_SIZE | WM_DPICHANGED => {
+            dispatch_window_layout_message(hwnd, message, wparam, lparam, state_ptr)
+        }
+        WM_TIMER
+            if matches!(
+                wparam.0,
+                TRAY_RETRY_TIMER_ID | TIMER_LOGS_ID | TIMER_OPENED_ID | TIMER_TOOLTIPS_ID | IDLE_ART_TIMER_ID
+            ) =>
+        {
+            dispatch_timer_message(hwnd, message, wparam, lparam, state_ptr)
+        }
+        WM_NOTIFY => dispatch_timer_message(hwnd, message, wparam, lparam, state_ptr),
+        WM_VSCROLL | WM_MOUSEWHEEL => dispatch_settings_scroll_message(hwnd, message, wparam, lparam, state_ptr),
+        WM_GETOBJECT => dispatch_settings_uia_message(hwnd, message, wparam, lparam, state_ptr),
+        WM_KEYDOWN => dispatch_settings_keyboard_message(hwnd, message, wparam, lparam, state_ptr),
+        WM_LBUTTONDOWN => dispatch_primary_click_message(hwnd, message, wparam, lparam, state_ptr),
+        WM_SETTINGS_ACTIVATE_MSG => dispatch_settings_activate_message(hwnd, message, wparam, lparam, state_ptr),
+        WM_MOUSEMOVE | WM_MOUSELEAVE => dispatch_pointer_hover_message(hwnd, message, wparam, lparam, state_ptr),
+        WM_CTLCOLORLISTBOX | WM_DRAWITEM => dispatch_owner_draw_message(hwnd, message, wparam, lparam, state_ptr),
+        MEDIA_EVENT_MSG
+        | RESTART_RESULT_MSG
+        | POSITION_MSG
+        | COMPACT_POSITION_MSG
+        | PICKER_RESULT_MSG
+        | AUTO_SOURCES_RESULT_MSG
+        | PINNED_SOURCE_RESULT_MSG => dispatch_app_message(hwnd, message, wparam, lparam, state_ptr),
+        WM_DISPLAYCHANGE | WM_CLOSE | WM_SETTINGCHANGE | WM_DESTROY => {
+            dispatch_window_state_message(hwnd, message, wparam, lparam, state_ptr)
+        }
+        WM_TRAY => dispatch_tray_message(hwnd, message, wparam, lparam, state_ptr),
+        WM_SETTINGS_SNAPSHOT_MSG | WM_SETTINGS_FOCUS_MSG => {
+            dispatch_settings_provider_message(hwnd, message, wparam, lparam, state_ptr)
+        }
+        WM_NCDESTROY => dispatch_nc_destroy_message(hwnd, message, wparam, lparam, state_ptr),
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_taskbar_created(hwnd: HWND) -> LRESULT {
+    debug!("Explorer restarted the notification area; re-adding the tray icon");
+    match install_tray_icon(hwnd) {
+        Ok(()) => {
+            // A success while the startup retry budget is still armed
+            // (e.g. the timer fired between Explorer's restart and this
+            // broadcast): clear it, or the timer's next NIM_ADD would
+            // target an already-installed (hwnd, uID) and march the
+            // budget to its give-up error line for nothing.
+            let state_ptr = window_state::<MainWindowState>(hwnd);
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                if state.tray_add_attempts != 0 {
+                    state.tray_add_attempts = 0;
+                    let _ = kill_timer(hwnd, TRAY_RETRY_TIMER_ID);
+                    info!("tray icon re-added after an Explorer restart; retry budget cleared");
+                }
+            }
+        }
+        Err(error) => {
+            error!("re-adding the tray icon after an Explorer restart failed: {error}");
+            // Explorer will not broadcast again until its next restart,
+            // so a failed re-add must re-arm the retry budget rather
+            // than leave the app icon-less until then.
+            let state_ptr = window_state::<MainWindowState>(hwnd);
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.tray_add_attempts = 1;
+                let _ = set_timer(hwnd, TRAY_RETRY_TIMER_ID, TRAY_RETRY_INTERVAL_MS, None);
+            }
+        }
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_window_layout_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
     match message {
         WM_CREATE => {
             if !state_ptr.is_null() {
@@ -6296,106 +6348,188 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             LRESULT(0)
         }
-        WM_TIMER if wparam.0 == TRAY_RETRY_TIMER_ID => {
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                if install_tray_icon(hwnd).is_ok() {
-                    info!("tray icon installed on retry {}", state.tray_add_attempts);
-                    state.tray_add_attempts = 0;
-                    let _ = kill_timer(hwnd, TRAY_RETRY_TIMER_ID);
-                } else {
-                    state.tray_add_attempts += 1;
-                    if state.tray_add_attempts >= TRAY_RETRY_MAX_ATTEMPTS {
-                        error!(
-                            "the tray icon could not be added after {} attempts over the backoff schedule; \
-                             pills are unaffected and an Explorer restart will re-add it",
-                            state.tray_add_attempts
-                        );
-                        state.tray_add_attempts = 0;
-                        let _ = kill_timer(hwnd, TRAY_RETRY_TIMER_ID);
-                    } else {
-                        // Backoff: 2 s doubling to a 60 s cap, so a slow
-                        // logon keeps retrying for minutes instead of giving
-                        // up after the old ~8 s window.
-                        let _ = set_timer(
-                            hwnd,
-                            TRAY_RETRY_TIMER_ID,
-                            tray_retry_delay_ms(state.tray_add_attempts),
-                            None,
-                        );
-                    }
-                }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_timer_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    if message == WM_NOTIFY {
+        return handle_tooltip_notify(hwnd, message, wparam, lparam, state_ptr);
+    }
+    match wparam.0 {
+        TRAY_RETRY_TIMER_ID => handle_tray_retry_timer(hwnd, message, wparam, lparam, state_ptr),
+        TIMER_LOGS_ID => handle_logs_timer(hwnd, message, wparam, lparam, state_ptr),
+        TIMER_OPENED_ID => handle_opened_timer(hwnd, message, wparam, lparam, state_ptr),
+        TIMER_TOOLTIPS_ID => handle_tooltips_timer(hwnd, message, wparam, lparam, state_ptr),
+        IDLE_ART_TIMER_ID => handle_idle_art_timer(hwnd, message, wparam, lparam, state_ptr),
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_tray_retry_timer(
+    hwnd: HWND,
+    _message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    if !state_ptr.is_null() {
+        let state = &mut *state_ptr;
+        if install_tray_icon(hwnd).is_ok() {
+            info!("tray icon installed on retry {}", state.tray_add_attempts);
+            state.tray_add_attempts = 0;
+            let _ = kill_timer(hwnd, TRAY_RETRY_TIMER_ID);
+        } else {
+            state.tray_add_attempts += 1;
+            if state.tray_add_attempts >= TRAY_RETRY_MAX_ATTEMPTS {
+                error!(
+                    "the tray icon could not be added after {} attempts over the backoff schedule; \
+                     pills are unaffected and an Explorer restart will re-add it",
+                    state.tray_add_attempts
+                );
+                state.tray_add_attempts = 0;
+                let _ = kill_timer(hwnd, TRAY_RETRY_TIMER_ID);
+            } else {
+                // Backoff: 2 s doubling to a 60 s cap, so a slow
+                // logon keeps retrying for minutes instead of giving
+                // up after the old ~8 s window.
+                let _ = set_timer(
+                    hwnd,
+                    TRAY_RETRY_TIMER_ID,
+                    tray_retry_delay_ms(state.tray_add_attempts),
+                    None,
+                );
             }
-            LRESULT(0)
         }
-        WM_TIMER if wparam.0 == TIMER_LOGS_ID => {
-            unsafe {
-                let _ = kill_timer(hwnd, TIMER_LOGS_ID);
-            }
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                state.logs_copied_at = None;
-                state.invalidate();
-            }
-            LRESULT(0)
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_logs_timer(
+    hwnd: HWND,
+    _message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    unsafe {
+        let _ = kill_timer(hwnd, TIMER_LOGS_ID);
+    }
+    if !state_ptr.is_null() {
+        let state = &mut *state_ptr;
+        state.logs_copied_at = None;
+        state.invalidate();
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_opened_timer(
+    hwnd: HWND,
+    _message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    unsafe {
+        let _ = kill_timer(hwnd, TIMER_OPENED_ID);
+    }
+    if !state_ptr.is_null() {
+        let state = &mut *state_ptr;
+        state.logs_opened_at = None;
+        state.config_opened_at = None;
+        state.invalidate();
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_tooltips_timer(
+    _hwnd: HWND,
+    _message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    if !state_ptr.is_null() {
+        unsafe {
+            (*state_ptr).sync_tooltips();
         }
-        WM_TIMER if wparam.0 == TIMER_OPENED_ID => {
-            unsafe {
-                let _ = kill_timer(hwnd, TIMER_OPENED_ID);
-            }
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                state.logs_opened_at = None;
-                state.config_opened_at = None;
-                state.invalidate();
-            }
-            LRESULT(0)
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_idle_art_timer(
+    hwnd: HWND,
+    _message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    if !state_ptr.is_null() {
+        let state = &mut *state_ptr;
+        // show_window() kills this timer, so firing while the window
+        // is visible would be a logic error elsewhere; the check
+        // keeps the free from ever racing a paint.
+        if !unsafe { IsWindowVisible(hwnd).as_bool() }
+            && let Some(current) = &mut state.current
+        {
+            free_art_blit(&mut current.art_blit);
+            free_art_blit(&mut current.icon_blit);
         }
-        WM_TIMER if wparam.0 == TIMER_TOOLTIPS_ID => {
-            if !state_ptr.is_null() {
-                unsafe {
-                    (*state_ptr).sync_tooltips();
-                }
-            }
-            LRESULT(0)
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_tooltip_notify(
+    _hwnd: HWND,
+    _message: u32,
+    _wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    // The track-mode tooltip registers its tool with
+    // LPSTR_TEXTCALLBACK, so when the control prepares to display it
+    // requests text through TTN_GETDISPINFO. The hover poller stages
+    // the exact string to show into the window-owned wide buffer on
+    // every activation; serving that pointer keeps the displayed
+    // text and the dwell decision in lockstep. Without this answer
+    // the control never shows the tooltip at all.
+    if !state_ptr.is_null() && lparam.0 != 0 {
+        let nmhdr = unsafe { &*(lparam.0 as *const NMHDR) };
+        // Only our own tooltip control's notifications are answered:
+        // the shared text-buffer contract must not silently extend
+        // to a future child control forwarding the same message.
+        if nmhdr.code == TTN_GETDISPINFOW && nmhdr.hwndFrom == (*state_ptr).tooltip_ctrl {
+            let state = &mut *state_ptr;
+            let info = unsafe { &mut *(lparam.0 as *mut NMTTDISPINFOW) };
+            info.lpszText = PWSTR(state.tooltip_text.as_mut_ptr());
+            info.hinst = HINSTANCE::default();
         }
-        WM_TIMER if wparam.0 == IDLE_ART_TIMER_ID => {
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                // show_window() kills this timer, so firing while the window
-                // is visible would be a logic error elsewhere; the check
-                // keeps the free from ever racing a paint.
-                if !unsafe { IsWindowVisible(hwnd).as_bool() }
-                    && let Some(current) = &mut state.current
-                {
-                    free_art_blit(&mut current.art_blit);
-                    free_art_blit(&mut current.icon_blit);
-                }
-            }
-            LRESULT(0)
-        }
-        WM_NOTIFY => {
-            // The track-mode tooltip registers its tool with
-            // LPSTR_TEXTCALLBACK, so when the control prepares to display it
-            // requests text through TTN_GETDISPINFO. The hover poller stages
-            // the exact string to show into the window-owned wide buffer on
-            // every activation; serving that pointer keeps the displayed
-            // text and the dwell decision in lockstep. Without this answer
-            // the control never shows the tooltip at all.
-            if !state_ptr.is_null() && lparam.0 != 0 {
-                let nmhdr = unsafe { &*(lparam.0 as *const NMHDR) };
-                // Only our own tooltip control's notifications are answered:
-                // the shared text-buffer contract must not silently extend
-                // to a future child control forwarding the same message.
-                if nmhdr.code == TTN_GETDISPINFOW && nmhdr.hwndFrom == (*state_ptr).tooltip_ctrl {
-                    let state = &mut *state_ptr;
-                    let info = unsafe { &mut *(lparam.0 as *mut NMTTDISPINFOW) };
-                    info.lpszText = PWSTR(state.tooltip_text.as_mut_ptr());
-                    info.hinst = HINSTANCE::default();
-                }
-            }
-            LRESULT(0)
-        }
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_settings_scroll_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    match message {
         WM_VSCROLL => {
             // The dynamic vertical scrollbar drives Settings-pane scrolling;
             // outside the Settings pane the message belongs to the default
@@ -6448,6 +6582,19 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_settings_uia_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    match message {
         WM_GETOBJECT => {
             // UI Automation asks for a provider with lParam == UiaRootObjectId;
             // MSAA OBJID_* queries keep the DefWindowProcW answer. Only the
@@ -6474,338 +6621,429 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
-        WM_KEYDOWN => {
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                let k = VIRTUAL_KEY(wparam.0 as u16);
-                // From the Activity pane, Tab / Enter / Down / Right steps into
-                // the Settings pane and focuses its first control.
-                if state.active_pane != Pane::Settings {
-                    if matches!(k, VK_TAB | VK_RETURN | VK_SPACE | VK_DOWN | VK_RIGHT) {
-                        state.active_pane = Pane::Settings;
-                        state.apply_pane();
-                        crate::accessibility::raise_settings_structure_changed(hwnd, None);
-                        let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
-                        let (client_w, _) = client_size(hwnd);
-                        let sidebar_w = (SIDEBAR_W * scale).round() as i32;
-                        let pad = (PAD * scale) as i32;
-                        let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
-                        if let Some(first) = targets.first() {
-                            let new_hover = Some((first.row_index, first.sub));
-                            let old = state.settings_hover;
-                            state.settings_hover = new_hover;
-                            state.invalidate_hover_rows(client_w, old, new_hover);
-                            raise_settings_focus_event(hwnd, new_hover);
-                        }
-                        let (client_w, client_h) = client_size(hwnd);
-                        state.sync_settings_scroll(client_w, client_h);
-                        state.invalidate();
-                    }
-                    // Handled keys switch panes; every other key falls through
-                    // to the default handler instead of being silently eaten,
-                    // so future default key behavior keeps working.
-                    return DefWindowProcW(hwnd, message, wparam, lparam);
-                }
-                // Settings pane: walk focusable controls and activate one.
-                let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
-                let (client_w, _) = client_size(hwnd);
-                let sidebar_w = (SIDEBAR_W * scale).round() as i32;
-                let pad = (PAD * scale) as i32;
-                let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
-                if targets.is_empty() {
-                    return LRESULT(0);
-                }
-                let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 };
-                let idx = state
-                    .settings_hover
-                    .and_then(|(r, s)| targets.iter().position(|t| t.row_index == r && t.sub == s))
-                    .unwrap_or(0);
-                match k {
-                    VK_TAB => {
-                        let next = if shift {
-                            (idx + targets.len() - 1) % targets.len()
-                        } else {
-                            (idx + 1) % targets.len()
-                        };
-                        state.focus_settings_target(&targets, next, client_w);
-                    }
-                    VK_DOWN | VK_RIGHT => {
-                        state.focus_settings_target(&targets, (idx + 1) % targets.len(), client_w);
-                    }
-                    VK_UP | VK_LEFT => {
-                        state.focus_settings_target(&targets, (idx + targets.len() - 1) % targets.len(), client_w);
-                    }
-                    VK_RETURN | VK_SPACE => {
-                        if let Some(t) = targets.get(idx) {
-                            let lp = LPARAM(t.cx as isize | (t.cy as isize) << 16);
-                            let _ = unsafe { post_message(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp) };
-                        }
-                    }
-                    VK_ESCAPE => {
-                        // Return to the Activity pane and clear the keyboard
-                        // focus highlight so the next Tab starts fresh.
-                        // The Settings root is captured BEFORE the flip: its
-                        // children vanish with it, and the invalidation must
-                        // name an element that still laid out.
-                        let leaving = if state.active_pane == Pane::Settings {
-                            crate::accessibility::settings_provider(hwnd)
-                        } else {
-                            None
-                        };
-                        state.active_pane = Pane::Activity;
-                        let old = state.settings_hover;
-                        state.settings_hover = None;
-                        state.apply_pane();
-                        crate::accessibility::raise_settings_structure_changed(hwnd, leaving);
-                        state.invalidate_hover_rows(client_w, old, None);
-                        state.invalidate();
-                    }
-                    VK_PRIOR => {
-                        // PageUp: scroll one viewport up without moving focus.
-                        let (_, client_h) = client_size(hwnd);
-                        let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
-                        let row_h = (34.0 * scale) as i32;
-                        state.scroll_settings_by(-(client_h - row_h).max(row_h), client_w, client_h);
-                    }
-                    VK_NEXT => {
-                        // PageDown: scroll one viewport down.
-                        let (_, client_h) = client_size(hwnd);
-                        let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
-                        let row_h = (34.0 * scale) as i32;
-                        state.scroll_settings_by((client_h - row_h).max(row_h), client_w, client_h);
-                    }
-                    VK_HOME => {
-                        let (_, client_h) = client_size(hwnd);
-                        state.settings_scroll_y = 0;
-                        state.sync_settings_scroll(client_w, client_h);
-                    }
-                    VK_END => {
-                        let (_, client_h) = client_size(hwnd);
-                        state.settings_scroll_y = i32::MAX;
-                        state.sync_settings_scroll(client_w, client_h);
-                    }
-                    _ => {}
-                }
-                return LRESULT(0);
-            }
-            LRESULT(0)
-        }
-        WM_LBUTTONDOWN => {
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
-                let x = (lparam.0 & 0xFFFF) as i32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                let sidebar_w = (SIDEBAR_W * scale).round() as i32;
-                let pad = (PAD * scale) as i32;
-                let (client_w, _client_h) = client_size(hwnd);
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
 
-                // Check sidebar clicks
-                if x < sidebar_w {
-                    let item_h = (32.0 * scale) as i32;
-                    let item0_y = (40.0 * scale) as i32;
-                    let item1_y = item0_y + item_h + (4.0 * scale) as i32;
-                    let previous = state.active_pane;
-                    // Leaving Settings via the sidebar: capture its root
-                    // before the flip.
-                    let leaving = if previous == Pane::Settings {
-                        crate::accessibility::settings_provider(hwnd)
-                    } else {
-                        None
-                    };
-                    if y >= item0_y && y < item0_y + item_h {
-                        state.active_pane = Pane::Activity;
-                    } else if y >= item1_y && y < item1_y + item_h {
-                        state.active_pane = Pane::Settings;
-                    }
-                    if previous != state.active_pane {
-                        crate::accessibility::raise_settings_structure_changed(
-                            hwnd,
-                            if previous == Pane::Settings { leaving } else { None },
-                        );
-                        debug!("switched to the {:?} pane", state.active_pane);
-                        // When entering Settings via mouse, set keyboard focus
-                        // on the first control so the next Tab starts from a
-                        // known position instead of a stale or absent highlight.
-                        if state.active_pane == Pane::Settings {
-                            let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
-                            if let Some(first) = targets.first() {
-                                let new_hover = Some((first.row_index, first.sub));
-                                let old = state.settings_hover;
-                                state.settings_hover = new_hover;
-                                state.invalidate_hover_rows(client_w, old, new_hover);
-                                raise_settings_focus_event(hwnd, new_hover);
-                            }
-                        }
-                        // Clear the Settings focus highlight when leaving, so
-                        // it does not persist behind the Activity pane.
-                        if state.active_pane == Pane::Activity {
-                            let old = state.settings_hover;
-                            state.settings_hover = None;
-                            state.invalidate_hover_rows(client_w, old, None);
-                        }
-                    }
-                    state.apply_pane();
-                    if state.active_pane == Pane::Settings {
-                        // Entering Settings re-evaluates whether the document
-                        // overflows and shows the dynamic scrollbar if so.
-                        let (client_w, client_h) = client_size(hwnd);
-                        state.sync_settings_scroll(client_w, client_h);
-                    }
-                    state.invalidate();
-                } else if state.active_pane == Pane::Activity {
-                    // Check position area click in Activity pane
-                    let pos_y = ((ART_Y + ART_SIZE + SEP_GAP + HIST_GAP + HIST_H) * scale).round() as i32
-                        + (4.0 * scale) as i32;
-                    let pos_bottom = pos_y + (16.0 * scale) as i32;
-                    if y >= pos_y && y <= pos_bottom {
-                        let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
-                    }
-                } else if state.active_pane == Pane::Settings {
-                    // Resolve geometry into a semantic action before any
-                    // mutation/Win32 work begins.
-                    let items = state
-                        .settings_items(sidebar_w, client_w, pad, scale, state.settings_scroll_y)
-                        .items;
-                    if let Some((id, row_index, rect, action)) = hit_test_settings(&items, x, y, scale) {
-                        perform_setting_action(hwnd, id, row_index, &rect, action, scale);
-                        return LRESULT(0);
-                    }
-                }
-            }
-            LRESULT(0)
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_settings_keyboard_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    if message != WM_KEYDOWN {
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    if state_ptr.is_null() {
+        return LRESULT(0);
+    }
+    let state = &mut *state_ptr;
+    let key = VIRTUAL_KEY(wparam.0 as u16);
+    if state.active_pane != Pane::Settings {
+        enter_settings_from_keyboard(hwnd, state, key);
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    navigate_settings_from_keyboard(hwnd, state, key);
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn enter_settings_from_keyboard(hwnd: HWND, state: &mut MainWindowState, key: VIRTUAL_KEY) {
+    if !matches!(key, VK_TAB | VK_RETURN | VK_SPACE | VK_DOWN | VK_RIGHT) {
+        return;
+    }
+    state.active_pane = Pane::Settings;
+    state.apply_pane();
+    crate::accessibility::raise_settings_structure_changed(hwnd, None);
+    let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+    let (client_w, _) = client_size(hwnd);
+    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+    let pad = (PAD * scale) as i32;
+    let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
+    if let Some(first) = targets.first() {
+        let new_hover = Some((first.row_index, first.sub));
+        let old = state.settings_hover;
+        state.settings_hover = new_hover;
+        state.invalidate_hover_rows(client_w, old, new_hover);
+        raise_settings_focus_event(hwnd, new_hover);
+    }
+    let (client_w, client_h) = client_size(hwnd);
+    state.sync_settings_scroll(client_w, client_h);
+    state.invalidate();
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn navigate_settings_from_keyboard(hwnd: HWND, state: &mut MainWindowState, key: VIRTUAL_KEY) {
+    let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+    let (client_w, _) = client_size(hwnd);
+    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+    let pad = (PAD * scale) as i32;
+    let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
+    if targets.is_empty() {
+        return;
+    }
+    let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+    let idx = state
+        .settings_hover
+        .and_then(|(row, sub)| {
+            targets
+                .iter()
+                .position(|target| target.row_index == row && target.sub == sub)
+        })
+        .unwrap_or(0);
+    match key {
+        VK_TAB => {
+            let next = if shift {
+                (idx + targets.len() - 1) % targets.len()
+            } else {
+                (idx + 1) % targets.len()
+            };
+            state.focus_settings_target(&targets, next, client_w);
         }
-        WM_SETTINGS_ACTIVATE_MSG => {
-            // A Settings control's stable runtime id, posted by the UIA
-            // provider's Invoke/Toggle. Re-resolved against the LIVE layout:
-            // a stale provider (scrolled, rebuilt, torn down) finds no row
-            // and the activation is dropped instead of acting on whatever
-            // control now occupies the old position.
-            if !state_ptr.is_null() {
-                let state = unsafe { &mut *state_ptr };
-                let encoded = wparam.0 as i32;
-                if encoded & 0x80 != 0 {
-                    let row_index = (encoded >> 8) as usize;
-                    if let Some(sub) = setting_sub_from_tag(encoded & 0x7F) {
-                        let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
-                        let sidebar_w = (SIDEBAR_W * scale).round() as i32;
-                        let pad = (PAD * scale) as i32;
-                        let (client_w, client_h) = client_size(hwnd);
-                        // A Settings control was explicitly activated: bring
-                        // the Settings pane up first, exactly like a sidebar
-                        // click on it would.
-                        if state.active_pane != Pane::Settings {
-                            state.active_pane = Pane::Settings;
-                            state.apply_pane();
-                            crate::accessibility::raise_settings_structure_changed(hwnd, None);
-                            state.sync_settings_scroll(client_w, client_h);
-                        }
-                        let items = state
-                            .settings_items(sidebar_w, client_w, pad, scale, state.settings_scroll_y)
-                            .items;
-                        let mut row = 0usize;
-                        for item in &items {
-                            if let SettingsItem::Row { id, rect } = item {
-                                if row == row_index {
-                                    if let Some((x, y)) = setting_sub_click_point(*id, sub, rect, scale) {
-                                        apply_settings_row_click(hwnd, id, row_index, rect, x, y, scale);
-                                    }
-                                    break;
-                                }
-                                row += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            LRESULT(0)
+        VK_DOWN | VK_RIGHT => state.focus_settings_target(&targets, (idx + 1) % targets.len(), client_w),
+        VK_UP | VK_LEFT => {
+            state.focus_settings_target(&targets, (idx + targets.len() - 1) % targets.len(), client_w);
         }
+        VK_RETURN | VK_SPACE => {
+            if let Some(target) = targets.get(idx) {
+                let lp = LPARAM(target.cx as isize | (target.cy as isize) << 16);
+                let _ = post_message(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp);
+            }
+        }
+        VK_ESCAPE => leave_settings_from_keyboard(hwnd, state, client_w),
+        VK_PRIOR => scroll_settings_page(state, client_w, -1),
+        VK_NEXT => scroll_settings_page(state, client_w, 1),
+        VK_HOME => {
+            let (_, client_h) = client_size(hwnd);
+            state.settings_scroll_y = 0;
+            state.sync_settings_scroll(client_w, client_h);
+        }
+        VK_END => {
+            let (_, client_h) = client_size(hwnd);
+            state.settings_scroll_y = i32::MAX;
+            state.sync_settings_scroll(client_w, client_h);
+        }
+        _ => {}
+    }
+}
+
+fn leave_settings_from_keyboard(hwnd: HWND, state: &mut MainWindowState, client_w: i32) {
+    let leaving = crate::accessibility::settings_provider(hwnd);
+    state.active_pane = Pane::Activity;
+    let old = state.settings_hover;
+    state.settings_hover = None;
+    state.apply_pane();
+    crate::accessibility::raise_settings_structure_changed(hwnd, leaving);
+    state.invalidate_hover_rows(client_w, old, None);
+    state.invalidate();
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn scroll_settings_page(state: &mut MainWindowState, client_w: i32, direction: i32) {
+    let (_, client_h) = client_size(state.hwnd);
+    let scale = GetDpiForWindow(state.hwnd).max(96) as f32 / 96.0;
+    let row_h = (34.0 * scale) as i32;
+    let page = (client_h - row_h).max(row_h);
+    state.scroll_settings_by(direction * page, client_w, client_h);
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_primary_click_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    if message != WM_LBUTTONDOWN {
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    if state_ptr.is_null() {
+        return LRESULT(0);
+    }
+    let state = &mut *state_ptr;
+    let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+    let x = (lparam.0 & 0xFFFF) as i32;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+    let pad = (PAD * scale) as i32;
+    let (client_w, _) = client_size(hwnd);
+    if x < sidebar_w {
+        handle_sidebar_click(hwnd, state, y, sidebar_w, client_w, pad, scale);
+        return LRESULT(0);
+    }
+    if state.active_pane == Pane::Activity {
+        handle_activity_position_click(hwnd, state, y, scale);
+    } else if state.active_pane == Pane::Settings {
+        handle_settings_content_click(hwnd, state, x, y, (sidebar_w, client_w, pad, scale));
+    }
+    LRESULT(0)
+}
+
+fn handle_sidebar_click(
+    hwnd: HWND,
+    state: &mut MainWindowState,
+    y: i32,
+    sidebar_w: i32,
+    client_w: i32,
+    pad: i32,
+    scale: f32,
+) {
+    let item_h = (32.0 * scale) as i32;
+    let item0_y = (40.0 * scale) as i32;
+    let item1_y = item0_y + item_h + (4.0 * scale) as i32;
+    let previous = state.active_pane;
+    let leaving = if previous == Pane::Settings {
+        crate::accessibility::settings_provider(hwnd)
+    } else {
+        None
+    };
+    if y >= item0_y && y < item0_y + item_h {
+        state.active_pane = Pane::Activity;
+    } else if y >= item1_y && y < item1_y + item_h {
+        state.active_pane = Pane::Settings;
+    }
+    if previous != state.active_pane {
+        crate::accessibility::raise_settings_structure_changed(
+            hwnd,
+            if previous == Pane::Settings { leaving } else { None },
+        );
+        debug!("switched to the {:?} pane", state.active_pane);
+        if state.active_pane == Pane::Settings {
+            focus_first_settings_target(hwnd, state, sidebar_w, client_w, pad, scale);
+        }
+        if state.active_pane == Pane::Activity {
+            let old = state.settings_hover;
+            state.settings_hover = None;
+            state.invalidate_hover_rows(client_w, old, None);
+        }
+    }
+    state.apply_pane();
+    if state.active_pane == Pane::Settings {
+        let (client_w, client_h) = client_size(hwnd);
+        state.sync_settings_scroll(client_w, client_h);
+    }
+    state.invalidate();
+}
+
+fn focus_first_settings_target(
+    hwnd: HWND,
+    state: &mut MainWindowState,
+    sidebar_w: i32,
+    client_w: i32,
+    pad: i32,
+    scale: f32,
+) {
+    let targets = state.settings_focus_targets(sidebar_w, client_w, pad, scale);
+    if let Some(first) = targets.first() {
+        let new_hover = Some((first.row_index, first.sub));
+        let old = state.settings_hover;
+        state.settings_hover = new_hover;
+        state.invalidate_hover_rows(client_w, old, new_hover);
+        raise_settings_focus_event(hwnd, new_hover);
+    }
+}
+
+fn handle_activity_position_click(hwnd: HWND, state: &mut MainWindowState, y: i32, scale: f32) {
+    let pos_y = ((ART_Y + ART_SIZE + SEP_GAP + HIST_GAP + HIST_H) * scale).round() as i32 + (4.0 * scale) as i32;
+    let pos_bottom = pos_y + (16.0 * scale) as i32;
+    if y >= pos_y && y <= pos_bottom {
+        let _ = crate::positioner::open(hwnd, state.overlay_hwnd);
+    }
+}
+
+fn handle_settings_content_click(hwnd: HWND, state: &MainWindowState, x: i32, y: i32, geometry: (i32, i32, i32, f32)) {
+    let (sidebar_w, client_w, pad, scale) = geometry;
+    let items = state
+        .settings_items(sidebar_w, client_w, pad, scale, state.settings_scroll_y)
+        .items;
+    if let Some((id, row_index, rect, action)) = hit_test_settings(&items, x, y, scale) {
+        perform_setting_action(hwnd, id, row_index, &rect, action, scale);
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_settings_activate_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    if message != WM_SETTINGS_ACTIVATE_MSG {
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    if state_ptr.is_null() {
+        return LRESULT(0);
+    }
+    let encoded = wparam.0 as i32;
+    if encoded & 0x80 == 0 {
+        return LRESULT(0);
+    }
+    let Some(sub) = setting_sub_from_tag(encoded & 0x7F) else {
+        return LRESULT(0);
+    };
+    activate_settings_runtime_target(hwnd, &mut *state_ptr, (encoded >> 8) as usize, sub);
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn activate_settings_runtime_target(hwnd: HWND, state: &mut MainWindowState, row_index: usize, sub: SettingSub) {
+    let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+    let pad = (PAD * scale) as i32;
+    let (client_w, client_h) = client_size(hwnd);
+    if state.active_pane != Pane::Settings {
+        state.active_pane = Pane::Settings;
+        state.apply_pane();
+        crate::accessibility::raise_settings_structure_changed(hwnd, None);
+        state.sync_settings_scroll(client_w, client_h);
+    }
+    let items = state
+        .settings_items(sidebar_w, client_w, pad, scale, state.settings_scroll_y)
+        .items;
+    let mut row = 0usize;
+    for item in &items {
+        if let SettingsItem::Row { id, rect } = item {
+            if row == row_index {
+                if let Some((x, y)) = setting_sub_click_point(*id, sub, rect, scale) {
+                    apply_settings_row_click(hwnd, id, row_index, rect, x, y, scale);
+                }
+                break;
+            }
+            row += 1;
+        }
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_pointer_hover_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    match message {
         WM_MOUSEMOVE => {
             if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                if state.active_pane == Pane::Settings {
-                    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
-                    let x = (lparam.0 & 0xFFFF) as i32;
-                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
-                    let pad = (PAD * scale) as i32;
-                    let (client_w, _client_h) = client_size(hwnd);
-                    let hover = if x < sidebar_w {
-                        None
-                    } else {
-                        state.settings_hover_at(x, y, sidebar_w, client_w, pad, scale)
-                    };
-                    if hover != state.settings_hover {
-                        let old = state.settings_hover;
-                        state.settings_hover = hover;
-                        state.invalidate_hover_rows(client_w, old, hover);
-                    }
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: hwnd,
-                        dwHoverTime: 0,
-                    };
-                    let _ = TrackMouseEvent(&mut tme);
-                } else if let Some(old) = state.settings_hover {
-                    state.settings_hover = None;
-                    let (client_w, _client_h) = client_size(hwnd);
-                    state.invalidate_hover_rows(client_w, Some(old), None);
-                }
-                // Position indicator hover in the Activity pane.
-                if state.active_pane == Pane::Activity {
-                    let scale = unsafe { GetDpiForWindow(hwnd).max(96) } as f32 / 96.0;
-                    let x = (lparam.0 & 0xFFFF) as i32;
-                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
-                    let pad = (PAD * scale) as i32;
-                    let (client_w, _) = client_size(hwnd);
-                    let content_left = sidebar_w;
-                    let art = (ART_SIZE * scale).round() as i32;
-                    let art_y = (ART_Y * scale) as i32;
-                    let sep_y = art_y + art + (SEP_GAP * scale) as i32;
-                    let hist_bottom = sep_y + ((HIST_GAP + HIST_H) * scale) as i32;
-                    let pos_y = hist_bottom + (4.0 * scale) as i32;
-                    let pos_bottom = pos_y + (16.0 * scale) as i32;
-                    let over = x >= content_left + pad && x < client_w - pad && y >= pos_y && y <= pos_bottom;
-                    if over != state.position_hover {
-                        state.position_hover = over;
-                        let pos_rect = RECT {
-                            left: content_left + pad,
-                            top: pos_y,
-                            right: client_w - pad,
-                            bottom: pos_bottom,
-                        };
-                        state.invalidate_rect(&pos_rect);
-                    }
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: hwnd,
-                        dwHoverTime: 0,
-                    };
-                    let _ = TrackMouseEvent(&mut tme);
-                } else if state.position_hover {
-                    state.position_hover = false;
-                }
+                handle_main_mouse_move(hwnd, &mut *state_ptr, lparam);
             }
             LRESULT(0)
         }
         WM_MOUSELEAVE => {
             if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                if let Some(old) = state.settings_hover {
-                    state.settings_hover = None;
-                    let (client_w, _client_h) = client_size(hwnd);
-                    state.invalidate_hover_rows(client_w, Some(old), None);
-                }
-                if state.position_hover {
-                    state.position_hover = false;
-                    state.invalidate();
-                }
+                handle_main_mouse_leave(&mut *state_ptr);
             }
             LRESULT(0)
         }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_main_mouse_move(hwnd: HWND, state: &mut MainWindowState, lparam: LPARAM) {
+    update_settings_pointer_hover(hwnd, state, lparam);
+    update_activity_position_hover(hwnd, state, lparam);
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn update_settings_pointer_hover(hwnd: HWND, state: &mut MainWindowState, lparam: LPARAM) {
+    if state.active_pane != Pane::Settings {
+        if let Some(old) = state.settings_hover {
+            state.settings_hover = None;
+            let (client_w, _) = client_size(hwnd);
+            state.invalidate_hover_rows(client_w, Some(old), None);
+        }
+        return;
+    }
+    let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+    let x = (lparam.0 & 0xFFFF) as i32;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+    let pad = (PAD * scale) as i32;
+    let (client_w, _) = client_size(hwnd);
+    let hover = if x < sidebar_w {
+        None
+    } else {
+        state.settings_hover_at(x, y, sidebar_w, client_w, pad, scale)
+    };
+    if hover != state.settings_hover {
+        let old = state.settings_hover;
+        state.settings_hover = hover;
+        state.invalidate_hover_rows(client_w, old, hover);
+    }
+    track_main_mouse_leave(hwnd);
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn update_activity_position_hover(hwnd: HWND, state: &mut MainWindowState, lparam: LPARAM) {
+    if state.active_pane != Pane::Activity {
+        if state.position_hover {
+            state.position_hover = false;
+        }
+        return;
+    }
+    let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+    let x = (lparam.0 & 0xFFFF) as i32;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+    let sidebar_w = (SIDEBAR_W * scale).round() as i32;
+    let pad = (PAD * scale) as i32;
+    let (client_w, _) = client_size(hwnd);
+    let art = (ART_SIZE * scale).round() as i32;
+    let art_y = (ART_Y * scale) as i32;
+    let sep_y = art_y + art + (SEP_GAP * scale) as i32;
+    let hist_bottom = sep_y + ((HIST_GAP + HIST_H) * scale) as i32;
+    let pos_y = hist_bottom + (4.0 * scale) as i32;
+    let pos_bottom = pos_y + (16.0 * scale) as i32;
+    let over = x >= sidebar_w + pad && x < client_w - pad && y >= pos_y && y <= pos_bottom;
+    if over != state.position_hover {
+        state.position_hover = over;
+        let pos_rect = RECT {
+            left: sidebar_w + pad,
+            top: pos_y,
+            right: client_w - pad,
+            bottom: pos_bottom,
+        };
+        state.invalidate_rect(&pos_rect);
+    }
+    track_main_mouse_leave(hwnd);
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn track_main_mouse_leave(hwnd: HWND) {
+    let mut tme = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    let _ = TrackMouseEvent(&mut tme);
+}
+
+fn handle_main_mouse_leave(state: &mut MainWindowState) {
+    if let Some(old) = state.settings_hover {
+        state.settings_hover = None;
+        let (client_w, _) = client_size(state.hwnd);
+        state.invalidate_hover_rows(client_w, Some(old), None);
+    }
+    if state.position_hover {
+        state.position_hover = false;
+        state.invalidate();
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_owner_draw_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    match message {
         WM_CTLCOLORLISTBOX => {
             let hdc = HDC(wparam.0 as *mut c_void);
             SetTextColor(hdc, colorref(0xE6, 0xE6, 0xE6));
@@ -6821,137 +7059,226 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             LRESULT(1)
         }
-        MEDIA_EVENT_MSG => {
-            if !state_ptr.is_null() {
-                (*state_ptr).receive_events();
-            }
-            LRESULT(0)
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_app_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    match message {
+        MEDIA_EVENT_MSG => handle_media_event_message(hwnd, message, wparam, lparam, state_ptr),
+        RESTART_RESULT_MSG => handle_restart_result_message(hwnd, message, wparam, lparam, state_ptr),
+        POSITION_MSG => handle_position_message(hwnd, message, wparam, lparam, state_ptr),
+        COMPACT_POSITION_MSG => handle_compact_position_message(hwnd, message, wparam, lparam, state_ptr),
+        PICKER_RESULT_MSG => handle_picker_result_message(hwnd, message, wparam, lparam, state_ptr),
+        AUTO_SOURCES_RESULT_MSG => handle_auto_sources_result_message(hwnd, message, wparam, lparam, state_ptr),
+        PINNED_SOURCE_RESULT_MSG => handle_pinned_source_result_message(hwnd, message, wparam, lparam, state_ptr),
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_media_event_message(
+    _hwnd: HWND,
+    _message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    if !state_ptr.is_null() {
+        (*state_ptr).receive_events();
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_restart_result_message(
+    _hwnd: HWND,
+    _message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    // Success exits from the handoff helper immediately after the
+    // singleton transfer. Receiving this message therefore means the
+    // bounded background attempt failed and restored the guard. Keep
+    // the UI alive and responsive; the worker already logged the
+    // specific failure reason.
+    if !state_ptr.is_null() {
+        debug!("restart handoff completed without exit; current instance remains active");
+        (*state_ptr).invalidate();
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_position_message(
+    _hwnd: HWND,
+    _message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    if !state_ptr.is_null() {
+        let state = &mut *state_ptr;
+        // Custom position posted by the positioner (logical pixels).
+        let x = wparam.0 as i32;
+        let y = lparam.0 as i32;
+        state.mutate_config(|cfg| {
+            cfg.overlay.position_x = Some(x);
+            cfg.overlay.position_y = Some(y);
+        });
+        info!("overlay position set from the adjustor: ({x}, {y})");
+        let cfg = state.cfg();
+        set_positions(
+            state.overlay_hwnd,
+            OverlayPos::from_config(&cfg),
+            OverlayPos::compact_from_config(&cfg),
+        );
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_compact_position_message(
+    _hwnd: HWND,
+    _message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    // Custom Compact position posted by the positioner (logical
+    // pixels). Applied unconditionally: the compact row and tray
+    // submenu are always editable, so a legitimately open adjustor
+    // must persist even while "follows Expanded" is ON — the values
+    // are stored and take effect once the follow toggle is OFF.
+    if !state_ptr.is_null() {
+        let state = &mut *state_ptr;
+        let x = wparam.0 as i32;
+        let y = lparam.0 as i32;
+        state.mutate_config(|cfg| {
+            cfg.overlay.compact_position_x = Some(x);
+            cfg.overlay.compact_position_y = Some(y);
+        });
+        info!("compact position set from the adjustor: ({x}, {y})");
+        let cfg = state.cfg();
+        set_positions(
+            state.overlay_hwnd,
+            OverlayPos::from_config(&cfg),
+            OverlayPos::compact_from_config(&cfg),
+        );
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_picker_result_message(
+    hwnd: HWND,
+    _message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    // The picker writes its confirmed patterns into the shared result
+    // slot (never into the message itself) and posts this bare
+    // message. Taking the slot is safe even when the message was
+    // posted by a foreign process: it can only deliver values this
+    // process's own picker produced.
+    if !state_ptr.is_null() {
+        let state = &mut *state_ptr;
+        let patterns = state
+            .picker_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(patterns) = patterns {
+            apply_and_announce_settings_row(state, hwnd, SettingId::AllowedApps, |state| {
+                let command = ControlCommand::SetAllowedSources(patterns.clone());
+                state.mutate_config(|cfg| cfg.behavior.media_sources = patterns);
+                push_control(&state.control_mailbox, &state.control_tx, command);
+                state.invalidate();
+            });
         }
-        RESTART_RESULT_MSG => {
-            // Success exits from the handoff helper immediately after the
-            // singleton transfer. Receiving this message therefore means the
-            // bounded background attempt failed and restored the guard. Keep
-            // the UI alive and responsive; the worker already logged the
-            // specific failure reason.
-            if !state_ptr.is_null() {
-                debug!("restart handoff completed without exit; current instance remains active");
-                (*state_ptr).invalidate();
-            }
-            LRESULT(0)
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_auto_sources_result_message(
+    hwnd: HWND,
+    _message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    // Same contract as PICKER_RESULT_MSG, but for the Auto-compact
+    // sources picker: the confirmed patterns land in the shared slot
+    // and are taken here into `behavior.auto_compact_sources`.
+    if !state_ptr.is_null() {
+        let state = &mut *state_ptr;
+        let patterns = state
+            .auto_sources_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(patterns) = patterns {
+            apply_and_announce_settings_row(state, hwnd, SettingId::AutoCompactApps, |state| {
+                state.mutate_config(|cfg| cfg.behavior.auto_compact_sources = patterns);
+                state.invalidate();
+            });
         }
-        POSITION_MSG => {
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                // Custom position posted by the positioner (logical pixels).
-                let x = wparam.0 as i32;
-                let y = lparam.0 as i32;
-                state.mutate_config(|cfg| {
-                    cfg.overlay.position_x = Some(x);
-                    cfg.overlay.position_y = Some(y);
-                });
-                info!("overlay position set from the adjustor: ({x}, {y})");
-                let cfg = state.cfg();
-                set_positions(
-                    state.overlay_hwnd,
-                    OverlayPos::from_config(&cfg),
-                    OverlayPos::compact_from_config(&cfg),
-                );
-            }
-            LRESULT(0)
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_pinned_source_result_message(
+    hwnd: HWND,
+    _message: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    // Same contract as PICKER_RESULT_MSG, but for the single-select
+    // pinned-source picker: at most one pattern lands in the shared
+    // slot and is taken here into `behavior.pinned_source` (an empty
+    // result clears the pin). The live overlay keeps its own config
+    // snapshot, so the change is pushed there too — the pin only
+    // decides what the persistent pill returns to after a dismiss.
+    if !state_ptr.is_null() {
+        let state = &mut *state_ptr;
+        let patterns = state
+            .pinned_source_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(patterns) = patterns {
+            let pin = patterns.into_iter().next();
+            apply_and_announce_settings_row(state, hwnd, SettingId::PinnedSource, |state| {
+                state.mutate_config(|cfg| cfg.behavior.pinned_source = pin);
+                set_pinned_source(state.overlay_hwnd, state.cfg().behavior.pinned_source.clone());
+                state.invalidate();
+            });
         }
-        COMPACT_POSITION_MSG => {
-            // Custom Compact position posted by the positioner (logical
-            // pixels). Applied unconditionally: the compact row and tray
-            // submenu are always editable, so a legitimately open adjustor
-            // must persist even while "follows Expanded" is ON — the values
-            // are stored and take effect once the follow toggle is OFF.
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                let x = wparam.0 as i32;
-                let y = lparam.0 as i32;
-                state.mutate_config(|cfg| {
-                    cfg.overlay.compact_position_x = Some(x);
-                    cfg.overlay.compact_position_y = Some(y);
-                });
-                info!("compact position set from the adjustor: ({x}, {y})");
-                let cfg = state.cfg();
-                set_positions(
-                    state.overlay_hwnd,
-                    OverlayPos::from_config(&cfg),
-                    OverlayPos::compact_from_config(&cfg),
-                );
-            }
-            LRESULT(0)
-        }
-        PICKER_RESULT_MSG => {
-            // The picker writes its confirmed patterns into the shared result
-            // slot (never into the message itself) and posts this bare
-            // message. Taking the slot is safe even when the message was
-            // posted by a foreign process: it can only deliver values this
-            // process's own picker produced.
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                let patterns = state
-                    .picker_result
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                if let Some(patterns) = patterns {
-                    apply_and_announce_settings_row(state, hwnd, SettingId::AllowedApps, |state| {
-                        let command = ControlCommand::SetAllowedSources(patterns.clone());
-                        state.mutate_config(|cfg| cfg.behavior.media_sources = patterns);
-                        push_control(&state.control_mailbox, &state.control_tx, command);
-                        state.invalidate();
-                    });
-                }
-            }
-            LRESULT(0)
-        }
-        AUTO_SOURCES_RESULT_MSG => {
-            // Same contract as PICKER_RESULT_MSG, but for the Auto-compact
-            // sources picker: the confirmed patterns land in the shared slot
-            // and are taken here into `behavior.auto_compact_sources`.
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                let patterns = state
-                    .auto_sources_result
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                if let Some(patterns) = patterns {
-                    apply_and_announce_settings_row(state, hwnd, SettingId::AutoCompactApps, |state| {
-                        state.mutate_config(|cfg| cfg.behavior.auto_compact_sources = patterns);
-                        state.invalidate();
-                    });
-                }
-            }
-            LRESULT(0)
-        }
-        PINNED_SOURCE_RESULT_MSG => {
-            // Same contract as PICKER_RESULT_MSG, but for the single-select
-            // pinned-source picker: at most one pattern lands in the shared
-            // slot and is taken here into `behavior.pinned_source` (an empty
-            // result clears the pin). The live overlay keeps its own config
-            // snapshot, so the change is pushed there too — the pin only
-            // decides what the persistent pill returns to after a dismiss.
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                let patterns = state
-                    .pinned_source_result
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                if let Some(patterns) = patterns {
-                    let pin = patterns.into_iter().next();
-                    apply_and_announce_settings_row(state, hwnd, SettingId::PinnedSource, |state| {
-                        state.mutate_config(|cfg| cfg.behavior.pinned_source = pin);
-                        set_pinned_source(state.overlay_hwnd, state.cfg().behavior.pinned_source.clone());
-                        state.invalidate();
-                    });
-                }
-            }
-            LRESULT(0)
-        }
+    }
+    LRESULT(0)
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_window_state_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    match message {
         WM_DISPLAYCHANGE => {
             // A display was added, removed, or reordered (or its resolution
             // changed). Invalidate the shared display cache so the next tray
@@ -6999,6 +7326,19 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             PostQuitMessage(0);
             LRESULT(0)
         }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_tray_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    match message {
         WM_TRAY => {
             let event = lparam.0 as u32;
             if event == WM_RBUTTONUP {
@@ -7018,6 +7358,19 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             LRESULT(0)
         }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_settings_provider_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    match message {
         WM_SETTINGS_SNAPSHOT_MSG => {
             // A UIA provider thread asked for a fresh Settings snapshot. The
             // UI thread is the only one allowed to read the window-state box,
@@ -7040,6 +7393,19 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             }
             LRESULT(0)
         }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dispatch_nc_destroy_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    state_ptr: *mut MainWindowState,
+) -> LRESULT {
+    match message {
         WM_NCDESTROY => {
             // Explicit timer kills before the handle becomes invalid — OS
             // auto-kills on DestroyWindow, but explicit makes teardown
