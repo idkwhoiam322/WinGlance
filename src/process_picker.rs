@@ -47,7 +47,8 @@ use windows::core::{PCWSTR, PWSTR};
 const CLASS_NAME: &str = "WinGlanceProcessPicker";
 const WIDTH: i32 = 400;
 const HEADER_H: i32 = 30;
-const ROW_HEIGHT: i32 = 22;
+/// Minimum logical row height for an actionable picker target.
+const ROW_HEIGHT: i32 = 24;
 const MAX_VISIBLE: usize = 12;
 /// 24 logical px so the close target clears the WCAG 2.2 minimum target size
 /// even at 100% scaling. It was widened from 20 px to meet the accessibility benchmark.
