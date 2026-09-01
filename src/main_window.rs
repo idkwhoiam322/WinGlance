@@ -5225,25 +5225,8 @@ fn taskbar_created_msg() -> u32 {
 
 static TASKBAR_CREATED_MSG: OnceLock<u32> = OnceLock::new();
 
-/// The main window's window class, in one place: `FindWindowW` from a
-/// duplicate launch (the "show yourself" ping) must name the exact class the
-/// window was registered with.
+/// The main window's stable window class name.
 pub(crate) const MAIN_WINDOW_CLASS: &str = "WinGlanceMainWindow";
-
-/// Registered-message name for the duplicate-launch ping. A registered
-/// message (not a bare WM_APP constant) is the cross-process-safe way to
-/// identify the ping; the value is per-session, resolved identically in both
-/// processes.
-pub(crate) const SHOW_YOURSELF_MSG: &str = "WinGlance.ShowYourself";
-
-/// The show-yourself message, registered once — same shape as
-/// `taskbar_created_msg`. Returns 0 only if registration failed, which the
-/// pinging side treats as "skip the ping".
-fn show_yourself_msg() -> u32 {
-    *SHOW_YOURSELF_MSG_ID.get_or_init(|| unsafe { RegisterWindowMessageW(PCWSTR(wide(SHOW_YOURSELF_MSG).as_ptr())) })
-}
-
-static SHOW_YOURSELF_MSG_ID: OnceLock<u32> = OnceLock::new();
 
 fn remove_tray_icon(hwnd: HWND) {
     let Ok(data) = tray_data(hwnd) else {
@@ -6184,9 +6167,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Explorer (re)started and rebuilt the notification area: re-add the
-    // tray icon, which Explorer's restart wiped. The zero check mirrors the
-    // show-yourself probe below: a failed RegisterWindowMessageW returns 0
-    // (WM_NULL), and re-firing NIM_ADD on every WM_NULL would be nonsense.
+    // tray icon, which Explorer's restart wiped. A failed
+    // RegisterWindowMessageW returns 0 (WM_NULL), so never treat WM_NULL as
+    // the TaskbarCreated broadcast.
     if message != 0 && message == taskbar_created_msg() {
         debug!("Explorer restarted the notification area; re-adding the tray icon");
         match install_tray_icon(hwnd) {
@@ -6217,20 +6200,6 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
                     state.tray_add_attempts = 1;
                     let _ = set_timer(hwnd, TRAY_RETRY_TIMER_ID, TRAY_RETRY_INTERVAL_MS, None);
                 }
-            }
-        }
-        return LRESULT(0);
-    }
-    // Duplicate-launch "show yourself" ping: another
-    // WinGlance.exe hit the singleton mutex while we own it and asked us to
-    // surface the tracking window — most likely a user whose tray icon is
-    // gone. Show it exactly like a tray double-click. The ping was posted
-    // fire-and-forget, so nothing here can block or fail the sender.
-    if message == show_yourself_msg() && message != 0 {
-        let state_ptr = window_state::<MainWindowState>(hwnd);
-        if !state_ptr.is_null() {
-            unsafe {
-                (*state_ptr).show_window();
             }
         }
         return LRESULT(0);
