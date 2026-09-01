@@ -1872,19 +1872,14 @@ impl ListenerState {
             }
         }
 
-        // A TrackChanged already surfaces the new content in the pill. A
-        // simultaneous PlaybackStateChanged reported by the same session
-        // refresh — Playing from a freshly adopted session, or Paused/Stopped
-        // from the previous session during a session switch — is redundant,
-        // and showing both would flash two pills for one transition. The
-        // TrackChanged alone is enough; the state the pill shows is implied by
-        // the fresh track. Same-track artwork refreshes never reach this
-        // rule: the artwork-changed force absorbs them when the state event
-        // is in the batch, so a pause cannot be swallowed by a re-read of the
-        // same cover (see `artwork_refresh_absorbed`).
-        if events.iter().any(|e| matches!(e, MediaEvent::TrackChanged(_))) {
-            events.retain(|e| !matches!(e, MediaEvent::PlaybackStateChanged(_, _)));
-        }
+        // Final presentation coalescing for one successful refresh. A
+        // TrackChanged snapshot carries the authoritative playback state, so
+        // a paired PlaybackStateChanged would show the same transition twice.
+        // Keep one TrackChanged and let its embedded state drive the symbol.
+        // Evidence-based recreation/deferral gates above run first; therefore
+        // this rule never turns a proven-noise state into track content. A
+        // playback-only refresh still passes through unchanged.
+        coalesce_track_with_playback_state(&mut events);
 
         // The session may have stopped being current, or its source may have
         // been disallowed, while the slow reads above were running. Revalidate
@@ -3117,6 +3112,16 @@ impl Drop for ListenerState {
         // `WorkerExit::Stalled` branch in main.rs), so a warning stranded in
         // the leaked mailbox cannot lose the note for the rest of the run.
         self.clear_pending_output();
+    }
+}
+
+/// Collapses a same-refresh track + playback pair into the track event. The
+/// TrackInfo snapshot already owns the authoritative playback state used by
+/// the overlay, so retaining the separate state event would create a second
+/// pill for one media transition. Playback-only refreshes are untouched.
+fn coalesce_track_with_playback_state(events: &mut Vec<MediaEvent>) {
+    if events.iter().any(|event| matches!(event, MediaEvent::TrackChanged(_))) {
+        events.retain(|event| !matches!(event, MediaEvent::PlaybackStateChanged(_, _)));
     }
 }
 
@@ -6547,6 +6552,87 @@ mod tests {
         assert!(retry_should_emit(&real, Some(&old)));
         // Same identity with art already shown stays suppressed (recreation).
         assert!(!retry_should_emit(&old, Some(&old)));
+    }
+
+    #[test]
+    fn track_change_coalescing_keeps_authoritative_playback_snapshot() {
+        for state in [PlaybackState::Playing, PlaybackState::Paused, PlaybackState::Stopped] {
+            let source = SourceIdentity::for_test("Player");
+            let track = TrackInfo {
+                source_app: source.clone(),
+                title: "Song".into(),
+                playback_state: Some(state),
+                ..TrackInfo::default()
+            };
+            let mut events = vec![
+                MediaEvent::PlaybackStateChanged(state, source),
+                MediaEvent::TrackChanged(track),
+            ];
+
+            coalesce_track_with_playback_state(&mut events);
+
+            assert_eq!(
+                events.len(),
+                1,
+                "one media transition must produce one notification fact"
+            );
+            match &events[0] {
+                MediaEvent::TrackChanged(track) => assert_eq!(track.playback_state, Some(state)),
+                _ => panic!("the TrackChanged snapshot must win the same-refresh pair"),
+            }
+        }
+    }
+
+    #[test]
+    fn playback_only_refresh_survives_track_coalescing() {
+        let mut events = vec![MediaEvent::PlaybackStateChanged(
+            PlaybackState::Paused,
+            SourceIdentity::for_test("Player"),
+        )];
+
+        coalesce_track_with_playback_state(&mut events);
+
+        assert!(matches!(
+            events.as_slice(),
+            [MediaEvent::PlaybackStateChanged(PlaybackState::Paused, _)]
+        ));
+    }
+
+    #[test]
+    fn recreated_session_noise_does_not_duplicate_the_track_notification() {
+        let source = SourceIdentity::for_test("Player");
+        let mut track = TrackInfo {
+            source_app: source.clone(),
+            title: "Song".into(),
+            playback_state: Some(PlaybackState::Paused),
+            ..TrackInfo::default()
+        };
+        let mut events = vec![
+            MediaEvent::PlaybackStateChanged(PlaybackState::Paused, source),
+            MediaEvent::TrackChanged(track.clone()),
+        ];
+
+        assert!(spurious_recreated_playback(
+            Some(PlaybackState::Paused),
+            Some(PlaybackState::Paused)
+        ));
+        events.retain(|event| !matches!(event, MediaEvent::PlaybackStateChanged(_, _)));
+        // Mirror refresh_session: when the recreation state is proven noise,
+        // the TrackChanged must not re-introduce that state through its snapshot.
+        track.playback_state = None;
+        if let Some(MediaEvent::TrackChanged(existing)) = events
+            .iter_mut()
+            .find(|event| matches!(event, MediaEvent::TrackChanged(_)))
+        {
+            existing.playback_state = track.playback_state;
+        }
+        coalesce_track_with_playback_state(&mut events);
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            MediaEvent::TrackChanged(track) => assert_eq!(track.playback_state, None),
+            _ => panic!("recreation noise must leave only the track notification"),
+        }
     }
 
     #[test]
