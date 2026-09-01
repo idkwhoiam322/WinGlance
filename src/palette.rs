@@ -73,7 +73,7 @@ pub(crate) fn palette_from_rgba(rgba: &[u8]) -> Option<Palette> {
     // single stack frame on the UI thread's render path (under ensure_art), and
     // the worker threads already run on deliberately small stacks.
     let mut buckets = Box::new([Bucket::default(); BUCKET_COUNT]);
-    for px in sampled.chunks_exact(4) {
+    for px in sampled.as_chunks::<4>().0 {
         let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
         if a < 32 {
             continue;

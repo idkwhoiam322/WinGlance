@@ -537,7 +537,7 @@ pub(crate) fn decode_artwork_pm(data: &[u8], size: usize) -> Option<Vec<u8>> {
     let image = image::imageops::resize(&image, size as u32, size as u32, image::imageops::FilterType::Triangle);
     let raw = image.into_raw();
     let mut pm = Vec::with_capacity(raw.len());
-    for px in raw.chunks_exact(4) {
+    for px in raw.as_chunks::<4>().0 {
         let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
         pm.push((b * a / 255) as u8);
         pm.push((g * a / 255) as u8);
