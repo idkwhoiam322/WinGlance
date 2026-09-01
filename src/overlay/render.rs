@@ -3351,7 +3351,7 @@ pub(super) fn composite_pm(pixels: &mut [u8], width: usize, x: usize, y: usize, 
 /// from the buffer length.
 pub(crate) fn pm_bgra_to_rgba(pm: &[u8]) -> Option<Vec<u8>> {
     let mut rgba = Vec::with_capacity(pm.len());
-    for px in pm.chunks_exact(4) {
+    for px in pm.as_chunks::<4>().0 {
         let (b, g, r, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
         if a == 0 {
             rgba.extend_from_slice(&[0, 0, 0, 0]);

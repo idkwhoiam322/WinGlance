@@ -96,7 +96,7 @@ fn hbitmap_to_bgra_premul(hdc: HDC, bitmap: HBITMAP, size: usize) -> Option<Vec<
     }
 
     let mut pm = Vec::with_capacity(total_bytes);
-    for px in buf.chunks_exact(4) {
+    for px in buf.as_chunks::<4>().0 {
         let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
         pm.push(premultiply_channel(b, a));
         pm.push(premultiply_channel(g, a));
