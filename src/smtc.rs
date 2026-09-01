@@ -1,4 +1,6 @@
-use crate::events::{MediaEvent, PlaybackState, PlaybackType, TrackInfo, artwork_bytes, decode_artwork_pm};
+use crate::events::{
+    MediaEvent, PlaybackState, PlaybackType, SourceIdentity, TrackInfo, artwork_bytes, decode_artwork_pm,
+};
 use crate::palette::{Palette, palette_from_rgba};
 use anyhow::{Context, Result};
 use log::{debug, info, warn};
@@ -116,7 +118,7 @@ struct LogicalState {
     album_artist: String,
     subtitle: String,
     has_artwork: bool,
-    source_app: String,
+    source_app: SourceIdentity,
     duration_secs: Option<u64>,
     track_number: Option<u32>,
     track_count: Option<u32>,
@@ -398,7 +400,7 @@ struct ListenerState {
     last_session_check: Instant,
     /// Session-creation counts per source app within a rolling window, for the
     /// churn cool-down.
-    churn: HashMap<String, VecDeque<Instant>>,
+    churn: HashMap<SourceIdentity, VecDeque<Instant>>,
     /// Source apps currently excluded from tracking until the stored time:
     /// either the churn cool-down (a session-recreation storm) or the
     /// wedged-read exclusion (an async read that timed out — see
@@ -431,7 +433,7 @@ struct ListenerState {
     /// absent for `TERMINAL_STOP_GRACE`, so a source that recreates its
     /// session (YouTube Music does this on every track change) does not fire
     /// a spurious STOP in the snapshot gap.
-    terminal_pending: HashMap<String, Instant>,
+    terminal_pending: HashMap<SourceIdentity, Instant>,
     /// Heartbeat touched each loop iteration so the supervisor can detect a
     /// stall and restart the listener.
     heartbeat: Arc<Mutex<Instant>>,
@@ -451,21 +453,21 @@ struct ListenerState {
     /// change): the new session has a default LogicalState, so content_differ
     /// always sees a change. We compare title + artist + artwork-presence so
     /// that a genuine artwork gain still surfaces as an in-place refresh.
-    last_track_per_source: HashMap<String, TrackInfo>,
+    last_track_per_source: HashMap<SourceIdentity, TrackInfo>,
     /// Sources whose cached last-emitted track lost its artwork bytes to the
     /// retained-artwork budget (see `store_last_track`). The recreation gate
     /// consults this: a budget-stripped cache cannot prove a re-reported
     /// cover is the same one, so an art-gained re-report of an identical
     /// title/artist is treated as the same media instead of a cover swap.
     /// Cleared for a source the next time its store keeps the artwork.
-    budget_stripped_art: HashSet<String>,
+    budget_stripped_art: HashSet<SourceIdentity>,
     /// Metadata-only tombstone for dedup after `last_track_per_source` is pruned:
     /// when a source's session disappears past `TERMINAL_STOP_GRACE` its artwork
     /// cache is evicted, but a 60s tombstone (no artwork bytes, only identity +
     /// stripped flag) keeps the recreation predicate able to suppress a stale
     /// re-report of the same title/artist that would otherwise duplicate the
     /// pill after a switch-back. Bounded by `MAX_TRACKED_SOURCES` and a window.
-    dedup_tombstones: HashMap<String, DedupTombstone>,
+    dedup_tombstones: HashMap<SourceIdentity, DedupTombstone>,
     /// Last playback state each source app reported, surviving session-key
     /// changes. A recreated session (new key, default state) re-reports the
     /// source's current playback; comparing it against this value tells the
@@ -473,7 +475,7 @@ struct ListenerState {
     /// or the user's real pause/play (state changed — YouTube Music recreates
     /// its session when the transport buttons are used, so the fresh session's
     /// first state can be the actual transition).
-    last_known_playback_per_source: HashMap<String, PlaybackState>,
+    last_known_playback_per_source: HashMap<SourceIdentity, PlaybackState>,
     /// The source the overlay's pill is currently displaying, published by
     /// the overlay into a shared cell (see `OverlayState::now_showing`). The
     /// session-recreation dedup below only applies while the pill already
@@ -483,7 +485,7 @@ struct ListenerState {
     /// here: an event this worker emitted can be queued or superseded on the
     /// overlay side, so attributing from this worker's emissions would
     /// suppress a re-emit whose pill never actually appeared.
-    now_showing: Arc<Mutex<Option<String>>>,
+    now_showing: Arc<Mutex<Option<SourceIdentity>>>,
     /// Debounce window for flush scheduling, seeded once at worker startup
     /// (the supervisor samples `behavior.debounce_ms` at each spawn). The
     /// field is set-only after startup: `debounce_ms` has no settings-pane
@@ -493,12 +495,12 @@ struct ListenerState {
     /// Cached app icons keyed by normalized source_app label (lowercased via
     /// `normalize_for_match`, so `Spotify` vs `spotify` does not cache twice).
     /// Bounded LRU of 64.
-    icon_cache: HashMap<String, Option<Arc<[u8]>>>,
-    icon_cache_order: VecDeque<String>,
+    icon_cache: HashMap<SourceIdentity, Option<Arc<[u8]>>>,
+    icon_cache_order: VecDeque<SourceIdentity>,
     /// Per-source monotonic artwork generation, bumped only when distinct
     /// decoded bytes are attached. Carried in `TrackInfo.art_generation` for
     /// the overlay to drop reordered late decodes.
-    artwork_generations: HashMap<String, u64>,
+    artwork_generations: HashMap<SourceIdentity, u64>,
     /// When the last overflow warning fired. Bounds the admission-rejection log
     /// to one line per `OVERFLOW_WARN_INTERVAL` during a hostile session storm,
     /// instead of one WARN per rejected session.
@@ -514,7 +516,7 @@ struct ListenerState {
     /// the artwork-changed re-emit: SMTC re-reads the thumbnail within ~1s
     /// of a change and may return different bytes for the same cover, which
     /// would otherwise fire a duplicate pill for the same song.
-    last_emit_at: HashMap<String, Instant>,
+    last_emit_at: HashMap<SourceIdentity, Instant>,
     /// The two-color palette derived per track identity (source + title +
     /// artist), from the first trusted artwork decode for that identity. A
     /// source that re-encodes its thumbnail between reads supplies different
@@ -524,8 +526,8 @@ struct ListenerState {
     /// recomputes its palette. Keyed by `palette_cache_key`; bounded by
     /// `PALETTE_CACHE_CAP` (256) with LRU order and pruned of departed sources
     /// in `sync_subscriptions`.
-    palette_per_identity: HashMap<String, Palette>,
-    palette_cache_order: VecDeque<String>,
+    palette_per_identity: HashMap<PaletteCacheKey, Palette>,
+    palette_cache_order: VecDeque<PaletteCacheKey>,
 }
 
 /// The worker's config values, sampled once by the supervisor at each spawn.
@@ -549,7 +551,7 @@ pub(crate) struct ListenerSeed {
 /// all its sessions), wedged reads are per-session (one wedged tab must not
 /// mute a good tab of the same app).
 pub(crate) struct ExclusionMaps {
-    pub(crate) per_source: HashMap<String, Instant>,
+    pub(crate) per_source: HashMap<SourceIdentity, Instant>,
     pub(crate) per_session: HashMap<usize, Instant>,
 }
 
@@ -829,7 +831,7 @@ pub struct SmtcListener {
     /// worker restarts: the supervisor spawns every worker with the same
     /// cell, so a session recreated after a restart still compares against
     /// what the user actually sees.
-    now_showing: Arc<Mutex<Option<String>>>,
+    now_showing: Arc<Mutex<Option<SourceIdentity>>>,
     /// Shared exclusion map (see `ListenerState::excluded_sources`).
     /// Survives worker restarts: exclusions a predecessor paid for carry
     /// into the replacement worker.
@@ -848,7 +850,7 @@ impl SmtcListener {
         live_generation: Arc<AtomicU64>,
         my_generation: u64,
         shutdown: Arc<AtomicBool>,
-        now_showing: Arc<Mutex<Option<String>>>,
+        now_showing: Arc<Mutex<Option<SourceIdentity>>>,
         excluded_sources: SharedExclusions,
         sync_com_budget: SyncComBudget,
         control_tx: SyncSender<Signal>,
@@ -939,7 +941,7 @@ impl ListenerState {
         live_generation: Arc<AtomicU64>,
         my_generation: u64,
         shutdown: Arc<AtomicBool>,
-        now_showing: Arc<Mutex<Option<String>>>,
+        now_showing: Arc<Mutex<Option<SourceIdentity>>>,
         excluded_sources: SharedExclusions,
         sync_com_budget: SyncComBudget,
         control_mailbox: Arc<Mutex<ControlMailbox>>,
@@ -1464,7 +1466,7 @@ impl ListenerState {
         // path as Playing/Paused and can produce a pill like any other real
         // transition. Transitional statuses leave the stored state untouched.
         let mut known_playback = None;
-        let mut deferred_playback: Option<(String, PlaybackState)> = None;
+        let mut deferred_playback: Option<(SourceIdentity, PlaybackState)> = None;
         if playback != prev.playback
             && let Some(state) = playback
         {
@@ -1552,12 +1554,12 @@ impl ListenerState {
                         let label = track_label(&merged);
                         debug!("stale thumbnail dropped | reason=identity-switch | {label}");
                     }
-                    // App icon extraction: one icon per source app, cached
-                    // (keyed by the source_app label, derived from the AUMID).
+                    // App icon extraction: one icon per stable source identity.
+                    // Distinct AUMIDs that share a friendly label never share cache state.
                     // The AUMID is read from the live session; the icon is
                     // attached to the track so the overlay can render it.
                     if merged.app_icon.is_none() {
-                        let icon_key = normalize_for_match(&merged.source_app);
+                        let icon_key = merged.source_app.clone();
                         if let Some(cached_icon) = self.icon_cache.get(&icon_key).cloned() {
                             // Move to back for LRU
                             if let Some(pos) = self.icon_cache_order.iter().position(|k| k == &icon_key) {
@@ -1645,7 +1647,7 @@ impl ListenerState {
                         self.last_track_per_source.get(&merged.source_app),
                         &merged,
                         read_artwork,
-                        shown_source.as_deref(),
+                        shown_source.as_ref(),
                         self.budget_stripped_art.contains(&merged.source_app),
                     );
                     // Tombstone fallback: after `sync_subscriptions` evicts the
@@ -1658,7 +1660,7 @@ impl ListenerState {
                     {
                         let same_identity = tomb.title == merged.title && tomb.artist == merged.artist;
                         let within_window = Instant::now().duration_since(tomb.when) < DEDUP_TOMBSTONE_WINDOW;
-                        let shown_matches = shown_source.as_deref() == Some(merged.source_app.as_str());
+                        let shown_matches = shown_source.as_ref() == Some(&merged.source_app);
                         // Same derived rule as the primary gate: stripped
                         // cache cannot prove cover is same, so art-gained
                         // re-report of same identity stays suppressed.
@@ -1919,7 +1921,7 @@ impl ListenerState {
         let current = self.manager.GetCurrentSession().ok();
         let current_key = current.as_ref().map(session_key);
         let current_source = current.as_ref().map(read_source_app);
-        if let (Some(key), Some(source)) = (current_key, current_source.as_deref()) {
+        if let (Some(key), Some(source)) = (current_key, current_source.as_ref()) {
             debug!("SMTC current session | key={key} | source={source}");
         }
         // Under browser session churn, GetCurrentSession can briefly return a
@@ -1956,7 +1958,7 @@ impl ListenerState {
         // downstream.
         let mut new_candidates = 0usize;
         let mut dropped_by_bound = 0usize;
-        let mut snapshot_keys: Vec<(usize, String)> = Vec::new();
+        let mut snapshot_keys: Vec<(usize, SourceIdentity)> = Vec::new();
         for session in &sessions {
             let key = session_key(session);
             let is_current = Some(key) == current_key;
@@ -1980,7 +1982,7 @@ impl ListenerState {
         );
         let by_key: HashMap<usize, &GlobalSystemMediaTransportControlsSession> =
             sessions.iter().map(|session| (session_key(session), session)).collect();
-        let prioritized: Vec<(GlobalSystemMediaTransportControlsSession, usize, String)> = ordered
+        let prioritized: Vec<(GlobalSystemMediaTransportControlsSession, usize, SourceIdentity)> = ordered
             .into_iter()
             .filter_map(|(key, source)| by_key.get(&key).map(|s| ((*s).clone(), key, source)))
             .collect();
@@ -1991,7 +1993,7 @@ impl ListenerState {
         // count survivors only, which keeps the live loop in lockstep with
         // the `admit_sessions` test model (which also counts survivors and
         // nothing that is about to be evicted).
-        let mut admitted_sources: HashSet<String> = self
+        let mut admitted_sources: HashSet<SourceIdentity> = self
             .subscriptions
             .values()
             .filter(|s| alive.contains(&session_key(&s.session)))
@@ -2037,7 +2039,7 @@ impl ListenerState {
                 self.evict(*key);
                 continue;
             }
-            if !session_matches_current_source(*key, source, current_key, current_source.as_deref()) {
+            if !session_matches_current_source(*key, source, current_key, current_source.as_ref()) {
                 // Same once-per-appearance gate: an allowed-but-not-current
                 // session (e.g. a second tab of a browser) is uninteresting
                 // in volume, and under a storm every new candidate would hit
@@ -2064,7 +2066,7 @@ impl ListenerState {
                 && admission_blocked(
                     admitted_sessions,
                     &admitted_sources,
-                    source.as_str(),
+                    source,
                     MAX_TRACKED_SESSIONS,
                     MAX_TRACKED_SOURCES,
                 )
@@ -2080,7 +2082,7 @@ impl ListenerState {
                         &prioritized,
                         &alive,
                         *key,
-                        source.as_str(),
+                        source,
                         &mut admitted_sessions,
                         &mut admitted_sources,
                     );
@@ -2147,9 +2149,9 @@ impl ListenerState {
             .filter(|k| !alive.contains(k))
             .copied()
             .collect();
-        if let (Some(current_key), Some(current_source)) = (current_key, current_source.as_deref()) {
+        if let (Some(current_key), Some(current_source)) = (current_key, current_source.as_ref()) {
             for (key, subscription) in &self.subscriptions {
-                if *key != current_key && read_source_app(&subscription.session) == current_source {
+                if *key != current_key && read_source_app(&subscription.session) == *current_source {
                     stale.push(*key);
                 }
             }
@@ -2173,7 +2175,7 @@ impl ListenerState {
         // the enumeration bound is treated as departed — under a hostile
         // storm that is exactly the caps' intent, and under normal volumes
         // the bound never drops anything.
-        let alive_sources: HashSet<String> = snapshot_keys.iter().map(|(_, source)| source.clone()).collect();
+        let alive_sources: HashSet<SourceIdentity> = snapshot_keys.iter().map(|(_, source)| source.clone()).collect();
         for key in &stale {
             if let Some(subscription) = self.subscriptions.get(key) {
                 let source = read_source_app(&subscription.session);
@@ -2186,7 +2188,7 @@ impl ListenerState {
             debug!("SMTC session disappeared | key={key}");
             self.evict(*key);
         }
-        let mut settled: Vec<String> = Vec::new();
+        let mut settled: Vec<SourceIdentity> = Vec::new();
         self.terminal_pending.retain(|source, absent_since| {
             let alive = alive_sources.contains(source);
             // A source still open restarts its grace from this scan, so a
@@ -2239,20 +2241,21 @@ impl ListenerState {
         // is how the user adds them to the allow-list. Dedup and cap it
         // separately so a hostile session storm cannot grow the picker list
         // without bound.
-        let active_sources: Vec<String> = dedup_capped(
-            // Truncate the enumeration to the first MAX_TRACKED_SESSIONS
-            // sessions: the source cap bounds the distinct sources the
-            // picker can list anyway, and bounding the WinRT reads ahead of
-            // it keeps a hostile session storm from paying for the whole
-            // snapshot.
-            sessions
+        // Internal pruning uses stable source identities. The picker cache is
+        // deliberately display-only and therefore keeps bounded friendly labels.
+        let active_identities: Vec<SourceIdentity> = sessions
+            .iter()
+            .take(MAX_TRACKED_SESSIONS)
+            .map(read_source_app)
+            .collect();
+        let active: HashSet<SourceIdentity> = active_identities.iter().cloned().collect();
+        let active_sources = dedup_capped(
+            active_identities
                 .iter()
-                .take(MAX_TRACKED_SESSIONS)
-                .map(read_source_app)
+                .map(|source| source.as_str().to_owned())
                 .collect(),
             MAX_TRACKED_SOURCES,
         );
-        let active: HashSet<String> = active_sources.iter().cloned().collect();
         set_active_session_sources(active_sources);
         // Evict source-level caches for apps that no longer have an open
         // session: their cached track (with artwork bytes) and icon would
@@ -2295,11 +2298,11 @@ impl ListenerState {
         // matching the other source-level caches: the same track can
         // re-report during the settle and needs its identity-stable palette.
         self.palette_per_identity.retain(|key, _| {
-            let source = palette_key_source(key);
+            let source = &key.source;
             active.contains(source) || self.terminal_pending.contains_key(source)
         });
         self.palette_cache_order.retain(|key| {
-            let source = palette_key_source(key);
+            let source = &key.source;
             active.contains(source) || self.terminal_pending.contains_key(source)
         });
     }
@@ -2324,7 +2327,7 @@ impl ListenerState {
     /// track matches the given title+artist identity. This only returns art for
     /// the *same track* — never cross-track — so a recreated session reports the
     /// cover without re-reading the (often transiently-empty) thumbnail stream.
-    fn cached_artwork_for(&self, source_app: &str, title: &str, artist: &str) -> Option<Arc<[u8]>> {
+    fn cached_artwork_for(&self, source_app: &SourceIdentity, title: &str, artist: &str) -> Option<Arc<[u8]>> {
         cached_artwork_for(&self.last_track_per_source, source_app, title, artist)
     }
 
@@ -2576,12 +2579,12 @@ impl ListenerState {
     fn rejected_row_text(
         &mut self,
         session: &GlobalSystemMediaTransportControlsSession,
-        source: &str,
+        source: &SourceIdentity,
     ) -> (String, String) {
         if self.source_on_cooldown(source) {
-            return (source.to_string(), String::new());
+            return (source.as_str().to_owned(), String::new());
         }
-        match read_session_text(session, source) {
+        match read_session_text(session, source.as_str()) {
             Ok(pair) => pair,
             Err(error) => {
                 if is_wait_timeout(&error) {
@@ -2589,7 +2592,7 @@ impl ListenerState {
                 } else {
                     debug!("rejected-session metadata unreadable | source={source} | error={error:#}");
                 }
-                (source.to_string(), String::new())
+                (source.as_str().to_owned(), String::new())
             }
         }
     }
@@ -2630,7 +2633,7 @@ impl ListenerState {
     /// re-reported cover is the same one, so an art-gained re-report of an
     /// identical identity is the same media, not a cover swap (see
     /// `should_suppress_recreation`).
-    fn store_last_emitted_track(&mut self, source: String, track: TrackInfo) {
+    fn store_last_emitted_track(&mut self, source: SourceIdentity, track: TrackInfo) {
         // Tombstone captures the identity for dedup after the artwork cache is
         // pruned (>TERMINAL_STOP_GRACE). No artwork bytes held, only the window
         // keeps it bounded.
@@ -2676,7 +2679,7 @@ impl ListenerState {
     /// The source the overlay's pill is currently displaying, if any. Read
     /// for every session-recreation candidate so the gate compares against
     /// what the user actually sees, not against what this worker emitted.
-    fn shown_source(&self) -> Option<String> {
+    fn shown_source(&self) -> Option<SourceIdentity> {
         self.now_showing
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2695,7 +2698,7 @@ impl ListenerState {
             .SourceAppUserModelId()
             .map(|value| value.to_string())
             .unwrap_or_default();
-        let label = source_app_label(&aumid);
+        let source = source_identity_from_aumid(&aumid);
         {
             let maps = self
                 .excluded_sources
@@ -2705,7 +2708,7 @@ impl ListenerState {
             if maps.per_session.get(&key).is_some_and(|until| *until > now) {
                 return false;
             }
-            if maps.per_source.get(&label).is_some_and(|until| *until > now) {
+            if maps.per_source.get(&source).is_some_and(|until| *until > now) {
                 return false;
             }
         }
@@ -2719,7 +2722,7 @@ impl ListenerState {
             return true;
         }
         let naumid = normalize_for_match(&aumid);
-        let nlabel = normalize_for_match(&label);
+        let nlabel = normalize_for_match(source.as_str());
         // Empty normalized patterns are skipped so a hand-edited "" cannot
         // match via the empty-substring rule (see `pattern_matches`).
         normalized
@@ -2731,7 +2734,7 @@ impl ListenerState {
     /// Per-session wedged exclusions are checked via `session_source_allowed`
     /// and deliberately not here — terminal `Stopped`/`SourceGone` hygiene must
     /// not be silenced by a single wedged tab.
-    fn source_on_cooldown(&self, source: &str) -> bool {
+    fn source_on_cooldown(&self, source: &SourceIdentity) -> bool {
         self.excluded_sources
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2748,9 +2751,9 @@ impl ListenerState {
     /// that carry no track (title fell back to the source-app label) count:
     /// a source recreating its session per real track change never reaches
     /// the threshold.
-    fn record_churn(&mut self, source: &str) {
+    fn record_churn(&mut self, source: &SourceIdentity) {
         let now = Instant::now();
-        let events = self.churn.entry(source.to_string()).or_default();
+        let events = self.churn.entry(source.clone()).or_default();
         events.push_back(now);
         while events
             .front()
@@ -2763,7 +2766,7 @@ impl ListenerState {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .per_source
-                .insert(source.to_string(), now + Duration::from_millis(CHURN_COOLDOWN_MS));
+                .insert(source.clone(), now + Duration::from_millis(CHURN_COOLDOWN_MS));
             warn!(
                 "source {source} is churning sessions ({CHURN_THRESHOLD}+ new sessions in {CHURN_WINDOW_MS}ms); excluding it from tracking for {CHURN_COOLDOWN_MS}ms"
             );
@@ -2861,7 +2864,7 @@ impl ListenerState {
             return Ok(false);
         }
         let source = read_source_app(session);
-        let distinct_sources: HashSet<String> = self
+        let distinct_sources: HashSet<SourceIdentity> = self
             .subscriptions
             .values()
             .map(|s| read_source_app(&s.session))
@@ -2892,12 +2895,12 @@ impl ListenerState {
     /// storm cannot use it to grow the tracked set.
     fn displace_survivors(
         &mut self,
-        prioritized: &[(GlobalSystemMediaTransportControlsSession, usize, String)],
+        prioritized: &[(GlobalSystemMediaTransportControlsSession, usize, SourceIdentity)],
         alive: &HashSet<usize>,
         incoming: usize,
-        incoming_source: &str,
+        incoming_source: &SourceIdentity,
         admitted_sessions: &mut usize,
-        admitted_sources: &mut HashSet<String>,
+        admitted_sources: &mut HashSet<SourceIdentity>,
     ) -> usize {
         // The distinct-source cap can only be relieved by displacing a
         // survivor whose source is exclusively subscribed; if no such
@@ -3121,13 +3124,13 @@ impl Drop for ListenerState {
 /// the same downstream state (same kind, same source) may be superseded by
 /// the newest of the pair. `WorkerFailed` has no source and is only ever
 /// emitted once by the supervisor, so it never collides.
-fn event_coalesce_key(event: &MediaEvent) -> (&'static str, Option<&str>) {
+fn event_coalesce_key(event: &MediaEvent) -> (&'static str, Option<&SourceIdentity>) {
     match event {
-        MediaEvent::TrackChanged(track) => ("track", Some(track.source_app.as_str())),
-        MediaEvent::PlaybackStateChanged(_, source) => ("playback", Some(source.as_str())),
-        MediaEvent::SessionRejected { source_app, .. } => ("rejected", Some(source_app.as_str())),
-        MediaEvent::SourceGone { source_app } => ("gone", Some(source_app.as_str())),
-        MediaEvent::ProgressChanged { source_app, .. } => ("progress", Some(source_app.as_str())),
+        MediaEvent::TrackChanged(track) => ("track", Some(&track.source_app)),
+        MediaEvent::PlaybackStateChanged(_, source) => ("playback", Some(source)),
+        MediaEvent::SessionRejected { source_app, .. } => ("rejected", Some(source_app)),
+        MediaEvent::SourceGone { source_app } => ("gone", Some(source_app)),
+        MediaEvent::ProgressChanged { source_app, .. } => ("progress", Some(source_app)),
         MediaEvent::WorkerFailed { .. } => ("worker-failed", None),
         MediaEvent::ArtworkBudgetExceeded => ("art-budget", None),
     }
@@ -3261,9 +3264,9 @@ fn track_label(track: &TrackInfo) -> String {
 /// app becoming current does not erase another app's session state.
 fn session_matches_current_source(
     key: usize,
-    source: &str,
+    source: &SourceIdentity,
     current_key: Option<usize>,
-    current_source: Option<&str>,
+    current_source: Option<&SourceIdentity>,
 ) -> bool {
     match (current_key, current_source) {
         (Some(current_key), Some(current_source)) if current_source == source => key == current_key,
@@ -3277,8 +3280,8 @@ fn session_matches_current_source(
 /// recreated session reports the cover without re-reading the
 /// (often transiently-empty) thumbnail stream.
 fn cached_artwork_for(
-    last_track_per_source: &HashMap<String, TrackInfo>,
-    source_app: &str,
+    last_track_per_source: &HashMap<SourceIdentity, TrackInfo>,
+    source_app: &SourceIdentity,
     title: &str,
     artist: &str,
 ) -> Option<Arc<[u8]>> {
@@ -3338,11 +3341,11 @@ fn note_appearance(seen: &mut HashSet<usize>, key: usize) -> bool {
 /// `GetCurrentSession` authoritative over a stale `GetSessions` list); the
 /// loops below skip it by key, so it is never duplicated.
 fn prioritize_sessions(
-    snapshot: &[(usize, String)],
-    current: Option<(usize, String)>,
+    snapshot: &[(usize, SourceIdentity)],
+    current: Option<(usize, SourceIdentity)>,
     before: &HashSet<usize>,
     session_cap: usize,
-) -> Vec<(usize, String)> {
+) -> Vec<(usize, SourceIdentity)> {
     let mut ordered = Vec::with_capacity(snapshot.len() + usize::from(current.is_some()));
     if let Some((cur_key, cur_source)) = current.as_ref() {
         ordered.push((*cur_key, cur_source.clone()));
@@ -3379,8 +3382,8 @@ fn prioritize_sessions(
 /// disagree on an admission-cap rejection.
 pub(crate) fn admission_blocked(
     session_count: usize,
-    admitted_sources: &HashSet<String>,
-    source: &str,
+    admitted_sources: &HashSet<SourceIdentity>,
+    source: &SourceIdentity,
     session_cap: usize,
     source_cap: usize,
 ) -> bool {
@@ -3435,14 +3438,14 @@ fn displacement_victim(
 /// is modeled.
 #[cfg(test)]
 fn admit_sessions(
-    ordered: &[(usize, String)],
+    ordered: &[(usize, SourceIdentity)],
     existing_keys: &HashSet<usize>,
-    existing_sources: &HashSet<String>,
+    existing_sources: &HashSet<SourceIdentity>,
     session_cap: usize,
     source_cap: usize,
 ) -> (HashSet<usize>, usize) {
     let mut admitted_keys: HashSet<usize> = existing_keys.clone();
-    let mut admitted_sources: HashSet<String> = existing_sources.clone();
+    let mut admitted_sources: HashSet<SourceIdentity> = existing_sources.clone();
     let mut rejected = 0;
     for (key, source) in ordered {
         if admitted_keys.contains(key) {
@@ -3460,7 +3463,7 @@ fn admit_sessions(
 
 /// Total raw-artwork bytes retained across a source-keyed last-emitted track
 /// map. Used to enforce `MAX_RETAINED_ARTWORK_BYTES` on insertion.
-fn retained_art_bytes(last_track: &HashMap<String, TrackInfo>) -> usize {
+fn retained_art_bytes(last_track: &HashMap<SourceIdentity, TrackInfo>) -> usize {
     last_track
         .values()
         .map(|t| t.artwork.as_ref().map_or(0, |a| a.len()))
@@ -3471,7 +3474,7 @@ fn retained_art_bytes(last_track: &HashMap<String, TrackInfo>) -> usize {
 /// Bump only when distinct decoded bytes are attached (re-encoded same cover
 /// where bytes are byte-identical via `artwork_same` does not bump, so a
 /// re-encode storm does not churn the generation).
-fn next_art_generation(state: &mut ListenerState, source: &str, decoded: Option<&[u8]>) -> u64 {
+fn next_art_generation(state: &mut ListenerState, source: &SourceIdentity, decoded: Option<&[u8]>) -> u64 {
     let Some(bytes) = decoded else {
         return state.artwork_generations.get(source).copied().unwrap_or(0);
     };
@@ -3482,7 +3485,7 @@ fn next_art_generation(state: &mut ListenerState, source: &str, decoded: Option<
     if crate::events::artwork_same(last, Some(bytes)) {
         return state.artwork_generations.get(source).copied().unwrap_or(0);
     }
-    let generation = state.artwork_generations.entry(source.to_string()).or_insert(0);
+    let generation = state.artwork_generations.entry(source.clone()).or_insert(0);
     *generation += 1;
     *generation
 }
@@ -3493,8 +3496,8 @@ fn next_art_generation(state: &mut ListenerState, source: &str, decoded: Option<
 /// retained) so the pill renders a placeholder instead of holding stale cover
 /// bytes. Returns whether the artwork was kept (false => placeholder retained).
 fn store_last_track(
-    last_track: &mut HashMap<String, TrackInfo>,
-    source: String,
+    last_track: &mut HashMap<SourceIdentity, TrackInfo>,
+    source: SourceIdentity,
     mut track: TrackInfo,
     budget: usize,
 ) -> bool {
@@ -3554,28 +3557,27 @@ fn overflow_warn_allowed(last: Option<Instant>, window: Duration) -> bool {
 /// entry is dropped.
 const PALETTE_CACHE_CAP: usize = 256;
 
-/// Composite palette-cache key: source, title, artist, NUL-joined. A single
-/// allocation per lookup instead of the three strings the tuple form needed
-/// (the key is built even on cache hits). Fields read back via
-/// `palette_key_source`.
-fn palette_cache_key(source: &str, title: &str, artist: &str) -> String {
-    let mut key = String::with_capacity(source.len() + title.len() + artist.len() + 2);
-    key.push_str(source);
-    key.push('\0');
-    key.push_str(title);
-    key.push('\0');
-    key.push_str(artist);
-    key
+/// Composite palette-cache key. The stable source identity prevents two
+/// colliding friendly labels from sharing a palette; title/artist retain the
+/// existing per-track identity semantics.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PaletteCacheKey {
+    source: SourceIdentity,
+    title: String,
+    artist: String,
 }
 
-/// The source field of a `palette_cache_key` (everything up to the first NUL).
-fn palette_key_source(key: &str) -> &str {
-    key.split('\0').next().unwrap_or_default()
+fn palette_cache_key(source: &SourceIdentity, title: &str, artist: &str) -> PaletteCacheKey {
+    PaletteCacheKey {
+        source: source.clone(),
+        title: title.to_owned(),
+        artist: artist.to_owned(),
+    }
 }
 
 fn palette_for_identity(
-    cache: &mut HashMap<String, Palette>,
-    order: &mut VecDeque<String>,
+    cache: &mut HashMap<PaletteCacheKey, Palette>,
+    order: &mut VecDeque<PaletteCacheKey>,
     merged: &TrackInfo,
     decoded_art: Option<&[u8]>,
 ) -> Option<Palette> {
@@ -3650,7 +3652,7 @@ fn should_suppress_recreation(
     last_track: Option<&TrackInfo>,
     merged: &TrackInfo,
     read_artwork: bool,
-    shown_source: Option<&str>,
+    shown_source: Option<&SourceIdentity>,
     art_was_stripped: bool,
 ) -> bool {
     last_track.is_some_and(|prev_track| {
@@ -3661,7 +3663,7 @@ fn should_suppress_recreation(
                 && read_artwork
                 && prev_track.artwork.is_none()
                 && merged.artwork.is_some());
-        recreation && shown_source == Some(merged.source_app.as_str())
+        recreation && shown_source == Some(&merged.source_app)
     })
 }
 
@@ -3919,7 +3921,7 @@ fn with_decoded_art(mut track: TrackInfo, size: usize) -> TrackInfo {
 /// data when YouTube Music (or another source) populates it.
 fn is_placeholder_read(prev: &LogicalState, merged: &TrackInfo) -> bool {
     let is_first_read = prev.source_app.is_empty() && prev.title.is_empty();
-    is_first_read && merged.artist.is_empty() && merged.title == merged.source_app
+    is_first_read && merged.artist.is_empty() && merged.title == merged.source_app.as_str()
 }
 
 /// A metadata snapshot that carries no real content: the title is just the
@@ -3930,7 +3932,7 @@ fn is_placeholder_read(prev: &LogicalState, merged: &TrackInfo) -> bool {
 /// never announced as a (fake) "sample track". A real `MediaPropertiesChanged` or
 /// the periodic poll supersedes it once metadata lands.
 fn is_placeholder_like(merged: &TrackInfo) -> bool {
-    merged.artist.is_empty() && merged.title == merged.source_app
+    merged.artist.is_empty() && merged.title == merged.source_app.as_str()
 }
 
 /// Whether a session's first read charges churn for its source. Only
@@ -4087,11 +4089,16 @@ fn session_key(session: &GlobalSystemMediaTransportControlsSession) -> usize {
     session.as_raw() as usize
 }
 
-fn read_source_app(session: &GlobalSystemMediaTransportControlsSession) -> String {
+fn source_identity_from_aumid(raw: &str) -> SourceIdentity {
+    let label = source_app_label(raw);
+    SourceIdentity::from_raw_and_label(raw, label)
+}
+
+fn read_source_app(session: &GlobalSystemMediaTransportControlsSession) -> SourceIdentity {
     session
         .SourceAppUserModelId()
-        .map(|value| source_app_label(&value.to_string()))
-        .unwrap_or_else(|_| "Media".to_string())
+        .map(|value| source_identity_from_aumid(&value.to_string()))
+        .unwrap_or_else(|_| SourceIdentity::from("Media"))
 }
 
 /// Bounds and canonicalizes an SMTC-provided metadata string. Sources are
@@ -4253,7 +4260,7 @@ fn read_track_info(
     // the invariant "empty title ⇒ equals the source label" survives
     // sanitization.
     if title.is_empty() {
-        title = source_app.clone();
+        title = source_app.as_str().to_owned();
     }
     // Keep artist empty when the app has not provided it yet; the pill and
     // the Activity pane show "Unknown Artist" as a placeholder so the row
@@ -4744,6 +4751,10 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
 
+    fn sid(label: impl AsRef<str>) -> SourceIdentity {
+        SourceIdentity::for_test(label)
+    }
+
     #[test]
     fn thumbnail_stream_size_accepts_compact_covers_and_rejects_hostile_sizes() {
         // Compact 64-128 px covers can compress below 1 KiB: the floor is low
@@ -5070,22 +5081,19 @@ mod tests {
 
     #[test]
     fn current_session_filter_rejects_stale_sessions_for_the_same_source() {
-        assert!(session_matches_current_source(10, "spotify", Some(10), Some("spotify")));
-        assert!(!session_matches_current_source(
-            11,
-            "spotify",
-            Some(10),
-            Some("spotify")
-        ));
+        let spotify = sid("spotify");
+        let youtube_music = sid("youtube-music");
+        assert!(session_matches_current_source(10, &spotify, Some(10), Some(&spotify)));
+        assert!(!session_matches_current_source(11, &spotify, Some(10), Some(&spotify)));
         // A different source remains independent.
         assert!(session_matches_current_source(
             11,
-            "youtube-music",
+            &youtube_music,
             Some(10),
-            Some("spotify")
+            Some(&spotify)
         ));
         // A transient GetCurrentSession failure uses the permissive fallback.
-        assert!(session_matches_current_source(11, "spotify", None, None));
+        assert!(session_matches_current_source(11, &spotify, None, None));
     }
 
     #[test]
@@ -5510,7 +5518,7 @@ mod tests {
         // With the fallback re-applied (as read_track_info now does), the
         // snapshot is exactly the placeholder shape.
         let mut with_fallback = merged.clone();
-        with_fallback.title = with_fallback.source_app.clone();
+        with_fallback.title = with_fallback.source_app.as_str().to_owned();
         assert!(is_placeholder_like(&with_fallback));
         // And the un-repaired form would have slipped past — documenting
         // why the fix lives at the read site.
@@ -5845,18 +5853,21 @@ mod tests {
         // `source_on_cooldown` is what the churn path and the G4 wedged-read
         // path share, so the trip must be visible through it.
         let mut state = listener_state_for_exclusion_tests();
-        assert!(!state.source_on_cooldown("spotify"), "a fresh source is not excluded");
+        assert!(
+            !state.source_on_cooldown(&sid("spotify")),
+            "a fresh source is not excluded"
+        );
         for _ in 0..CHURN_THRESHOLD {
-            state.record_churn("spotify");
+            state.record_churn(&sid("spotify"));
         }
         assert!(
-            state.source_on_cooldown("spotify"),
+            state.source_on_cooldown(&sid("spotify")),
             "the churn cool-down must gate the source"
         );
         // Churn while already excluded is absorbed: the source stays gated
         // and the exclusion is not extended (the guard prevents re-insert).
-        state.record_churn("spotify");
-        assert!(state.source_on_cooldown("spotify"));
+        state.record_churn(&sid("spotify"));
+        assert!(state.source_on_cooldown(&sid("spotify")));
         assert_eq!(
             state
                 .excluded_sources
@@ -5885,11 +5896,11 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .per_source
             .insert(
-                "spotify".to_string(),
+                sid("spotify"),
                 Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
             );
         let session = unsafe { GlobalSystemMediaTransportControlsSession::from_raw(std::ptr::null_mut()) };
-        let (title, artist) = state.rejected_row_text(&session, "spotify");
+        let (title, artist) = state.rejected_row_text(&session, &sid("spotify"));
         assert_eq!(title, "spotify", "the row falls back to the source label");
         assert_eq!(artist, "");
         std::mem::forget(session);
@@ -5910,7 +5921,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             map.per_source.insert(
-                "spotify".to_string(),
+                sid("spotify"),
                 Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
             );
         }
@@ -5919,7 +5930,7 @@ mod tests {
         // predecessor's exclusion without any write of its own.
         let replacement = listener_state_with_exclusions(shared.clone());
         assert!(
-            replacement.source_on_cooldown("spotify"),
+            replacement.source_on_cooldown(&sid("spotify")),
             "an exclusion written by the predecessor worker must gate the replacement"
         );
         std::mem::forget(predecessor);
@@ -5939,18 +5950,21 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .per_source
             .insert(
-                "spotify".to_string(),
+                sid("spotify"),
                 Instant::now() + Duration::from_millis(CHURN_COOLDOWN_MS),
             );
-        assert!(state.source_on_cooldown("spotify"), "a live exclusion gates the source");
+        assert!(
+            state.source_on_cooldown(&sid("spotify")),
+            "a live exclusion gates the source"
+        );
         state
             .excluded_sources
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .per_source
-            .insert("spotify".to_string(), Instant::now() - Duration::from_millis(1));
+            .insert(sid("spotify"), Instant::now() - Duration::from_millis(1));
         assert!(
-            !state.source_on_cooldown("spotify"),
+            !state.source_on_cooldown(&sid("spotify")),
             "an expired exclusion releases the source"
         );
         std::mem::forget(state);
@@ -5959,10 +5973,13 @@ mod tests {
     #[test]
     fn cached_artwork_reused_only_for_same_track_identity() {
         // Build a last_track_per_source map directly — no ListenerState needed.
+        let youtube_music = sid("youtube-music");
+        let spotify = sid("spotify");
+        let unknown = sid("unknown");
         let mut last_track_per_source = HashMap::new();
         let art: Arc<[u8]> = Arc::from(vec![0x89, 0x50, 0x4E, 0x47]);
         last_track_per_source.insert(
-            "youtube-music".to_string(),
+            youtube_music.clone(),
             TrackInfo {
                 title: "Song".into(),
                 artist: "Artist".into(),
@@ -5973,24 +5990,21 @@ mod tests {
 
         // Same source + title + artist → cached artwork returned.
         assert_eq!(
-            cached_artwork_for(&last_track_per_source, "youtube-music", "Song", "Artist"),
+            cached_artwork_for(&last_track_per_source, &youtube_music, "Song", "Artist"),
             Some(art.clone())
         );
-
         // Cross-track (same source, different title) → None (no bleed).
         assert_eq!(
-            cached_artwork_for(&last_track_per_source, "youtube-music", "Other", "Artist"),
+            cached_artwork_for(&last_track_per_source, &youtube_music, "Other", "Artist"),
             None
         );
-
         // Cross-source → None.
         assert_eq!(
-            cached_artwork_for(&last_track_per_source, "spotify", "Song", "Artist"),
+            cached_artwork_for(&last_track_per_source, &spotify, "Song", "Artist"),
             None
         );
-
         // No cached entry → None.
-        assert_eq!(cached_artwork_for(&HashMap::new(), "unknown", "Song", "Artist"), None);
+        assert_eq!(cached_artwork_for(&HashMap::new(), &unknown, "Song", "Artist"), None);
     }
 
     #[test]
@@ -6170,13 +6184,18 @@ mod tests {
     }
 
     #[test]
-    fn palette_cache_keys_round_trip_the_source_field() {
-        let key = palette_cache_key("youtube-music", "Some Title", "Some Artist");
-        assert_eq!(palette_key_source(&key), "youtube-music");
-        // Exactly three NUL-separated segments: source, title, artist.
-        assert_eq!(key.split('\0').count(), 3);
-        assert_eq!(palette_key_source("no-separator"), "no-separator");
-        assert_eq!(palette_key_source(""), "");
+    fn palette_cache_key_preserves_stable_source_identity() {
+        let first = SourceIdentity::from_raw_and_label("Publisher.One_family!Player", "Player");
+        let second = SourceIdentity::from_raw_and_label("Publisher.Two_family!Player", "Player");
+        let key = palette_cache_key(&first, "Some Title", "Some Artist");
+        assert_eq!(key.source, first);
+        assert_eq!(key.title, "Some Title");
+        assert_eq!(key.artist, "Some Artist");
+        assert_ne!(
+            key,
+            palette_cache_key(&second, "Some Title", "Some Artist"),
+            "friendly-label collisions must not share palette cache entries"
+        );
     }
 
     #[test]
@@ -6196,10 +6215,10 @@ mod tests {
         assert_eq!(cache.len(), 3);
         // The exact retain the production sync uses: departed source gone,
         // surviving source's entries kept.
-        let active: HashSet<String> = ["zeta"].into_iter().map(str::to_owned).collect();
-        cache.retain(|key, _| active.contains(palette_key_source(key)));
+        let active: HashSet<SourceIdentity> = [sid("zeta")].into_iter().collect();
+        cache.retain(|key, _| active.contains(&key.source));
         assert_eq!(cache.len(), 1);
-        assert!(cache.contains_key(&palette_cache_key("zeta", "Z", "Artist")));
+        assert!(cache.contains_key(&palette_cache_key(&sid("zeta"), "Z", "Artist")));
     }
 
     #[test]
@@ -6239,13 +6258,14 @@ mod tests {
         // by a recreated session, but the last pill on screen belongs to
         // ZuneMusic. The re-report must re-emit (the overlay cache was evicted
         // in the meantime), not be suppressed as recreation noise.
-        let source = "youtube-music";
+        let source = sid("youtube-music");
+        let zune = sid("ZuneMusic");
         let prev = TrackInfo {
-            source_app: source.into(),
+            source_app: source.clone(),
             ..track("All Fall Down", "OneRepublic")
         };
         let same = TrackInfo {
-            source_app: source.into(),
+            source_app: source.clone(),
             ..track("All Fall Down", "OneRepublic")
         };
         // Pill already shows this source's track: recreation noise.
@@ -6253,7 +6273,7 @@ mod tests {
             Some(&prev),
             &same,
             true,
-            Some(source),
+            Some(&source),
             false
         ));
         // Another app's pill was the last thing shown: switch-back re-emits.
@@ -6261,22 +6281,22 @@ mod tests {
             Some(&prev),
             &same,
             true,
-            Some("ZuneMusic"),
+            Some(&zune),
             false
         ));
         // No pill shown yet (first emit of the session): never suppressed.
         assert!(!should_suppress_recreation(Some(&prev), &same, true, None, false));
         // No prior emit for this source: no dedup baseline.
-        assert!(!should_suppress_recreation(None, &same, true, Some(source), false));
+        assert!(!should_suppress_recreation(None, &same, true, Some(&source), false));
         // A different track is never recreation noise.
         assert!(!should_suppress_recreation(
             Some(&prev),
             &TrackInfo {
-                source_app: source.into(),
+                source_app: source.clone(),
                 ..track("Tyrant", "OneRepublic")
             },
             true,
-            Some(source),
+            Some(&source),
             false
         ));
         // Poll reads (no artwork read) keep the same suppression behavior.
@@ -6284,14 +6304,14 @@ mod tests {
             Some(&prev),
             &same,
             false,
-            Some(source),
+            Some(&source),
             false
         ));
         assert!(!should_suppress_recreation(
             Some(&prev),
             &same,
             false,
-            Some("ZuneMusic"),
+            Some(&zune),
             false
         ));
         // Artwork gained on the re-report is never suppressed: the pill must
@@ -6304,7 +6324,7 @@ mod tests {
             Some(&prev),
             &with_art,
             true,
-            Some(source),
+            Some(&source),
             false
         ));
         // ...unless the cache's artwork was stripped by the retained-artwork
@@ -6316,18 +6336,18 @@ mod tests {
             Some(&prev),
             &with_art,
             true,
-            Some(source),
+            Some(&source),
             true
         ));
         assert!(!should_suppress_recreation(
             Some(&prev),
             &TrackInfo {
                 artwork: Some(Arc::from(vec![1])),
-                source_app: source.into(),
+                source_app: source.clone(),
                 ..track("Tyrant", "OneRepublic")
             },
             true,
-            Some(source),
+            Some(&source),
             true
         ));
         // The marker only covers the art-gained direction: an art loss on a
@@ -6336,7 +6356,7 @@ mod tests {
             Some(&with_art),
             &same,
             true,
-            Some(source),
+            Some(&source),
             true
         ));
     }
@@ -6732,22 +6752,22 @@ mod tests {
 
     #[test]
     fn admission_blocked_respects_session_and_source_caps() {
-        let empty: HashSet<String> = HashSet::new();
+        let empty: HashSet<SourceIdentity> = HashSet::new();
         // Session cap ceiling hits first.
-        assert!(admission_blocked(64, &empty, "A", 64, 32));
-        assert!(!admission_blocked(63, &empty, "A", 64, 32));
+        assert!(admission_blocked(64, &empty, &sid("A"), 64, 32));
+        assert!(!admission_blocked(63, &empty, &sid("A"), 64, 32));
         // A brand-new source at the source cap is blocked.
-        let full: HashSet<String> = (0..32).map(|i| format!("s{i}")).collect();
-        assert!(admission_blocked(0, &full, "new", 64, 32));
+        let full: HashSet<SourceIdentity> = (0..32).map(|i| sid(format!("s{i}"))).collect();
+        assert!(admission_blocked(0, &full, &sid("new"), 64, 32));
         // An already-tracked source never trips the source cap.
-        assert!(!admission_blocked(63, &full, "s0", 64, 32));
+        assert!(!admission_blocked(63, &full, &sid("s0"), 64, 32));
     }
 
     #[test]
     fn admit_sessions_keeps_current_first_under_a_tight_session_cap() {
         // The first entry is the current session; with a session cap of 1 it
         // must be the one retained, not a later new session.
-        let ordered: Vec<(usize, String)> = vec![(1, "A".into()), (2, "A".into()), (3, "A".into())];
+        let ordered: Vec<(usize, SourceIdentity)> = vec![(1, "A".into()), (2, "A".into()), (3, "A".into())];
         let (admitted, rejected) = admit_sessions(&ordered, &HashSet::new(), &HashSet::new(), 1, 100);
         assert!(admitted.contains(&1), "current session must be admitted first");
         assert!(!admitted.contains(&2));
@@ -6758,9 +6778,9 @@ mod tests {
     fn admit_sessions_retains_existing_before_new() {
         // A surviving existing subscription fills its slot; a genuinely new
         // session is rejected by the cap instead of evicting a live one.
-        let ordered: Vec<(usize, String)> = vec![(2, "A".into())];
+        let ordered: Vec<(usize, SourceIdentity)> = vec![(2, "A".into())];
         let existing_keys: HashSet<usize> = [1].into_iter().collect();
-        let existing_sources: HashSet<String> = ["A".to_string()].into_iter().collect();
+        let existing_sources: HashSet<SourceIdentity> = [sid("A")].into_iter().collect();
         let (admitted, rejected) = admit_sessions(&ordered, &existing_keys, &existing_sources, 1, 100);
         assert!(admitted.contains(&1), "existing subscription is retained");
         assert!(!admitted.contains(&2));
@@ -6770,7 +6790,7 @@ mod tests {
     #[test]
     fn admit_sessions_rejects_the_65th_session_only() {
         // 65 sessions of one source, session cap 64: 64 admitted, 1 rejected.
-        let ordered: Vec<(usize, String)> = (0..65).map(|k| (k, "youtube-music".to_string())).collect();
+        let ordered: Vec<(usize, SourceIdentity)> = (0..65).map(|k| (k, sid("youtube-music"))).collect();
         let (admitted, rejected) = admit_sessions(&ordered, &HashSet::new(), &HashSet::new(), 64, 100);
         assert_eq!(admitted.len(), 64);
         assert_eq!(rejected, 1);
@@ -6779,7 +6799,7 @@ mod tests {
     #[test]
     fn admit_sessions_rejects_the_33rd_source_only() {
         // 33 distinct sources, source cap 32: 32 admitted, 1 rejected.
-        let ordered: Vec<(usize, String)> = (0..33).map(|k| (k, format!("src-{k}"))).collect();
+        let ordered: Vec<(usize, SourceIdentity)> = (0..33).map(|k| (k, sid(format!("src-{k}")))).collect();
         let (admitted, rejected) = admit_sessions(&ordered, &HashSet::new(), &HashSet::new(), 100, 32);
         assert_eq!(admitted.len(), 32);
         assert_eq!(rejected, 1);
@@ -6791,7 +6811,7 @@ mod tests {
         // snapshot order, then genuinely new sessions — the exact contract
         // the live sync loop feeds to the caps.
         let before: HashSet<usize> = [4, 5].into_iter().collect();
-        let snapshot: Vec<(usize, String)> = vec![
+        let snapshot: Vec<(usize, SourceIdentity)> = vec![
             (1, "one".into()),
             (2, "two".into()),
             (3, "three".into()),
@@ -6810,7 +6830,7 @@ mod tests {
         // cap before the loop, so the per-sync work (and the log lines) stay
         // bounded; overflow candidates are never even enumerated.
         let before: HashSet<usize> = [1, 2].into_iter().collect();
-        let snapshot: Vec<(usize, String)> = (1..=100).map(|k| (k, format!("src-{k}"))).collect();
+        let snapshot: Vec<(usize, SourceIdentity)> = (1..=100).map(|k| (k, sid(format!("src-{k}")))).collect();
         let ordered = prioritize_sessions(&snapshot, None, &before, MAX_TRACKED_SESSIONS);
         let keys: Vec<usize> = ordered.iter().map(|(k, _)| *k).collect();
         // Existing subscriptions first (1, 2), then new candidates truncated
@@ -6824,7 +6844,7 @@ mod tests {
         // GetCurrentSession can outrun a stale GetSessions snapshot (browser
         // churn); the current session is authoritative and comes first.
         let before: HashSet<usize> = HashSet::new();
-        let snapshot: Vec<(usize, String)> = vec![(1, "one".into()), (2, "two".into())];
+        let snapshot: Vec<(usize, SourceIdentity)> = vec![(1, "one".into()), (2, "two".into())];
         let ordered = prioritize_sessions(&snapshot, Some((9, "nine".into())), &before, 64);
         let keys: Vec<usize> = ordered.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, vec![9, 1, 2], "the current session must lead and not duplicate");
@@ -6837,10 +6857,10 @@ mod tests {
         // only after truncation, existing subscriptions survive, and the
         // overflow is never enumerated (bounded per-sync work).
         let existing_keys: HashSet<usize> = [1].into_iter().collect();
-        let existing_sources: HashSet<String> = ["spotify".to_string()].into_iter().collect();
+        let existing_sources: HashSet<SourceIdentity> = [sid("spotify")].into_iter().collect();
         // One hostile source with 99 sessions: only the session cap can bind.
-        let snapshot: Vec<(usize, String)> = std::iter::once((1, "spotify".to_string()))
-            .chain((2..=100).map(|k| (k, "storm-src".to_string())))
+        let snapshot: Vec<(usize, SourceIdentity)> = std::iter::once((1, sid("spotify")))
+            .chain((2..=100).map(|k| (k, sid("storm-src"))))
             .collect();
         let ordered = prioritize_sessions(&snapshot, None, &existing_keys, MAX_TRACKED_SESSIONS);
         let (admitted, rejected) = admit_sessions(
@@ -6894,7 +6914,7 @@ mod tests {
         // The budget is a conservative per-entry sum: it cannot see that two
         // entries clone the same Arc, so sharing over-counts. Err safe: the
         // retained bytes never exceed the cap even when buffers are shared.
-        let mut map: HashMap<String, TrackInfo> = HashMap::new();
+        let mut map: HashMap<SourceIdentity, TrackInfo> = HashMap::new();
         let art: Arc<[u8]> = Arc::from([7u8; 1024]);
         map.insert(
             "a".into(),
@@ -6924,7 +6944,7 @@ mod tests {
 
     #[test]
     fn store_last_track_replaces_under_the_art_budget() {
-        let mut map: HashMap<String, TrackInfo> = HashMap::new();
+        let mut map: HashMap<SourceIdentity, TrackInfo> = HashMap::new();
         let big: Arc<[u8]> = Arc::from(vec![1u8; MAX_RETAINED_ARTWORK_BYTES]);
         let small: Arc<[u8]> = Arc::from([2u8; 4]);
         map.insert(
@@ -6936,7 +6956,7 @@ mod tests {
         );
         store_last_track(
             &mut map,
-            "only".to_string(),
+            sid("only"),
             TrackInfo {
                 artwork: Some(small),
                 ..TrackInfo::default()
@@ -6944,7 +6964,7 @@ mod tests {
             MAX_RETAINED_ARTWORK_BYTES,
         );
         assert_eq!(
-            map["only"].artwork,
+            map[&sid("only")].artwork,
             Some(Arc::<[u8]>::from([2u8; 4])),
             "replacement must overwrite the old entry"
         );
@@ -6961,22 +6981,22 @@ mod tests {
         // evict the bytes (false) while retaining the metadata, so the pill
         // renders a placeholder instead of a stale cover. The budget never
         // grows past the cap even across a replacement.
-        let mut map: HashMap<String, TrackInfo> = HashMap::new();
+        let mut map: HashMap<SourceIdentity, TrackInfo> = HashMap::new();
         let big: Arc<[u8]> = Arc::from(vec![1u8; MAX_RETAINED_ARTWORK_BYTES]);
         let full = TrackInfo {
             artwork: Some(big),
             ..TrackInfo::default()
         };
-        store_last_track(&mut map, "only".to_string(), full, MAX_RETAINED_ARTWORK_BYTES);
+        store_last_track(&mut map, sid("only"), full, MAX_RETAINED_ARTWORK_BYTES);
         assert_eq!(
-            map["only"].artwork.as_deref().map(<[u8]>::len),
+            map[&sid("only")].artwork.as_deref().map(<[u8]>::len),
             Some(MAX_RETAINED_ARTWORK_BYTES)
         );
 
         // A second, artwork-bearing track cannot fit within the budget.
         let kept = store_last_track(
             &mut map,
-            "second".to_string(),
+            sid("second"),
             TrackInfo {
                 artwork: Some(Arc::<[u8]>::from([3u8; 8])),
                 ..TrackInfo::default()
@@ -6985,7 +7005,8 @@ mod tests {
         );
         assert!(!kept, "over-budget artwork must be dropped");
         assert_eq!(
-            map["second"].artwork, None,
+            map[&sid("second")].artwork,
+            None,
             "the placeholder retains metadata, never stale cover bytes"
         );
         assert_eq!(
@@ -7010,6 +7031,19 @@ mod tests {
         // Just outside the window: a new warn is allowed.
         let stale = Instant::now() - Duration::from_millis(5_001);
         assert!(overflow_warn_allowed(Some(stale), window));
+    }
+
+    #[test]
+    fn pending_output_keeps_distinct_raw_sources_with_same_label() {
+        let a = SourceIdentity::from_raw_and_label("Publisher.One_family!Player", "Player");
+        let b = SourceIdentity::from_raw_and_label("Publisher.Two_family!Player", "Player");
+        let first = Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Paused, a));
+        let second = Arc::new(MediaEvent::PlaybackStateChanged(PlaybackState::Playing, b));
+        let warned = AtomicBool::new(false);
+        let mut queue = VecDeque::new();
+        assert_eq!(coalesce_pending_event(&mut queue, first, 8, &warned), 0);
+        assert_eq!(coalesce_pending_event(&mut queue, second, 8, &warned), 0);
+        assert_eq!(queue.len(), 2, "display-label collisions must not coalesce");
     }
 
     #[test]
@@ -8477,7 +8511,7 @@ mod hostile_identity_fuzz {
             album_artist: cap_meta(hostile_string(rng)),
             subtitle: cap_meta(hostile_string(rng)),
             genre: Some(cap_meta(hostile_string(rng))),
-            source_app: source_label.to_string(),
+            source_app: SourceIdentity::for_test(source_label),
             duration_secs: Some(rng.next() % 1_000_000),
             track_number: Some((rng.next() % 100_000) as u32),
             track_count: Some((rng.next() % 100_000) as u32),
@@ -8511,12 +8545,12 @@ mod hostile_identity_fuzz {
     /// value past the character cap (the no-growth invariant).
     fn assert_sane_fields(track: &TrackInfo, context: &str) {
         for (name, value) in [
-            ("title", &track.title),
-            ("artist", &track.artist),
-            ("album", &track.album),
-            ("album_artist", &track.album_artist),
-            ("subtitle", &track.subtitle),
-            ("source_app", &track.source_app),
+            ("title", track.title.as_str()),
+            ("artist", track.artist.as_str()),
+            ("album", track.album.as_str()),
+            ("album_artist", track.album_artist.as_str()),
+            ("subtitle", track.subtitle.as_str()),
+            ("source_app", track.source_app.as_str()),
         ] {
             assert!(
                 value.chars().all(|c| !display_unsafe(c)),
@@ -8576,7 +8610,7 @@ mod hostile_identity_fuzz {
 
             // Emit/suppress decisions, stale-thumbnail pairing, placeholder
             // and churn gates: total over hostile metadata (no panic).
-            let _ = should_suppress_recreation(Some(&a), &b, true, Some(&source_b), false);
+            let _ = should_suppress_recreation(Some(&a), &b, true, Some(&b.source_app), false);
             let _ = emit_track(&state_from(&a), &b, true);
             let _ = stale_thumbnail(&b, Some(&a));
             let _ = is_placeholder_like(&b);
@@ -8735,12 +8769,13 @@ mod hostile_identity_fuzz {
         let mut rng = FuzzRng(0xABCD_EF01_ABCD_EF01);
         for iteration in 0..2000 {
             let source = source_app_label(&hostile_string(&mut rng));
+            let source_id = SourceIdentity::for_test(&source);
             let title = cap_meta(hostile_string(&mut rng));
             let artist = cap_meta(hostile_string(&mut rng));
             let cover: Arc<[u8]> = Arc::from(vec![(rng.next() % 256) as u8; (rng.next() % 32) as usize]);
             let mut map = HashMap::new();
             map.insert(
-                source.clone(),
+                source_id.clone(),
                 TrackInfo {
                     title: title.clone(),
                     artist: artist.clone(),
@@ -8752,7 +8787,7 @@ mod hostile_identity_fuzz {
 
             // Exact identity (source + title + artist) returns the cover.
             assert_eq!(
-                cached_artwork_for(&map, &source, &title, &artist),
+                cached_artwork_for(&map, &source_id, &title, &artist),
                 Some(cover.clone()),
                 "{context}: the exact identity missed the cache"
             );
@@ -8764,14 +8799,14 @@ mod hostile_identity_fuzz {
             let other_artist = cap_meta(hostile_string(&mut rng));
             if other_title != title {
                 assert_eq!(
-                    cached_artwork_for(&map, &source, &other_title, &artist),
+                    cached_artwork_for(&map, &source_id, &other_title, &artist),
                     None,
                     "{context}: a different title returned the cached cover"
                 );
             }
             if other_artist != artist {
                 assert_eq!(
-                    cached_artwork_for(&map, &source, &title, &other_artist),
+                    cached_artwork_for(&map, &source_id, &title, &other_artist),
                     None,
                     "{context}: a different artist returned the cached cover"
                 );

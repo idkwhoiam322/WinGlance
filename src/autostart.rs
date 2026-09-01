@@ -217,7 +217,12 @@ fn read_run_value(key: HKEY, name: &[u16]) -> RunValue {
     if rc != WIN32_ERROR(0) || ty != REG_SZ {
         return RunValue::Foreign;
     }
-    let mut units: Vec<u16> = buf.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let mut units: Vec<u16> = buf
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
     while units.last() == Some(&0) {
         units.pop();
     }
