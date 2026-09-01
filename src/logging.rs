@@ -1,18 +1,17 @@
 use chrono::Local;
 use log::{LevelFilter, Log, Metadata, Record};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// The live log is reset when it exceeds this many bytes counted against it:
-/// a churn-heavy session can otherwise write tens of MB of Debug lines to
-/// disk. On plain launches the count starts at zero (the file was truncated
-/// on open); on the in-app "Restart app" path the file is preserved instead
-/// of truncated and the count starts at the existing file length, so the cap
-/// still bounds the total file on every launch path.
+/// Maximum live-log size. Plain launches may truncate the live log once at
+/// startup; after startup the file is append-only and logging simply stops at
+/// this cap. Earlier diagnostics are never erased to make room for later ones.
+/// The in-app restart path preserves the file and continues using its remaining
+/// capacity.
 const LIVE_LOG_CAP: u64 = 1024 * 1024;
 
 /// Opens the live log for a launch. With `preserve` set (the in-app "Restart
@@ -33,26 +32,25 @@ const LIVE_LOG_CAP: u64 = 1024 * 1024;
 fn open_live_log(live_path: &Path, preserve: bool) -> std::io::Result<(File, u64)> {
     let mut file = crate::winutil::open_verified_file(live_path, /*truncate=*/ !preserve)?;
     if preserve {
-        // The boundary line is appended after the verified open, at the real
-        // end of the preserved file (the open leaves the pointer at 0).
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(
-            format!(
-                "===== restarted via the Settings 'Restart app' action at {} =====\n",
-                Local::now().to_rfc3339()
-            )
-            .as_bytes(),
-        )?;
-        // Best-effort flush of the restart boundary so a crash before the
-        // next log line does not leave the boundary buffered.
-        let _ = file.sync_all();
+        let boundary = format!(
+            "===== restarted via the Settings 'Restart app' action at {} =====\n",
+            Local::now().to_rfc3339()
+        );
+        let existing = file.metadata()?.len();
+        if live_log_can_append(existing, boundary.len()) {
+            // Append only when the complete boundary fits. A partial marker is
+            // worse than no marker, and the cap never authorizes overwriting
+            // older diagnostics.
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(boundary.as_bytes())?;
+            let _ = file.sync_all();
+        }
     }
     let written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     Ok((file, written))
 }
 
 pub fn init_logging(logs_dir: &Path, preserve: bool) {
-    let _ = fs::create_dir_all(logs_dir);
     let live_path = logs_dir.join("log-Live.log");
     let files = match open_live_log(&live_path, preserve) {
         Ok((file, written)) => Some(LogFiles { live: file, written }),
@@ -133,8 +131,10 @@ pub fn reseat_live_log_to_eof() {
     if let Some(logger) = LOGGER.get()
         && let Ok(mut files) = logger.files.lock()
         && let Some(files) = files.as_mut()
+        && files.live.seek(SeekFrom::End(0)).is_ok()
+        && let Ok(meta) = files.live.metadata()
     {
-        let _ = files.live.seek(SeekFrom::End(0));
+        files.written = meta.len();
     }
 }
 
@@ -157,6 +157,10 @@ struct FileLogger {
 /// How often the write-failure fallback reports to crash.log.
 const WRITE_FAILURE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
+fn live_log_can_append(written: u64, bytes: usize) -> bool {
+    u64::try_from(bytes).is_ok_and(|bytes| bytes <= LIVE_LOG_CAP.saturating_sub(written))
+}
+
 impl Log for FileLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
         metadata.level() <= log::max_level()
@@ -176,41 +180,16 @@ impl Log for FileLogger {
         match self.files.lock() {
             Ok(mut guard) => match guard.as_mut() {
                 Some(files) => {
-                    // The cap counter advances only on a successful write:
-                    // phantom bytes from failed writes would trip the reset while
-                    // the disk still holds the old body. No per-line flush: the OS
-                    // page cache keeps the write durable across a process crash,
-                    // which is what the log is for. Flushing every Debug line would
-                    // stall the SMTC worker under churn; only a power loss can lose
-                    // the last few lines.
-                    if let Err(error) = files.live.write_all(line.as_bytes()) {
-                        // The live log just became untrustworthy: surface the
-                        // failure through crash.log — the channel that works
-                        // independently of the live log — rate-limited so a
-                        // persistent disk-full condition cannot spam it past its
-                        // own cap. Diagnostics-only: the log line itself is
-                        // dropped either way. Control falls through to the console
-                        // echo, which in debug builds is the only channel left
-                        // when the file write failed.
-                        self.report_write_failure(&error.to_string());
-                    } else {
-                        files.written += line.len() as u64;
-                    }
-                    if files.written >= LIVE_LOG_CAP {
-                        // Start the log fresh instead of growing without bound; the
-                        // file is diagnostic scratch, not user data. If the truncate
-                        // itself fails (a full disk again), keep appending past the
-                        // stale cursor rather than resetting it: overwriting live
-                        // bytes with a wrong offset would garble what is still
-                        // readable.
-                        if files.live.set_len(0).is_ok() {
-                            // Best-effort durability: file metadata flushed so a
-                            // power loss after the cap reset does not leave a
-                            // stale directory entry. Directory flush is done
-                            // via the handle's sync (FlushFileBuffers).
-                            let _ = files.live.sync_all();
-                            let _ = files.live.seek(SeekFrom::Start(0));
-                            files.written = 0;
+                    // The cap is append-only after startup: once a complete
+                    // line no longer fits, drop it rather than truncating or
+                    // overwriting earlier diagnostics. The counter advances only
+                    // after a successful write, so failed writes never consume
+                    // capacity that still exists on disk.
+                    if live_log_can_append(files.written, line.len()) {
+                        if let Err(error) = files.live.write_all(line.as_bytes()) {
+                            self.report_write_failure(&error.to_string());
+                        } else {
+                            files.written += line.len() as u64;
                         }
                     }
                 }
@@ -354,6 +333,27 @@ mod tests {
             !real.join("logs").join("log-Live.log").exists(),
             "no log file may be created through the junction"
         );
+    }
+
+    #[test]
+    fn live_log_cap_is_monotonic_and_never_requires_overwrite() {
+        assert!(live_log_can_append(0, LIVE_LOG_CAP as usize));
+        assert!(!live_log_can_append(1, LIVE_LOG_CAP as usize));
+        assert!(live_log_can_append(LIVE_LOG_CAP - 4, 4));
+        assert!(!live_log_can_append(LIVE_LOG_CAP - 4, 5));
+        assert!(!live_log_can_append(LIVE_LOG_CAP, 1));
+    }
+
+    #[test]
+    fn preserved_log_without_room_for_boundary_stays_byte_identical() {
+        let guard = TestDir::new("reload-full");
+        let live_path = guard.dir.join("log-Live.log");
+        let original = vec![b'x'; LIVE_LOG_CAP as usize - 1];
+        std::fs::write(&live_path, &original).unwrap();
+        let (file, written) = open_live_log(&live_path, true).unwrap();
+        assert_eq!(written, original.len() as u64);
+        drop(file);
+        assert_eq!(std::fs::read(&live_path).unwrap(), original);
     }
 
     #[test]

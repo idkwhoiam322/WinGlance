@@ -1079,12 +1079,52 @@ pub(crate) fn open_pinned_parent(dir: &Path) -> io::Result<DirGuard> {
     Ok(DirGuard { handle })
 }
 
+/// Creates a fixed chain of application-owned directories beneath a trusted
+/// OS-resolved root. The root may legitimately be the target of Windows folder
+/// redirection, so it is canonicalized once; below that boundary every child is
+/// created one component at a time while its parent is pinned, then opened and
+/// verified before traversal continues. A pre-existing symlink/junction in the
+/// WinGlance-owned subtree is therefore rejected rather than followed.
+pub(crate) fn ensure_owned_subdirectories(trusted_root: &Path, components: &[&str]) -> io::Result<PathBuf> {
+    let mut current = std::fs::canonicalize(trusted_root)?;
+    let mut current_guard = open_pinned_parent(&current)?;
+    for component in components {
+        if component.is_empty()
+            || *component == "."
+            || *component == ".."
+            || component.contains('\\')
+            || component.contains('/')
+            || component.contains('\0')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "owned directory name is not a single path component",
+            ));
+        }
+        let child = current.join(component);
+        let created = match std::fs::create_dir(&child) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(error),
+        };
+        let child_guard = open_pinned_parent(&child)?;
+        if created {
+            // Best-effort metadata durability for the newly-created entry.
+            let _ = unsafe { FlushFileBuffers(current_guard.handle) };
+        }
+        drop(current_guard);
+        current = child;
+        current_guard = child_guard;
+    }
+    drop(current_guard);
+    Ok(current)
+}
+
 /// Randomized temp name: `wg-{pid:x}-{32hex}.tmp` from `BCryptGenRandom`
 /// (128-bit). No fixed name can be pre-armed (CREATE_NEW + OPEN_REPARSE_POINT
-/// defeat a guessed link anyway). The pid prefix lets `sweep_orphan_temps`
-/// keep a live in-flight temp during a restart handoff (`main` sweeps while
-/// old instance still holds its handle). On BCrypt failure the save is aborted
-/// — no predictable fallback.
+/// defeat a guessed link anyway). On BCrypt failure the save is aborted — no
+/// predictable fallback. A hard-crash leftover is intentionally left alone:
+/// startup never deletes pre-existing entries from the user-data directory.
 fn temp_name() -> io::Result<String> {
     use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
     let mut buf = [0u8; 16];
@@ -1095,81 +1135,6 @@ fn temp_name() -> io::Result<String> {
     }
     let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
     Ok(format!("wg-{:x}-{hex}.tmp", std::process::id()))
-}
-
-/// Deletes the temp through its own handle (disposition-delete) and closes
-/// The pattern `sweep_orphan_temps` matches: only files the save path
-/// itself creates (`wg-<pid>-<seq>-<nanos>.tmp`) are ever removed, so a
-/// directory shared with anything else is untouched.
-pub(crate) const ORPHAN_TEMP_PATTERN: (&str, &str) = ("wg-", ".tmp");
-
-/// Best-effort removal of orphaned config-save temps: a hard crash
-/// between temp creation and the rename commit leaves one randomized file
-/// next to config.toml forever. Called once at startup from `main`, against
-/// the data dir; matches ONLY this app's own temp naming. Failures are
-/// silently ignored — a leftover temp is cosmetic, and deleting files on a
-/// best-effort sweep must never risk user data.
-pub(crate) fn sweep_orphan_temps(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with(ORPHAN_TEMP_PATTERN.0) && name.ends_with(ORPHAN_TEMP_PATTERN.1) {
-            // A directory wearing the temp naming pattern (a misbehaving
-            // tool) would fail every remove_file with ACCESS_DENIED — once
-            // per boot, silently. Skip it explicitly.
-            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-                debug!("orphan-temp sweep skipped a directory wearing the temp naming pattern: {name:?}");
-                continue;
-            }
-            // The temp name embeds the creating pid (`temp_name`). A pid that
-            // still runs may be mid-save — this exact window exists during
-            // the restart handoff, where the successor sweeps while the old
-            // instance is still alive — so only a provably dead pid's temp
-            // is an orphan. Unparseable names keep the old behavior: they
-            // match the app's pattern and are best-effort removed.
-            let pid_alive = name
-                .trim_start_matches(ORPHAN_TEMP_PATTERN.0)
-                .split('-')
-                .next()
-                .and_then(|pid| u32::from_str_radix(pid, 16).ok())
-                .is_some_and(orphan_temp_pid_alive);
-            if pid_alive {
-                continue;
-            }
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// Whether `pid` names a live process: `OpenProcess` + a zero wait. A pid
-/// that opens and is not signaled is alive; one that cannot be opened at all
-/// is treated as alive too (a protected process must not lose its in-flight
-/// temp) — except a clean "no such process", which is the dead-pid signature
-/// and lets the sweep do its job.
-fn orphan_temp_pid_alive(pid: u32) -> bool {
-    use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_TIMEOUT};
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
-    unsafe {
-        match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
-            Ok(handle) => {
-                let _guard = match HandleGuard::new(handle) {
-                    Some(g) => g,
-                    None => return true,
-                };
-                let wait = WaitForSingleObject(_guard.get(), 0);
-                // WAIT_TIMEOUT is the live signature; WAIT_FAILED is treated
-                // as alive too — every ambiguous answer errs toward keeping
-                // an in-flight temp, which is the guard's whole point.
-                wait == WAIT_TIMEOUT || wait == WAIT_FAILED
-            }
-            Err(error) => error.code() != windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0),
-        }
-    }
 }
 
 /// Deletes the temp through its own handle (disposition-delete) and closes
@@ -1247,7 +1212,10 @@ fn atomic_replace_file_impl(
         if expected.is_some() {
             return Ok(AtomicReplaceOutcome::Conflict);
         }
-        std::fs::create_dir_all(parent)?;
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "target parent directory does not exist",
+        ));
     }
     let guard = open_pinned_parent(parent)?;
 
@@ -1444,7 +1412,10 @@ pub(crate) fn atomic_create_new_file(target: &Path, content: &[u8]) -> io::Resul
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target has no parent directory"))?;
     if !parent.exists() {
-        std::fs::create_dir_all(parent)?;
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "target parent directory does not exist",
+        ));
     }
     let guard = open_pinned_parent(parent)?;
 
@@ -1577,10 +1548,11 @@ pub(crate) fn atomic_create_new_file(target: &Path, content: &[u8]) -> io::Resul
 /// truncated, or written through a link or a swapped parent.
 pub(crate) fn open_verified_file(path: &Path, truncate: bool) -> io::Result<File> {
     let parent = path.parent();
-    if let Some(parent) = parent
-        && !parent.exists()
-    {
-        std::fs::create_dir_all(parent)?;
+    if parent.is_some_and(|parent| !parent.exists()) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "target parent directory does not exist",
+        ));
     }
     // Held through the open, validation and (when requested) the truncate:
     // while the guard lives the parent cannot be renamed or removed, so no
@@ -1695,10 +1667,11 @@ pub(crate) fn open_verified_file(path: &Path, truncate: bool) -> io::Result<File
 /// `crash_log_write_retained`.
 pub(crate) fn open_verified_file_append(path: &Path) -> io::Result<File> {
     let parent = path.parent();
-    if let Some(parent) = parent
-        && !parent.exists()
-    {
-        std::fs::create_dir_all(parent)?;
+    if parent.is_some_and(|parent| !parent.exists()) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "target parent directory does not exist",
+        ));
     }
     let _guard = match parent {
         Some(parent) => Some(open_pinned_parent(parent)?),
@@ -1784,21 +1757,21 @@ pub(crate) fn open_verified_file_append(path: &Path) -> io::Result<File> {
 /// Appends `data` to `path` through `open_verified_file` under a size cap:
 /// the parent is pinned through the open, the final component is opened
 /// without following a reparse point and rejected if it IS one, and the
-/// identity check lands before any mutation. Used by the crash.log writers,
-/// which run where a full temp+rename transaction is not warranted. When the
-/// file already exceeds `cap`, it is truncated to zero before the append, so
-/// a crash loop cannot grow it without bound (the allocation-free vectored
-/// handler enforces the same budget with its own byte counter). The
-/// truncation happens through the already-verified handle, never through a
-/// re-resolved path.
+/// identity check lands before any mutation. Used only as the crash-log
+/// fallback when the retained append-only handle could not be installed.
+/// Existing bytes are never truncated or overwritten: when the complete new
+/// record would exceed `cap`, it is dropped and the existing file stays
+/// byte-identical. This mirrors the retained crash-log writer's cap-stop
+/// contract and keeps every pre-existing log under the sacred-data rule.
 pub(crate) fn append_verified_bounded(path: &Path, data: &[u8], cap: u64) -> io::Result<()> {
     let mut file = open_verified_file(path, false)?;
-    if cap != u64::MAX && file.metadata()?.len() > cap {
-        file.set_len(0)?;
+    let existing = file.metadata()?.len();
+    let incoming = u64::try_from(data.len()).unwrap_or(u64::MAX);
+    if cap != u64::MAX && incoming > cap.saturating_sub(existing) {
+        return Ok(());
     }
-    // With FILE_WRITE_DATA granted (needed for the cap truncation) the OS no
-    // longer writes at EOF automatically, so position the pointer explicitly
-    // before every append.
+    // The verified handle grants ordinary write access, so seek to EOF before
+    // appending. No truncation or replacement is permitted on this path.
     file.seek(std::io::SeekFrom::End(0))?;
     file.write_all(data)?;
     // Best-effort durability without allocation: crash frequency is low, so
@@ -1821,36 +1794,45 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn orphan_temp_sweep_removes_only_matching_names() {
-        // The sweep must delete exactly this app's dead-pid `wg-*.tmp`
-        // files and nothing else — a foreign temp-looking file, an
-        // unrelated document, or a temp whose creating pid is still alive
-        // (the restart-handoff window) stays put.
-        let dir = std::env::temp_dir().join(format!("wg-sweep-{}-{}", std::process::id(), std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let keep = [
-            "config.toml",
-            "not-wg.tmp",
-            "wg-preserved.tmp.bak",
-            "random.tmp",
-            // This process is alive: its temp must survive the sweep.
-            &format!("wg-{:x}-0-0.tmp", std::process::id()),
-        ];
-        // Pids near the u32 ceiling: no real process can sit there (kernel
-        // pid space tops out far below), so the sweep's dead-pid verdict is
-        // machine-independent and these temps are always removed.
-        let remove = ["wg-fffffffe-0-5678.tmp", "wg-fffffffd-ef-1234.tmp"];
-        for name in keep.iter().chain(remove.iter()) {
-            std::fs::write(dir.join(name), b"x").unwrap();
+    fn owned_subdirectories_create_and_verify_plain_chain() {
+        let root = std::env::temp_dir().join(format!(
+            "wg-owned-chain-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let created = ensure_owned_subdirectories(&root, &["WinGlance", "WinGlance", "data", "logs"]).unwrap();
+        assert!(created.is_dir());
+        assert!(open_pinned_parent(&created).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn owned_subdirectories_reject_reparse_component_without_touching_target() {
+        let root = std::env::temp_dir().join(format!(
+            "wg-owned-link-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let external = std::env::temp_dir().join(format!(
+            "wg-owned-external-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("marker.txt"), b"untouched").unwrap();
+        let link = root.join("WinGlance");
+        if std::os::windows::fs::symlink_dir(&external, &link).is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&external);
+            return;
         }
-        sweep_orphan_temps(&dir);
-        for name in &keep {
-            assert!(dir.join(name).is_file(), "{name} must survive the sweep");
-        }
-        for name in &remove {
-            assert!(!dir.join(name).exists(), "{name} must be swept");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ensure_owned_subdirectories(&root, &["WinGlance", "data"]).is_err());
+        assert_eq!(std::fs::read(external.join("marker.txt")).unwrap(), b"untouched");
+        assert!(!external.join("data").exists());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&external);
     }
 
     #[test]
@@ -2298,11 +2280,12 @@ mod tests {
     }
 
     #[test]
-    fn replace_creates_a_missing_parent_chain() {
+    fn replace_requires_a_prepared_parent_chain() {
         let guard = TestDir::new("deep");
         let target = guard.dir.join("a").join("b").join("config.toml");
-        atomic_replace_file(&target, b"x").unwrap();
-        assert_eq!(std::fs::read(&target).unwrap(), b"x");
+        let error = atomic_replace_file(&target, b"x").expect_err("low-level writes must not create arbitrary parents");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!guard.dir.join("a").exists(), "the rejected write must create nothing");
     }
 
     #[test]
@@ -2378,18 +2361,37 @@ mod tests {
     }
 
     #[test]
-    fn append_verified_writes_and_obeys_the_cap() {
+    fn append_verified_writes_until_cap_then_preserves_existing_bytes() {
         let guard = TestDir::new("append");
         let path = guard.dir.join("crash.log");
 
-        append_verified_bounded(&path, b"first\n", 100).unwrap();
-        append_verified_bounded(&path, b"second\n", 100).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"first\nsecond\n");
+        append_verified_bounded(
+            &path, b"first
+", 100,
+        )
+        .unwrap();
+        append_verified_bounded(
+            &path, b"second
+", 100,
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            before,
+            b"first
+second
+"
+        );
 
-        // A file past the cap is truncated before the next append, so a crash
-        // loop stays bounded: the file ends with only the latest line.
-        append_verified_bounded(&path, b"third\n", 6).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
+        // The fallback writer must never erase old diagnostics to make room.
+        // A complete record that does not fit is dropped and the pre-existing
+        // file remains byte-identical.
+        append_verified_bounded(
+            &path, b"third
+", 6,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
@@ -2429,13 +2431,12 @@ mod tests {
     }
 
     #[test]
-    fn open_verified_file_creates_a_missing_parent_chain() {
+    fn open_verified_file_requires_a_prepared_parent_chain() {
         let guard = TestDir::new("open-deep");
         let path = guard.dir.join("a").join("b").join("live.log");
-        let mut file = open_verified_file(&path, true).unwrap();
-        file.write_all(b"x").unwrap();
-        drop(file);
-        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+        let error = open_verified_file(&path, true).expect_err("verified opens must not create arbitrary parents");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!guard.dir.join("a").exists(), "the rejected open must create nothing");
     }
 
     #[test]

@@ -503,7 +503,7 @@ pub(crate) fn crash_log_append(message: &[u8]) {
     if crash_log_write_retained(message) {
         return;
     }
-    if let Some(dir) = config::Config::data_dir().ok().map(|d| d.join("logs")) {
+    if let Ok(dir) = config::Config::ensure_logs_dir() {
         let _ = crate::winutil::append_verified_bounded(&dir.join("crash.log"), message, CRASH_LOG_CAP);
     }
 }
@@ -1063,19 +1063,14 @@ fn main() -> Result<()> {
     // the log file. The reload marker must be scanned first, because on that
     // path the live log is preserved (appended to) instead of truncated.
     let reload_config = std::env::args_os().any(|arg| arg == "--reload-config");
-    logging::init_logging(&config::Config::default().logs_dir(), reload_config);
-    // Crash handlers install BEFORE Config::load: a failure during
-    // startup must leave a crash.log record, and the logs directory comes
-    // from the built-in defaults, never from the user's file (which may be
-    // exactly what is failing).
-    install_crash_handler(&config::Config::default().logs_dir());
+    let logs_dir = config::Config::ensure_logs_dir()?;
+    logging::init_logging(&logs_dir, reload_config);
+    // Crash handlers install BEFORE Config::load: a failure during startup
+    // must leave a crash.log record. The directory was created through the
+    // verified WinGlance-owned descendant chain above; startup never scans or
+    // removes pre-existing data-directory entries.
+    install_crash_handler(&logs_dir);
     install_panic_hook();
-    // Remove orphaned config-save temps left by a previous hard
-    // crash, before anything recreates them. Data-dir only; app-pattern
-    // only; best-effort.
-    if let Ok(dir) = config::Config::data_dir() {
-        crate::winutil::sweep_orphan_temps(&dir);
-    }
     let config = match config::Config::load() {
         Ok(config) => config,
         Err(error) => {

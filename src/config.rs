@@ -1,7 +1,6 @@
 use crate::smtc::normalize_for_match;
 use log::{debug, info, warn};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -548,22 +547,6 @@ impl AppearanceConfig {
 /// Reads the config file, retrying a bounded number of times so a transient
 /// read failure (a momentary AV/indexer lock) does not count as a corrupt
 /// config. Returns the last error when every attempt fails.
-fn read_config_with_retry(config_path: &Path) -> std::io::Result<String> {
-    let mut error = None;
-    for attempt in 0..Config::READ_RETRIES {
-        match read_config_bounded(config_path) {
-            Ok(content) => return Ok(content),
-            Err(err) => {
-                error = Some(err);
-                if attempt + 1 < Config::READ_RETRIES {
-                    std::thread::sleep(Config::READ_RETRY_DELAY);
-                }
-            }
-        }
-    }
-    Err(error.unwrap_or_else(|| std::io::Error::other("read retries exhausted")))
-}
-
 fn read_config_with_retry_verified(config_path: &Path) -> std::io::Result<(String, crate::winutil::FileIdentity)> {
     let mut error = None;
     for attempt in 0..Config::READ_RETRIES {
@@ -582,17 +565,6 @@ fn read_config_with_retry_verified(config_path: &Path) -> std::io::Result<(Strin
         }
     }
     Err(error.unwrap_or_else(|| std::io::Error::other("read retries exhausted")))
-}
-
-/// One bounded read attempt: buffers at most `MAX_CONFIG_BYTES + 1` bytes,
-/// then decodes them as UTF-8. The callers' post-read length check treats the
-/// result as oversized when it exceeds `MAX_CONFIG_BYTES`, so a hostile file
-/// can never make the process allocate by its declared size.
-fn read_config_bounded(config_path: &Path) -> std::io::Result<String> {
-    let file = std::fs::File::open(config_path)?;
-    let mut bytes = Vec::new();
-    file.take(MAX_CONFIG_BYTES as u64 + 1).read_to_end(&mut bytes)?;
-    String::from_utf8(bytes).map_err(|error| std::io::Error::other(format!("config is not valid UTF-8: {error}")))
 }
 
 /// Clamps a finite float into `min..=max`. A non-finite value — `NaN`, `+inf`
@@ -616,7 +588,12 @@ impl Config {
     const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
 
     pub fn load() -> anyhow::Result<Self> {
-        Self::load_from_path(&Self::config_path()?)
+        #[cfg(test)]
+        if test_hooks::CONFIG_PATH_OVERRIDE.get().is_some() {
+            return Self::load_from_path(&Self::config_path()?);
+        }
+        let data_dir = Self::ensure_data_dir()?;
+        Self::load_from_path(&data_dir.join("config.toml"))
     }
 
     /// Rejects a config path whose declared length exceeds `MAX_CONFIG_BYTES`
@@ -667,8 +644,8 @@ impl Config {
                 "exceeds the {MAX_CONFIG_BYTES} byte size bound"
             )));
         }
-        let content = match read_config_with_retry(config_path) {
-            Ok(content) => content,
+        let content = match read_config_with_retry_verified(config_path) {
+            Ok((content, _identity)) => content,
             Err(error) => {
                 return Ok(Self::defaults_in_memory(&format!(
                     "could not be read after {} attempts ({error})",
@@ -913,9 +890,36 @@ impl Config {
         Ok(Self::data_dir()?.join("config.toml"))
     }
 
-    pub fn data_dir() -> anyhow::Result<PathBuf> {
+    fn resolved_app_data_root() -> anyhow::Result<PathBuf> {
         let base = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("Could not find the Windows app-data directory"))?;
+        std::fs::canonicalize(&base).map_err(|error| {
+            anyhow::anyhow!(
+                "Could not resolve the Windows app-data directory {}: {error}",
+                base.display()
+            )
+        })
+    }
+
+    pub fn data_dir() -> anyhow::Result<PathBuf> {
+        let base = Self::resolved_app_data_root()?;
         Ok(base.join("WinGlance").join("WinGlance").join("data"))
+    }
+
+    /// Creates (or verifies) only WinGlance-owned descendants beneath the
+    /// OS-resolved AppData root. The root itself is trusted after Windows'
+    /// redirection has been resolved; every child we own is then pinned and
+    /// rejected if it is a reparse point before traversal continues.
+    pub(crate) fn ensure_data_dir() -> anyhow::Result<PathBuf> {
+        let base = Self::resolved_app_data_root()?;
+        Ok(crate::winutil::ensure_owned_subdirectories(
+            &base,
+            &["WinGlance", "WinGlance", "data"],
+        )?)
+    }
+
+    pub(crate) fn ensure_logs_dir() -> anyhow::Result<PathBuf> {
+        let data = Self::ensure_data_dir()?;
+        Ok(crate::winutil::ensure_owned_subdirectories(&data, &["logs"])?)
     }
 
     pub fn logs_dir(&self) -> PathBuf {

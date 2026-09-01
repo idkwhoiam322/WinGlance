@@ -46,9 +46,15 @@ with media playing — cannot be verified headless.
   after an in-app "Restart app", at Debug level (session churn, dedup skips
   and suppressed events are logged
   — use it to answer "why did/didn't a notification fire").
-- Never delete user data under `%APPDATA%\WinGlance\WinGlance\data\` (only the
-  log file may be truncated at startup). The Settings pane has a "Copy logs"
-  button that puts the log on the clipboard.
+- Never delete user data under `%APPDATA%\WinGlance\WinGlance\data\`. No
+  startup cleanup may remove pre-existing entries, including `wg-*.tmp`: a
+  hard-crash leftover is safer than guessing that a future/user file is
+  disposable. The only deletion allowed is the exact randomized temp created
+  by the current save transaction on that transaction's own failure path.
+  `log-Live.log` is the sole startup-truncation exception; after startup it is
+  append-only and stops accepting lines at its cap rather than truncating or
+  rotating earlier diagnostics. The Settings pane has a "Copy logs" button
+  that puts the log on the clipboard.
 
 ## Never launch anything
 
