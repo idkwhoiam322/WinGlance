@@ -1142,7 +1142,7 @@ fn main() -> Result<()> {
     // event can be queued or superseded on the overlay side — and the cell
     // survives worker restarts, so a session recreated after a restart still
     // compares against what the user actually sees.
-    let now_showing: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let now_showing: Arc<Mutex<Option<crate::events::SourceIdentity>>> = Arc::new(Mutex::new(None));
     let now_showing_supervisor = now_showing.clone();
     // Churn/wedged-read exclusions, shared across worker generations: a
     // replacement worker must not re-pay a fresh 10 s read for every source
@@ -2249,7 +2249,7 @@ mod tests {
         for i in 0..(EVENT_QUEUE_CAP + 50) {
             queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
                 PlaybackState::Paused,
-                format!("src-{i}"),
+                format!("src-{i}").into(),
             )));
             enforce_queue_cap(&mut queue, "test");
         }
@@ -2304,7 +2304,7 @@ mod tests {
         for i in 0..EVENT_QUEUE_CAP {
             queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
                 PlaybackState::Playing,
-                format!("src-{i}"),
+                format!("src-{i}").into(),
             )));
             enforce_queue_cap(&mut queue, "test");
         }
@@ -2325,7 +2325,7 @@ mod tests {
         for i in 0..EVENT_QUEUE_CAP {
             queue.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
                 PlaybackState::Playing,
-                format!("src-{i}"),
+                format!("src-{i}").into(),
             )));
         }
         queue.push_back(Arc::new(MediaEvent::ArtworkBudgetExceeded));
@@ -2403,7 +2403,7 @@ mod tests {
             for i in 0..3 {
                 q.push_back(Arc::new(MediaEvent::PlaybackStateChanged(
                     PlaybackState::Playing,
-                    format!("src-{i}"),
+                    format!("src-{i}").into(),
                 )));
             }
         }
@@ -2497,7 +2497,7 @@ mod tests {
         let mut queue = VecDeque::new();
         for index in 0..EVENT_QUEUE_CAP + 5 {
             queue.push_back(Arc::new(MediaEvent::SourceGone {
-                source_app: format!("source-{index}"),
+                source_app: format!("source-{index}").into(),
             }));
             enforce_queue_cap(&mut queue, "test");
         }

@@ -2053,7 +2053,7 @@ pub(super) fn pill_text_from_track(track: &TrackInfo) -> PillText {
     PillText {
         title: track.title.clone(),
         artist: track.artist.clone(),
-        source_app: track.source_app.clone(),
+        source_app: track.source_app.as_str().to_owned(),
         app_icon: track.app_icon.clone(),
         meta_clock,
         meta,
@@ -2412,9 +2412,13 @@ pub(super) fn draw_compact_pill(
                 // no app icon is available.
                 None => {
                     let name = if !source_app.is_empty() {
-                        source_app.clone()
+                        source_app.as_str().to_owned()
                     } else {
-                        state.current_source.clone().unwrap_or_default()
+                        state
+                            .current_source
+                            .as_ref()
+                            .map(|source| source.as_str().to_owned())
+                            .unwrap_or_default()
                     };
                     (name, None, *playback, PlaybackType::Unknown)
                 }
@@ -2547,9 +2551,13 @@ pub(super) fn draw_morph_content(
                 // TrackChanged): the source name stands in for the title.
                 None => {
                     let name = if !source_app.is_empty() {
-                        source_app.clone()
+                        source_app.as_str().to_owned()
                     } else {
-                        state.current_source.clone().unwrap_or_default()
+                        state
+                            .current_source
+                            .as_ref()
+                            .map(|source| source.as_str().to_owned())
+                            .unwrap_or_default()
                     };
                     (name, None, *playback, PlaybackType::Unknown)
                 }

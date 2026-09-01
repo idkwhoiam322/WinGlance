@@ -1,5 +1,9 @@
-use std::sync::Arc;
+use std::collections::hash_map::RandomState;
+use std::fmt;
+use std::hash::BuildHasher;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
@@ -63,6 +67,114 @@ const _: () = {
     }
 };
 
+/// Stable process-local identity for one media source plus its bounded
+/// user-facing label. Equality and hashing include a keyed 128-bit fingerprint
+/// of the full raw AUMID, so two distinct AUMIDs that collapse to the same
+/// friendly label cannot share cooldowns, caches, queue slots, or playback
+/// state. The raw AUMID is intentionally not retained after construction.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct SourceIdentity {
+    fingerprint: [u64; 2],
+    label: Arc<String>,
+}
+
+impl SourceIdentity {
+    pub(crate) fn from_raw_and_label(raw: &str, label: impl Into<String>) -> Self {
+        Self {
+            fingerprint: Self::fingerprint(raw),
+            label: Arc::new(label.into()),
+        }
+    }
+
+    fn fingerprint(raw: &str) -> [u64; 2] {
+        static HASHERS: OnceLock<(RandomState, RandomState)> = OnceLock::new();
+        let (first, second) = HASHERS.get_or_init(|| (RandomState::new(), RandomState::new()));
+        [first.hash_one(raw), second.hash_one(raw)]
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.label
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(label: impl AsRef<str>) -> Self {
+        let label = label.as_ref();
+        Self::from_raw_and_label(label, label)
+    }
+}
+
+impl Default for SourceIdentity {
+    fn default() -> Self {
+        Self {
+            fingerprint: [0, 0],
+            label: Arc::new(String::new()),
+        }
+    }
+}
+
+impl Deref for SourceIdentity {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for SourceIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for SourceIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceIdentity")
+            .field("label", &self.as_str())
+            .field("fingerprint", &self.fingerprint)
+            .finish()
+    }
+}
+
+impl From<&str> for SourceIdentity {
+    fn from(value: &str) -> Self {
+        Self::from_raw_and_label(value, value)
+    }
+}
+
+impl From<String> for SourceIdentity {
+    fn from(value: String) -> Self {
+        let fingerprint = Self::fingerprint(&value);
+        Self {
+            fingerprint,
+            label: Arc::new(value),
+        }
+    }
+}
+
+impl From<&SourceIdentity> for SourceIdentity {
+    fn from(value: &SourceIdentity) -> Self {
+        value.clone()
+    }
+}
+
+impl PartialEq<str> for SourceIdentity {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for SourceIdentity {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for SourceIdentity {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ArtworkLifetime {
     bytes: u64,
@@ -116,7 +228,7 @@ pub struct TrackInfo {
     /// App icon (premultiplied BGRA pixel data) extracted from the source's
     /// AUMID via the shell, cached per-app and shared across track clones.
     pub app_icon: Option<Arc<[u8]>>,
-    pub source_app: String,
+    pub source_app: SourceIdentity,
     /// Total duration in seconds, when the app reports timeline info.
     pub duration_secs: Option<u64>,
     /// 1-based track number within the album, when provided.
@@ -426,14 +538,14 @@ pub enum PlaybackType {
 #[allow(clippy::large_enum_variant)]
 pub enum MediaEvent {
     TrackChanged(TrackInfo),
-    PlaybackStateChanged(PlaybackState, String),
+    PlaybackStateChanged(PlaybackState, SourceIdentity),
     /// A session was seen but is not tracked (rejected by `media_sources`
     /// or on the churn cool-down). Carries whatever display info SMTC exposed
     /// at discovery time. The history records it as a muted row so all media
     /// sources are visible; `accepted` marks entries whose state reached the
     /// pill — a tracked source's redundant re-report records grey.
     SessionRejected {
-        source_app: String,
+        source_app: SourceIdentity,
         title: String,
         artist: String,
         state: PlaybackState,
@@ -460,7 +572,7 @@ pub enum MediaEvent {
     /// screen. Never rendered as a pill and never stored as the active
     /// content — it is a data update only.
     ProgressChanged {
-        source_app: String,
+        source_app: SourceIdentity,
         position_secs: Option<f64>,
         duration_secs: Option<u64>,
         playback_rate: Option<f64>,
@@ -474,7 +586,7 @@ pub enum MediaEvent {
     /// a track whose source is gone. Never rendered as a pill and never
     /// stored as the active content.
     SourceGone {
-        source_app: String,
+        source_app: SourceIdentity,
     },
 }
 
@@ -550,6 +662,18 @@ pub(crate) fn decode_artwork_pm(data: &[u8], size: usize) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_identity_distinguishes_raw_aumids_with_the_same_label() {
+        let a = SourceIdentity::from_raw_and_label("Publisher.One_family!Player", "Player");
+        let b = SourceIdentity::from_raw_and_label("Publisher.Two_family!Player", "Player");
+        assert_eq!(a.as_str(), b.as_str());
+        assert_ne!(a, b, "lossy display labels must never become behavior identity");
+        let mut map = std::collections::HashMap::new();
+        map.insert(a, 1);
+        map.insert(b, 2);
+        assert_eq!(map.len(), 2);
+    }
 
     #[test]
     fn playback_states_are_compared_by_value() {

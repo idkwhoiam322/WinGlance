@@ -1,8 +1,8 @@
 use crate::autostart;
 use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, SaveOutcome, VerticalPosition};
 use crate::events::{
-    COMPACT_POSITION_MSG, MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, RESTART_RESULT_MSG, TOGGLE_MSG,
-    TrackInfo, media_event_into_owned,
+    COMPACT_POSITION_MSG, MEDIA_EVENT_MSG, MediaEvent, POSITION_MSG, PlaybackState, RESTART_RESULT_MSG, SourceIdentity,
+    TOGGLE_MSG, TrackInfo, media_event_into_owned,
 };
 use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
@@ -1289,10 +1289,10 @@ struct MainWindowState {
     /// Last playback state each source app reported, so a new track from a
     /// source starts with its own state instead of inheriting the previous
     /// activity's (which may belong to another app).
-    source_states: HashMap<String, PlaybackState>,
+    source_states: HashMap<SourceIdentity, PlaybackState>,
     /// Insertion order of `source_states` keys, so the map can be capped by
     /// forgetting the oldest sources first.
-    source_order: VecDeque<String>,
+    source_order: VecDeque<SourceIdentity>,
     /// Wake flag for the event queue: `true` while a `MEDIA_EVENT_MSG` is in
     /// flight. The forwarder and this window only post when the flag was
     /// clear, so an event burst collapses into one wake message per drain.
@@ -2067,7 +2067,7 @@ impl MainWindowState {
     /// system that churns through many apps cannot grow it without bound.
     /// Forgetting the oldest source only falls back to the default state for
     /// its next track; it never drops user data.
-    fn remember_source_state(&mut self, source: String, state: PlaybackState) {
+    fn remember_source_state(&mut self, source: SourceIdentity, state: PlaybackState) {
         if !self.source_states.contains_key(&source) {
             self.source_order.push_back(source.clone());
         }
@@ -2311,7 +2311,7 @@ impl MainWindowState {
     /// state (the worker suppresses the paired event when it emits a
     /// TrackChanged, so the state must arrive on the track), then the source's
     /// last remembered state, then Playing.
-    fn resolve_track_state(track: &TrackInfo, source_states: &HashMap<String, PlaybackState>) -> PlaybackState {
+    fn resolve_track_state(track: &TrackInfo, source_states: &HashMap<SourceIdentity, PlaybackState>) -> PlaybackState {
         track
             .playback_state
             .or_else(|| source_states.get(&track.source_app).copied())
@@ -2394,7 +2394,14 @@ impl MainWindowState {
     /// Records a session that was seen but not tracked (filtered by
     /// `media_sources` or on the churn cool-down). The row renders muted;
     /// it never becomes the "Now Playing" activity.
-    fn add_session(&mut self, source_app: String, title: String, artist: String, state: PlaybackState, accepted: bool) {
+    fn add_session(
+        &mut self,
+        source_app: SourceIdentity,
+        title: String,
+        artist: String,
+        state: PlaybackState,
+        accepted: bool,
+    ) {
         let track = TrackInfo {
             title,
             artist,
@@ -4982,7 +4989,7 @@ fn history_cell_texts(track: &TrackInfo, at_label: &str, state: PlaybackState) -
         if track.source_app.trim().is_empty() {
             String::new()
         } else {
-            track.source_app.clone()
+            track.source_app.as_str().to_owned()
         },
     ]
 }
@@ -5157,7 +5164,7 @@ fn push_track_detail_lines(parts: &mut Vec<String>, track: &TrackInfo) {
         parts.push(meta);
     }
     if !track.source_app.trim().is_empty() {
-        parts.push(track.source_app.clone());
+        parts.push(track.source_app.as_str().to_owned());
     }
 }
 
@@ -8888,13 +8895,14 @@ mod tests {
         // never by defaulting to Playing (which would mask a pause/stop that
         // rode the TrackChanged because the worker suppressed its paired state
         // event in the same batch).
+        let spotify = SourceIdentity::for_test("spotify");
         let mk = |state: Option<PlaybackState>| TrackInfo {
-            source_app: "spotify".to_string(),
+            source_app: spotify.clone(),
             playback_state: state,
             ..TrackInfo::default()
         };
-        let mut cache: HashMap<String, PlaybackState> = HashMap::new();
-        cache.insert("spotify".to_string(), PlaybackState::Paused);
+        let mut cache: HashMap<SourceIdentity, PlaybackState> = HashMap::new();
+        cache.insert(spotify.clone(), PlaybackState::Paused);
         // Snapshot wins over the remembered source state.
         assert_eq!(
             MainWindowState::resolve_track_state(&mk(Some(PlaybackState::Stopped)), &cache),
@@ -8906,7 +8914,7 @@ mod tests {
             PlaybackState::Paused
         );
         // A None snapshot with no cache falls back to Playing.
-        let empty: HashMap<String, PlaybackState> = HashMap::new();
+        let empty: HashMap<SourceIdentity, PlaybackState> = HashMap::new();
         assert_eq!(
             MainWindowState::resolve_track_state(&mk(None), &empty),
             PlaybackState::Playing

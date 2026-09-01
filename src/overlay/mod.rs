@@ -7,7 +7,8 @@
 
 use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, VerticalPosition};
 use crate::events::{
-    MEDIA_EVENT_MSG, MediaEvent, PlaybackState, TOGGLE_MSG, TrackInfo, artwork_same, media_event_into_owned,
+    MEDIA_EVENT_MSG, MediaEvent, PlaybackState, SourceIdentity, TOGGLE_MSG, TrackInfo, artwork_same,
+    media_event_into_owned,
 };
 use crate::gdi::FontProvider;
 use crate::palette::Palette;
@@ -466,7 +467,7 @@ struct PillText {
 }
 
 struct ReducedOverlayBatch {
-    track_sources: Vec<String>,
+    track_sources: Vec<SourceIdentity>,
     events: Vec<MediaEvent>,
 }
 
@@ -475,7 +476,7 @@ struct ReducedOverlayBatch {
 /// order remaining progress updates before display events. `now` is supplied
 /// by the impure shell so tests can pin the merged position timestamp.
 fn reduce_overlay_batch(batch: Vec<Arc<MediaEvent>>, now: Instant) -> ReducedOverlayBatch {
-    let track_sources: Vec<String> = batch
+    let track_sources: Vec<SourceIdentity> = batch
         .iter()
         .filter_map(|event| match event.as_ref() {
             MediaEvent::TrackChanged(track) => Some(track.source_app.clone()),
@@ -484,7 +485,7 @@ fn reduce_overlay_batch(batch: Vec<Arc<MediaEvent>>, now: Instant) -> ReducedOve
         .collect();
     let owned: Vec<MediaEvent> = batch.into_iter().map(media_event_into_owned).collect();
     #[allow(clippy::type_complexity)]
-    let progress_by_source: HashMap<String, (Option<f64>, Option<u64>, Option<f64>)> = owned
+    let progress_by_source: HashMap<SourceIdentity, (Option<f64>, Option<u64>, Option<f64>)> = owned
         .iter()
         .filter_map(|event| match event {
             MediaEvent::ProgressChanged {
@@ -496,14 +497,14 @@ fn reduce_overlay_batch(batch: Vec<Arc<MediaEvent>>, now: Instant) -> ReducedOve
             _ => None,
         })
         .collect();
-    let has_track_for_source: HashSet<String> = owned
+    let has_track_for_source: HashSet<SourceIdentity> = owned
         .iter()
         .filter_map(|event| match event {
             MediaEvent::TrackChanged(track) => Some(track.source_app.clone()),
             _ => None,
         })
         .collect();
-    let mut last_track_idx: HashMap<String, usize> = HashMap::new();
+    let mut last_track_idx: HashMap<SourceIdentity, usize> = HashMap::new();
     for (idx, event) in owned.iter().enumerate() {
         if let MediaEvent::TrackChanged(track) = event {
             last_track_idx.insert(track.source_app.clone(), idx);
@@ -844,7 +845,7 @@ struct OverlayState {
     /// snapshot's stale position/rate — the live estimate, anchor and rate the
     /// overlay maintains via `ProgressChanged` and the tick crawl stay
     /// authoritative. A different identity re-seeds.
-    progress_track_key: Option<(String, String, String)>,
+    progress_track_key: Option<(SourceIdentity, String, String)>,
     /// Wake flag for the event queue: `true` while a `MEDIA_EVENT_MSG` is in
     /// flight. The forwarder and this window only post when the flag was
     /// clear, so an event burst collapses into one wake message per drain.
@@ -875,7 +876,7 @@ struct OverlayState {
     /// cleared on dismiss — the pill's last content is still what the user
     /// last saw, so suppressing a re-report of it stays correct. Attached
     /// by `create_window`; `None` in tests.
-    now_showing: Option<Arc<Mutex<Option<String>>>>,
+    now_showing: Option<Arc<Mutex<Option<SourceIdentity>>>>,
     /// Current track as the pill's accessible name, kept in a shared cell so
     /// the read-only UIA name provider (which UIA core may call from any
     /// thread, and which can outlive the window) never dereferences window
@@ -887,7 +888,7 @@ struct OverlayState {
     /// Source app of the last TrackChanged shown, used as the label fallback
     /// in state pills for current-session playback states so the pill always
     /// names the app that owns the media — never another app's last track.
-    current_source: Option<String>,
+    current_source: Option<SourceIdentity>,
     /// Per-source track cache: the last TrackChanged shown for each source app,
     /// so that a later PlaybackStateChanged for that source can render the
     /// correct track info instead of the most-recently-shown app's track, and
@@ -896,7 +897,7 @@ struct OverlayState {
     /// insert — see `cache_track`). LRU-ordered and bounded by
     /// `TRACK_CACHE_CAP` alone: retention is indefinite once inserted, so a
     /// source that stops playing drops out only when the cap evicts it.
-    track_cache: HashMap<String, TrackInfo>,
+    track_cache: HashMap<SourceIdentity, TrackInfo>,
     /// Last known playback state per source app, so successor selection knows
     /// which cached tracks belong to sources that are *actually playing* (see
     /// `best_successor`). Fed by TrackChanged snapshots (only when the
@@ -905,13 +906,13 @@ struct OverlayState {
     /// allow-list-removed or churn-excluded source is marked Stopped and can
     /// never surface again until it emits a new event). Bounded by
     /// `LEDGER_STATE_CAP`, evicting Stopped entries first.
-    source_state: HashMap<String, PlaybackState>,
+    source_state: HashMap<SourceIdentity, PlaybackState>,
     /// Per-source monotonic artwork generation watermark; late decodes whose
     /// generation is older than the watermark are dropped (receive_events).
-    artwork_gen: HashMap<String, u64>,
+    artwork_gen: HashMap<SourceIdentity, u64>,
     /// Recency order of `track_cache` keys (front = oldest). Kept in sync by
     /// `cache_track`.
-    track_cache_order: VecDeque<String>,
+    track_cache_order: VecDeque<SourceIdentity>,
     /// Pre-rendered text pieces of the pill currently on screen, resolved once
     /// per content change (see `resolve_pill_text`).
     pill_text: Option<PillText>,
@@ -2093,8 +2094,8 @@ impl OverlayState {
     /// ledger somehow exceeds the cap with no Stopped entry (the worker's
     /// admission caps keep live sources far below `LEDGER_STATE_CAP`), any
     /// entry is evicted as a defense.
-    fn remember_source_state(&mut self, source: &str, state: PlaybackState) {
-        self.source_state.insert(source.to_owned(), state);
+    fn remember_source_state(&mut self, source: &SourceIdentity, state: PlaybackState) {
+        self.source_state.insert(source.clone(), state);
         if self.source_state.len() <= LEDGER_STATE_CAP {
             return;
         }
@@ -2228,7 +2229,7 @@ impl OverlayState {
     /// The source an event belongs to, for content-ownership checks. None for
     /// events that never render (rejected sessions, worker failures, progress
     /// updates).
-    fn event_source(event: &MediaEvent) -> Option<&str> {
+    fn event_source(event: &MediaEvent) -> Option<&SourceIdentity> {
         match event {
             MediaEvent::TrackChanged(track) => Some(&track.source_app),
             MediaEvent::PlaybackStateChanged(_, source) => Some(source),
@@ -2241,14 +2242,14 @@ impl OverlayState {
     /// whose state is Paused, Stopped, or unknown is never a successor:
     /// swapping the pill to it would announce "now playing" content that is
     /// not playing. Returns None when no playing source has a cached track.
-    fn best_successor(&self, excluded: &str) -> Option<TrackInfo> {
+    fn best_successor(&self, excluded: Option<&SourceIdentity>) -> Option<TrackInfo> {
         self.track_cache_order.iter().rev().find_map(|source| {
-            if source.as_str() == excluded {
+            if excluded.is_some_and(|excluded| source == excluded) {
                 return None;
             }
             self.track_cache
                 .get(source)
-                .filter(|_| self.source_state.get(source.as_str()) == Some(&PlaybackState::Playing))
+                .filter(|_| self.source_state.get(source) == Some(&PlaybackState::Playing))
                 .cloned()
         })
     }
@@ -2265,12 +2266,12 @@ impl OverlayState {
     fn pinned_track(&self) -> Option<TrackInfo> {
         let pin = self.config.behavior.pinned_source.as_deref()?;
         self.track_cache_order.iter().rev().find_map(|source| {
-            if !source_matches_pin(source, pin) {
+            if !source_matches_pin(source.as_str(), pin) {
                 return None;
             }
             self.track_cache
                 .get(source)
-                .filter(|_| self.source_state.get(source.as_str()) == Some(&PlaybackState::Playing))
+                .filter(|_| self.source_state.get(source) == Some(&PlaybackState::Playing))
                 .cloned()
         })
     }
@@ -2296,7 +2297,7 @@ impl OverlayState {
         // The pill already rests on the pinned source (its track, or a state
         // pill for it): nothing to return to.
         let shown_source = self.content.as_ref().and_then(Self::event_source);
-        if shown_source.is_some_and(|source| source_matches_pin(source, pin)) {
+        if shown_source.is_some_and(|source| source_matches_pin(source.as_str(), pin)) {
             return false;
         }
         let Some(track) = self.pinned_track() else {
@@ -2319,7 +2320,7 @@ impl OverlayState {
     /// pill when nothing playing remains. Runs regardless of the notifications
     /// toggle — a disabled overlay must not resurrect a retired source's
     /// content at the next show.
-    fn retire_source(&mut self, retired: &str) {
+    fn retire_source(&mut self, retired: &SourceIdentity) {
         // The retired source must never be a successor again: mark it Stopped
         // in the ledger before the early return below, so a later successor
         // lookup (for another source) cannot surface its cached track.
@@ -2345,11 +2346,11 @@ impl OverlayState {
         let last_is_retired = self
             .last_track
             .as_ref()
-            .is_some_and(|track| track.source_app == retired);
+            .is_some_and(|track| &track.source_app == retired);
         if !content_is_retired && !held_is_retired && !last_is_retired {
             return;
         }
-        let successor = self.best_successor(retired);
+        let successor = self.best_successor(Some(retired));
         if content_is_retired {
             if let Some(track) = &successor {
                 debug!("retired source {retired}: swapping the pill to the most recent playing source");
@@ -2372,7 +2373,7 @@ impl OverlayState {
         if self
             .last_track
             .as_ref()
-            .is_some_and(|track| track.source_app == retired)
+            .is_some_and(|track| &track.source_app == retired)
         {
             self.last_track = successor.clone();
         }
@@ -2394,7 +2395,7 @@ impl OverlayState {
     /// tombstone itself — hiding it early would cut the deliberate dismissal
     /// UX. Runs regardless of the notifications toggle — a disabled overlay
     /// must not restore the gone source's content at the next show.
-    fn retire_source_gone(&mut self, gone: &str) {
+    fn retire_source_gone(&mut self, gone: &SourceIdentity) {
         // The settled source must never be a successor again: mark it Stopped
         // unconditionally (before the content checks), so a later SourceGone
         // for another source cannot surface its cached track. A returning
@@ -2405,17 +2406,17 @@ impl OverlayState {
         self.pending.retain(|event| Self::event_source(event) != Some(gone));
         let content_is_gone_track = matches!(
             self.content.as_ref(),
-            Some(MediaEvent::TrackChanged(track)) if track.source_app == gone
+            Some(MediaEvent::TrackChanged(track)) if &track.source_app == gone
         );
         let held_is_gone_track = matches!(
             self.held_content.as_ref(),
-            Some(MediaEvent::TrackChanged(track)) if track.source_app == gone
+            Some(MediaEvent::TrackChanged(track)) if &track.source_app == gone
         );
-        let last_is_gone = self.last_track.as_ref().is_some_and(|track| track.source_app == gone);
+        let last_is_gone = self.last_track.as_ref().is_some_and(|track| &track.source_app == gone);
         if !content_is_gone_track && !held_is_gone_track && !last_is_gone {
             return;
         }
-        let successor = self.best_successor(gone);
+        let successor = self.best_successor(Some(gone));
         if content_is_gone_track {
             if let Some(track) = &successor {
                 debug!("settled source {gone}: swapping the pill to the most recent playing source");
@@ -2455,7 +2456,7 @@ impl OverlayState {
     /// TrackChanged re-display is the same timeline the progress state already
     /// tracks. Matches the worker's track dedup identity, so a session-
     /// recreation re-emit and a held-content resume both compare equal.
-    fn track_progress_key(track: &TrackInfo) -> (String, String, String) {
+    fn track_progress_key(track: &TrackInfo) -> (SourceIdentity, String, String) {
         (track.source_app.clone(), track.title.clone(), track.artist.clone())
     }
 
@@ -3326,7 +3327,7 @@ impl OverlayState {
                     && matches!(self.phase, Phase::Shown)
                 {
                     let tombstone_source = match &self.content {
-                        Some(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, source)) => Some(source.as_str()),
+                        Some(MediaEvent::PlaybackStateChanged(PlaybackState::Stopped, source)) => Some(source),
                         _ => None,
                     };
                     let pinned_tombstone = tombstone_source.is_some_and(|source| {
@@ -3334,10 +3335,10 @@ impl OverlayState {
                             .behavior
                             .pinned_source
                             .as_deref()
-                            .is_some_and(|pin| source_matches_pin(source, pin))
+                            .is_some_and(|pin| source_matches_pin(source.as_str(), pin))
                     });
                     let successor = if pinned_tombstone {
-                        tombstone_source.and_then(|gone| self.best_successor(gone))
+                        tombstone_source.and_then(|gone| self.best_successor(Some(gone)))
                     } else {
                         None
                     };
@@ -4183,7 +4184,7 @@ impl OverlayState {
             // been served by `pinned_track` above.
             if let Some(track) = self.pinned_track() {
                 self.show(MediaEvent::TrackChanged(track), true);
-            } else if let Some(track) = self.best_successor("") {
+            } else if let Some(track) = self.best_successor(None) {
                 self.show(MediaEvent::TrackChanged(track), true);
             } else if let Some(held) = self.held_content.take() {
                 self.show(held, true);
@@ -4352,7 +4353,7 @@ pub(crate) fn create_window(
     config: Config,
     queue: EventQueue,
     wake: Arc<AtomicBool>,
-    now_showing: Arc<Mutex<Option<String>>>,
+    now_showing: Arc<Mutex<Option<SourceIdentity>>>,
 ) -> Result<HWND> {
     let module = unsafe { GetModuleHandleW(None) }.context("getting the process module")?;
     let instance: HINSTANCE = module.into();
@@ -5013,7 +5014,7 @@ mod tests {
         TrackInfo {
             title: title.into(),
             artist: artist.into(),
-            source_app: source.into(),
+            source_app: SourceIdentity::for_test(source),
             ..TrackInfo::default()
         }
     }
@@ -5136,13 +5137,13 @@ mod tests {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.cache_track(&track_for("alpha", "Song A", "Artist"));
         state.cache_track(&track_for("zeta", "Song Z", "Artist"));
-        assert!(state.track_cache.contains_key("alpha"));
+        assert!(state.track_cache.contains_key(&SourceIdentity::for_test("alpha")));
         // Retiring a source that is not on screen must still drop its cache
         // entry: the purge runs before the early return.
-        state.retire_source("alpha");
-        assert!(!state.track_cache.contains_key("alpha"));
+        state.retire_source(&SourceIdentity::for_test("alpha"));
+        assert!(!state.track_cache.contains_key(&SourceIdentity::for_test("alpha")));
         assert!(!state.track_cache_order.iter().any(|s| s == "alpha"));
-        assert!(state.track_cache.contains_key("zeta"));
+        assert!(state.track_cache.contains_key(&SourceIdentity::for_test("zeta")));
         assert!(state.track_cache_order.iter().any(|s| s == "zeta"));
     }
 
@@ -5154,13 +5155,13 @@ mod tests {
         }
         assert_eq!(state.track_cache.len(), TRACK_CACHE_CAP);
         assert!(
-            !state.track_cache.contains_key("source-0"),
+            !state.track_cache.contains_key(&SourceIdentity::for_test("source-0")),
             "the two oldest sources must be evicted"
         );
         assert!(
             state
                 .track_cache
-                .contains_key(&format!("source-{}", TRACK_CACHE_CAP + 1)),
+                .contains_key(&SourceIdentity::for_test(format!("source-{}", TRACK_CACHE_CAP + 1))),
             "the newest source stays"
         );
         // Re-caching an existing source refreshes its recency: it survives
@@ -5168,7 +5169,7 @@ mod tests {
         state.cache_track(&track_for("source-1", "Song", "Artist"));
         state.cache_track(&track_for("source-new", "Song", "Artist"));
         assert!(
-            state.track_cache.contains_key("source-1"),
+            state.track_cache.contains_key(&SourceIdentity::for_test("source-1")),
             "a re-cached source must not be evicted"
         );
         assert_eq!(state.track_cache.len(), TRACK_CACHE_CAP);
@@ -5187,10 +5188,10 @@ mod tests {
         state.track_cache_order.push_back("stale".into());
         state.cache_track(&track_for("fresh", "New", "Song"));
         assert!(
-            state.track_cache.contains_key("stale"),
+            state.track_cache.contains_key(&SourceIdentity::for_test("stale")),
             "an idle entry must be retained below the cap"
         );
-        assert!(state.track_cache.contains_key("fresh"));
+        assert!(state.track_cache.contains_key(&SourceIdentity::for_test("fresh")));
         assert_eq!(state.track_cache.len(), 2);
         // ... and the cap still evicts the oldest entries once exceeded.
         for i in 0..TRACK_CACHE_CAP {
@@ -5198,7 +5199,7 @@ mod tests {
         }
         assert_eq!(state.track_cache.len(), TRACK_CACHE_CAP);
         assert!(
-            !state.track_cache.contains_key("stale"),
+            !state.track_cache.contains_key(&SourceIdentity::for_test("stale")),
             "the oldest entries must be evicted at the cap"
         );
     }
@@ -5282,7 +5283,9 @@ mod tests {
         state.receive_events();
 
         assert!(
-            state.track_cache.contains_key("youtube-music"),
+            state
+                .track_cache
+                .contains_key(&SourceIdentity::for_test("youtube-music")),
             "a disabled pill kind must not starve the track cache"
         );
         assert!(
@@ -5505,7 +5508,7 @@ mod tests {
         // swap and a fresh show — publishes the content's source into the
         // shared cell the worker reads.
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
-        let cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let cell: Arc<Mutex<Option<SourceIdentity>>> = Arc::new(Mutex::new(None));
         state.now_showing = Some(cell.clone());
 
         state.update_content(
@@ -5514,7 +5517,7 @@ mod tests {
         );
         assert_eq!(
             *cell.lock().unwrap(),
-            Some("youtube-music".to_string()),
+            Some(SourceIdentity::for_test("youtube-music")),
             "an in-place content swap must publish its source"
         );
 
@@ -5525,7 +5528,7 @@ mod tests {
         );
         assert_eq!(
             *cell.lock().unwrap(),
-            Some("Brave".to_string()),
+            Some(SourceIdentity::for_test("Brave")),
             "a fresh show must publish its source"
         );
     }
@@ -5682,7 +5685,7 @@ mod tests {
 
     fn reject(source: &str) -> MediaEvent {
         MediaEvent::SessionRejected {
-            source_app: source.into(),
+            source_app: SourceIdentity::for_test(source),
             title: String::new(),
             artist: String::new(),
             state: PlaybackState::Paused,
@@ -6834,7 +6837,10 @@ mod tests {
         let state = unsafe { &mut *state_ptr };
         assert!(state.enabled, "notifications must be re-enabled");
         assert!(
-            state.track_cache.get("spotify").is_some_and(|t| t.title == "New Song"),
+            state
+                .track_cache
+                .get(&SourceIdentity::for_test("spotify"))
+                .is_some_and(|t| t.title == "New Song"),
             "the disabled drain must still cache the track for the restore"
         );
         assert!(
@@ -6879,7 +6885,10 @@ mod tests {
             "the media event must update the enabled pill in place to the newer track"
         );
         assert!(
-            state.track_cache.get("spotify").is_some_and(|t| t.title == "New Song"),
+            state
+                .track_cache
+                .get(&SourceIdentity::for_test("spotify"))
+                .is_some_and(|t| t.title == "New Song"),
             "the enabled drain must cache the newer track too"
         );
         destroy_wndproc_overlay(hwnd, state_ptr);
@@ -7068,7 +7077,7 @@ mod tests {
             "no pill may be shown while notifications are disabled"
         );
         assert!(
-            matches!(state.track_cache.get("spotify"), Some(t) if t.title == "New Song"),
+            matches!(state.track_cache.get(&SourceIdentity::for_test("spotify")), Some(t) if t.title == "New Song"),
             "the track cache must be refreshed while notifications are disabled"
         );
 
@@ -7440,8 +7449,14 @@ mod tests {
             .unwrap()
             .push_back(Arc::new(MediaEvent::TrackChanged(playing)));
         state.receive_events();
-        assert_eq!(state.source_state.get("yt"), Some(&PlaybackState::Paused));
-        assert_eq!(state.source_state.get("spotify"), Some(&PlaybackState::Playing));
+        assert_eq!(
+            state.source_state.get(&SourceIdentity::for_test("yt")),
+            Some(&PlaybackState::Paused)
+        );
+        assert_eq!(
+            state.source_state.get(&SourceIdentity::for_test("spotify")),
+            Some(&PlaybackState::Playing)
+        );
 
         // A TrackChanged whose snapshot carries no state (transitional read)
         // must not downgrade a known state.
@@ -7454,7 +7469,7 @@ mod tests {
             .push_back(Arc::new(MediaEvent::TrackChanged(transitional)));
         state.receive_events();
         assert_eq!(
-            state.source_state.get("spotify"),
+            state.source_state.get(&SourceIdentity::for_test("spotify")),
             Some(&PlaybackState::Playing),
             "a transitional snapshot must not erase a playing state"
         );
@@ -7464,18 +7479,20 @@ mod tests {
     fn source_state_evicts_a_stopped_entry_at_the_ledger_cap() {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         for i in 0..(LEDGER_STATE_CAP - 1) {
-            state.remember_source_state(&format!("live-{i}"), PlaybackState::Playing);
+            state.remember_source_state(&SourceIdentity::for_test(format!("live-{i}")), PlaybackState::Playing);
         }
-        state.remember_source_state("stopped-old", PlaybackState::Stopped);
+        state.remember_source_state(&SourceIdentity::for_test("stopped-old"), PlaybackState::Stopped);
         // Overflow evicts the inert Stopped entry; live sources survive.
-        state.remember_source_state("live-last", PlaybackState::Playing);
+        state.remember_source_state(&SourceIdentity::for_test("live-last"), PlaybackState::Playing);
         assert_eq!(state.source_state.len(), LEDGER_STATE_CAP);
         assert!(
-            !state.source_state.contains_key("stopped-old"),
+            !state
+                .source_state
+                .contains_key(&SourceIdentity::for_test("stopped-old")),
             "a Stopped entry must be evicted first"
         );
-        assert!(state.source_state.contains_key("live-last"));
-        assert!(state.source_state.contains_key("live-0"));
+        assert!(state.source_state.contains_key(&SourceIdentity::for_test("live-last")));
+        assert!(state.source_state.contains_key(&SourceIdentity::for_test("live-0")));
     }
 
     #[test]
@@ -9539,9 +9556,9 @@ mod tests {
         let mut state = OverlayState::new(config, EventQueue::default());
 
         // Simulate the state show_next() leaves behind after a TrackChanged.
-        state.current_source = Some("youtube-music".to_string());
+        state.current_source = Some(SourceIdentity::for_test("youtube-music"));
         state.content = Some(MediaEvent::TrackChanged(TrackInfo {
-            source_app: "youtube-music".to_string(),
+            source_app: SourceIdentity::for_test("youtube-music"),
             ..TrackInfo::default()
         }));
         state.phase = Phase::Shown;
