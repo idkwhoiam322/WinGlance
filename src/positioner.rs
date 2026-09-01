@@ -13,12 +13,15 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT,
+    VK_UP,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect, HWND_TOPMOST, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, ShowWindow, WM_CLOSE, WM_DPICHANGED, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, ShowWindow, WM_CLOSE, WM_DPICHANGED,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
 
@@ -29,6 +32,9 @@ const SNAP_THRESHOLD: i32 = 30;
 const CLOSE_BTN_W: i32 = 28;
 const CLOSE_BTN_H: i32 = 28;
 const DEFAULT_MARGIN: f32 = 8.0;
+const ACCESSIBLE_INSTRUCTIONS: &str =
+    "Place WinGlance. Drag or use arrow keys; hold Shift for 10-pixel moves; Enter saves; Escape cancels.";
+const PAINT_INSTRUCTIONS: &str = "Drag / arrows Â· Enter saves Â· Esc cancels";
 /// Logical width of the close-button cross pen, scaled by the window's DPI so
 /// the drawn lines keep the same visual weight on any display.
 const PEN_W: f32 = 2.0;
@@ -117,7 +123,7 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
         let hwnd = create_window(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             PCWSTR(class_name.as_ptr()),
-            PCWSTR(wide("Place the WinGlance").as_ptr()),
+            PCWSTR(wide(ACCESSIBLE_INSTRUCTIONS).as_ptr()),
             WS_POPUP | WS_VISIBLE,
             0,
             0,
@@ -164,6 +170,16 @@ fn open_with(owner: HWND, overlay: HWND, result_msg: u32) -> bool {
                     0,
                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 );
+                // The positioner is opened only from an explicit Settings
+                // action, so it is allowed to become the active keyboard target.
+                // The pill itself remains passive/no-activate; this temporary
+                // editor is the deliberate interactive exception.
+                if !SetForegroundWindow(hwnd).as_bool() {
+                    debug!(
+                        "positioner SetForegroundWindow was refused; SetFocus will still target the editor on this UI thread"
+                    );
+                }
+                let _ = SetFocus(Some(hwnd));
                 debug!("position adjustor opened at ({x}, {y})");
                 true
             }
@@ -252,6 +268,83 @@ fn monitor_work_area(hwnd: HWND) -> RECT {
 /// Snaps a value to the nearest edge if within `threshold` physical pixels.
 fn snap(val: i32, edge: i32, threshold: i32) -> i32 {
     if (val - edge).abs() <= threshold { edge } else { val }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PositionerKeyAction {
+    Nudge(i32, i32),
+    Commit,
+    Cancel,
+    Ignore,
+}
+
+/// Pure keyboard mapping for the interactive positioner. Arrow keys move one
+/// logical pixel, or ten while Shift is held; Enter confirms once and Escape
+/// closes without committing the unconfirmed keyboard preview.
+fn positioner_key_action(key: u16, shift: bool) -> PositionerKeyAction {
+    let step = if shift { 10 } else { 1 };
+    match key {
+        k if k == VK_LEFT.0 => PositionerKeyAction::Nudge(-step, 0),
+        k if k == VK_RIGHT.0 => PositionerKeyAction::Nudge(step, 0),
+        k if k == VK_UP.0 => PositionerKeyAction::Nudge(0, -step),
+        k if k == VK_DOWN.0 => PositionerKeyAction::Nudge(0, step),
+        k if k == VK_RETURN.0 => PositionerKeyAction::Commit,
+        k if k == VK_ESCAPE.0 => PositionerKeyAction::Cancel,
+        _ => PositionerKeyAction::Ignore,
+    }
+}
+
+/// Applies a keyboard preview nudge in physical pixels and clamps the sample
+/// into the current monitor work area. Snap is intentionally deferred to
+/// `commit`, exactly like mouse dragging: applying snap after every 1 px key
+/// press would make a snapped edge impossible to leave.
+fn nudge_clamped_position(
+    origin: (i32, i32),
+    delta_logical: (i32, i32),
+    scale: f32,
+    work: RECT,
+    sample_size: (i32, i32),
+) -> (i32, i32) {
+    let (left, top) = origin;
+    let (dx_logical, dy_logical) = delta_logical;
+    let (sample_w, sample_h) = sample_size;
+    let dx = (dx_logical as f32 * scale).round() as i32;
+    let dy = (dy_logical as f32 * scale).round() as i32;
+    (
+        (left + dx).clamp(work.left, (work.right - sample_w).max(work.left)),
+        (top + dy).clamp(work.top, (work.bottom - sample_h).max(work.top)),
+    )
+}
+
+fn nudge_positioner(hwnd: HWND, dx_logical: i32, dy_logical: i32) {
+    unsafe {
+        let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+        let work = monitor_work_area(hwnd);
+        let sample_w = (WIDTH as f32 * scale).round() as i32;
+        let sample_h = (HEIGHT as f32 * scale).round() as i32;
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return;
+        }
+        let (x, y) = nudge_clamped_position(
+            (rect.left, rect.top),
+            (dx_logical, dy_logical),
+            scale,
+            work,
+            (sample_w, sample_h),
+        );
+        if let Err(error) = set_window_pos(
+            hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW,
+        ) {
+            debug!("positioner keyboard SetWindowPos failed: {error}");
+        }
+    }
 }
 
 /// Persists the positioner window's current screen position as absolute overlay
@@ -418,9 +511,26 @@ unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
             // Don't destroy — keep window open so user can fine-tune
             LRESULT(0)
         }
-        WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
-            let _ = DestroyWindow(hwnd);
-            LRESULT(0)
+        WM_KEYDOWN => {
+            let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+            match positioner_key_action(wparam.0 as u16, shift) {
+                PositionerKeyAction::Nudge(dx, dy) => {
+                    nudge_positioner(hwnd, dx, dy);
+                    LRESULT(0)
+                }
+                PositionerKeyAction::Commit => {
+                    if !state_ptr.is_null() {
+                        commit(hwnd, &mut *state_ptr);
+                    }
+                    let _ = DestroyWindow(hwnd);
+                    LRESULT(0)
+                }
+                PositionerKeyAction::Cancel => {
+                    let _ = DestroyWindow(hwnd);
+                    LRESULT(0)
+                }
+                PositionerKeyAction::Ignore => DefWindowProcW(hwnd, message, wparam, lparam),
+            }
         }
         WM_DPICHANGED => {
             // The user dragged the sample onto a display with a different DPI.
@@ -485,7 +595,7 @@ unsafe fn positioner_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                     };
                     let _ = SetBkMode(hdc, TRANSPARENT);
                     let _ = SetTextColor(hdc, COLORREF(0xCCCCCC));
-                    let mut text = wide("Drag to place the WinGlance").into_vec();
+                    let mut text = wide(PAINT_INSTRUCTIONS).into_vec();
                     let _ = DrawTextW(hdc, &mut text, &mut text_rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
                     // Draw X button (cross lines — always perfectly
@@ -546,7 +656,55 @@ fn to_logical(phys: i32, target_scale: f32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::to_logical;
+    use super::{PositionerKeyAction, nudge_clamped_position, positioner_key_action, to_logical};
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP};
+
+    #[test]
+    fn keyboard_actions_cover_fine_coarse_commit_and_cancel() {
+        assert_eq!(
+            positioner_key_action(VK_LEFT.0, false),
+            PositionerKeyAction::Nudge(-1, 0)
+        );
+        assert_eq!(
+            positioner_key_action(VK_RIGHT.0, true),
+            PositionerKeyAction::Nudge(10, 0)
+        );
+        assert_eq!(positioner_key_action(VK_UP.0, true), PositionerKeyAction::Nudge(0, -10));
+        assert_eq!(
+            positioner_key_action(VK_DOWN.0, false),
+            PositionerKeyAction::Nudge(0, 1)
+        );
+        assert_eq!(positioner_key_action(VK_RETURN.0, false), PositionerKeyAction::Commit);
+        assert_eq!(positioner_key_action(VK_ESCAPE.0, true), PositionerKeyAction::Cancel);
+        assert_eq!(positioner_key_action(0, false), PositionerKeyAction::Ignore);
+    }
+
+    #[test]
+    fn keyboard_nudge_clamps_to_the_work_area_without_edge_locking() {
+        let work = RECT {
+            left: 100,
+            top: 200,
+            right: 500,
+            bottom: 500,
+        };
+        // Fine movement away from an edge is allowed immediately; snap is
+        // deferred to commit, so the user is never trapped on the edge.
+        assert_eq!(
+            nudge_clamped_position((100, 200), (1, 1), 1.0, work, (100, 60)),
+            (101, 201)
+        );
+        // Movement beyond the far edge clamps the whole sample into rcWork.
+        assert_eq!(
+            nudge_clamped_position((400, 440), (10, 10), 1.0, work, (100, 60)),
+            (400, 440)
+        );
+        // Logical movement scales with DPI.
+        assert_eq!(
+            nudge_clamped_position((200, 300), (10, -10), 1.5, work, (100, 60)),
+            (215, 285)
+        );
+    }
 
     #[test]
     fn the_stored_point_converts_with_the_target_scale() {
