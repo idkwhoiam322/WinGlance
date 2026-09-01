@@ -700,28 +700,56 @@ impl Config {
                     unknown: raw.unknown,
                     ..Default::default()
                 };
+                // A typed-section failure means this build cannot faithfully
+                // round-trip that section: its raw table can contain unknown
+                // future keys alongside the invalid known value. Keep valid
+                // sibling sections in memory, but fail closed for persistence
+                // so a later Settings save cannot serialize defaults over the
+                // unrepresentable section and silently discard those keys.
+                let mut section_invalid = false;
                 if let Some(tbl) = raw.overlay {
                     match tbl.try_into::<OverlayConfig>() {
                         Ok(o) => config.overlay = o,
-                        Err(e) => warn!("config [overlay] invalid ({}); using defaults for [overlay]", e),
+                        Err(e) => {
+                            section_invalid = true;
+                            warn!("config [overlay] invalid ({}); using defaults for [overlay]", e);
+                        }
                     }
                 }
                 if let Some(tbl) = raw.behavior {
                     match tbl.try_into::<BehaviorConfig>() {
                         Ok(b) => config.behavior = b,
-                        Err(e) => warn!("config [behavior] invalid ({}); using defaults for [behavior]", e),
+                        Err(e) => {
+                            section_invalid = true;
+                            warn!("config [behavior] invalid ({}); using defaults for [behavior]", e);
+                        }
                     }
                 }
                 if let Some(tbl) = raw.appearance {
                     match tbl.try_into::<AppearanceConfig>() {
                         Ok(a) => config.appearance = a,
-                        Err(e) => warn!("config [appearance] invalid ({}); using defaults for [appearance]", e),
+                        Err(e) => {
+                            section_invalid = true;
+                            warn!("config [appearance] invalid ({}); using defaults for [appearance]", e);
+                        }
                     }
                 }
-                // The revision snapshots the exact bytes this load was based
-                // on, so `save_checked` can prove the file was not edited
-                // between now and the next save.
-                config.revision = Some(ConfigRevision::captured(content.into_bytes()));
+                if section_invalid {
+                    // The original bytes are intentionally kept as the only
+                    // authoritative representation for this run. No revision
+                    // means every save returns PersistenceDisabled without
+                    // touching the existing file.
+                    config.persistable = false;
+                    config.revision = None;
+                    warn!(
+                        "config.toml contains an invalid section; valid sibling sections apply for this run, but persistence is disabled so the original file stays byte-identical"
+                    );
+                } else {
+                    // The revision snapshots the exact bytes this load was based
+                    // on, so `save_checked` can prove the file was not edited
+                    // between now and the next save.
+                    config.revision = Some(ConfigRevision::captured(content.into_bytes()));
+                }
                 // Report anything normalize() clamped.
                 let before = config.clone();
                 config.normalize();
@@ -1029,6 +1057,11 @@ impl Config {
                 after.behavior.debounce_ms,
             ),
             diff(
+                "behavior.history_tooltip_dwell_ms",
+                before.behavior.history_tooltip_dwell_ms,
+                after.behavior.history_tooltip_dwell_ms,
+            ),
+            diff(
                 "appearance.corner_radius",
                 before.appearance.corner_radius,
                 after.appearance.corner_radius,
@@ -1120,6 +1153,7 @@ mod tests {
         let mut raw = Config::default();
         raw.overlay.max_width = 1000; // clamps to 800
         raw.behavior.debounce_ms = 1; // clamps to 150
+        raw.behavior.history_tooltip_dwell_ms = 5_000; // clamps to 2_000
         raw.appearance.art_size = 0; // clamps to 24
         raw.overlay.duration_ms = 12_000; // in range: must not be reported
         let after = {
@@ -1128,7 +1162,7 @@ mod tests {
             config
         };
         let changes = Config::normalized_changes(&raw, &after);
-        assert_eq!(changes.len(), 3, "{changes:#?}");
+        assert_eq!(changes.len(), 4, "{changes:#?}");
         assert!(
             changes
                 .iter()
@@ -1139,6 +1173,12 @@ mod tests {
             changes
                 .iter()
                 .any(|c| c.contains("behavior.debounce_ms") && c.contains("150")),
+            "{changes:#?}"
+        );
+        assert!(
+            changes.iter().any(|c| {
+                c.contains("behavior.history_tooltip_dwell_ms") && c.contains("5000") && c.contains("2000")
+            }),
             "{changes:#?}"
         );
         assert!(
@@ -1289,6 +1329,43 @@ nested_appearance = [1, 2, 3]
             SaveOutcome::PersistenceDisabled
         );
         assert_eq!(std::fs::read(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn partially_invalid_section_disables_persistence_and_preserves_original_bytes() {
+        let guard = TempDir::new("partial-invalid-config");
+        let config_path = guard.dir.join("config.toml");
+        let original = br#"future_top = "kept"
+
+[overlay]
+monitor = "not-a-real-monitor"
+future_overlay = "must-survive"
+
+[behavior]
+start_in_tray = false
+"#;
+        std::fs::write(&config_path, original).unwrap();
+
+        let mut config = Config::load_from_path(&config_path).unwrap();
+        // Valid siblings still apply in memory, but the invalid overlay cannot
+        // be faithfully round-tripped because its raw future key would be lost.
+        assert!(!config.behavior.start_in_tray);
+        assert_eq!(config.overlay.monitor, MonitorMode::ActiveWindow);
+        assert!(!config.persistable);
+        assert!(config.revision.is_none());
+        assert_eq!(std::fs::read(&config_path).unwrap(), original);
+
+        config.behavior.start_in_tray = true;
+        assert_eq!(
+            config.save_checked_to(&config_path).unwrap(),
+            SaveOutcome::PersistenceDisabled
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            original,
+            "a Settings save must not rewrite or discard unknown keys from an invalid section"
+        );
+        assert_eq!(sibling_names(&guard.dir), vec!["config.toml"]);
     }
 
     #[test]
