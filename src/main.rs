@@ -1621,6 +1621,13 @@ fn overlay_bound(event: &MediaEvent) -> bool {
     )
 }
 
+/// Idle receive timeout for the event forwarder. Each consecutive quiet
+/// receive stretches the wait by 200 ms up to a 1 s ceiling; any real event
+/// resets the caller's quiet-cycle counter to zero.
+fn event_forwarder_idle_timeout(quiet_cycles: u32) -> Duration {
+    Duration::from_millis(200 * (1 + quiet_cycles.min(4) as u64))
+}
+
 /// Drains SMTC events into each window's queue and wakes both windows.
 /// Returns the thread handle so main can join it before destroying the
 /// windows. The loop exits within ~200ms of `shutdown` being set. At most one
@@ -1668,12 +1675,15 @@ fn spawn_event_forwarder(
                         "main window",
                     );
                 }
-                let event = match receiver.recv_timeout(Duration::from_millis(200 * (1 + quiet_cycles.min(4) as u64))) {
+                let event = match receiver.recv_timeout(event_forwarder_idle_timeout(quiet_cycles)) {
                     Ok(event) => {
                         quiet_cycles = 0;
                         event
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        quiet_cycles = quiet_cycles.saturating_add(1);
+                        continue;
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
                 // One allocation per event, shared by both window queues via
@@ -1952,6 +1962,15 @@ mod tests {
             "died before re-verify: abort"
         );
         assert!(!handoff_survives_reverify([false, false]));
+    }
+
+    #[test]
+    fn event_forwarder_idle_timeout_backs_off_to_one_second_and_caps() {
+        let observed: Vec<u64> = (0..=6)
+            .map(|quiet| event_forwarder_idle_timeout(quiet).as_millis() as u64)
+            .collect();
+        assert_eq!(observed, [200, 400, 600, 800, 1000, 1000, 1000]);
+        assert_eq!(event_forwarder_idle_timeout(u32::MAX), Duration::from_millis(1000));
     }
 
     #[test]
