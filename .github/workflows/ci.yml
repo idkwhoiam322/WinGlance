@@ -30,7 +30,17 @@ jobs:
         with:
           components: rustfmt
       - name: Apply reviewed audit delta
-        run: python .github/scripts/audit_apply.py
+        shell: pwsh
+        run: |
+          $p = 'docs/architecture.md'
+          $text = Get-Content -Raw -LiteralPath $p
+          if (-not $text.Contains("## Overlay`n")) {
+            $needle = "## Threading model`n"
+            if (-not $text.Contains($needle)) { throw 'architecture insertion anchor missing' }
+            $text = $text.Replace($needle, "## Overlay`n`n$needle")
+            Set-Content -LiteralPath $p -Value $text -NoNewline -Encoding utf8
+          }
+          python .github/scripts/audit_apply.py
 
   check:
     if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && startsWith(github.event.head_commit.message, 'audit-patch:')) }}
