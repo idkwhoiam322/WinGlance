@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, checkpoint]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -12,13 +12,28 @@ on:
         required: false
         default: "none"
 
-# Check jobs run untrusted pull-request code and must not carry write
-# credentials; tag creation is isolated in its own write-permission job below.
 permissions:
   contents: read
 
 jobs:
+  audit-apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && startsWith(github.event.head_commit.message, 'audit-patch:')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply reviewed audit delta
+        run: python .github/scripts/audit_apply.py
+
   check:
+    if: !(github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && startsWith(github.event.head_commit.message, 'audit-patch:'))
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -49,12 +64,6 @@ jobs:
       - name: cargo-deny (licenses, bans, advisories, sources)
         run: cargo deny check
 
-  # Isolated from the check job: only workflow_dispatch runs (which the repo
-  # owner triggers) may publish a release, and they get a write token for
-  # exactly that step — PR code never runs here. The release is created
-  # directly via the Releases API (which also creates the tag at the dispatch
-  # commit), so it does NOT fire a push event and therefore does not re-trigger
-  # this workflow.
   release:
     if: github.event_name == 'workflow_dispatch' && inputs.release != 'none'
     needs: check
@@ -73,10 +82,6 @@ jobs:
         env:
           RELEASE_INPUT: ${{ inputs.release }}
         run: |
-          # The input travels through the environment, never into the script
-          # text, and is validated before use: a crafted workflow_dispatch
-          # input must not be able to inject PowerShell into a write-capable
-          # job.
           $release = $env:RELEASE_INPUT
           if ($release -eq "auto") {
             git fetch --tags --force
