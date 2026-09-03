@@ -150,7 +150,7 @@ Expanded rules, in the compact layout the Compact rules):
 | `notifications_enabled`         | `true`  | bool   | Master switch for pill notifications; mirrors the tray "Toggle notifications" item and is persisted so the toggle survives a restart |
 | `debounce_ms`                   | `200`   | 150-250 | Coalescing window for bursty SMTC events |
 | `history_tooltip_dwell_ms`      | `300`   | 0-2000  | How long the cursor must rest on a history-table cell before its tooltip appears (0 = immediately) |
-| `start_in_tray`                 | `true`  | bool   | Start silently: no window, only the tray icon + pill. The very first run (the launch that creates config.toml) shows the tracking window once, regardless of this setting |
+| `start_in_tray`                 | `true`  | bool   | Backward-compatible key retained for existing configs. Startup is always silent; `false` is accepted when parsing but the effective running config is forced to `true`, so it no longer opens the tracking window |
 | `start_on_login`                | `false` | bool   | Register a Windows startup entry to launch WinGlance at logon |
 | `close_to_tray`                 | `true`  | bool   | Hide (instead of close) the window when its X is pressed |
 | `media_sources`                 | `[]`    | list   | Media source apps (case-insensitive substrings) to allow; empty = all apps |
@@ -277,9 +277,12 @@ reloaded run stays diagnosable.
 WinGlance keeps a maximized tracking window alongside the WinGlance pill. The window shows
 the current activity (art, state, title/artist/album) and the per-session history;
 it is opened from the tray icon (single click, double-click, or the **Open WinGlance**
-menu item). Launches stay silent: `start_in_tray = true` (the default) shows only the
-tray icon and pill, `start_in_tray = false` opens the window, and the very first run —
-the launch that creates config.toml — shows it once regardless.
+menu item). Every process launch stays silent: first run, normal launches, logon
+startup, and the Settings **Restart app** action create the window hidden. The
+legacy `start_in_tray` key remains readable for backward compatibility, but
+`false` is normalized to the effective silent policy and no longer opens the
+window. User interaction through the tray is the only startup-independent path
+that raises the tracking window.
 
 The tray menu mirrors the `[behavior]` toggles in real time:
 

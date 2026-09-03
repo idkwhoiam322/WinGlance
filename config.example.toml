@@ -69,7 +69,9 @@ debounce_ms = 200
 # How long the cursor must rest on a history-table cell before its tooltip
 # appears, in milliseconds (0 shows it immediately).
 history_tooltip_dwell_ms = 300
-# Launch quietly to the system tray: no window pops up, just the WinGlance + tray icon.
+# Compatibility key retained for older configs. WinGlance always starts
+# silently; false is still accepted when parsing but is ignored for the
+# effective running config.
 start_in_tray = true
 # Create a startup registry entry so Windows launches WinGlance at logon.
 start_on_login = false
