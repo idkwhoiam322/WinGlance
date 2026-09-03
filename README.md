@@ -60,7 +60,11 @@ restarts stay silent in the tray. Open the tracking window again by clicking (or
 double-clicking) the tray icon. It shows the current activity and a per-source
 history on the **Now Playing** pane, plus a **Settings** pane mirroring the tray
 menu (notifications, duration, start-on-login, close-to-tray, allowed apps,
-layout, position, monitor, preferred source, logs).
+layout, position, monitor, preferred source, logs). While no media is
+active, the passive compact pill remains visible as **No media playing**; a real
+media notification temporarily replaces it and the idle status returns after the
+notification settles. The idle pill is static, so it does not continuously
+rerender or animate.
 
 ### Tray menu
 

@@ -30,6 +30,11 @@ the top of the screen when the track or the playback state changes.
 - **Config over code.** All visual and behavioral knobs live in
   `config.toml`, clamped to safe ranges by `Config::normalize()`.
 
+## Overlay
+
+The overlay owns one local no-media status state that is deliberately **not** a `MediaEvent`. On startup and after the last notification settles it renders a compact, passive `No media playing` pill with no dismiss deadline, progress animation, comet, or hover action. Real SMTC events replace that status immediately. Keeping this state local prevents synthetic status from entering history, deduplication, source-ledger, or worker transport semantics.
+
+
 ## Threading model
 
 ```

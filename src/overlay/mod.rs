@@ -652,6 +652,10 @@ struct OverlayState {
     /// `ContentFade`).
     content_fade: Option<ContentFade>,
     content: Option<MediaEvent>,
+    /// True only for the overlay-local no-media status card. The backing
+    /// `MediaEvent` is a private render sentinel and never enters the event
+    /// transport or history; this flag keeps status semantics out of SMTC.
+    idle_content: bool,
     /// The identity-stable palette the SMTC worker attached to the current
     /// track, if any. `palette` is derived from it (when present) instead of
     /// a fresh per-frame derivation, so a source that re-encodes its
@@ -1293,6 +1297,7 @@ impl OverlayState {
             pending: VecDeque::new(),
             enabled,
             content: None,
+            idle_content: false,
             content_palette: None,
             last_track: None,
             phase: Phase::Hidden,
@@ -1373,6 +1378,55 @@ impl OverlayState {
             #[cfg(test)]
             render_count: 0,
         }
+    }
+
+    fn idle_event() -> MediaEvent {
+        MediaEvent::TrackChanged(TrackInfo {
+            title: "No media playing".into(),
+            ..Default::default()
+        })
+    }
+
+    /// Shows the process-lifetime no-media status. It is deliberately static:
+    /// no dismiss deadline, progress, comet, marquee morph, or hover action, so
+    /// after the one initial layered-window upload the normal render gate stays
+    /// cold until a real event or placement/configuration change arrives.
+    fn show_idle(&mut self) {
+        unsafe {
+            let _ = kill_timer(self.hwnd, IDLE_BUFFER_TIMER_ID);
+        }
+        self.idle_content = true;
+        self.hidden_watchdog = false;
+        self.held_content = None;
+        self.current_source = None;
+        self.progress_anchor = None;
+        self.estimated_position_secs = None;
+        self.progress_duration_secs = None;
+        self.progress_rate = None;
+        self.progress_playing = false;
+        self.last_bar_fraction = None;
+        self.progress_track_key = None;
+        self.content_rev += 1;
+        self.content = Some(Self::idle_event());
+        self.content_palette = None;
+        self.palette = None;
+        self.layout = LayoutMode::Compact;
+        self.dismiss_at = None;
+        self.hover_dismiss_at = None;
+        self.hover_expand = None;
+        self.hover_expanded_once = false;
+        self.hover_leave_at = None;
+        self.persistent_faded = false;
+        self.persistent_collapse_on_dismiss = false;
+        self.content_fade = None;
+        self.resolve_pill_text();
+        self.reset_scroll();
+        self.phase = Phase::Shown;
+        self.sync_anim_timer();
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+        self.render();
     }
 
     fn reset_scroll(&mut self) {
@@ -1750,6 +1804,13 @@ impl OverlayState {
             }
             match event {
                 MediaEvent::TrackChanged(track) if self.config.behavior.enable_track_change => {
+                    if self.idle_content {
+                        self.current_source = Some(track.source_app.clone());
+                        self.last_track = Some(track.clone());
+                        self.cache_track(&track);
+                        self.show(MediaEvent::TrackChanged(track), true);
+                        continue;
+                    }
                     // A metadata refresh for the track currently on screen
                     // (SMTC fills artwork/album progressively, a moment after
                     // the title) updates the pill in place instead of queueing
@@ -1851,6 +1912,15 @@ impl OverlayState {
                 MediaEvent::PlaybackStateChanged(state, source_app)
                     if self.config.behavior.enable_playback_state_change =>
                 {
+                    if self.idle_content {
+                        // A terminal state with no active content is still no
+                        // media; playing/paused state establishes real content
+                        // and therefore replaces the status immediately.
+                        if state != PlaybackState::Stopped {
+                            self.show(MediaEvent::PlaybackStateChanged(state, source_app), false);
+                        }
+                        continue;
+                    }
                     // Persistent-compact: a Stopped that does not belong to
                     // the source the pill is showing (or holding while
                     // auto-hidden) is dropped. The in-place swap below would
@@ -2572,10 +2642,14 @@ impl OverlayState {
         let Some(cell) = &self.now_showing else {
             return;
         };
-        let source = match &self.content {
-            Some(MediaEvent::TrackChanged(track)) => Some(track.source_app.clone()),
-            Some(MediaEvent::PlaybackStateChanged(_, source)) if !source.is_empty() => Some(source.clone()),
-            _ => None,
+        let source = if self.idle_content {
+            None
+        } else {
+            match &self.content {
+                Some(MediaEvent::TrackChanged(track)) => Some(track.source_app.clone()),
+                Some(MediaEvent::PlaybackStateChanged(_, source)) if !source.is_empty() => Some(source.clone()),
+                _ => None,
+            }
         };
         // Always write, clearing on an empty source: a stale
         // now-showing label would keep the worker suppressing re-reports for
@@ -2584,6 +2658,7 @@ impl OverlayState {
     }
 
     fn update_content(&mut self, event: MediaEvent, min_visible: Duration) {
+        self.idle_content = false;
         // PersistentCompact auto-hide: a meaningful update that arrives while the
         // pill is already hidden for a fullscreen/listed foreground must surface
         // briefly like a compact notification (full configured duration, then
@@ -2719,7 +2794,7 @@ impl OverlayState {
             let changed = old != name;
             *guard = name.clone();
             drop(guard);
-            if changed && Self::announces_pill_name_change(&self.content) {
+            if changed && !self.idle_content && Self::announces_pill_name_change(&self.content) {
                 crate::accessibility::raise_pill_name_changed(self.hwnd, cell, old, name.clone());
                 // The notification event is what active screen readers speak
                 // without focus; the property-changed event above serves
@@ -2766,6 +2841,7 @@ impl OverlayState {
         if !self.enabled {
             return;
         }
+        self.idle_content = false;
         // Any show ends the auto-hide hold: the watchdog (armed by hide()
         // when content was held) must not poll while a pill is up, and the
         // next hide re-arms it from scratch.
@@ -2859,6 +2935,10 @@ impl OverlayState {
     /// fullscreen geometry of an unchanged window is re-read on every call
     /// (cheap window/monitor queries).
     fn refresh_layout(&mut self) {
+        if self.idle_content {
+            self.layout = LayoutMode::Compact;
+            return;
+        }
         let verdict = self.sample_foreground();
         let decided = decide_layout(&self.config, &verdict);
         if decided != self.layout {
@@ -2916,6 +2996,9 @@ impl OverlayState {
     /// state (pre-carriage sessions, spurious-recreation snapshots) counts as
     /// playing — the same rule the progress estimate uses.
     fn content_playing(&self) -> bool {
+        if self.idle_content {
+            return false;
+        }
         match &self.content {
             Some(MediaEvent::TrackChanged(track)) => track.playback_state.is_none_or(|s| s == PlaybackState::Playing),
             Some(MediaEvent::PlaybackStateChanged(s, _)) => *s == PlaybackState::Playing,
@@ -3099,9 +3182,10 @@ impl OverlayState {
         // starts. Re-entering (or never leaving) keeps the pill engaged.
         // Computed here, outside the phase guard, so the `held` gate below
         // can use it.
-        let cursor_over = if self.config.overlay.dismiss_on_hover
-            || self.config.overlay.expand_compact_on_hover
-            || self.config.overlay.layout == LayoutMode::PersistentCompact
+        let cursor_over = if !self.idle_content
+            && (self.config.overlay.dismiss_on_hover
+                || self.config.overlay.expand_compact_on_hover
+                || self.config.overlay.layout == LayoutMode::PersistentCompact)
         {
             self.is_cursor_over_pill()
         } else {
@@ -4098,8 +4182,13 @@ impl OverlayState {
             let _ = set_timer(self.hwnd, IDLE_BUFFER_TIMER_ID, IDLE_BUFFER_RELEASE_MS, None);
         }
         // Advance the queue: the next pending notification shows as a fresh
-        // pill. show() checks `enabled`, so a toggle-off collapse stays hidden.
+        // pill. show() checks `enabled`, so a toggle-off collapse cannot show
+        // media, but the no-media status remains available below.
         self.show_next();
+        if matches!(self.phase, Phase::Hidden) && self.held_content.is_none() {
+            self.show_idle();
+            return;
+        }
         // Auto-hide watchdog: while the pill stays hidden with held content
         // (PersistentCompact auto-hide for a fullscreen/listed foreground),
         // keep a coarse 1 s timer polling the foreground. A same-window
@@ -4234,7 +4323,7 @@ impl OverlayState {
     /// Shared by the position/layout/separation push functions instead of
     /// duplicating the phase check at each site.
     fn preview_if_hidden(&mut self) -> bool {
-        if matches!(self.phase, Phase::Hidden) {
+        if matches!(self.phase, Phase::Hidden) || self.idle_content {
             self.show_sample();
             true
         } else {
@@ -4249,6 +4338,7 @@ impl OverlayState {
     /// has been seen it falls back to a track-change pill with sample data.
     fn show_sample(&mut self) {
         debug!("sample pill shown");
+        self.idle_content = false;
         // A sample pill is a show: cancel the idle-release deadline so the
         // buffers survive the preview.
         unsafe {
@@ -4413,6 +4503,9 @@ pub(crate) fn create_window(
                 unsafe {
                     (*state_ptr).hook = Some(hook);
                 }
+            }
+            unsafe {
+                (*state_ptr).show_idle();
             }
             Ok(hwnd)
         }
@@ -4744,6 +4837,36 @@ mod tests {
     use windows::Win32::UI::WindowsAndMessaging::{
         DestroyWindow, DispatchMessageW, GetMessageW, TranslateMessage, WINDOW_EX_STYLE, WM_NULL,
     };
+
+    #[test]
+    fn idle_status_is_static_compact_and_nonplaying() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.idle_content = true;
+        state.content = Some(OverlayState::idle_event());
+        state.phase = Phase::Shown;
+        state.layout = LayoutMode::Compact;
+        state.dismiss_at = None;
+        assert!(state.idle_content);
+        assert!(matches!(state.phase, Phase::Shown));
+        assert_eq!(state.layout, LayoutMode::Compact);
+        assert!(state.dismiss_at.is_none());
+        assert!(!state.content_playing());
+        assert!(!state.orbiting());
+    }
+
+    #[test]
+    fn idle_status_has_truthful_accessible_name_and_no_source_identity() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.idle_content = true;
+        state.content = Some(OverlayState::idle_event());
+        state.pill_name = Some(Arc::new(Mutex::new(None)));
+        state.resolve_pill_text();
+        assert_eq!(
+            state.pill_name.as_ref().unwrap().lock().unwrap().as_deref(),
+            Some("No media playing")
+        );
+        assert!(!OverlayState::announces_pill_name_change(&None));
+    }
 
     #[test]
     fn needs_font_rebuild_is_true_only_when_the_target_dpi_differs() {

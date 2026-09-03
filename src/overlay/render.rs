@@ -2483,7 +2483,7 @@ pub(super) fn draw_compact_pill(
     let symbol_y = inset + (pill_h - symbol) / 2;
     // The playback symbol is static; only the scrolling title belongs in the
     // `Foreground` pass.
-    if layer != RenderLayer::Foreground {
+    if layer != RenderLayer::Foreground && !state.idle_content {
         draw_symbol_pixels(
             pixels,
             width as usize,
