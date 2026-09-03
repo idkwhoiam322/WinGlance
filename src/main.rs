@@ -987,18 +987,15 @@ pub fn spawn_handoff_thread(hwnd: HWND) {
     drop(worker);
 }
 
-/// Applies the public startup contract to the effective in-memory config.
-/// Legacy configs may still contain `start_in_tray = false`, and first-run
-/// config creation still records its transient discovery flag, but neither is
-/// allowed to raise a production window: every process launch is silent until
-/// the user explicitly opens WinGlance from the tray.
-fn enforce_silent_startup(config: &mut Config) {
-    if config.first_run || !config.behavior.start_in_tray {
-        info!(
-            "startup window request ignored: WinGlance always starts silently; open the tracking window from the tray"
-        );
+/// Applies the startup contract to the effective in-memory config.
+/// The first-run discovery flag is deliberately preserved so the tracking
+/// window opens once for initial setup. Legacy `start_in_tray = false` values
+/// remain parse-compatible but cannot make later launches, logon startup, or
+/// Settings-triggered restarts raise the window.
+fn enforce_startup_policy(config: &mut Config) {
+    if !config.behavior.start_in_tray {
+        info!("legacy start_in_tray=false ignored: only the first-ever launch opens the tracking window automatically");
     }
-    config.first_run = false;
     config.behavior.start_in_tray = true;
 }
 
@@ -1067,7 +1064,7 @@ fn main() -> Result<()> {
             return Err(error);
         }
     };
-    enforce_silent_startup(&mut config);
+    enforce_startup_policy(&mut config);
     config.log_settings();
 
     info!("starting WinGlance");
@@ -1865,15 +1862,20 @@ mod tests {
     const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
 
     #[test]
-    fn startup_policy_always_forces_silent_effective_config() {
-        let mut config = Config::default();
-        config.first_run = true;
-        config.behavior.start_in_tray = false;
-        enforce_silent_startup(&mut config);
-        assert!(!config.first_run, "first-run discovery must never raise a window");
+    fn startup_policy_preserves_first_run_but_silences_later_launches() {
+        let mut config = Config {
+            first_run: true,
+            behavior: crate::config::BehaviorConfig {
+                start_in_tray: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        enforce_startup_policy(&mut config);
+        assert!(config.first_run, "the first launch must remain discoverable for setup");
         assert!(
             config.behavior.start_in_tray,
-            "legacy start_in_tray=false must not override the silent-start contract"
+            "legacy start_in_tray=false must not make later launches visible"
         );
     }
 
