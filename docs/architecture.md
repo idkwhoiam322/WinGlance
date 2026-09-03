@@ -32,7 +32,7 @@ the top of the screen when the track or the playback state changes.
 
 ## Overlay
 
-The overlay owns one local no-media status state that is deliberately **not** a `MediaEvent`. On startup and after the last notification settles it renders a compact, passive `No media playing` pill with no dismiss deadline, progress animation, comet, or hover action. Real SMTC events replace that status immediately. Keeping this state local prevents synthetic status from entering history, deduplication, source-ledger, or worker transport semantics.
+The overlay owns one local passive status state that is deliberately **not** a `MediaEvent`. On startup and after the last notification settles it renders a compact `No media playing` pill; when notifications are disabled (or both notification event types are disabled) the same card reads `Notifications paused` instead. The status has no dismiss deadline, progress animation, comet, or hover action. Real SMTC events replace the active no-media status immediately. Keeping this state local prevents synthetic status from entering history, deduplication, source-ledger, or worker transport semantics.
 
 
 ## Threading model

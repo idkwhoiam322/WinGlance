@@ -1380,9 +1380,19 @@ impl OverlayState {
         }
     }
 
-    fn idle_event() -> MediaEvent {
+    fn idle_status_title(&self) -> &'static str {
+        if !self.enabled
+            || (!self.config.behavior.enable_track_change && !self.config.behavior.enable_playback_state_change)
+        {
+            "Notifications paused"
+        } else {
+            "No media playing"
+        }
+    }
+
+    fn idle_event(&self) -> MediaEvent {
         MediaEvent::TrackChanged(TrackInfo {
-            title: "No media playing".into(),
+            title: self.idle_status_title().into(),
             ..Default::default()
         })
     }
@@ -1407,7 +1417,7 @@ impl OverlayState {
         self.last_bar_fraction = None;
         self.progress_track_key = None;
         self.content_rev += 1;
-        self.content = Some(Self::idle_event());
+        self.content = Some(self.idle_event());
         self.content_palette = None;
         self.palette = None;
         self.layout = LayoutMode::Compact;
@@ -4279,9 +4289,14 @@ impl OverlayState {
                 self.show(held, true);
             } else if let Some(track) = self.last_track.clone() {
                 self.show(MediaEvent::TrackChanged(track), true);
+            } else {
+                // No restoreable live content: refresh the passive card so
+                // the just-enabled state says "No media playing" instead of
+                // retaining the disabled-state "Notifications paused" label.
+                self.show_idle();
             }
-            // If none is available, the worker's re-show read surfaces the
-            // current track through the normal receive_events path.
+            // If no live content was available, the worker's re-show read
+            // will replace the passive card through the normal event path.
         }
     }
 
@@ -4842,7 +4857,7 @@ mod tests {
     fn idle_status_is_static_compact_and_nonplaying() {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.idle_content = true;
-        state.content = Some(OverlayState::idle_event());
+        state.content = Some(state.idle_event());
         state.phase = Phase::Shown;
         state.layout = LayoutMode::Compact;
         state.dismiss_at = None;
@@ -4858,7 +4873,7 @@ mod tests {
     fn idle_status_has_truthful_accessible_name_and_no_source_identity() {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.idle_content = true;
-        state.content = Some(OverlayState::idle_event());
+        state.content = Some(state.idle_event());
         state.pill_name = Some(Arc::new(Mutex::new(None)));
         state.resolve_pill_text();
         assert_eq!(
@@ -4866,6 +4881,19 @@ mod tests {
             Some("No media playing")
         );
         assert!(!OverlayState::announces_pill_name_change(&None));
+    }
+
+    #[test]
+    fn idle_status_reports_paused_notifications_truthfully() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.enabled = false;
+        assert_eq!(state.idle_status_title(), "Notifications paused");
+        state.enabled = true;
+        state.config.behavior.enable_track_change = false;
+        state.config.behavior.enable_playback_state_change = false;
+        assert_eq!(state.idle_status_title(), "Notifications paused");
+        state.config.behavior.enable_track_change = true;
+        assert_eq!(state.idle_status_title(), "No media playing");
     }
 
     #[test]

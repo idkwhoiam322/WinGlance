@@ -63,8 +63,10 @@ menu (notifications, duration, start-on-login, close-to-tray, allowed apps,
 layout, position, monitor, preferred source, logs). While no media is
 active, the passive compact pill remains visible as **No media playing**; a real
 media notification temporarily replaces it and the idle status returns after the
-notification settles. The idle pill is static, so it does not continuously
-rerender or animate.
+notification settles. When notifications are disabled, the same passive card
+reads **Notifications paused** instead of incorrectly claiming that no media is
+playing. The passive card is static, so it does not continuously rerender or
+animate.
 
 ### Tray menu
 
