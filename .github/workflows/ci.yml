@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   audit-apply:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && startsWith(github.event.head_commit.message, 'audit-patch:')
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && startsWith(github.event.head_commit.message, 'audit-patch:') }}
     runs-on: windows-latest
     permissions:
       contents: write
@@ -33,7 +33,7 @@ jobs:
         run: python .github/scripts/audit_apply.py
 
   check:
-    if: !(github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && startsWith(github.event.head_commit.message, 'audit-patch:'))
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && startsWith(github.event.head_commit.message, 'audit-patch:')) }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -65,7 +65,7 @@ jobs:
         run: cargo deny check
 
   release:
-    if: github.event_name == 'workflow_dispatch' && inputs.release != 'none'
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.release != 'none' }}
     needs: check
     runs-on: ubuntu-latest
     permissions:
