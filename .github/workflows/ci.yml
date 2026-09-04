@@ -91,7 +91,7 @@ jobs:
       - name: Install pinned mutation runner
         run: cargo install cargo-mutants --version 27.1.0 --locked
       - name: Require zero surviving mutants (shard ${{ matrix.shard }}/10)
-        run: cargo mutants --no-shuffle --baseline=skip --in-place --shard ${{ matrix.shard }}/10 --timeout-multiplier 3 --jobs 2
+        run: cargo mutants --no-shuffle --baseline=skip --in-place --shard ${{ matrix.shard }}/10 --timeout-multiplier 3
 
   release:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.release != 'none' }}
