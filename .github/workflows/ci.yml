@@ -42,6 +42,14 @@ jobs:
           $scriptPath = '.github/scripts/audit_apply.py'
           $script = Get-Content -Raw -LiteralPath $scriptPath
           $script = $script.Replace('"/// Read-only name provider for the passive overlay pill window.\n",', '"#[implement(IRawElementProviderSimple)]\nstruct PillNameProvider {\n",')
+          $script = $script.Replace(
+            '    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITORINFOF_PRIMARY,',
+            "    DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR,`n    MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,"
+          )
+          $script = $script.Replace(
+            "    DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,`n    MONITORINFOEXW, MONITORINFOF_PRIMARY,",
+            "    DISPLAY_DEVICEW, DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayDevicesW, EnumDisplayMonitors, EnumDisplaySettingsW,`n    GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,"
+          )
           Set-Content -LiteralPath $scriptPath -Value $script -NoNewline -Encoding utf8
           python .github/scripts/audit_apply.py
 
