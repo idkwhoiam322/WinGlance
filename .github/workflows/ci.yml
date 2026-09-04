@@ -30,13 +30,7 @@ jobs:
         with:
           components: rustfmt
       - name: Apply reviewed audit delta
-        shell: pwsh
-        run: |
-          $p = "src/overlay/mod.rs"
-          $s = Get-Content -Raw $p
-          $s = $s.Replace('name: format!(r"\\.\DISPLAY{handle}"),', 'name: format!("display-{handle}"),')
-          Set-Content -Path $p -Value $s -NoNewline -Encoding utf8
-          python .github/scripts/audit_apply.py
+        run: python .github/scripts/audit_apply.py
 
   check:
     if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && startsWith(github.event.head_commit.message, 'audit-patch:')) }}
