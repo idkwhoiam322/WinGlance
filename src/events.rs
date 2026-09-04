@@ -564,8 +564,10 @@ pub enum MediaEvent {
     /// A session was seen but is not tracked (rejected by `media_sources`
     /// or on the churn cool-down). Carries whatever display info SMTC exposed
     /// at discovery time. The history records it as a muted row so all media
-    /// sources are visible; `accepted` marks entries whose state reached the
-    /// pill — a tracked source's redundant re-report records grey.
+    /// sources are visible. `accepted` is retained for backward-compatible
+    /// transport/tests; the main window derives its history disposition from
+    /// the event kind and current notification state instead of treating this
+    /// boolean as a user-facing reason.
     SessionRejected {
         source_app: SourceIdentity,
         title: String,
