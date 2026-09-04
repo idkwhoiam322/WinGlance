@@ -4,6 +4,13 @@ version = "1.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
+# `windows::core::implement!` expands to code that names `::windows_core`
+# directly. Static source scanners cannot see that generated reference, so
+# keep this single intentional false positive explicit rather than weakening
+# the unused-dependency gate globally.
+[package.metadata.cargo-machete]
+ignored = ["windows-core"]
+
 [dependencies]
 # Direct dependency so the `windows::core::implement!` macro's generated code
 # (which references `::windows_core`) resolves. `windows` already pulls in this
