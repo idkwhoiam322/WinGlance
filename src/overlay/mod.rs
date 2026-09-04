@@ -789,7 +789,7 @@ struct OverlayState {
     /// invalidated by any `ChromeKey` change (see `chrome_cache_key`).
     chrome_cache: Option<ChromeCache>,
     // Colder control, discovery, accessibility, and retained-cache state follows.
-    config: Config,
+    config: Box<Config>,
     queue: EventQueue,
     /// Notifications waiting to be shown, in arrival order. Distinct events
     /// from different sources show one after another instead of clobbering
@@ -1303,7 +1303,7 @@ impl OverlayState {
         let enabled = config.behavior.notifications_enabled;
         Self {
             hwnd: HWND::default(),
-            config,
+            config: Box::new(config),
             queue,
             pending: VecDeque::new(),
             enabled,
