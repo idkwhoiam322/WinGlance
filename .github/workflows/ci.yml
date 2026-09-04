@@ -16,24 +16,7 @@ permissions:
   contents: read
 
 jobs:
-  audit-apply:
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && startsWith(github.event.head_commit.message, 'audit-patch:') }}
-    runs-on: windows-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Apply reviewed audit delta
-        run: python .github/scripts/audit_apply.py
-
   check:
-    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && startsWith(github.event.head_commit.message, 'audit-patch:')) }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -64,9 +47,43 @@ jobs:
       - name: cargo-deny (licenses, bans, advisories, sources)
         run: cargo deny check
 
+  metrics:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned static-analysis tools
+        run: |
+          cargo install rust-code-analysis-cli --version 0.0.25 --locked
+          cargo install cargo-machete --version 0.9.2 --locked
+      - name: Complexity and Halstead thresholds
+        run: |
+          mkdir -p target/quality-metrics
+          rust-code-analysis-cli -m -p src -O json -o target/quality-metrics
+          python scripts/check_quality_metrics.py target/quality-metrics
+      - name: Unused dependency check
+        run: cargo machete
+
+  mutation:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.release != 'none' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned mutation runner
+        run: cargo install cargo-mutants --version 27.1.0 --locked
+      - name: Require zero surviving mutants
+        run: cargo mutants --no-shuffle --timeout-multiplier 3 --jobs 2
+
   release:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.release != 'none' }}
-    needs: check
+    needs: [check, metrics, mutation]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -100,7 +117,6 @@ jobs:
             Write-Error "invalid release input '$release': expected 'auto' or a vN.N.N tag"
             exit 1
           }
-          Write-Host "Release tag: $tag"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
       - name: Download CI artifact
         uses: actions/download-artifact@v8
