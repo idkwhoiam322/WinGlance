@@ -39,6 +39,10 @@ jobs:
             $text = [regex]::Replace($text, '(?m)^## Threading model\r?$', "## Overlay`r`n`r`n## Threading model", 1)
             Set-Content -LiteralPath $p -Value $text -NoNewline -Encoding utf8
           }
+          $scriptPath = '.github/scripts/audit_apply.py'
+          $script = Get-Content -Raw -LiteralPath $scriptPath
+          $script = $script.Replace('"/// Read-only name provider for the passive overlay pill window.\n",', '"#[implement(IRawElementProviderSimple)]\nstruct PillNameProvider {\n",')
+          Set-Content -LiteralPath $scriptPath -Value $script -NoNewline -Encoding utf8
           python .github/scripts/audit_apply.py
 
   check:
