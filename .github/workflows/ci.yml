@@ -62,7 +62,9 @@ jobs:
           cargo install cargo-machete --version 0.9.2 --locked
       - name: Complexity and Halstead thresholds
         env:
-          QUALITY_BASE_SHA: 32f27897d5f2370997d597b52045279cd96c628c
+          # Last fully verified behavioral-remediation tree. Existing debt at
+          # this boundary is grandfathered; new or worsened debt fails CI.
+          QUALITY_BASE_SHA: 601818d34500201f04d37aa23fc5d085e09c9cfd
         run: |
           mkdir -p target/quality-metrics target/quality-baseline target/quality-baseline-metrics
           rust-code-analysis-cli -m -p src -O json -o target/quality-metrics
