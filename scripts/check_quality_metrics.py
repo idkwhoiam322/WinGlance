@@ -49,6 +49,25 @@ def halstead_difficulty(metrics):
     return None
 
 
+def source_metric_path(path, root):
+    """Return a scan-root-independent `src/...json` identity.
+
+    rust-code-analysis preserves the scanned input path beneath its output
+    directory. The current scan therefore emits `src/...`, while an archived
+    baseline scanned from `target/quality-baseline/src` emits that longer
+    prefix. Comparing the raw output paths would falsely classify unchanged
+    legacy functions as new debt. Anchor both forms at the final `src/`
+    component instead.
+    """
+    rel = path.relative_to(root).as_posix()
+    if rel.startswith("src/"):
+        return rel
+    marker = "/src/"
+    if marker in rel:
+        return "src/" + rel.rsplit(marker, 1)[1]
+    return rel
+
+
 def collect(root):
     root = pathlib.Path(root)
     files = sorted(root.rglob("*.json"))
@@ -61,7 +80,7 @@ def collect(root):
     checked = 0
     seen_kinds = set()
     for path in files:
-        rel = path.relative_to(root).as_posix()
+        rel = source_metric_path(path, root)
         data = json.loads(path.read_text(encoding="utf-8"))
         for unit in iter_dicts(data):
             metrics = unit.get("metrics")
