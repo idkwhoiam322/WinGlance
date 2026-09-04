@@ -1425,6 +1425,19 @@ pub fn create_window(
 /// sources are forgotten and fall back to the default `Playing` state.
 const SOURCE_STATES_CAP: usize = 64;
 
+/// Computes the document scroll offset needed to recenter a Settings
+/// focus target whose `client_y` is already in client coordinates. Keeping
+/// the current scroll separate is the important invariant: adding it to the
+/// visibility comparison double-counts the offset once the pane has scrolled.
+fn settings_focus_scroll_y(current_scroll: i32, client_y: i32, client_h: i32, row_h: i32) -> i32 {
+    let margin = row_h / 2;
+    if client_y < margin || client_y > client_h - margin {
+        current_scroll.saturating_add(client_y - client_h / 2)
+    } else {
+        current_scroll
+    }
+}
+
 impl MainWindowState {
     fn cfg(&self) -> std::sync::RwLockReadGuard<'_, Config> {
         self.config.read().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2662,7 +2675,15 @@ impl MainWindowState {
         let text_right = client_w - pad;
 
         let accent_color = self.accent_color;
-        let text_color = self.cfg().appearance.text_color;
+        // Keep the user's serialized color untouched, but never render the
+        // large Now Playing title below WCAG AA contrast against this pane's
+        // actual black surface. `ensure_contrast` is shared with the overlay,
+        // so both UI surfaces use the same 4.5:1 floor.
+        let text_color = crate::overlay::ensure_contrast(
+            self.cfg().appearance.text_color,
+            [0, 0, 0, 0xFF],
+            crate::overlay::TEXT_CONTRAST_AA,
+        );
 
         // The SMTC worker already decoded the artwork once at event time (see
         // smtc.rs `with_decoded_art`); the UI thread only ever copies the
@@ -4189,8 +4210,9 @@ impl MainWindowState {
         let (_, client_h) = client_size(self.hwnd);
         let scale = unsafe { GetDpiForWindow(self.hwnd).max(96) } as f32 / 96.0;
         let row_h = (34.0 * scale) as i32;
-        if t.cy < self.settings_scroll_y + row_h / 2 || t.cy > self.settings_scroll_y + client_h - row_h / 2 {
-            self.settings_scroll_y = t.cy - client_h / 2;
+        let new_scroll = settings_focus_scroll_y(self.settings_scroll_y, t.cy, client_h, row_h);
+        if new_scroll != self.settings_scroll_y {
+            self.settings_scroll_y = new_scroll;
             self.sync_settings_scroll(client_w, client_h);
         }
         raise_settings_focus_event(self.hwnd, new_hover);
@@ -9412,5 +9434,22 @@ mod tests {
         let _ = MainWindowState::tooltip_text_buffer(&mut buffer, &short);
         assert_eq!(buffer.len(), 41);
         assert_eq!(String::from_utf16_lossy(&buffer[..40]), short);
+    }
+
+    #[test]
+    fn settings_focus_scroll_uses_client_coordinates_from_nonzero_offsets() {
+        let current = 300;
+        let client_h = 600;
+        let row_h = 34;
+
+        // A target already inside the viewport must not move merely because
+        // the document itself is scrolled. The old comparison added `current`
+        // to the client-space bounds and incorrectly moved this target.
+        assert_eq!(settings_focus_scroll_y(current, 280, client_h, row_h), current);
+
+        // Offscreen-near-top and offscreen-near-bottom targets recenter around
+        // their document position by applying a delta to the existing scroll.
+        assert_eq!(settings_focus_scroll_y(current, 8, client_h, row_h), 8);
+        assert_eq!(settings_focus_scroll_y(current, 592, client_h, row_h), 592);
     }
 }

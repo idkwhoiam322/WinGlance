@@ -37,8 +37,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LB_GETCOUNT, LB_GETCURSEL, LB_GETITEMDATA, LB_GETITEMRECT, LB_GETTOPINDEX, LB_SETCURSEL, LB_SETITEMDATA,
     LB_SETITEMHEIGHT, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadCursorW, SW_SHOWNOACTIVATE,
     SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, ShowWindow, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SETFONT, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WM_DPICHANGED, WM_DRAWITEM, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
+    WM_PAINT, WM_SETFONT, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
     WS_VSCROLL,
 };
 use windows::core::BOOL;
@@ -68,6 +68,10 @@ pub(crate) const AUTO_SOURCES_RESULT_MSG: u32 = WM_APP + 11;
 /// pattern — the config field it feeds (`behavior.pinned_source`) is a single
 /// app, not a list.
 pub(crate) const PINNED_SOURCE_RESULT_MSG: u32 = WM_APP + 12;
+/// Posted by the picker UIA provider to the picker window. `wParam` is the
+/// row index; `lParam == 0` toggles through the same path as mouse/Space and
+/// `lParam == 1` only moves list focus to the row.
+pub(crate) const PICKER_UIA_ACTION_MSG: u32 = WM_APP + 15;
 
 /// Identifier for the listbox's Comctl32 subclass registration.
 const LISTBOX_SUBCLASS_ID: usize = 1;
@@ -870,6 +874,79 @@ fn read_checked(hwnd: HWND, lb: HWND) -> Vec<String> {
     result
 }
 
+#[derive(Clone)]
+pub(crate) struct PickerAccessibleRow {
+    pub index: usize,
+    pub name: String,
+    pub checked: bool,
+    pub toggleable: bool,
+    /// Listbox-client coordinates; UIA converts these to screen coordinates.
+    pub rect: RECT,
+}
+
+/// Live UIA snapshot for the owner-drawn picker. The checkbox state comes from
+/// the same `LB_GETITEMDATA` source of truth used by painting, mouse clicks,
+/// keyboard Space and result collection, so accessibility can never drift from
+/// what the user sees or what gets saved.
+pub(crate) fn picker_accessibility_rows(parent: HWND) -> Vec<PickerAccessibleRow> {
+    let state_ptr = window_state::<PickerState>(parent);
+    if state_ptr.is_null() {
+        return Vec::new();
+    }
+    let state = unsafe { &*state_ptr };
+    if state.listbox.0.is_null() {
+        return Vec::new();
+    }
+    let fixed_status = state.list.first().is_some_and(|entry| entry.pattern.is_empty());
+    state
+        .list
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let mut rect = RECT::default();
+            let result = unsafe {
+                send_message(
+                    state.listbox,
+                    LB_GETITEMRECT,
+                    WPARAM(index),
+                    LPARAM(&mut rect as *mut RECT as isize),
+                )
+            };
+            if result.0 < 0 {
+                return None;
+            }
+            let checked = unsafe { send_message(state.listbox, LB_GETITEMDATA, WPARAM(index), LPARAM(0)) }.0 as usize
+                == BST_CHECKED;
+            let toggleable = !(fixed_status && index == 0);
+            let name = if toggleable {
+                entry.display_name.clone()
+            } else {
+                format!("{} (always included)", entry.display_name)
+            };
+            Some(PickerAccessibleRow {
+                index,
+                name,
+                checked,
+                toggleable,
+                rect,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn picker_selected_index(parent: HWND) -> Option<usize> {
+    let state_ptr = window_state::<PickerState>(parent);
+    if state_ptr.is_null() {
+        return None;
+    }
+    let state = unsafe { &*state_ptr };
+    if state.listbox.0.is_null() {
+        return None;
+    }
+    let selected = unsafe { send_message(state.listbox, LB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0;
+    (selected >= 0).then_some(selected as usize)
+}
+
 fn post_result(hwnd: HWND, cancelled: bool) {
     let state_ptr = window_state::<PickerState>(hwnd);
     if state_ptr.is_null() {
@@ -993,8 +1070,20 @@ unsafe extern "system" fn listbox_proc(
 unsafe fn listbox_proc_body(lb: HWND, message: u32, wparam: WPARAM, lparam: LPARAM, ref_data: usize) -> LRESULT {
     let parent = HWND(ref_data as *mut std::ffi::c_void);
     match message {
+        WM_GETOBJECT => {
+            if let Some(provider) = crate::accessibility::picker_provider(parent, lb) {
+                unsafe {
+                    windows::Win32::UI::Accessibility::UiaReturnRawElementProvider(lb, wparam, lparam, Some(&provider))
+                }
+            } else {
+                unsafe { DefSubclassProc(lb, message, wparam, lparam) }
+            }
+        }
         WM_NCDESTROY => {
-            // Unhook cleanly before deflecting the rest of destruction.
+            // UIA core can retain providers across destruction; disconnect the
+            // listbox provider before removing our subclass so no later query
+            // can resolve window state that has already been released.
+            crate::accessibility::detach_hwnd_provider(lb);
             let _ = unsafe { RemoveWindowSubclass(lb, Some(listbox_proc), LISTBOX_SUBCLASS_ID) };
             unsafe { DefSubclassProc(lb, message, wparam, lparam) }
         }
@@ -1123,6 +1212,21 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_CREATE => LRESULT(0),
+        PICKER_UIA_ACTION_MSG => {
+            let state_ptr = window_state::<PickerState>(hwnd);
+            if !state_ptr.is_null() {
+                let state = unsafe { &mut *state_ptr };
+                let index = wparam.0;
+                if index < state.list.len() && !state.listbox.0.is_null() {
+                    let _ = unsafe { send_message(state.listbox, LB_SETCURSEL, WPARAM(index), LPARAM(0)) };
+                    let _ = unsafe { SetFocus(Some(state.listbox)) };
+                    if lparam.0 == 0 {
+                        toggle_picker_row(state.listbox, state, index);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
         WM_DPICHANGED => {
             // The owner was dragged to a display with a different DPI while
             // the picker was open (or the picker followed it there). Rebuild

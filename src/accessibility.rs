@@ -37,9 +37,9 @@ use windows::Win32::UI::Accessibility::{
     NavigateDirection_FirstChild, NavigateDirection_LastChild, NavigateDirection_NextSibling, NavigateDirection_Parent,
     NavigateDirection_PreviousSibling, NotificationKind_ItemAdded, NotificationProcessing_MostRecent,
     ProviderOptions_ServerSideProvider, StructureChangeType_ChildrenInvalidated, ToggleState_Off, ToggleState_On,
-    UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId, UIA_IsEnabledPropertyId,
-    UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId, UIA_PATTERN_ID, UIA_PROPERTY_ID, UIA_PaneControlTypeId,
-    UIA_TextControlTypeId, UIA_TogglePatternId, UiaAppendRuntimeId, UiaHostProviderFromHwnd,
+    UIA_CheckBoxControlTypeId, UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId, UIA_InvokePatternId,
+    UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
+    UIA_PaneControlTypeId, UIA_TextControlTypeId, UIA_TogglePatternId, UiaAppendRuntimeId, UiaHostProviderFromHwnd,
     UiaRaiseAutomationPropertyChangedEvent, UiaRaiseNotificationEvent, UiaRaiseStructureChangedEvent, UiaRect,
     UiaReturnRawElementProvider,
 };
@@ -497,6 +497,321 @@ fn runtime_id_array(id: i32) -> windows::core::Result<*mut SAFEARRAY> {
 /// off the UI thread — a provider instance that outlives the window (UIA
 /// core holds a reference across the last release) degrades to an empty name
 /// instead of reading freed memory.
+/// UI Automation fragment for the owner-drawn app-picker listbox. The
+/// native LISTBOX exposes selection, but its custom checkbox state lives in
+/// item data and is otherwise invisible to UIA. This provider exposes each row
+/// as a CheckBox with a live ToggleState and routes Toggle/SetFocus back to the
+/// picker UI thread through `PICKER_UIA_ACTION_MSG`.
+#[derive(Clone)]
+enum PickerProviderKind {
+    Root,
+    Child(usize),
+}
+
+#[implement(
+    IRawElementProviderSimple,
+    IRawElementProviderFragment,
+    IRawElementProviderFragmentRoot,
+    IToggleProvider
+)]
+struct PickerProvider {
+    parent: HWND,
+    listbox: HWND,
+    kind: PickerProviderKind,
+}
+
+impl PickerProvider {
+    fn resolve(&self) -> Option<crate::process_picker::PickerAccessibleRow> {
+        let PickerProviderKind::Child(index) = self.kind else {
+            return None;
+        };
+        crate::process_picker::picker_accessibility_rows(self.parent)
+            .into_iter()
+            .find(|row| row.index == index)
+    }
+
+    fn make(&self, kind: PickerProviderKind) -> PickerProvider {
+        PickerProvider {
+            parent: self.parent,
+            listbox: self.listbox,
+            kind,
+        }
+    }
+
+    fn child_fragment(&self, index: usize) -> IRawElementProviderFragment {
+        self.make(PickerProviderKind::Child(index)).into()
+    }
+
+    fn root_fragment(&self) -> IRawElementProviderFragment {
+        self.make(PickerProviderKind::Root).into()
+    }
+
+    fn root_fragment_root(&self) -> IRawElementProviderFragmentRoot {
+        self.make(PickerProviderKind::Root).into()
+    }
+
+    fn screen_rect(&self, client: RECT) -> UiaRect {
+        let mut p = POINT {
+            x: client.left,
+            y: client.top,
+        };
+        if !self.listbox.0.is_null() {
+            unsafe {
+                let _ = ClientToScreen(self.listbox, &mut p);
+            }
+        }
+        UiaRect {
+            left: p.x as f64,
+            top: p.y as f64,
+            width: (client.right - client.left) as f64,
+            height: (client.bottom - client.top) as f64,
+        }
+    }
+
+    fn activate(&self, action: isize) {
+        let Some(row) = self.resolve() else {
+            return;
+        };
+        if self.parent.0.is_null() {
+            return;
+        }
+        let _ = unsafe {
+            post_message(
+                self.parent,
+                crate::process_picker::PICKER_UIA_ACTION_MSG,
+                WPARAM(row.index),
+                LPARAM(action),
+            )
+        };
+    }
+}
+
+impl IRawElementProviderSimple_Impl for PickerProvider_Impl {
+    fn ProviderOptions(&self) -> windows::core::Result<windows::Win32::UI::Accessibility::ProviderOptions> {
+        catch_uia("picker UIA ProviderOptions", || Ok(ProviderOptions_ServerSideProvider))
+    }
+
+    fn GetPatternProvider(&self, patternid: UIA_PATTERN_ID) -> windows::core::Result<IUnknown> {
+        catch_uia("picker UIA GetPatternProvider", || {
+            let this = &self.this;
+            let Some(row) = this.resolve() else {
+                return Err(Error::empty());
+            };
+            if row.toggleable && patternid == UIA_TogglePatternId {
+                let p: IToggleProvider = this.make(PickerProviderKind::Child(row.index)).into();
+                return p.cast::<IUnknown>();
+            }
+            Err(Error::empty())
+        })
+    }
+
+    fn GetPropertyValue(&self, propertyid: UIA_PROPERTY_ID) -> windows::core::Result<VARIANT> {
+        catch_uia("picker UIA GetPropertyValue", || {
+            let this = &self.this;
+            if propertyid == UIA_NamePropertyId {
+                let name = match this.kind {
+                    PickerProviderKind::Root => "App selection".to_string(),
+                    PickerProviderKind::Child(_) => this.resolve().map(|row| row.name).unwrap_or_default(),
+                };
+                return Ok(VARIANT::from(BSTR::from(name)));
+            }
+            if propertyid == windows::Win32::UI::Accessibility::UIA_ControlTypePropertyId {
+                let ty = if matches!(this.kind, PickerProviderKind::Root) {
+                    UIA_PaneControlTypeId
+                } else {
+                    UIA_CheckBoxControlTypeId
+                };
+                return Ok(VARIANT::from(ty.0));
+            }
+            if propertyid == UIA_IsEnabledPropertyId {
+                let enabled = match this.kind {
+                    PickerProviderKind::Root => true,
+                    PickerProviderKind::Child(_) => this.resolve().is_some(),
+                };
+                return Ok(VARIANT::from(enabled));
+            }
+            if propertyid == UIA_IsKeyboardFocusablePropertyId {
+                return Ok(VARIANT::from(matches!(this.kind, PickerProviderKind::Child(_))));
+            }
+            if propertyid == UIA_HasKeyboardFocusPropertyId {
+                let focused = match this.kind {
+                    PickerProviderKind::Child(index) => {
+                        crate::process_picker::picker_selected_index(this.parent) == Some(index)
+                    }
+                    PickerProviderKind::Root => false,
+                };
+                return Ok(VARIANT::from(focused));
+            }
+            Ok(VARIANT::default())
+        })
+    }
+
+    fn HostRawElementProvider(&self) -> windows::core::Result<IRawElementProviderSimple> {
+        catch_uia("picker UIA HostRawElementProvider", || {
+            if matches!(self.this.kind, PickerProviderKind::Root) && !self.this.listbox.0.is_null() {
+                unsafe { UiaHostProviderFromHwnd(self.this.listbox) }
+            } else {
+                Err(Error::empty())
+            }
+        })
+    }
+}
+
+impl IRawElementProviderFragment_Impl for PickerProvider_Impl {
+    fn Navigate(&self, direction: NavigateDirection) -> windows::core::Result<IRawElementProviderFragment> {
+        catch_uia("picker UIA Navigate", || {
+            let this = &self.this;
+            let rows = crate::process_picker::picker_accessibility_rows(this.parent);
+            match this.kind {
+                PickerProviderKind::Root => {
+                    if direction == NavigateDirection_FirstChild
+                        && let Some(row) = rows.first()
+                    {
+                        return Ok(this.child_fragment(row.index));
+                    }
+                    if direction == NavigateDirection_LastChild
+                        && let Some(row) = rows.last()
+                    {
+                        return Ok(this.child_fragment(row.index));
+                    }
+                }
+                PickerProviderKind::Child(index) => {
+                    if direction == NavigateDirection_Parent {
+                        return Ok(this.root_fragment());
+                    }
+                    if let Some(pos) = rows.iter().position(|row| row.index == index) {
+                        if direction == NavigateDirection_NextSibling
+                            && let Some(row) = rows.get(pos + 1)
+                        {
+                            return Ok(this.child_fragment(row.index));
+                        }
+                        if direction == NavigateDirection_PreviousSibling && pos > 0 {
+                            return Ok(this.child_fragment(rows[pos - 1].index));
+                        }
+                    }
+                }
+            }
+            Err(Error::empty())
+        })
+    }
+
+    fn GetRuntimeId(&self) -> windows::core::Result<*mut SAFEARRAY> {
+        catch_uia("picker UIA GetRuntimeId", || match self.this.kind {
+            PickerProviderKind::Root => Ok(std::ptr::null_mut()),
+            PickerProviderKind::Child(index) => runtime_id_array(0x6000_i32.saturating_add(index as i32)),
+        })
+    }
+
+    fn BoundingRectangle(&self) -> windows::core::Result<UiaRect> {
+        catch_uia("picker UIA BoundingRectangle", || {
+            let this = &self.this;
+            let client = match this.kind {
+                PickerProviderKind::Root => {
+                    let mut rect = RECT::default();
+                    if this.listbox.0.is_null() {
+                        None
+                    } else {
+                        unsafe {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(this.listbox, &mut rect);
+                        }
+                        Some(rect)
+                    }
+                }
+                PickerProviderKind::Child(_) => this.resolve().map(|row| row.rect),
+            };
+            Ok(client.map_or(UiaRect::default(), |rect| this.screen_rect(rect)))
+        })
+    }
+
+    fn GetEmbeddedFragmentRoots(&self) -> windows::core::Result<*mut SAFEARRAY> {
+        catch_uia("picker UIA GetEmbeddedFragmentRoots", || Ok(std::ptr::null_mut()))
+    }
+
+    fn SetFocus(&self) -> windows::core::Result<()> {
+        catch_uia("picker UIA SetFocus", || {
+            if matches!(self.this.kind, PickerProviderKind::Child(_)) {
+                self.this.activate(1);
+            }
+            Ok(())
+        })
+    }
+
+    fn FragmentRoot(&self) -> windows::core::Result<IRawElementProviderFragmentRoot> {
+        catch_uia("picker UIA FragmentRoot", || Ok(self.this.root_fragment_root()))
+    }
+}
+
+impl IRawElementProviderFragmentRoot_Impl for PickerProvider_Impl {
+    fn ElementProviderFromPoint(&self, x: f64, y: f64) -> windows::core::Result<IRawElementProviderFragment> {
+        catch_uia("picker UIA ElementProviderFromPoint", || {
+            let this = &self.this;
+            let mut point = POINT {
+                x: x as i32,
+                y: y as i32,
+            };
+            if !this.listbox.0.is_null() {
+                unsafe {
+                    let _ = ScreenToClient(this.listbox, &mut point);
+                }
+            }
+            for row in crate::process_picker::picker_accessibility_rows(this.parent) {
+                if point.x >= row.rect.left
+                    && point.x < row.rect.right
+                    && point.y >= row.rect.top
+                    && point.y < row.rect.bottom
+                {
+                    return Ok(this.child_fragment(row.index));
+                }
+            }
+            Ok(this.root_fragment())
+        })
+    }
+
+    fn GetFocus(&self) -> windows::core::Result<IRawElementProviderFragment> {
+        catch_uia("picker UIA GetFocus", || {
+            let Some(index) = crate::process_picker::picker_selected_index(self.this.parent) else {
+                return Err(Error::empty());
+            };
+            Ok(self.this.child_fragment(index))
+        })
+    }
+}
+
+impl IToggleProvider_Impl for PickerProvider_Impl {
+    fn Toggle(&self) -> windows::core::Result<()> {
+        catch_uia("picker UIA Toggle", || {
+            if self.this.resolve().is_some_and(|row| row.toggleable) {
+                self.this.activate(0);
+            }
+            Ok(())
+        })
+    }
+
+    fn ToggleState(&self) -> windows::core::Result<windows::Win32::UI::Accessibility::ToggleState> {
+        catch_uia("picker UIA ToggleState", || {
+            Ok(if self.this.resolve().is_some_and(|row| row.checked) {
+                ToggleState_On
+            } else {
+                ToggleState_Off
+            })
+        })
+    }
+}
+
+pub fn picker_provider(parent: HWND, listbox: HWND) -> Option<IRawElementProviderSimple> {
+    if crate::process_picker::picker_accessibility_rows(parent).is_empty() {
+        return None;
+    }
+    Some(
+        PickerProvider {
+            parent,
+            listbox,
+            kind: PickerProviderKind::Root,
+        }
+        .into(),
+    )
+}
+
 #[implement(IRawElementProviderSimple)]
 struct PillNameProvider {
     hwnd: HWND,

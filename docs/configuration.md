@@ -204,7 +204,7 @@ playing track through the normal event path.
 | Key                | Default       | Range    | Effect                                  |
 |--------------------|---------------|----------|-----------------------------------------|
 | `background_color` | `[18, 20, 28, 235]` | RGBA 0–255 | Near-opaque dark-slate pill background (alpha 235 ≈ 92%; lower for more translucency) |
-| `text_color`       | `[255, 255, 255, 255]` | RGBA 0–255 | Title and state-label color |
+| `text_color`       | `[255, 255, 255, 255]` | RGBA 0–255 | Stored title/state color; the Activity title is rendered with the minimum lightening needed for 4.5:1 contrast on its black surface |
 | `accent_color`     | `[240, 110, 155, 255]` | RGBA 0–255 | Playback symbols, music note, album-art rim; aura fallback when the artwork palette has no vibrant color |
 | `corner_radius`    | `26.0`     | 4–48    | Corner rounding in logical pixels       |
 | `compact_corner_radius` | `12.0` | 4–48    | Corner rounding of the Compact layout, in logical pixels (independent of `corner_radius`; see below) |
