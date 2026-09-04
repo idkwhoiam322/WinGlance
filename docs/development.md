@@ -14,7 +14,7 @@ WinGlance/
 ├── create_exe.ps1          Build/format/check/test/audit packaging script
 ├── .github/
 │   └── workflows/
-│       └── ci.yml          fmt / clippy / test / build / cargo-deny on push/PR
+│       └── ci.yml          fmt / clippy / test / build / audit / metrics on push/PR
 ├── docs/
 │   ├── architecture.md     Design, threading, SMTC selection, rendering, placement
 │   ├── development.md      This file
@@ -150,8 +150,7 @@ The release build produces a single `target\release\WinGlance.exe` (profile:
 `codegen-units = 1`, `lto = "fat"`, `strip = "symbols"`). It has no data
 dependencies: config and logs are created at first run under
 `%APPDATA%\WinGlance\WinGlance\data\`, and every icon/resource is drawn with system GDI
-calls. Launching from the Start menu (or at logon) surfaces only the tray icon and
-the always-visible pill — no window, no console, no dialogs.
+calls. On a genuine first-ever launch, WinGlance opens the tracking window once so the user can review Settings. Later Start-menu launches and logon starts surface only the tray icon and always-visible pill — no console or dialogs — unless the user explicitly opens the window from the tray.
 
 ## Runtime data
 
@@ -159,7 +158,7 @@ the always-visible pill — no window, no console, no dialogs.
 |---------------|--------------------------------------------------|
 | Config        | `%APPDATA%\WinGlance\WinGlance\data\config.toml`         |
 | Logs          | `%APPDATA%\WinGlance\WinGlance\data\logs\log-Live.log`  |
-| Artwork cache | In memory only: one decoded buffer per unique cover; the overlay's cap-3 track cache (indefinite retention) plus its 64-entry playback-state ledger; per-source icon caches evicted when a session closes |
+| Artwork cache | In memory only: one decoded buffer per unique cover; the overlay's cap-8 track cache (indefinite retention, LRU-bounded) plus its 64-entry playback-state ledger; per-source icon caches evicted when a session closes |
 
 ## Testing notes
 
