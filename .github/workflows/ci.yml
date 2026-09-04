@@ -30,28 +30,7 @@ jobs:
         with:
           components: rustfmt
       - name: Apply reviewed audit delta
-        shell: pwsh
-        run: |
-          $p = 'docs/architecture.md'
-          $text = Get-Content -Raw -LiteralPath $p
-          if ($text -notmatch '(?m)^## Overlay\r?$') {
-            if ($text -notmatch '(?m)^## Threading model\r?$') { throw 'architecture insertion anchor missing' }
-            $text = [regex]::Replace($text, '(?m)^## Threading model\r?$', "## Overlay`r`n`r`n## Threading model", 1)
-            Set-Content -LiteralPath $p -Value $text -NoNewline -Encoding utf8
-          }
-          $scriptPath = '.github/scripts/audit_apply.py'
-          $script = Get-Content -Raw -LiteralPath $scriptPath
-          $script = $script.Replace('"/// Read-only name provider for the passive overlay pill window.\n",', '"#[implement(IRawElementProviderSimple)]\nstruct PillNameProvider {\n",')
-          $script = $script.Replace(
-            '    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITORINFOF_PRIMARY,',
-            "    DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR,`n    MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,"
-          )
-          $script = $script.Replace(
-            "    DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,`n    MONITORINFOEXW, MONITORINFOF_PRIMARY,",
-            "    DISPLAY_DEVICEW, DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayDevicesW, EnumDisplayMonitors, EnumDisplaySettingsW,`n    GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,"
-          )
-          Set-Content -LiteralPath $scriptPath -Value $script -NoNewline -Encoding utf8
-          python .github/scripts/audit_apply.py
+        run: python .github/scripts/audit_apply.py
 
   check:
     if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && startsWith(github.event.head_commit.message, 'audit-patch:')) }}
