@@ -1513,6 +1513,7 @@ impl MainWindowState {
         let mut changed = {
             let mut cfg = self.config.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             mutate(&mut cfg);
+            crate::overlay::refresh_monitor_identities(&mut cfg);
             cfg.clone()
         };
         self.persist_change(&mut changed);
@@ -4763,6 +4764,8 @@ impl MainWindowState {
                     cfg.overlay.compact_position_x = cfg.overlay.position_x;
                     cfg.overlay.compact_position_y = cfg.overlay.position_y;
                     cfg.overlay.compact_monitor = cfg.overlay.monitor;
+                    cfg.overlay.compact_monitor_device_id = cfg.overlay.monitor_device_id.clone();
+                    cfg.overlay.compact_monitor_device_index = cfg.overlay.monitor_device_index;
                 }
                 cfg.overlay.compact_position_separate = true;
             } else {

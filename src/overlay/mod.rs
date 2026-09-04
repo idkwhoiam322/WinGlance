@@ -40,7 +40,7 @@ mod fullscreen;
 mod morph;
 mod render;
 
-pub(crate) use fullscreen::{enumerate_displays_cached, invalidate_display_cache};
+pub(crate) use fullscreen::{enumerate_displays_cached, invalidate_display_cache, refresh_monitor_identities};
 pub(crate) use render::{TEXT_CONTRAST_AA, ensure_contrast, pm_bgra_to_rgba};
 // Tests outside this module assert contrast ratios through the shared
 // helper; the binary itself never names it.
@@ -50,7 +50,7 @@ pub(crate) use render::contrast_ratio;
 use fullscreen::{
     DisplayInfo, ForegroundVerdict, TargetMonitor, anchor_unchanged, decide_layout, effective_position_rect,
     foreground_fullscreens_target, foreground_monitor_index, log_target_once, monitor_dpi, placement,
-    refresh_period_ms, resolve_target_sticky, window_is_fullscreen,
+    refresh_period_ms, resolve_target_persisted, window_is_fullscreen,
 };
 use morph::{
     ENTRANCE_GROW, HoverExpand, HoverStep, HoverTick, MorphDirection, MorphProgress, animation_duration,
@@ -1017,7 +1017,18 @@ pub(crate) fn dpi_for_position(hwnd: HWND, compact: bool) -> u32 {
     };
     let displays = enumerate_displays_cached();
     let foreground_nearest = foreground_monitor_index(&displays);
-    resolve_target_sticky(position.monitor, &displays, foreground_nearest)
+    let (stable_id, stable_index) = if compact && state.config.overlay.compact_position_separate {
+        (
+            state.config.overlay.compact_monitor_device_id.as_deref(),
+            state.config.overlay.compact_monitor_device_index,
+        )
+    } else {
+        (
+            state.config.overlay.monitor_device_id.as_deref(),
+            state.config.overlay.monitor_device_index,
+        )
+    };
+    resolve_target_persisted(position.monitor, stable_id, stable_index, &displays, foreground_nearest)
         .map(|index| monitor_dpi(displays[index].handle))
         .unwrap_or(96)
 }
@@ -3879,7 +3890,25 @@ impl OverlayState {
     /// `target` against an explicit display snapshot (pure core, so the
     /// compact-monitor selection is testable without live displays).
     fn target_on(&self, displays: &[DisplayInfo], foreground_nearest: Option<usize>) -> Option<TargetMonitor> {
-        let index = resolve_target_sticky(self.active_pos().monitor, displays, foreground_nearest)?;
+        let compact_slot = self.effective_compact() && self.config.overlay.compact_position_separate;
+        let (stable_id, stable_index) = if compact_slot {
+            (
+                self.config.overlay.compact_monitor_device_id.as_deref(),
+                self.config.overlay.compact_monitor_device_index,
+            )
+        } else {
+            (
+                self.config.overlay.monitor_device_id.as_deref(),
+                self.config.overlay.monitor_device_index,
+            )
+        };
+        let index = resolve_target_persisted(
+            self.active_pos().monitor,
+            stable_id,
+            stable_index,
+            displays,
+            foreground_nearest,
+        )?;
         let display = &displays[index];
         let target = TargetMonitor {
             handle: display.handle,
@@ -12338,7 +12367,8 @@ mod tests {
                 bottom: 1080,
             },
             primary,
-            name: format!(r"\\.\DISPLAY{handle}"),
+            name: format!("display-{handle}"),
+            stable_id: Some(format!("monitor-{handle}")),
         }
     }
 

@@ -3,14 +3,13 @@
 use super::OverlayPos;
 use crate::config::{Config, HorizontalPosition, LayoutMode, MonitorMode, VerticalPosition};
 use log::{debug, warn};
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::Graphics::Gdi::{
-    DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
+    DEVMODEW, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS, EnumDisplayDevicesW, EnumDisplayMonitors, EnumDisplaySettingsW,
+    GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -118,8 +117,13 @@ pub(crate) struct DisplayInfo {
     pub monitor: RECT,
     /// Whether Windows flags this as the primary display.
     pub primary: bool,
-    /// The device name (`\\.\DISPLAY1`), as reported by the system.
+    /// The GDI display device name (`\\.\DISPLAY1`), useful for
+    /// diagnostics but not durable enough to persist as monitor identity.
     pub name: String,
+    /// `GUID_DEVINTERFACE_MONITOR` device-interface path. Windows registers
+    /// this per monitor, so it can re-find the same monitor after enumeration
+    /// order changes across restarts.
+    pub stable_id: Option<String>,
 }
 
 /// Cached display enumeration: returns the snapshot if it is less than 2 seconds
@@ -164,6 +168,25 @@ static DISPLAY_CACHE: Mutex<DisplayCacheEntry> = Mutex::new(DisplayCacheEntry(No
 /// Enumerates every active display. Returns an empty vec only when the system
 /// currently reports no display (for example, a locked or disconnected
 /// session).
+fn monitor_interface_id(gdi_name: &str) -> Option<String> {
+    let wide: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut device = DISPLAY_DEVICEW {
+        cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+        ..Default::default()
+    };
+    // EDD_GET_DEVICE_INTERFACE_NAME = 0x1. It asks EnumDisplayDevicesW to
+    // place the GUID_DEVINTERFACE_MONITOR path in DISPLAY_DEVICE.DeviceID.
+    if !unsafe { EnumDisplayDevicesW(PCWSTR(wide.as_ptr()), 0, &mut device, 0x1) }.as_bool() {
+        return None;
+    }
+    let end = device
+        .DeviceID
+        .iter()
+        .position(|&ch| ch == 0)
+        .unwrap_or(device.DeviceID.len());
+    (end != 0).then(|| String::from_utf16_lossy(&device.DeviceID[..end]))
+}
+
 pub(crate) fn enumerate_displays() -> Vec<DisplayInfo> {
     let mut displays: Vec<DisplayInfo> = Vec::new();
     unsafe extern "system" fn collect(monitor: HMONITOR, _hdc: HDC, _rect: *mut RECT, data: LPARAM) -> BOOL {
@@ -188,12 +211,15 @@ pub(crate) fn enumerate_displays() -> Vec<DisplayInfo> {
             .iter()
             .position(|&c| c == 0)
             .unwrap_or(info.szDevice.len());
+        let name = String::from_utf16_lossy(&info.szDevice[..name_len]);
+        let stable_id = monitor_interface_id(&name);
         displays.push(DisplayInfo {
             handle: monitor,
             work: info.monitorInfo.rcWork,
             monitor: info.monitorInfo.rcMonitor,
             primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
-            name: String::from_utf16_lossy(&info.szDevice[..name_len]),
+            name,
+            stable_id,
         });
         true.into()
     }
@@ -262,54 +288,155 @@ pub(crate) fn resolve_target(
     }
 }
 
-/// Remembered device names for `MonitorMode::Index(n)` picks. Windows can
-/// reorder `EnumDisplayMonitors` order across dock/driver events while the
-/// counts stay in range, which would silently retarget an index-configured
-/// pill onto a different physical display: the first resolution of an index
-/// records the picked device's name, and later resolutions prefer that same
-/// device wherever it moved. Falls back to the raw index when the remembered
-/// device is gone. In-memory only — across restarts the index keeps its
-/// documented enumeration-order meaning.
-static INDEXED_DISPLAY_NAMES: LazyLock<Mutex<HashMap<u32, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// `resolve_target` with the sticky device-name memory for index picks (see
-/// `INDEXED_DISPLAY_NAMES`); every other mode resolves identically.
-pub(super) fn resolve_target_sticky(
+/// Resolves a monitor selection, preferring the persisted per-monitor identity
+/// when it belongs to the current explicit index. A known-but-missing monitor
+/// falls back to primary rather than letting the same numeric index silently
+/// select a different physical display. Configs without identity metadata keep
+/// the legacy index behavior.
+pub(crate) fn resolve_target_persisted(
     mode: MonitorMode,
+    stable_id: Option<&str>,
+    stable_index: Option<u32>,
     displays: &[DisplayInfo],
     foreground_nearest: Option<usize>,
 ) -> Option<usize> {
     let MonitorMode::Index(index) = mode else {
         return resolve_target(mode, displays, foreground_nearest);
     };
-    let mut remembered = INDEXED_DISPLAY_NAMES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(name) = remembered.get(&index)
-        && let Some(pos) = displays.iter().position(|display| &display.name == name)
+    if stable_index == Some(index)
+        && let Some(id) = stable_id.filter(|id| !id.is_empty())
     {
-        return Some(pos);
+        if let Some(pos) = displays.iter().position(|display| {
+            display
+                .stable_id
+                .as_deref()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(id))
+        }) {
+            return Some(pos);
+        }
+        if displays.is_empty() {
+            return None;
+        }
+        return Some(displays.iter().position(|display| display.primary).unwrap_or(0));
     }
-    let picked = resolve_target(mode, displays, foreground_nearest)?;
-    // Record only genuine index hits — never a primary fallback, so the
-    // memory cannot glue an unplugged index to the primary and the setting
-    // still reapplies when the display returns. Never overwritten: the
-    // remembered device is the identity of the pick, by design.
-    if index as usize == picked
-        && let Some(display) = displays.get(picked)
-    {
-        remembered.entry(index).or_insert_with(|| display.name.clone());
-    }
-    Some(picked)
+    resolve_target(mode, displays, foreground_nearest)
 }
 
-/// Test seam: forgets every remembered index→device association.
+fn refresh_identity_slot(
+    mode: MonitorMode,
+    stable_id: &mut Option<String>,
+    stable_index: &mut Option<u32>,
+    displays: &[DisplayInfo],
+) -> bool {
+    let MonitorMode::Index(index) = mode else {
+        let changed = stable_id.is_some() || stable_index.is_some();
+        *stable_id = None;
+        *stable_index = None;
+        return changed;
+    };
+
+    // A matching pair is already authoritative. Preserve it while the monitor
+    // is temporarily absent so unplug/replug cannot erase the identity needed
+    // to recognize it when it returns.
+    if *stable_index == Some(index) && stable_id.as_deref().is_some_and(|id| !id.is_empty()) {
+        return false;
+    }
+    let next_id = displays
+        .get(index as usize)
+        .and_then(|display| display.stable_id.clone());
+    let changed = *stable_index != Some(index) || *stable_id != next_id;
+    *stable_index = Some(index);
+    *stable_id = next_id;
+    changed
+}
+
+/// Captures managed monitor identities for explicit-index selections. This is
+/// an additive migration: old configs keep working if Windows cannot expose a
+/// device-interface path, and existing remembered identities survive an
+/// unplug/replug cycle.
+pub(crate) fn refresh_monitor_identities(config: &mut Config) -> bool {
+    let displays = enumerate_displays_cached();
+    let expanded = refresh_identity_slot(
+        config.overlay.monitor,
+        &mut config.overlay.monitor_device_id,
+        &mut config.overlay.monitor_device_index,
+        &displays,
+    );
+    let compact = refresh_identity_slot(
+        config.overlay.compact_monitor,
+        &mut config.overlay.compact_monitor_device_id,
+        &mut config.overlay.compact_monitor_device_index,
+        &displays,
+    );
+    expanded || compact
+}
+
 #[cfg(test)]
-pub(super) fn forget_indexed_displays() {
-    INDEXED_DISPLAY_NAMES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
+mod persisted_monitor_tests {
+    use super::*;
+    use std::ffi::c_void;
+
+    fn display(handle: usize, primary: bool, id: Option<&str>) -> DisplayInfo {
+        DisplayInfo {
+            handle: HMONITOR(handle as *mut c_void),
+            work: RECT::default(),
+            monitor: RECT::default(),
+            primary,
+            name: format!("display-{handle}"),
+            stable_id: id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn persisted_identity_survives_enumeration_reorder() {
+        let displays = vec![
+            display(1, true, Some("monitor-b")),
+            display(2, false, Some("monitor-a")),
+        ];
+        assert_eq!(
+            resolve_target_persisted(MonitorMode::Index(0), Some("monitor-a"), Some(0), &displays, None),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn missing_known_monitor_uses_primary_without_forgetting_identity() {
+        let displays = vec![
+            display(1, true, Some("monitor-b")),
+            display(2, false, Some("monitor-c")),
+        ];
+        assert_eq!(
+            resolve_target_persisted(MonitorMode::Index(1), Some("monitor-a"), Some(1), &displays, None),
+            Some(0)
+        );
+        let mut id = Some("monitor-a".to_string());
+        let mut saved_index = Some(1);
+        assert!(!refresh_identity_slot(
+            MonitorMode::Index(1),
+            &mut id,
+            &mut saved_index,
+            &displays
+        ));
+        assert_eq!(id.as_deref(), Some("monitor-a"));
+    }
+
+    #[test]
+    fn manual_index_change_rebinds_managed_identity() {
+        let displays = vec![
+            display(1, true, Some("monitor-a")),
+            display(2, false, Some("monitor-b")),
+        ];
+        let mut id = Some("monitor-a".to_string());
+        let mut saved_index = Some(0);
+        assert!(refresh_identity_slot(
+            MonitorMode::Index(1),
+            &mut id,
+            &mut saved_index,
+            &displays
+        ));
+        assert_eq!(saved_index, Some(1));
+        assert_eq!(id.as_deref(), Some("monitor-b"));
+    }
 }
 
 /// Warns about a configured-but-unattached display index, at most once per
