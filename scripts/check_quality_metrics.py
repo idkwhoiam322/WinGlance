@@ -6,6 +6,7 @@ import sys
 CC_LIMIT = 22.0
 COGNITIVE_LIMIT = 22.0
 HALSTEAD_DIFFICULTY_LIMIT = 80.0
+FUNCTION_KINDS = {"function", "closure", "method"}
 
 
 def iter_dicts(value):
@@ -18,15 +19,38 @@ def iter_dicts(value):
             yield from iter_dicts(child)
 
 
-def metric_value(metrics, name):
+def metric_max(metrics, name):
+    """Return RCA's maximum value for one function-space metric.
+
+    rust-code-analysis stats are hierarchical. `sum` includes nested spaces
+    and therefore over-counts a function that owns closures (and whole impl
+    containers). The audit threshold is per function/closure, so `max` is the
+    correct statistic for a function space.
+    """
     value = metrics.get(name)
     if isinstance(value, dict):
-        for key in ("sum", "max", "average"):
-            candidate = value.get(key)
-            if isinstance(candidate, (int, float)):
-                return float(candidate)
+        candidate = value.get("max")
+        if isinstance(candidate, (int, float)):
+            return float(candidate)
+        candidate = value.get("average")
+        if isinstance(candidate, (int, float)):
+            return float(candidate)
     if isinstance(value, (int, float)):
         return float(value)
+    return None
+
+
+def halstead_difficulty(metrics):
+    halstead = metrics.get("halstead")
+    if not isinstance(halstead, dict):
+        return None
+    difficulty = halstead.get("difficulty")
+    if isinstance(difficulty, (int, float)):
+        return float(difficulty)
+    if isinstance(difficulty, dict):
+        candidate = difficulty.get("max")
+        if isinstance(candidate, (int, float)):
+            return float(candidate)
     return None
 
 
@@ -35,8 +59,10 @@ def main():
     files = sorted(root.rglob("*.json"))
     if not files:
         raise SystemExit(f"no rust-code-analysis JSON files found under {root}")
+
     checked = 0
     violations = []
+    seen_kinds = set()
     for path in files:
         data = json.loads(path.read_text(encoding="utf-8"))
         for unit in iter_dicts(data):
@@ -44,26 +70,33 @@ def main():
             if not isinstance(metrics, dict):
                 continue
             kind = str(unit.get("kind", "")).lower()
-            if kind in {"unit", "file", ""}:
+            if kind:
+                seen_kinds.add(kind)
+            if kind not in FUNCTION_KINDS:
                 continue
-            cc = metric_value(metrics, "cyclomatic")
-            cognitive = metric_value(metrics, "cognitive")
-            halstead = metrics.get("halstead")
-            difficulty = None
-            if isinstance(halstead, dict) and isinstance(halstead.get("difficulty"), (int, float)):
-                difficulty = float(halstead["difficulty"])
+            cc = metric_max(metrics, "cyclomatic")
+            cognitive = metric_max(metrics, "cognitive")
+            difficulty = halstead_difficulty(metrics)
             if cc is None and cognitive is None and difficulty is None:
                 continue
             checked += 1
             name = unit.get("name") or f"{path.name}:{unit.get('start_line', '?')}"
+            location = f"{path.name}:{unit.get('start_line', '?')}"
             if cc is not None and cc >= CC_LIMIT:
-                violations.append(f"{name}: cyclomatic {cc:g} >= {CC_LIMIT:g}")
+                violations.append(f"{location} {name}: cyclomatic {cc:g} >= {CC_LIMIT:g}")
             if cognitive is not None and cognitive >= COGNITIVE_LIMIT:
-                violations.append(f"{name}: cognitive {cognitive:g} >= {COGNITIVE_LIMIT:g}")
+                violations.append(f"{location} {name}: cognitive {cognitive:g} >= {COGNITIVE_LIMIT:g}")
             if difficulty is not None and difficulty >= HALSTEAD_DIFFICULTY_LIMIT:
-                violations.append(f"{name}: Halstead difficulty {difficulty:g} >= {HALSTEAD_DIFFICULTY_LIMIT:g}")
+                violations.append(
+                    f"{location} {name}: Halstead difficulty {difficulty:g} >= {HALSTEAD_DIFFICULTY_LIMIT:g}"
+                )
+
     if checked == 0:
-        raise SystemExit("rust-code-analysis output contained no function/closure metric spaces")
+        kinds = ", ".join(sorted(seen_kinds)) or "none"
+        raise SystemExit(
+            "rust-code-analysis output contained no function/closure metric spaces; "
+            f"observed kinds: {kinds}"
+        )
     print(f"quality metrics: checked {checked} function/closure spaces")
     if violations:
         print("quality metric violations:")
