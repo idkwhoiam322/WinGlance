@@ -5212,10 +5212,12 @@ mod tests {
             "a state pill with no cached track names the source app"
         );
 
-        // Hiding the pill goes quiet: the name must not linger for a hidden
-        // window.
+        // Retiring the media content falls back to the always-visible
+        // passive card; the accessible name must follow what is actually
+        // rendered rather than retaining the retired source.
         state.hide();
-        assert_eq!(*cell.lock().unwrap(), None);
+        assert!(state.idle_content);
+        assert_eq!(*cell.lock().unwrap(), Some("No media playing".to_string()));
     }
 
     #[test]
@@ -5879,7 +5881,7 @@ mod tests {
     }
 
     #[test]
-    fn session_rejected_hides_the_pill_when_nothing_valid_remains() {
+    fn session_rejected_falls_back_to_idle_when_nothing_valid_remains() {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.content = Some(MediaEvent::TrackChanged(brave_track("Brave Song")));
         state.current_source = Some("Brave".into());
@@ -5888,9 +5890,13 @@ mod tests {
         state.queue.lock().unwrap().push_back(Arc::new(reject("Brave")));
         state.receive_events();
 
-        assert!(state.content.is_none());
+        assert!(state.idle_content);
+        assert!(matches!(
+            state.content.as_ref(),
+            Some(MediaEvent::TrackChanged(track)) if track.title == "No media playing"
+        ));
         assert!(state.last_track.is_none());
-        assert!(matches!(state.phase, Phase::Hidden));
+        assert!(matches!(state.phase, Phase::Shown));
     }
 
     #[test]
@@ -7409,14 +7415,23 @@ mod tests {
             state.last_track.is_none(),
             "the fast-path restore source must be cleared"
         );
-        assert!(state.content.is_none(), "the stale track pill must be hidden");
+        assert!(state.idle_content, "the stale media must fall back to passive status");
+        assert!(matches!(
+            state.content.as_ref(),
+            Some(MediaEvent::TrackChanged(track)) if track.title == "Notifications paused"
+        ));
 
-        // Re-enable: the fast-path finds nothing to restore, so the pill
-        // stays hidden instead of resurrecting the settled source's track.
+        // Re-enable: the fast-path finds nothing to restore, so the passive
+        // card becomes the truthful no-media state instead of resurrecting
+        // the settled source's track.
         state.toggle_enabled();
         assert!(state.enabled);
-        assert!(state.content.is_none(), "no stale track may be restored on re-enable");
-        assert!(matches!(state.phase, Phase::Hidden), "the pill must stay hidden");
+        assert!(state.idle_content);
+        assert!(matches!(
+            state.content.as_ref(),
+            Some(MediaEvent::TrackChanged(track)) if track.title == "No media playing"
+        ));
+        assert!(matches!(state.phase, Phase::Shown));
     }
 
     #[test]
@@ -7434,9 +7449,16 @@ mod tests {
             source_app: "spotify".into(),
         }));
         state.receive_events();
-        assert!(state.content.is_none(), "the stale track pill must be dismissed");
+        assert!(
+            state.idle_content,
+            "the stale track pill must retire into passive status"
+        );
+        assert!(matches!(
+            state.content.as_ref(),
+            Some(MediaEvent::TrackChanged(track)) if track.title == "No media playing"
+        ));
         assert!(state.last_track.is_none(), "the standby must die with its source");
-        assert!(matches!(state.phase, Phase::Hidden), "nothing valid remains to show");
+        assert!(matches!(state.phase, Phase::Shown));
 
         // Same source, but the shown content is the Stopped tombstone: it is
         // left in place, while the standby is still cleaned.
@@ -7517,11 +7539,15 @@ mod tests {
         state.receive_events();
 
         assert!(
-            state.content.is_none(),
+            state.idle_content,
             "a paused survivor must not be announced as now playing"
         );
+        assert!(matches!(
+            state.content.as_ref(),
+            Some(MediaEvent::TrackChanged(track)) if track.title == "No media playing"
+        ));
         assert!(state.last_track.is_none());
-        assert!(matches!(state.phase, Phase::Hidden));
+        assert!(matches!(state.phase, Phase::Shown));
     }
 
     #[test]
@@ -7575,10 +7601,14 @@ mod tests {
         state.receive_events();
 
         assert!(
-            state.content.is_none(),
-            "with both sources settled there is nothing playing to announce"
+            state.idle_content,
+            "with both sources settled only passive status remains"
         );
-        assert!(matches!(state.phase, Phase::Hidden));
+        assert!(matches!(
+            state.content.as_ref(),
+            Some(MediaEvent::TrackChanged(track)) if track.title == "No media playing"
+        ));
+        assert!(matches!(state.phase, Phase::Shown));
     }
 
     #[test]
@@ -7809,15 +7839,20 @@ mod tests {
             "a stopped persistent pill must collapse at its deadline even with the fade enabled"
         );
 
-        // Run the collapse past its animation length: it must complete into a
-        // hide, not back into a bright shown pill at idle opacity.
+        // Run the collapse past its animation length: the Stopped tombstone
+        // must disappear, then the always-visible no-media status takes over.
         state.phase = Phase::Collapsing(Instant::now() - collapse_duration(&state.config) - Duration::from_millis(1));
         state.dismiss_at = Some(Instant::now() - Duration::from_millis(10));
         state.tick();
         assert!(
-            matches!(state.phase, Phase::Hidden),
-            "the completed collapse must hide the stopped pill"
+            state.idle_content,
+            "the completed tombstone must retire into passive status"
         );
+        assert!(matches!(
+            state.content.as_ref(),
+            Some(MediaEvent::TrackChanged(track)) if track.title == "No media playing"
+        ));
+        assert!(matches!(state.phase, Phase::Shown));
     }
 
     #[test]
@@ -9719,9 +9754,10 @@ mod tests {
 
         assert!(
             state.current_source.is_none(),
-            "current_source must clear when the pill collapses"
+            "current_source must clear when media content retires"
         );
-        assert!(matches!(state.phase, Phase::Hidden));
+        assert!(state.idle_content);
+        assert!(matches!(state.phase, Phase::Shown));
     }
 
     #[test]
