@@ -8854,7 +8854,7 @@ mod tests {
             cells: history_cell_texts(&full_track, "12:34:56", PlaybackState::NowPlaying),
             track: full_track,
             state: PlaybackState::NowPlaying,
-            accepted: true,
+            disposition: HistoryDisposition::Shown,
         };
         assert_eq!(history_cell_text(&entry, HISTORY_COL_TIME), "12:34:56");
         // The STATE cell paints the glyph; words live only in tooltips that
@@ -8898,7 +8898,7 @@ mod tests {
             cells: history_cell_texts(&tooltip_track, "12:00:00", PlaybackState::Paused),
             track: tooltip_track,
             state: PlaybackState::Paused,
-            accepted: true,
+            disposition: HistoryDisposition::Shown,
         };
         // A reported value reads "LABEL: value" (the cells were precomputed
         // with the genre set).
@@ -9333,7 +9333,7 @@ mod tests {
                 cells: history_cell_texts(&track, "", PlaybackState::Playing),
                 track,
                 state: PlaybackState::Playing,
-                accepted: true,
+                disposition: HistoryDisposition::Shown,
             });
         }
         assert_eq!(history.len(), 3);
@@ -9410,7 +9410,7 @@ mod tests {
     }
 
     #[test]
-    fn history_keeps_accepted_flag_with_newest_first() {
+    fn history_keeps_disposition_with_newest_first() {
         let mut history = History::new(3);
         let track_a = track("Track A");
         history.push(HistoryEntry {
@@ -9420,7 +9420,7 @@ mod tests {
             cells: history_cell_texts(&track_a, "", PlaybackState::Playing),
             track: track_a,
             state: PlaybackState::Playing,
-            accepted: true,
+            disposition: HistoryDisposition::Shown,
         });
         let track_b = track("Track B");
         history.push(HistoryEntry {
@@ -9430,14 +9430,14 @@ mod tests {
             cells: history_cell_texts(&track_b, "", PlaybackState::Paused),
             track: track_b,
             state: PlaybackState::Paused,
-            accepted: false,
+            disposition: HistoryDisposition::Rejected,
         });
         let entries: Vec<_> = history.iter().collect();
-        // Newest first, and the accepted flag travels with its entry.
+        // Newest first, and the explicit disposition travels with its entry.
         assert_eq!(entries[0].track.title, "Track B");
-        assert!(!entries[0].accepted);
+        assert_eq!(entries[0].disposition, HistoryDisposition::Rejected);
         assert_eq!(entries[1].track.title, "Track A");
-        assert!(entries[1].accepted);
+        assert_eq!(entries[1].disposition, HistoryDisposition::Shown);
     }
 
     #[test]
