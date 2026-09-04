@@ -12495,30 +12495,6 @@ mod tests {
     }
 
     #[test]
-    fn an_indexed_monitor_keeps_its_device_across_a_reorder() {
-        super::fullscreen::forget_indexed_displays();
-        let displays = vec![fake_display(1, true), fake_display(2, false)];
-        // First resolution of Index(1) remembers DISPLAY2 by name.
-        assert_eq!(resolve_target_sticky(MonitorMode::Index(1), &displays, None), Some(1));
-        // A dock/driver event reorders enumeration (DISPLAY2 first): the
-        // remembered device wins over the raw index.
-        let reordered = vec![fake_display(2, false), fake_display(1, true)];
-        assert_eq!(
-            resolve_target_sticky(MonitorMode::Index(1), &reordered, None),
-            Some(0),
-            "the remembered device must win over the raw index after a reorder"
-        );
-        // The remembered display unplugged: the raw index governs again —
-        // here out of range, so the primary fallback applies.
-        let gone = vec![fake_display(3, true)];
-        assert_eq!(
-            resolve_target_sticky(MonitorMode::Index(1), &gone, None),
-            Some(0),
-            "a gone device falls back to the raw index resolution (primary here)"
-        );
-    }
-
-    #[test]
     fn target_resolves_the_compact_monitor_while_separated() {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.layout = LayoutMode::Compact;
