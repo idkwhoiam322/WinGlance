@@ -76,7 +76,12 @@ jobs:
 
   mutation:
     if: ${{ (github.event_name == 'workflow_dispatch' && inputs.release != 'none') || (github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && contains(github.event.head_commit.message, '[mutation]')) }}
+    needs: check
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -85,8 +90,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install pinned mutation runner
         run: cargo install cargo-mutants --version 27.1.0 --locked
-      - name: Require zero surviving mutants
-        run: cargo mutants --no-shuffle --timeout-multiplier 3 --jobs 2
+      - name: Require zero surviving mutants (shard ${{ matrix.shard }}/10)
+        run: cargo mutants --no-shuffle --baseline=skip --in-place --shard ${{ matrix.shard }}/10 --timeout-multiplier 3 --jobs 2
 
   release:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.release != 'none' }}
