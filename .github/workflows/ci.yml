@@ -64,7 +64,7 @@ jobs:
         env:
           QUALITY_BASE_SHA: 32f27897d5f2370997d597b52045279cd96c628c
         run: |
-          mkdir -p target/quality-metrics target/quality-baseline
+          mkdir -p target/quality-metrics target/quality-baseline target/quality-baseline-metrics
           rust-code-analysis-cli -m -p src -O json -o target/quality-metrics
           git archive "$QUALITY_BASE_SHA" src | tar -x -C target/quality-baseline
           rust-code-analysis-cli -m -p target/quality-baseline/src -O json -o target/quality-baseline-metrics
@@ -73,7 +73,7 @@ jobs:
         run: cargo machete
 
   mutation:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.release != 'none' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.release != 'none') || (github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && contains(github.event.head_commit.message, '[mutation]')) }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
