@@ -34,10 +34,10 @@ pub const RESTART_RESULT_MSG: u32 = WM_APP + 14;
 /// the window whose proc handles its id; a duplicated numeric id would make
 /// the next change — routing any message to another window — silently execute
 /// the wrong handler. The `WM_APP + 13` UIA activation id is enumerated here
-/// too, so the assertion covers the newest message class as it grows.
+/// too, and the picker UIA action message is tracked here as well.
 /// Maintenance contract: adding (or renumbering) any app-private message id
 /// must update this list — the compiler only checks ids it can see.
-pub(crate) const APP_PRIVATE_MESSAGE_IDS: [u32; 14] = [
+pub(crate) const APP_PRIVATE_MESSAGE_IDS: [u32; 15] = [
     MEDIA_EVENT_MSG,
     TOGGLE_MSG,
     POSITION_MSG,
@@ -52,6 +52,7 @@ pub(crate) const APP_PRIVATE_MESSAGE_IDS: [u32; 14] = [
     crate::process_picker::PICKER_RESULT_MSG,
     crate::process_picker::AUTO_SOURCES_RESULT_MSG,
     crate::process_picker::PINNED_SOURCE_RESULT_MSG,
+    crate::process_picker::PICKER_UIA_ACTION_MSG,
 ];
 const _: () = {
     let ids = APP_PRIVATE_MESSAGE_IDS;
