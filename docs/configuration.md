@@ -42,6 +42,7 @@ the file itself is not rewritten (see `docs/architecture.md`).
 | `position_y`   | *(unset)* | integer | Absolute Y override (96-DPI logical px); set by *Adjust position…* |
 | `max_tick_hz`  | `60`    | 60–1000 | Animation tick-rate cap in Hz (config.toml only; see below) |
 | `monitor`      | `"active-window"` | string | Which display the pill is placed on (see below) |
+| `monitor_device_id` / `monitor_device_index` | *(managed)* | string / integer | WinGlance-managed identity metadata for an explicit `index-N` selection; normally omit these keys |
 | `compact_position_separate` | `false` | bool | Give the Compact layout its own position (see below). The settings toggle displays the *inverse* polarity: ON = Compact follows Expanded (`false`), OFF = independent (`true`) |
 | `compact_vertical` | `"top"` | `top` \| `bottom` | Compact layout's vertical anchor (only consulted while `compact_position_separate` is on) |
 | `compact_horizontal` | `"center"` | `left` \| `center` \| `right` | Compact layout's horizontal anchor (same condition) |
@@ -49,6 +50,7 @@ the file itself is not rewritten (see `docs/architecture.md`).
 | `compact_position_x` | *(unset)* | integer | Absolute X override for the Compact layout; set by the compact *Adjust position…* |
 | `compact_position_y` | *(unset)* | integer | Absolute Y override for the Compact layout        |
 | `compact_monitor` | `"active-window"` | string | Which display the Compact layout is placed on     |
+| `compact_monitor_device_id` / `compact_monitor_device_index` | *(managed)* | string / integer | Managed identity metadata for the independent Compact monitor slot |
 | `dismiss_on_hover` | `true` | bool | Hovering a pill in the Expanded layout arms its dismissal (remaining time capped at 500 ms, one-way). For Compact pills it makes the second hover dismiss (see below) |
 | `expand_compact_on_hover` | `true` | bool | Hovering a pill in the Compact layout expands it in place; with `dismiss_on_hover` on, the second hover dismisses (see below) |
 | `fade_persistent_pill` | `true` | bool | With `layout = "persistent-compact"`, fade the pill to idle opacity once `duration_ms` passes without cursor interaction. Off: the pill stays at full opacity while media is playing or paused (no idle fade), and hides only when the source has stopped. Hiding for fullscreen/listed foregrounds (`hide_for_auto_compact_sources`) applies either way |
@@ -94,10 +96,16 @@ the previously customized values.
 - `"index-N"` — the (N+1)-th display in Windows' enumeration order, so
   `"index-0"` is the first display, `"index-1"` the second, and so on.
 
-The index is resolved against the *current* display layout each time the pill
-is placed. If the configured display is temporarily unplugged or reordered,
-the pill falls back to the primary display while the setting stays untouched,
-so it reapplies automatically when the display returns. Custom
+On the first run where an `index-N` selection can be resolved, WinGlance
+records Windows' per-monitor device-interface path beside the numeric index.
+Future runs prefer that identity, so a display-enumeration reorder does not
+silently move the pill to a different physical monitor. The numeric index stays
+as the backward-compatible fallback for old configs or systems where Windows
+does not expose an interface path. If a remembered monitor is temporarily
+unplugged, the pill uses the primary display without erasing the identity; when
+the monitor returns it is selected again even at a different enumeration
+position. The `*_monitor_device_*` keys are managed metadata and normally should
+not be hand-edited. Custom
 `position_x`/`position_y` values keep their existing semantics: absolute
 virtual-screen coordinates in 96-DPI logical pixels — not relative to the
 selected display — and the resulting position is clamped into the selected

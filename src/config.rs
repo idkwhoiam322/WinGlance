@@ -177,6 +177,15 @@ pub struct OverlayConfig {
     pub position_y: Option<i32>,
     /// Which display the pill is placed on (see `MonitorMode`).
     pub monitor: MonitorMode,
+    /// Win32 monitor-interface path captured for an explicit `index-N` pick.
+    /// Managed by WinGlance, not required in hand-authored configs. The
+    /// companion index proves the identity belongs to the current monitor
+    /// value, so a manual `monitor = "index-M"` edit cannot inherit a stale
+    /// identity from the old index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor_device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor_device_index: Option<u32>,
     /// Which pill layout is used (see `LayoutMode`).
     pub layout: LayoutMode,
     /// Whether the Compact layout uses its own independent position
@@ -202,6 +211,11 @@ pub struct OverlayConfig {
     /// Which display the Compact pill is placed on while it uses its own
     /// position (see `MonitorMode`).
     pub compact_monitor: MonitorMode,
+    /// Managed monitor-interface identity for the independent Compact slot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_monitor_device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_monitor_device_index: Option<u32>,
     /// Hovering a pill in the *Expanded* layout arms its dismissal: the
     /// remaining time is capped at 500 ms, one-way (see `EARLY_EXIT_MS`).
     /// For pills in the Compact layout it makes the second hover dismiss
@@ -278,12 +292,12 @@ pub enum LayoutMode {
 /// monitor = "index-2"         # the third active display (zero-based)
 /// ```
 ///
-/// `Index(n)` is resolved against the *current* enumeration of active
-/// displays every time the pill is placed; an index that is temporarily
-/// out of range (a display unplugged or reordered after the config was
-/// saved) falls back to the primary display at placement time while the
-/// configured value is preserved, so it becomes valid again automatically
-/// when the display comes back.
+/// `Index(n)` remains the human-readable fallback. When WinGlance can
+/// resolve that index it also records Windows' per-monitor device-interface
+/// path in additive managed fields; later runs prefer that identity, so an
+/// enumeration reorder does not silently move the pill to another physical
+/// monitor. If the remembered monitor is absent, placement falls back to the
+/// primary display without rewriting the user's index or identity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MonitorMode {
     /// Preserves the behavior of configs written before the field existed.
@@ -401,6 +415,8 @@ impl Default for OverlayConfig {
             position_x: None,
             position_y: None,
             monitor: MonitorMode::default(),
+            monitor_device_id: None,
+            monitor_device_index: None,
             layout: LayoutMode::default(),
             compact_position_separate: false,
             compact_vertical: VerticalPosition::Top,
@@ -409,6 +425,8 @@ impl Default for OverlayConfig {
             compact_position_x: None,
             compact_position_y: None,
             compact_monitor: MonitorMode::default(),
+            compact_monitor_device_id: None,
+            compact_monitor_device_index: None,
             dismiss_on_hover: true,
             expand_compact_on_hover: true,
             fade_persistent_pill: true,

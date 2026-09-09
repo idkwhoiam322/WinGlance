@@ -21,9 +21,11 @@ max_width = 340
 # position_x = 0
 # position_y = 0
 # Which display the pill is placed on: "active-window" (the foreground
-# window's monitor, default) | "primary" | "index-N" (the (N+1)-th display
-# in Windows' enumeration order).
+# window's monitor, default) | "primary" | "index-N". For index picks,
+# WinGlance records managed monitor_device_* metadata so the same monitor is
+# preferred after restart even when Windows reorders display enumeration.
 monitor = "active-window"
+# monitor_device_id / monitor_device_index are managed by WinGlance; omit them.
 # Which pill layout is used: "expanded" (default) | "compact" |
 # "persistent-compact" (always-visible compact pill while media plays) |
 # "auto" (compact while the foreground app is fullscreen or on the
@@ -39,6 +41,7 @@ compact_margin = 8
 # compact_position_x = 0
 # compact_position_y = 0
 compact_monitor = "active-window"
+# compact_monitor_device_id / compact_monitor_device_index are managed by WinGlance.
 # Hovering a pill in the Expanded layout arms its dismissal (remaining time
 # capped at 500 ms, one-way). For Compact-layout pills it makes the second
 # hover dismiss: the first hover expands (see below), later hovers dismiss.

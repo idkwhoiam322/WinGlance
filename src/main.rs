@@ -1086,6 +1086,19 @@ fn main() -> Result<()> {
             warn!("per-monitor DPI awareness unavailable: {error}");
         }
     }
+    if overlay::refresh_monitor_identities(&mut config) {
+        match config.save_checked() {
+            Ok(config::SaveOutcome::Saved(revision)) => {
+                config.revision = Some(revision);
+                debug!("captured stable monitor identity metadata");
+            }
+            Ok(config::SaveOutcome::Conflict) => {
+                warn!("config changed while capturing monitor identity; keeping the in-memory identity only");
+            }
+            Ok(config::SaveOutcome::PersistenceDisabled) => {}
+            Err(error) => warn!("could not persist monitor identity metadata: {error:#}"),
+        }
+    }
 
     let (event_tx, event_rx) = mpsc::sync_channel::<Arc<MediaEvent>>(EVENT_CHANNEL_CAP);
     // Shared downstream artwork byte counter (see
