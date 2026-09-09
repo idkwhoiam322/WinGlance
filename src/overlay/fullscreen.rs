@@ -421,6 +421,66 @@ mod persisted_monitor_tests {
     }
 
     #[test]
+    fn leaving_explicit_index_clears_each_identity_field_independently() {
+        let displays = vec![display(1, true, Some("monitor-a"))];
+
+        let mut id = Some("monitor-a".to_string());
+        let mut saved_index = None;
+        assert!(refresh_identity_slot(
+            MonitorMode::Primary,
+            &mut id,
+            &mut saved_index,
+            &displays
+        ));
+        assert!(id.is_none());
+        assert!(saved_index.is_none());
+
+        let mut id = None;
+        let mut saved_index = Some(0);
+        assert!(refresh_identity_slot(
+            MonitorMode::ActiveWindow,
+            &mut id,
+            &mut saved_index,
+            &displays
+        ));
+        assert!(id.is_none());
+        assert!(saved_index.is_none());
+    }
+
+    #[test]
+    fn identity_refresh_reports_index_and_device_changes_independently() {
+        let displays = vec![
+            display(1, true, Some("monitor-a")),
+            display(2, false, Some("monitor-b")),
+        ];
+
+        // Same numeric slot but missing identity: only the identity changes.
+        let mut id = None;
+        let mut saved_index = Some(0);
+        assert!(refresh_identity_slot(
+            MonitorMode::Index(0),
+            &mut id,
+            &mut saved_index,
+            &displays
+        ));
+        assert_eq!(saved_index, Some(0));
+        assert_eq!(id.as_deref(), Some("monitor-a"));
+
+        // Identity already equals the destination monitor, but the saved
+        // numeric slot is stale: only the index changes.
+        let mut id = Some("monitor-b".to_string());
+        let mut saved_index = Some(0);
+        assert!(refresh_identity_slot(
+            MonitorMode::Index(1),
+            &mut id,
+            &mut saved_index,
+            &displays
+        ));
+        assert_eq!(saved_index, Some(1));
+        assert_eq!(id.as_deref(), Some("monitor-b"));
+    }
+
+    #[test]
     fn manual_index_change_rebinds_managed_identity() {
         let displays = vec![
             display(1, true, Some("monitor-a")),

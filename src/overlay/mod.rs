@@ -4975,6 +4975,28 @@ mod tests {
     }
 
     #[test]
+    fn content_playing_distinguishes_playback_state_events() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.idle_content = false;
+
+        for (playback, expected) in [
+            (PlaybackState::Playing, true),
+            (PlaybackState::Paused, false),
+            (PlaybackState::Stopped, false),
+        ] {
+            state.content = Some(MediaEvent::PlaybackStateChanged(playback, "spotify".into()));
+            assert_eq!(
+                state.content_playing(),
+                expected,
+                "PlaybackStateChanged({playback:?}) must map to playing={expected}"
+            );
+        }
+
+        state.content = None;
+        assert!(!state.content_playing());
+    }
+
+    #[test]
     fn idle_status_has_truthful_accessible_name_and_no_source_identity() {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.idle_content = true;

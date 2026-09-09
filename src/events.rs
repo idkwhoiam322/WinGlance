@@ -906,6 +906,100 @@ mod tests {
     }
 
     #[test]
+    fn same_media_checks_each_known_text_discriminator_independently() {
+        let base = TrackInfo {
+            album: "Album".into(),
+            subtitle: "Subtitle".into(),
+            album_artist: "Album Artist".into(),
+            ..track("Same Name", "Same Artist")
+        };
+
+        let cases = [
+            (
+                "album",
+                TrackInfo {
+                    album: "Other Album".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "subtitle",
+                TrackInfo {
+                    subtitle: "Other Subtitle".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "album artist",
+                TrackInfo {
+                    album_artist: "Other Album Artist".into(),
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (label, other) in cases {
+            assert!(
+                !base.same_media(&other),
+                "a known {label} contradiction must force new media"
+            );
+        }
+
+        // Unknown text is compatible in either direction. Keeping both
+        // directions explicit prevents either `||` leg in known_text_eq from
+        // being weakened without a regression test noticing.
+        let missing_album = TrackInfo {
+            album: String::new(),
+            ..base.clone()
+        };
+        assert!(missing_album.same_media(&base));
+        assert!(base.same_media(&missing_album));
+    }
+
+    #[test]
+    fn same_media_checks_playback_type_compatibility_independently() {
+        let music = TrackInfo {
+            playback_type: PlaybackType::Music,
+            ..track("Same Name", "Same Artist")
+        };
+        let unknown = TrackInfo {
+            playback_type: PlaybackType::Unknown,
+            ..music.clone()
+        };
+        let video = TrackInfo {
+            playback_type: PlaybackType::Video,
+            ..music.clone()
+        };
+        let same_music = music.clone();
+
+        assert!(unknown.same_media(&music));
+        assert!(music.same_media(&unknown));
+        assert!(music.same_media(&same_music));
+        assert!(!music.same_media(&video));
+    }
+
+    #[test]
+    fn same_media_checks_art_generation_compatibility_independently() {
+        let generation_four = TrackInfo {
+            art_generation: 4,
+            ..track("Same Name", "Same Artist")
+        };
+        let unknown_generation = TrackInfo {
+            art_generation: 0,
+            ..generation_four.clone()
+        };
+        let same_generation = generation_four.clone();
+        let generation_five = TrackInfo {
+            art_generation: 5,
+            ..generation_four.clone()
+        };
+
+        assert!(unknown_generation.same_media(&generation_four));
+        assert!(generation_four.same_media(&unknown_generation));
+        assert!(generation_four.same_media(&same_generation));
+        assert!(!generation_four.same_media(&generation_five));
+    }
+
+    #[test]
     fn into_history_text_drops_all_image_fields_and_keeps_text() {
         // The full-snapshot form (raw cover, decode, palette, app icon plus
         // every text field) is what a history insert receives.

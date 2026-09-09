@@ -992,11 +992,13 @@ pub fn spawn_handoff_thread(hwnd: HWND) {
 /// window opens once for initial setup. Legacy `start_in_tray = false` values
 /// remain parse-compatible but cannot make later launches, logon startup, or
 /// Settings-triggered restarts raise the window.
-fn enforce_startup_policy(config: &mut Config) {
-    if !config.behavior.start_in_tray {
+fn enforce_startup_policy(config: &mut Config) -> bool {
+    let ignored_visible_request = !config.behavior.start_in_tray;
+    if ignored_visible_request {
         info!("legacy start_in_tray=false ignored: only the first-ever launch opens the tracking window automatically");
     }
     config.behavior.start_in_tray = true;
+    ignored_visible_request
 }
 
 fn main() -> Result<()> {
@@ -1884,12 +1886,32 @@ mod tests {
             },
             ..Default::default()
         };
-        enforce_startup_policy(&mut config);
+        assert!(
+            enforce_startup_policy(&mut config),
+            "an explicit legacy visible-launch request must be reported as ignored"
+        );
         assert!(config.first_run, "the first launch must remain discoverable for setup");
         assert!(
             config.behavior.start_in_tray,
             "legacy start_in_tray=false must not make later launches visible"
         );
+    }
+
+    #[test]
+    fn startup_policy_does_not_report_an_already_silent_launch() {
+        let mut config = Config {
+            first_run: false,
+            behavior: crate::config::BehaviorConfig {
+                start_in_tray: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            !enforce_startup_policy(&mut config),
+            "an already-silent launch must not be reported as an ignored visible request"
+        );
+        assert!(config.behavior.start_in_tray);
     }
 
     #[test]

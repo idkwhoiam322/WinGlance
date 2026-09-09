@@ -148,9 +148,7 @@ rendering pipeline and dedup design.
 
 ## CI and releases
 
-`ci.yml` runs format/lint/test/release-build/cargo-deny on every push and PR, and
-publishes a GitHub Release (with the built exe and example config) only when manually
-dispatched from the Actions tab.
+`ci.yml` runs the Windows format/lint/test/release-build/audit/deny gate plus a pinned Rust static-metrics and unused-dependency gate on pushes to `main`/`checkpoint` and on pull requests. Cyclomatic and cognitive complexity must each stay below 22 per function/closure, and Halstead difficulty below 80. A manually dispatched release additionally runs pinned `cargo-mutants` and requires zero surviving viable mutants in the explicitly documented deterministic audit/remediation core. See `docs/quality.md` for the exact mutation scope, the monotonic complexity ratchet, and metrics that are intentionally not fabricated.
 
 ## License
 
