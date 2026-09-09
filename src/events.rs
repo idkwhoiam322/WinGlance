@@ -374,27 +374,48 @@ impl TrackInfo {
         (line.contains('⏱'), line.replace("⏱ ", ""))
     }
 
-    /// Whether `other` denotes the same media item as `self` for the
-    /// update-vs-new-pill decision: same source, title and artist, and no
-    /// contradicting artwork. A different cover (both sides present)
-    /// identifies different media (e.g. a video vs audio version of the same
-    /// song); missing artwork on either side — SMTC fills the thumbnail a
-    /// moment after the title — is tolerated as the same item so the pill
-    /// updates in place instead of re-notifying. With no artwork on either
-    /// side, an equal-or-unknown duration is required, so two recordings can
-    /// still be told apart.
+    /// Whether `other` denotes the same logical media item as `self` for
+    /// update-vs-new-pill/history decisions. Title/artist alone are not enough:
+    /// sources can legitimately play two items with the same labels. Artwork is
+    /// also not a complete identity because SMTC commonly reports it one read
+    /// late (or omits it on metadata-only polls).
+    ///
+    /// Therefore every *known on both sides* identity discriminator must agree
+    /// before a one-sided/missing-art snapshot may merge: duration, track
+    /// number/count, album/subtitle/album-artist, playback type, and artwork
+    /// generation. Unknown/late fields remain compatible, preserving the normal
+    /// title-first -> artwork-later refresh. When both covers exist, their bytes
+    /// must also agree. This keeps enrichment in place while a contradictory
+    /// same-title transition is always treated as new media.
     pub fn same_media(&self, other: &TrackInfo) -> bool {
+        fn known_eq<T: PartialEq>(a: Option<&T>, b: Option<&T>) -> bool {
+            a.zip(b).is_none_or(|(a, b)| a == b)
+        }
+        fn known_text_eq(a: &str, b: &str) -> bool {
+            a.trim().is_empty() || b.trim().is_empty() || a == b
+        }
+
+        let playback_type_compatible = self.playback_type == PlaybackType::Unknown
+            || other.playback_type == PlaybackType::Unknown
+            || self.playback_type == other.playback_type;
+        let art_generation_compatible =
+            self.art_generation == 0 || other.art_generation == 0 || self.art_generation == other.art_generation;
+        let metadata_compatible = known_eq(self.duration_secs.as_ref(), other.duration_secs.as_ref())
+            && known_eq(self.track_number.as_ref(), other.track_number.as_ref())
+            && known_eq(self.track_count.as_ref(), other.track_count.as_ref())
+            && known_text_eq(&self.album, &other.album)
+            && known_text_eq(&self.subtitle, &other.subtitle)
+            && known_text_eq(&self.album_artist, &other.album_artist)
+            && playback_type_compatible
+            && art_generation_compatible;
+
         self.source_app == other.source_app
             && self.title == other.title
             && self.artist == other.artist
+            && metadata_compatible
             && match (&self.artwork, &other.artwork) {
                 (Some(_), Some(_)) => artwork_same(self.artwork.as_deref(), other.artwork.as_deref()),
-                (None, Some(_)) | (Some(_), None) => true,
-                (None, None) => {
-                    self.duration_secs == other.duration_secs
-                        || self.duration_secs.is_none()
-                        || other.duration_secs.is_none()
-                }
+                _ => true,
             }
     }
 
@@ -795,16 +816,50 @@ mod tests {
     }
 
     #[test]
-    fn same_media_tolerates_late_or_lost_artwork() {
-        // SMTC fills the thumbnail a moment after the title: gaining art for
-        // the same track must stay an in-place update, not a new pill.
-        let no_art = track("Love Me Not", "Ravyn Lenae");
+    fn same_media_tolerates_late_or_poll_missing_artwork_without_contradiction() {
+        // SMTC fills the thumbnail a moment after the title, and metadata-only
+        // safety polls do not read artwork at all. Either direction remains an
+        // in-place refresh when all known identity metadata agrees.
+        let no_art = TrackInfo {
+            duration_secs: Some(218),
+            album: "Hypnos".into(),
+            ..track("Love Me Not", "Ravyn Lenae")
+        };
         let with_art = TrackInfo {
             artwork: art(b"cover"),
+            art_generation: 1,
             ..no_art.clone()
         };
         assert!(no_art.same_media(&with_art));
         assert!(with_art.same_media(&no_art));
+    }
+
+    #[test]
+    fn same_title_transition_with_missing_art_is_new_media_when_identity_conflicts() {
+        // Regression: the old one-sided-art rule returned true immediately and
+        // swallowed a real transition whenever the new thumbnail had not arrived
+        // yet. Strong metadata disagreement must win over artwork absence.
+        let old = TrackInfo {
+            artwork: art(b"old-cover"),
+            duration_secs: Some(180),
+            track_number: Some(1),
+            track_count: Some(12),
+            album: "First release".into(),
+            playback_type: PlaybackType::Music,
+            art_generation: 4,
+            ..track("Same Name", "Same Artist")
+        };
+        let incoming = TrackInfo {
+            artwork: None,
+            duration_secs: Some(240),
+            track_number: Some(2),
+            track_count: Some(12),
+            album: "Second release".into(),
+            playback_type: PlaybackType::Video,
+            ..track("Same Name", "Same Artist")
+        };
+        assert!(!old.same_media(&incoming));
+        assert!(!incoming.same_media(&old));
     }
 
     #[test]
@@ -837,7 +892,10 @@ mod tests {
             duration_secs: Some(218),
             ..a.clone()
         };
-        assert!(a.same_media(&shorter), "unknown duration matches anything");
+        assert!(
+            a.same_media(&shorter),
+            "unknown duration remains compatible with a later known value"
+        );
         assert!(
             !shorter.same_media(&longer),
             "both known and different -> different media"
