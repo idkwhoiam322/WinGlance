@@ -43,7 +43,8 @@ compact_margin = 8
 compact_monitor = "active-window"
 # compact_monitor_device_id / compact_monitor_device_index are managed by WinGlance.
 # Hovering a pill in the Expanded layout arms its dismissal (remaining time
-# capped at 500 ms, one-way). For Compact-layout pills it makes the second
+# capped at 500 ms). Leaving before that cap fires cancels the hover dismissal
+# and restores the pre-hover deadline. For Compact-layout pills it makes the second
 # hover dismiss: the first hover expands (see below), later hovers dismiss.
 # Off: no hover ever dismisses a pill.
 dismiss_on_hover = true

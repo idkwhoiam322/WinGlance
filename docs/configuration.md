@@ -51,7 +51,7 @@ the file itself is not rewritten (see `docs/architecture.md`).
 | `compact_position_y` | *(unset)* | integer | Absolute Y override for the Compact layout        |
 | `compact_monitor` | `"active-window"` | string | Which display the Compact layout is placed on     |
 | `compact_monitor_device_id` / `compact_monitor_device_index` | *(managed)* | string / integer | Managed identity metadata for the independent Compact monitor slot |
-| `dismiss_on_hover` | `true` | bool | Hovering a pill in the Expanded layout arms its dismissal (remaining time capped at 500 ms, one-way). For Compact pills it makes the second hover dismiss (see below) |
+| `dismiss_on_hover` | `true` | bool | Hovering a pill in the Expanded layout arms a 500 ms dismissal cap; leaving before it fires cancels that hover cap and restores the prior deadline. For Compact pills it makes the second hover dismiss (see below) |
 | `expand_compact_on_hover` | `true` | bool | Hovering a pill in the Compact layout expands it in place; with `dismiss_on_hover` on, the second hover dismisses (see below) |
 | `fade_persistent_pill` | `true` | bool | With `layout = "persistent-compact"`, fade the pill to idle opacity once `duration_ms` passes without cursor interaction. Off: the pill stays at full opacity while media is playing or paused (no idle fade), and hides only when the source has stopped. Hiding for fullscreen/listed foregrounds (`hide_for_auto_compact_sources`) applies either way |
 
@@ -131,8 +131,10 @@ layout currently in effect — an Auto pill in the expanded layout follows the
 Expanded rules, in the compact layout the Compact rules):
 
 - **Expanded layout, `dismiss_on_hover = true`** — hovering arms the
-  dismissal: the remaining time is capped at 500 ms, one-way (leaving before
-  that does not cancel it). The countdown is never deferred for the cursor.
+  dismissal: the remaining time is capped at 500 ms. Leaving before the
+  debounced hover cap fires cancels that hover-only dismissal and restores the
+  deadline that existed before the hover. Staying hovered still dismisses on
+  the cap, and leaving never revives a deadline that had already expired.
   This is the inverse of the Compact hover-to-expand interaction: parking
   the cursor on an Expanded pill to *read* it starts the dismissal, so
   hovering means "I've seen it" — it never holds the pill open. With

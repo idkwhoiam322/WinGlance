@@ -25,7 +25,8 @@ interrupts and never needs interaction.
   your game.
 - **Hover interaction** — hover a compact pill and it expands in place so
   you can read it (a second hover dismisses it); hover an expanded pill and
-  it dismisses within 500 ms instead of waiting out its full duration.
+  it dismisses within 500 ms instead of waiting out its full duration. Leave
+  before that hover cap fires and the original remaining lifetime is restored.
   Queueing a newer notification caps the current pill at 500 ms the same
   way. Both behaviors are tunable in the Settings pane.
 - **Marquee titles** — long titles scroll only when they actually overflow

@@ -632,12 +632,14 @@ struct OverlayState {
     hwnd: HWND,
     phase: Phase,
     dismiss_at: Option<Instant>,
-    /// When the cursor hovers over the pill, the dismiss deadline is
-    /// shortened to 500ms. The arm is one-way: the pill dismisses 500ms
-    /// after the hover is first detected even if the cursor leaves before
-    /// then. The flag also stops the tick from re-arming (which would keep
-    /// pushing the deadline forward while the cursor stays put).
+    /// When an Expanded pill is hovered, the dismiss deadline is capped
+    /// to 500 ms. The arm timestamp prevents re-arming while the cursor stays
+    /// put; leaving before that cap fires can restore the pre-hover deadline.
     hover_dismiss_at: Option<Instant>,
+    /// Deadline that was in force immediately before hover-dismiss armed.
+    /// Used only to undo the hover cap; if another subsystem changes the
+    /// deadline after arming, that newer deadline wins instead.
+    hover_dismiss_resume_at: Option<Instant>,
     /// The in-place compact→expanded hover morph, while one is in flight or
     /// pinned (see `HoverExpand`). `Some` with `done` keeps rendering the
     /// expanded pill after the animation; `hide`, a fresh show, and a layout
@@ -1267,6 +1269,65 @@ pub(crate) fn source_matches_pin(source: &str, pin: &str) -> bool {
     !nsource.is_empty() && !npin.is_empty() && (nsource.contains(&npin) || npin.contains(&nsource))
 }
 
+/// Apply the Expanded-layout hover cap without ever extending an earlier
+/// deadline. `None` means the pill previously had no deadline, so hover alone
+/// supplies the 500 ms cap.
+fn hover_capped_deadline(original: Option<Instant>, armed_at: Instant) -> Option<Instant> {
+    let early = armed_at + Duration::from_millis(EARLY_EXIT_MS);
+    Some(original.map_or(early, |deadline| deadline.min(early)))
+}
+
+/// Undo a hover cap only when it is still the deadline hover installed. A
+/// queue/content update that changed the deadline after arming is authoritative
+/// and must not be rolled back when the pointer leaves.
+fn hover_restored_deadline(original: Option<Instant>, armed_at: Instant, current: Option<Instant>) -> Option<Instant> {
+    if current == hover_capped_deadline(original, armed_at) {
+        original
+    } else {
+        current
+    }
+}
+
+#[cfg(test)]
+mod hover_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn leaving_before_hover_cap_restores_the_original_deadline() {
+        let armed = Instant::now();
+        let original = Some(armed + Duration::from_secs(5));
+        let capped = hover_capped_deadline(original, armed);
+        assert_eq!(capped, Some(armed + Duration::from_millis(EARLY_EXIT_MS)));
+        assert_eq!(hover_restored_deadline(original, armed, capped), original);
+    }
+
+    #[test]
+    fn leaving_never_revives_an_already_expired_deadline() {
+        let armed = Instant::now();
+        let original = Some(armed - Duration::from_millis(1));
+        let capped = hover_capped_deadline(original, armed);
+        assert_eq!(capped, original);
+        assert_eq!(hover_restored_deadline(original, armed, capped), original);
+    }
+
+    #[test]
+    fn a_newer_non_hover_deadline_wins_when_the_pointer_leaves() {
+        let armed = Instant::now();
+        let original = Some(armed + Duration::from_secs(5));
+        let newer = Some(armed + Duration::from_secs(2));
+        assert_ne!(newer, hover_capped_deadline(original, armed));
+        assert_eq!(hover_restored_deadline(original, armed, newer), newer);
+    }
+
+    #[test]
+    fn hovering_a_deadline_free_pill_is_fully_reversible() {
+        let armed = Instant::now();
+        let capped = hover_capped_deadline(None, armed);
+        assert_eq!(capped, Some(armed + Duration::from_millis(EARLY_EXIT_MS)));
+        assert_eq!(hover_restored_deadline(None, armed, capped), None);
+    }
+}
+
 /// Whether the pill's fonts must be rebuilt because the resolved target
 /// monitor's DPI differs from the DPI the current `FontProvider` was built
 /// for. On a mismatch every size derived from the fonts (layout, DIB, hitbox)
@@ -1314,6 +1375,7 @@ impl OverlayState {
             phase: Phase::Hidden,
             dismiss_at: None,
             hover_dismiss_at: None,
+            hover_dismiss_resume_at: None,
             hover_expand: None,
             hover_expanded_once: false,
             hover_leave_at: None,
@@ -1434,6 +1496,7 @@ impl OverlayState {
         self.layout = LayoutMode::Compact;
         self.dismiss_at = None;
         self.hover_dismiss_at = None;
+        self.hover_dismiss_resume_at = None;
         self.hover_expand = None;
         self.hover_expanded_once = false;
         self.hover_leave_at = None;
@@ -2925,6 +2988,7 @@ impl OverlayState {
         // re-arm hover-dismiss only if the cursor is still over the new pill,
         // and grant the new notification its own first expansion.
         self.hover_dismiss_at = None;
+        self.hover_dismiss_resume_at = None;
         self.hover_expand = None;
         self.hover_expanded_once = false;
         self.hover_leave_at = None;
@@ -3185,7 +3249,7 @@ impl OverlayState {
             }
         }
         // Hover handling. The rules follow the pill's *effective* layout
-        // (see `hover_step`): an Expanded-layout pill arms the one-way 500ms
+        // (see `hover_step`): an Expanded-layout pill arms the reversible 500ms
         // hover-dismiss only while `dismiss_on_hover` is enabled — the
         // countdown is never deferred for the cursor — and a Compact-layout
         // pill expands on hover while `expand_compact_on_hover` is enabled,
@@ -3218,7 +3282,7 @@ impl OverlayState {
         };
         // The previous tick's sample: the entrance-phase dismiss arm
         // requires two consecutive over-samples, so a single stray poll
-        // inside the growing pill's hitbox cannot arm the one-way dismiss.
+        // inside the growing pill's hitbox cannot arm the active hover dismiss.
         let cursor_was_over = self.last_cursor_over_pill;
         self.last_cursor_over_pill = cursor_over;
         if cursor_over {
@@ -3234,6 +3298,17 @@ impl OverlayState {
             self.hover_leave_at = Some(now);
         }
         let engaged = hover_engaged(cursor_over, self.hover_leave_at, now);
+        // Expanded-layout hover dismissal is forgiving: once the debounced
+        // leave is real, undo only the deadline installed by hover. If a
+        // newer queue/content decision changed the deadline meanwhile, keep it.
+        if !engaged
+            && self.hover_expand.is_none()
+            && let Some(armed_at) = self.hover_dismiss_at.take()
+        {
+            let original = self.hover_dismiss_resume_at.take();
+            self.dismiss_at = hover_restored_deadline(original, armed_at, self.dismiss_at);
+            debug!("pill hover-dismiss cancelled on leave");
+        }
         // Only the morph-origin expanded state is held — it is an
         // interaction, so its countdown is deferred while the cursor stays
         // on it. The hold is stateless math over the cursor inputs — no flag
@@ -3303,12 +3378,10 @@ impl OverlayState {
                         debug!("pill hover expand started");
                     }
                     HoverStep::ArmDismiss => {
+                        let original = self.dismiss_at;
+                        self.hover_dismiss_resume_at = original;
                         self.hover_dismiss_at = Some(now);
-                        // The arm caps the remaining time at 500ms; it must
-                        // never extend an already-sooner deadline (e.g. an
-                        // earlier hover arm or the queued-notification cap).
-                        let early = now + Duration::from_millis(EARLY_EXIT_MS);
-                        self.dismiss_at = Some(self.dismiss_at.map_or(early, |d| d.min(early)));
+                        self.dismiss_at = hover_capped_deadline(original, now);
                         debug!("pill hover-dismiss armed");
                     }
                     HoverStep::ReverseMorph => {
@@ -3349,14 +3422,15 @@ impl OverlayState {
                 // Expanded-layout pill arms (Compact pills only ever expand
                 // on hover, which the Shown path handles). Two consecutive
                 // over-samples are required — a single stray poll inside the
-                // growing hitbox must not arm the one-way dismiss and kill a
+                // growing hitbox must not arm the active hover dismiss and kill a
                 // just-appeared pill. The arm caps the remaining time at
                 // 500ms with `min`, never extends an already-sooner deadline
                 // — same shape as the Shown-path arm above.
                 if self.layout == LayoutMode::Expanded {
+                    let original = self.dismiss_at;
+                    self.hover_dismiss_resume_at = original;
                     self.hover_dismiss_at = Some(now);
-                    let early = now + Duration::from_millis(EARLY_EXIT_MS);
-                    self.dismiss_at = Some(self.dismiss_at.map_or(early, |d| d.min(early)));
+                    self.dismiss_at = hover_capped_deadline(original, now);
                     debug!("pill hover-dismiss armed");
                 }
             }
@@ -4144,6 +4218,7 @@ impl OverlayState {
         self.content = None;
         self.dismiss_at = None;
         self.hover_dismiss_at = None;
+        self.hover_dismiss_resume_at = None;
         self.hover_expand = None;
         self.hover_expanded_once = false;
         self.hover_leave_at = None;
@@ -4429,6 +4504,7 @@ impl OverlayState {
         // expanded with the cursor nowhere near it, and seed the sample's
         // collapse from a velocity that belonged to a different hover.
         self.hover_dismiss_at = None;
+        self.hover_dismiss_resume_at = None;
         self.hover_expand = None;
         self.hover_expanded_once = false;
         self.hover_leave_at = None;
@@ -11131,7 +11207,7 @@ mod tests {
         let remaining = state.dismiss_at.unwrap().saturating_duration_since(Instant::now());
         assert!(
             remaining <= Duration::from_millis(EARLY_EXIT_MS + 50),
-            "the one-way arm must not push the deadline while the cursor stays, got {remaining:?}"
+            "the hover arm must not push the deadline while the cursor stays, got {remaining:?}"
         );
         // A deadline that expires under the cursor dismisses the laid-out
         // expanded pill: no hold defers it.
