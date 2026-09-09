@@ -987,6 +987,18 @@ pub fn spawn_handoff_thread(hwnd: HWND) {
     drop(worker);
 }
 
+/// Applies the startup contract to the effective in-memory config.
+/// The first-run discovery flag is deliberately preserved so the tracking
+/// window opens once for initial setup. Legacy `start_in_tray = false` values
+/// remain parse-compatible but cannot make later launches, logon startup, or
+/// Settings-triggered restarts raise the window.
+fn enforce_startup_policy(config: &mut Config) {
+    if !config.behavior.start_in_tray {
+        info!("legacy start_in_tray=false ignored: only the first-ever launch opens the tracking window automatically");
+    }
+    config.behavior.start_in_tray = true;
+}
+
 fn main() -> Result<()> {
     // Record the thread that owns the windows before anything can create one:
     // the UIA provider helpers use this to tell whether a call already runs on
@@ -1038,7 +1050,7 @@ fn main() -> Result<()> {
     // removes pre-existing data-directory entries.
     install_crash_handler(&logs_dir);
     install_panic_hook();
-    let config = match config::Config::load() {
+    let mut config = match config::Config::load() {
         Ok(config) => config,
         Err(error) => {
             // A load failure is fatal (the data dir itself is unusable), and
@@ -1052,6 +1064,7 @@ fn main() -> Result<()> {
             return Err(error);
         }
     };
+    enforce_startup_policy(&mut config);
     config.log_settings();
 
     info!("starting WinGlance");
@@ -1847,6 +1860,24 @@ mod tests {
     // feature this crate does not enable; these values are stable ABI.
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
+
+    #[test]
+    fn startup_policy_preserves_first_run_but_silences_later_launches() {
+        let mut config = Config {
+            first_run: true,
+            behavior: crate::config::BehaviorConfig {
+                start_in_tray: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        enforce_startup_policy(&mut config);
+        assert!(config.first_run, "the first launch must remain discoverable for setup");
+        assert!(
+            config.behavior.start_in_tray,
+            "legacy start_in_tray=false must not make later launches visible"
+        );
+    }
 
     #[test]
     fn crash_log_handle_is_retained_under_the_verified_discipline_at_install() {

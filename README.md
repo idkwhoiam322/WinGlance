@@ -53,15 +53,14 @@ interrupts and never needs interaction.
 
 ## Getting started
 
-Download `WinGlance.exe` from the latest [release](../../releases), run it, and
-it sits in the tray. Later launches start silently (no window); the very first
-run — the one that creates the config — opens the tracking window once. The
-pill appears when media plays. Click (or double-click) the tray icon for the
-tracking window: it shows the
-current activity and a per-source history on the **Now Playing** pane, plus a
-**Settings** pane mirroring the tray menu (notifications, duration,
-start-on-login, close-to-tray, allowed apps, layout, position, monitor,
-preferred source, logs).
+Download `WinGlance.exe` from the latest [release](../../releases) and run it.
+The first-ever launch opens the tracking window once so you can review and adjust
+Settings. After that, normal launches, logon startup, and Settings-triggered
+restarts stay silent in the tray. Open the tracking window again by clicking (or
+double-clicking) the tray icon. It shows the current activity and a per-source
+history on the **Now Playing** pane, plus a **Settings** pane mirroring the tray
+menu (notifications, duration, start-on-login, close-to-tray, allowed apps,
+layout, position, monitor, preferred source, logs).
 
 ### Tray menu
 
