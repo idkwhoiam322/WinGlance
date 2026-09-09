@@ -258,6 +258,31 @@ mod tool_info_layout_tests {
     }
 }
 
+fn pack_signed_point_lparam(x: i32, y: i32) -> isize {
+    let x = x.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16 as u32;
+    let y = y.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16 as u32;
+    (x | (y << 16)) as isize
+}
+
+#[cfg(test)]
+mod tooltip_coordinate_tests {
+    use super::pack_signed_point_lparam;
+
+    #[test]
+    fn track_position_packing_preserves_negative_virtual_desktop_coordinates() {
+        let packed = pack_signed_point_lparam(-1200, -300) as u32;
+        assert_eq!((packed as u16) as i16, -1200);
+        assert_eq!(((packed >> 16) as u16) as i16, -300);
+    }
+
+    #[test]
+    fn track_position_packing_clamps_only_beyond_message_range() {
+        let packed = pack_signed_point_lparam(i32::MIN, i32::MAX) as u32;
+        assert_eq!((packed as u16) as i16, i16::MIN);
+        assert_eq!(((packed >> 16) as u16) as i16, i16::MAX);
+    }
+}
+
 const fn colorref(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
 }
@@ -1011,6 +1036,36 @@ fn segment_rects(rect: &RECT, count: usize, gap: i32) -> Vec<RECT> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryDisposition {
+    /// This event actually reached the notification pill.
+    Shown,
+    /// Notifications were disabled when the event arrived.
+    NotificationsPaused,
+    /// The source repeated a state already represented by the pill.
+    Redundant,
+    /// The source/session was deliberately not tracked (allow-list or churn protection).
+    Rejected,
+    /// WinGlance's media worker stopped after exhausting its restart budget.
+    InternalFailure,
+}
+
+impl HistoryDisposition {
+    fn shown(self) -> bool {
+        matches!(self, Self::Shown)
+    }
+
+    fn detail(self) -> Option<&'static str> {
+        match self {
+            Self::Shown => None,
+            Self::NotificationsPaused => Some("notifications paused"),
+            Self::Redundant => Some("redundant media update"),
+            Self::Rejected => Some("source not tracked (allowed-app filter or churn protection)"),
+            Self::InternalFailure => Some("internal media worker failure"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct HistoryEntry {
     /// Monotonic per-window id, so an in-place metadata refresh can find
@@ -1028,10 +1083,10 @@ struct HistoryEntry {
     cells: [String; 9],
     track: TrackInfo,
     state: PlaybackState,
-    /// Whether the source session passed the `media_sources` filter.
-    /// Accepted entries are highlighted; rejected ones render muted so every
-    /// media source is visible in the history.
-    accepted: bool,
+    /// Why this event did or did not reach the notification surface.
+    /// Only `Shown` rows are highlighted; every other disposition stays
+    /// visible but muted with a truthful tooltip reason.
+    disposition: HistoryDisposition,
 }
 
 struct History {
@@ -2018,7 +2073,7 @@ impl MainWindowState {
             );
             self.tooltip_shown = true;
 
-            let packed = ((clamped.top.max(0) as isize) << 16) | (clamped.left.max(0) as isize & 0xFFFF);
+            let packed = pack_signed_point_lparam(clamped.left, clamped.top);
             let _ = send_message(self.tooltip_ctrl, TTM_TRACKPOSITION, WPARAM(0), LPARAM(packed));
         }
     }
@@ -2338,7 +2393,7 @@ impl MainWindowState {
     /// The listbox top stays where the reader left it: rows above the new one
     /// only shift by one, so a scroll position mid-history is not yanked back
     /// to the newest row on every track change.
-    fn push_history(&mut self, track: TrackInfo, state: PlaybackState, accepted: bool) -> u64 {
+    fn push_history(&mut self, track: TrackInfo, state: PlaybackState, disposition: HistoryDisposition) -> u64 {
         let track = track.into_history_text();
         let at = Local::now();
         let at_label = at.format("%H:%M:%S").to_string();
@@ -2353,7 +2408,7 @@ impl MainWindowState {
             cells,
             track,
             state,
-            accepted,
+            disposition,
         });
         if !self.listbox.0.is_null() && self.history.len() <= before && before > 0 {
             // The cap dropped the oldest entry, which sits at the bottom of
@@ -2396,12 +2451,18 @@ impl MainWindowState {
         // Bright means the state reached the pill: a redundant re-report is
         // exactly what the overlay suppresses, and with notifications off
         // nothing reaches the pill at all.
-        let reached = !redundant && self.cfg().behavior.notifications_enabled;
+        let disposition = if redundant {
+            HistoryDisposition::Redundant
+        } else if self.cfg().behavior.notifications_enabled {
+            HistoryDisposition::Shown
+        } else {
+            HistoryDisposition::NotificationsPaused
+        };
         // Convert to the history's text-only form before the clone so the
         // image buffers (Arc-pinned covers, app icon, palette) are never copied
         // just to be discarded.
         let track = current.track.clone().into_history_text();
-        self.push_history(track, state, reached);
+        self.push_history(track, state, disposition);
     }
 
     /// Records a session that was seen but not tracked (filtered by
@@ -2413,7 +2474,7 @@ impl MainWindowState {
         title: String,
         artist: String,
         state: PlaybackState,
-        accepted: bool,
+        _accepted: bool,
     ) {
         let track = TrackInfo {
             title,
@@ -2421,7 +2482,7 @@ impl MainWindowState {
             source_app,
             ..TrackInfo::default()
         };
-        self.push_history(track, state, accepted);
+        self.push_history(track, state, HistoryDisposition::Rejected);
     }
 
     /// Adds a prominent history row when the SMTC worker gave up permanently:
@@ -2435,7 +2496,7 @@ impl MainWindowState {
             source_app: "WinGlance".into(),
             ..TrackInfo::default()
         };
-        self.push_history(track, PlaybackState::Stopped, false);
+        self.push_history(track, PlaybackState::Stopped, HistoryDisposition::InternalFailure);
         show_tray_note(self.hwnd, "Media notifications stopped", reason, NIIF_ERROR);
     }
 
@@ -2552,9 +2613,13 @@ impl MainWindowState {
         // History row is text-only: drop the image buffers (consume a clone).
         // Bright means the state reached the pill; with notifications off
         // nothing does.
-        let reached = self.cfg().behavior.notifications_enabled;
+        let disposition = if self.cfg().behavior.notifications_enabled {
+            HistoryDisposition::Shown
+        } else {
+            HistoryDisposition::NotificationsPaused
+        };
         let history_track = track.clone().into_history_text();
-        self.current_entry_id = Some(self.push_history(history_track, state, reached));
+        self.current_entry_id = Some(self.push_history(history_track, state, disposition));
         self.current = Some(CurrentActivity {
             track,
             state,
@@ -4349,7 +4414,7 @@ impl MainWindowState {
             // accent color) with bold text; redundant re-reports and rejected
             // sessions render muted, so the bright rows are exactly what the
             // pill showed.
-            let (row_color, bold) = if entry.accepted {
+            let (row_color, bold) = if entry.disposition.shown() {
                 (accent_color, true)
             } else {
                 (HISTORY_MUTED_TEXT, false)
@@ -5138,8 +5203,8 @@ fn entry_detail(entry: &HistoryEntry) -> String {
         ),
         entry.track.title.clone(),
     ];
-    if !entry.accepted {
-        parts.push("(filtered by allowed apps)".to_string());
+    if let Some(reason) = entry.disposition.detail() {
+        parts.push(format!("({reason})"));
     }
     push_track_detail_lines(&mut parts, &entry.track);
     parts.join("\n")
