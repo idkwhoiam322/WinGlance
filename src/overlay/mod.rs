@@ -4982,6 +4982,23 @@ mod tests {
     }
 
     #[test]
+    fn persistent_compact_still_owns_the_passive_idle_card() {
+        let mut config = Config::default();
+        config.overlay.layout = LayoutMode::PersistentCompact;
+        let mut state = OverlayState::new(config, EventQueue::default());
+
+        state.show_idle();
+
+        assert!(state.idle_content);
+        assert!(matches!(state.phase, Phase::Shown));
+        assert_eq!(state.layout, LayoutMode::Compact);
+        assert!(matches!(
+            state.content.as_ref(),
+            Some(MediaEvent::TrackChanged(track)) if track.title == "No media playing"
+        ));
+    }
+
+    #[test]
     fn idle_status_is_static_compact_and_nonplaying() {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.idle_content = true;
@@ -5362,12 +5379,13 @@ mod tests {
             "a state pill with no cached track names the source app"
         );
 
-        // Retiring the media content falls back to the always-visible
-        // passive card; the accessible name must follow what is actually
-        // rendered rather than retaining the retired source.
+        // Retiring media content in a transient layout actually hides
+        // the pill; the accessible name must clear with the hidden window
+        // rather than retaining the retired source.
         state.hide();
-        assert!(state.idle_content);
-        assert_eq!(*cell.lock().unwrap(), Some("No media playing".to_string()));
+        assert!(!state.idle_content);
+        assert!(matches!(state.phase, Phase::Hidden));
+        assert_eq!(*cell.lock().unwrap(), None);
     }
 
     #[test]
@@ -6031,7 +6049,7 @@ mod tests {
     }
 
     #[test]
-    fn session_rejected_falls_back_to_idle_when_nothing_valid_remains() {
+    fn session_rejected_hides_when_nothing_valid_remains() {
         let mut state = OverlayState::new(Config::default(), EventQueue::default());
         state.content = Some(MediaEvent::TrackChanged(brave_track("Brave Song")));
         state.current_source = Some("Brave".into());
@@ -6040,13 +6058,10 @@ mod tests {
         state.queue.lock().unwrap().push_back(Arc::new(reject("Brave")));
         state.receive_events();
 
-        assert!(state.idle_content);
-        assert!(matches!(
-            state.content.as_ref(),
-            Some(MediaEvent::TrackChanged(track)) if track.title == "No media playing"
-        ));
+        assert!(!state.idle_content);
+        assert!(state.content.is_none());
         assert!(state.last_track.is_none());
-        assert!(matches!(state.phase, Phase::Shown));
+        assert!(matches!(state.phase, Phase::Hidden));
     }
 
     #[test]
@@ -7565,23 +7580,20 @@ mod tests {
             state.last_track.is_none(),
             "the fast-path restore source must be cleared"
         );
-        assert!(state.idle_content, "the stale media must fall back to passive status");
-        assert!(matches!(
-            state.content.as_ref(),
-            Some(MediaEvent::TrackChanged(track)) if track.title == "Notifications paused"
-        ));
+        assert!(
+            !state.idle_content,
+            "transient layouts must stay hidden after stale media is cleared"
+        );
+        assert!(state.content.is_none());
+        assert!(matches!(state.phase, Phase::Hidden));
 
-        // Re-enable: the fast-path finds nothing to restore, so the passive
-        // card becomes the truthful no-media state instead of resurrecting
-        // the settled source's track.
+        // Re-enable: the fast-path finds nothing to restore, so the transient
+        // layout stays hidden instead of resurrecting the settled source's track.
         state.toggle_enabled();
         assert!(state.enabled);
-        assert!(state.idle_content);
-        assert!(matches!(
-            state.content.as_ref(),
-            Some(MediaEvent::TrackChanged(track)) if track.title == "No media playing"
-        ));
-        assert!(matches!(state.phase, Phase::Shown));
+        assert!(!state.idle_content);
+        assert!(state.content.is_none());
+        assert!(matches!(state.phase, Phase::Hidden));
     }
 
     #[test]
@@ -7600,15 +7612,12 @@ mod tests {
         }));
         state.receive_events();
         assert!(
-            state.idle_content,
-            "the stale track pill must retire into passive status"
+            !state.idle_content,
+            "the stale track pill must retire into the transient hidden state"
         );
-        assert!(matches!(
-            state.content.as_ref(),
-            Some(MediaEvent::TrackChanged(track)) if track.title == "No media playing"
-        ));
+        assert!(state.content.is_none());
         assert!(state.last_track.is_none(), "the standby must die with its source");
-        assert!(matches!(state.phase, Phase::Shown));
+        assert!(matches!(state.phase, Phase::Hidden));
 
         // Same source, but the shown content is the Stopped tombstone: it is
         // left in place, while the standby is still cleaned.
@@ -7689,15 +7698,12 @@ mod tests {
         state.receive_events();
 
         assert!(
-            state.idle_content,
+            !state.idle_content,
             "a paused survivor must not be announced as now playing"
         );
-        assert!(matches!(
-            state.content.as_ref(),
-            Some(MediaEvent::TrackChanged(track)) if track.title == "No media playing"
-        ));
+        assert!(state.content.is_none());
         assert!(state.last_track.is_none());
-        assert!(matches!(state.phase, Phase::Shown));
+        assert!(matches!(state.phase, Phase::Hidden));
     }
 
     #[test]
@@ -7751,14 +7757,11 @@ mod tests {
         state.receive_events();
 
         assert!(
-            state.idle_content,
-            "with both sources settled only passive status remains"
+            !state.idle_content,
+            "with both sources settled the transient pill must stay hidden"
         );
-        assert!(matches!(
-            state.content.as_ref(),
-            Some(MediaEvent::TrackChanged(track)) if track.title == "No media playing"
-        ));
-        assert!(matches!(state.phase, Phase::Shown));
+        assert!(state.content.is_none());
+        assert!(matches!(state.phase, Phase::Hidden));
     }
 
     #[test]
@@ -9906,8 +9909,9 @@ mod tests {
             state.current_source.is_none(),
             "current_source must clear when media content retires"
         );
-        assert!(state.idle_content);
-        assert!(matches!(state.phase, Phase::Shown));
+        assert!(!state.idle_content);
+        assert!(state.content.is_none());
+        assert!(matches!(state.phase, Phase::Hidden));
     }
 
     #[test]
