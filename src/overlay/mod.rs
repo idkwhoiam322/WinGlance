@@ -1470,11 +1470,16 @@ impl OverlayState {
         })
     }
 
-    /// Shows the process-lifetime no-media status. It is deliberately static:
-    /// no dismiss deadline, progress, comet, marquee morph, or hover action, so
+    /// Shows the PersistentCompact passive status. Transient layouts return
+    /// to Hidden after their normal dismiss deadline; only the explicitly
+    /// persistent layout owns an idle card. It is deliberately static: no
+    /// dismiss deadline, progress, comet, marquee morph, or hover action, so
     /// after the one initial layered-window upload the normal render gate stays
     /// cold until a real event or placement/configuration change arrives.
     fn show_idle(&mut self) {
+        if self.config.overlay.layout != LayoutMode::PersistentCompact {
+            return;
+        }
         unsafe {
             let _ = kill_timer(self.hwnd, IDLE_BUFFER_TIMER_ID);
         }
@@ -4957,6 +4962,24 @@ mod tests {
     use windows::Win32::UI::WindowsAndMessaging::{
         DestroyWindow, DispatchMessageW, GetMessageW, TranslateMessage, WINDOW_EX_STYLE, WM_NULL,
     };
+
+    #[test]
+    fn passive_idle_is_persistent_compact_only() {
+        for layout in [LayoutMode::Expanded, LayoutMode::Compact, LayoutMode::Auto] {
+            let mut config = Config::default();
+            config.overlay.layout = layout;
+            let mut state = OverlayState::new(config, EventQueue::default());
+
+            state.show_idle();
+
+            assert!(
+                matches!(state.phase, Phase::Hidden),
+                "{layout:?} must stay hidden while idle"
+            );
+            assert!(!state.idle_content, "{layout:?} must not create passive idle content");
+            assert!(state.content.is_none(), "{layout:?} must not retain an idle event");
+        }
+    }
 
     #[test]
     fn idle_status_is_static_compact_and_nonplaying() {
