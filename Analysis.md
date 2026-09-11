@@ -1,33 +1,42 @@
 # External Review: WinGlance
 
-**Audit target:** `idkwhoiam322/WinGlance` @ `dev-audit-fixes` commit `32f27897d5f2370997d597b52045279cd96c628c`  
-**Audit date:** 2026-09-04  
-**Mode:** repository-wide static audit using GitHub source/history and existing workflow metadata only. No executable, helper, packaging script, GUI tool, screenshot tool, or live `%APPDATA%\WinGlance` path was touched.  
-**Verification status at audited head:** **Unable to verify** build/test/lint/advisory status. The audited commit has no GitHub combined status/check records and no workflow run associated with the head. I therefore do **not** claim `fmt`, `clippy`, tests, release build, `cargo deny`, `cargo audit`, complexity limits, coverage, or mutation results pass at this head.
+**Audit target:** `idkwhoiam322/WinGlance` @ `dev-audit-fixes` commit `965ea8ff43572c0f8859553831ce2e447751d10a`  
+**Audit date:** 2026-09-12  
+**Report branch:** `checkpoint`, created directly from the audited commit  
+**Mode:** repository-wide read-only technical audit using GitHub source/history and GitHub Actions evidence. No source file was edited, no executable/helper/packaging script was run, no GUI/screenshot tooling was used, and nothing under live `%APPDATA%\WinGlance` was touched. The only repository write performed for this audit is this report on `checkpoint`.
 
-
-> **Post-audit implementation note (checkpoint):** The findings below describe the immutable audited head and are retained as historical evidence. The production-readiness implementation subsequently closed START-001, OVERLAY-001, DEDUP-001, A11Y-001/002/003, HIST-001, TOOLTIP-001, MON-001, HOVER-001, and CI-001. DATA-001 is an explicitly accepted developer-tool-only `-FreshInstall` behavior and was not changed at the maintainer's direction. SINGLE-001 remains the documented fail-closed same-user availability tradeoff. DOC-001/002/003 were reconciled with the implemented behavior. The corrected finding total is **1 Critical, 3 High, 10 Medium, 2 Low = 16**.
+**Verification status before this report commit:** the exact audited head `965ea8f` had no attached GitHub Actions run/status. The immediately preceding release-gate commit `d199566391f3a8aa8ccb3196a07a65cf3bb87f13` did have a successful checkpoint CI run (`34476785314`): Windows fmt, Clippy with `-D warnings`, tests, release build, `cargo audit`, `cargo deny`; Linux static-metrics/cargo-machete; and the selected deterministic-core mutation gate all completed successfully. The only commits after that gate are `e276201` (restrict idle card to Persistent Compact) and `965ea8f` (align tests with that behavior). This report commit is intentionally tagged `[mutation]` so the checkpoint workflow can re-run the current code through the same path. Until that run finishes, current-head build/test status is **Unable to verify**, while the unchanged subsystems remain supported by the prior successful gate plus direct source trace.
 
 ## Executive verdict
 
-The branch is substantially more production-hardened than the audit prompt's starting assumptions. The current code already has bounded event/mailbox/window queues, a bounded artwork byte budget, off-UI artwork decode, stale-art generation rejection, per-source/session caps, rate-limited/bounded logging, atomic revision-checked config saves, verified reparse-resistant file opens, callback panic containment, a typed window-state ownership handshake, UIA coverage for the Settings pane, DPI-scoped font ownership, cached render surfaces/text, bounded history, Explorer tray recreation, and explicit shutdown paths.
+WinGlance is substantially hardened and much closer to production-ready than the historical `Analysis.md` that was present on this branch. The prior remediation stack genuinely fixed the old media-identity, accessibility, history-truth, signed-tooltip, monitor-identity, hover-reversibility, and CI-coverage findings. I do **not** recommend reopening those areas or rewriting already-bounded/RAII-managed subsystems for stylistic purity.
 
-I found **one Critical, three High, ten Medium, and two Low** findings. The Critical is a direct user-data deletion path in the packaging script. The High findings are the forced first-run window popup, the absence of the mandated no-media idle pill, and a media-identity suppression rule that can merge a genuine same-title transition when one side temporarily lacks artwork. The remaining findings are accessibility/UX truth, multi-monitor semantics, singleton availability, documentation drift, and release-gate coverage.
+I retain **five current findings: 1 Critical, 2 High, 2 Medium**.
 
-**Release recommendation:** **not production-ready yet**. Fix `DATA-001`, `START-001`, `OVERLAY-001`, and `DEDUP-001` first; then close the Medium correctness/accessibility findings and establish CI evidence for the release-quality gates. I do **not** recommend broad rewrites of already-hardened subsystems merely to resemble the exemplars in the audit prompt.
+The release blockers are narrow but real:
+
+1. `create_exe.ps1 -FreshInstall` can still recursively delete the live `%APPDATA%\WinGlance\WinGlance\data` directory, directly violating the audit's sacred user-data rule.
+2. The first-ever application launch still opens the maximized tracking window, directly violating the hard no-popup startup contract.
+3. A regression after the earlier audit changed the truthful idle card to `PersistentCompact` only; Expanded, Compact and Auto now intentionally stay hidden while idle, directly violating the hard always-visible-pill/no-media scenario contract.
+
+The two Medium findings are release-quality evidence and documentation drift. The repository now has useful complexity/mutation gates, but they intentionally ratchet historical complexity debt instead of proving the requested absolute thresholds, do not produce a defensible CRAP value, and require zero surviving mutants only in a curated deterministic core. Documentation also contains stale one-way-hover and all-layout-idle descriptions after later code changes.
+
+**Release recommendation: not production-ready under the supplied contract.** Fix `DATA-001`, `START-001`, and `OVERLAY-001` before release. Close `QUALITY-001` with measured evidence/explicitly reviewed exceptions rather than metric theater, then reconcile `DOC-001`. No broad architecture rewrite is justified.
 
 ## Scope reconciliation / repo-map drift
 
-The provided starting map is stale relative to `dev-audit-fixes`: the branch additionally has `src/accessibility.rs`, `src/winapi.rs`, and `build.rs`, and the current `docs/development.md` describes those roles. That is prompt-map drift, not a repository documentation defect by itself. The important current ownership model is:
+The supplied repo map is older than the current branch. Current code additionally includes `src/accessibility.rs`, `src/winapi.rs`, `build.rs`, quality scripts, and `docs/quality.md`. Current ownership is coherent:
 
-- `main.rs`: startup, singleton/restart handoff, crash logging, supervisor/forwarder, UI message loop.
-- `smtc.rs`: MTA SMTC worker; hostile-input sanitization, bounded reads/decode/admission, per-source coalescing.
-- `overlay/`: passive layered pill, event reduction, state machine, display resolution, render cache, timer/hook lifetime.
-- `main_window.rs`: tracking window, bounded history, Settings, tray, config ownership/persistence, picker/dialog integration.
-- `accessibility.rs`: Settings/pill UIA providers with callback panic containment.
-- `winapi.rs` / `winutil.rs`: raw Win32 facade, state ownership, callback guards, verified filesystem writes, small RAII helpers.
+- `main.rs`: process startup, singleton/restart handoff, crash logging, SMTC supervisor/forwarder, UI message loop.
+- `smtc.rs`: isolated MTA SMTC worker, hostile-input sanitization, bounded async reads, bounded artwork decode/admission, session churn handling.
+- `overlay/`: passive layered pill, event reduction, state machine, placement/fullscreen logic, render caches, timers/hooks.
+- `main_window.rs`: tracking window, bounded history, Settings, tray lifecycle, config ownership/persistence.
+- `accessibility.rs`: Settings, picker and pill UI Automation providers with panic containment.
+- `winapi.rs` / `winutil.rs`: raw Win32 facade, callback/state ownership helpers, wide-string safety, verified filesystem writes.
 - `icon.rs`: isolated bounded shell-icon worker.
-- `positioner.rs`, `process_picker.rs`, `duration_dialog.rs`: user-invoked auxiliary UI; no config reload in the positioner.
+- `positioner.rs`, `process_picker.rs`, `duration_dialog.rs`: user-invoked auxiliary UI; config writes still flow back through the main window.
+
+The architecture guardrail that `positioner.rs` must never reload config from disk still holds. The SMTC worker consumes seeded/live control-mailbox state rather than becoming a second config writer.
 
 ---
 
@@ -35,31 +44,20 @@ The provided starting map is stale relative to `dev-audit-fixes`: the branch add
 
 | ID | Severity | Pass/Area | Location | Basis | Scenario trigger | Description | Suggested direction |
 |---|---|---|---|---|---|---|---|
-| DOC-001 | Medium | D8 / Documentation | `docs/configuration.md:1-18`; `src/config.rs:600-775` | Reasoned but not executed | Start with a syntactically valid TOML file containing a typed-invalid value such as `layout = "bogus"` | Documentation says a typed-invalid section remains persistable and will be canonicalized on the next save. Code intentionally sets `persistable = false` and clears the revision for **any** typed-section failure so no save can overwrite an unrepresentable future/unknown value. The code is safer; the docs are wrong. | Update the configuration reference to state that valid sibling sections apply in memory, but persistence is disabled for the run whenever any typed section fails. Do not weaken the code. |
-| DOC-002 | Low | D8 / Documentation | `docs/development.md:151-160`; `src/overlay/mod.rs:214-231` | Reasoned but not executed | Maintainer uses development docs to reason about memory bounds | Development docs still call the overlay track cache “cap-3”; this branch uses `TRACK_CACHE_CAP = 8`, matching architecture commentary. | Change the one stale bound to 8 and state that retention is indefinite but LRU cap-bounded. |
-| DOC-003 | Low | D8/D9 / Documentation | `README.md:156-164`; `.github/workflows/ci.yml:1-11` | Reasoned but not executed | Maintainer assumes every branch push receives CI | README says CI runs on every push and PR. Workflow push triggers only `main` (plus tags); PRs and manual dispatch are covered. | Make README wording match the workflow, or deliberately broaden the workflow in `CI-001`. |
+| QUALITY-001 | **Medium** | D6/D7/D9/F / release engineering | `.github/workflows/ci.yml:52-130`; `scripts/check_quality_metrics.py`; `scripts/check_mutation_core.py`; `docs/quality.md:18-88` | **Verified as gate design; current-head outcome pending** | Treat the branch as a release candidate and require the supplied absolute quality targets | CI's complexity job deliberately **grandfathers** functions already above cyclomatic/cognitive/Halstead targets at baseline `da06088`; it prevents regression but does not prove every current function is under the requested limits. Mutation requires zero survivors only in an explicitly curated deterministic core. `docs/quality.md` explicitly declines to fabricate CRAP because trustworthy function-level coverage/identity is not available. Therefore `Cyclomatic <22`, `Cognitive <22`, `Halstead <80`, `CRAP <25`, and repo-wide `surviving mutants = 0` are not all established release facts. | Keep the useful monotonic ratchet, but add a complete release inventory that lists every current over-threshold function and refactor only genuine maintainability hotspots. Add trustworthy coverage before computing CRAP; if a defensible join is unavailable, keep CRAP explicitly unverified rather than inventing a number. Extend strict mutation coverage to deterministic logic touched by the remaining fixes; do not mutate platform glue merely to manufacture a zero badge. |
+| DOC-001 | **Medium** | D8 / documentation drift | `docs/architecture.md:33-35`; `docs/architecture.md:352-389`; `src/config.rs:219-224`; related startup/idle prose in `README.md`, `docs/configuration.md`, `docs/development.md` | **Reasoned but not executed** | Maintainer/auditor uses architecture docs to reason about idle or hover behavior | Architecture still says startup/settled overlay always renders the passive no-media status, while current code limits it to `PersistentCompact`. The same architecture section and a `config.rs` doc comment still call Expanded hover dismissal “one-way” even though the implementation was deliberately made reversible on leave. Startup docs accurately describe the current first-run popup but thereby contradict the hard product mandate rather than the code. These are contract-level docs used by future reviewers, not harmless wording differences. | Update behavior-coupled docs in the same commits that fix startup/idle. Then do one final docs-only sweep for stale hover/media-identity wording and exact quality-gate semantics. Do not change correct code to match stale prose. |
 
 ---
 
 # Section 2 — Behavioral / Architectural Refactors
 
-> **Behavior-change warning:** `START-001`, `OVERLAY-001`, `DEDUP-001`, `MON-001`, `HOVER-001`, and the effective-color part of `A11Y-002` can visibly change what a user sees. Those changes are called out explicitly below.
+> **Behavior-change warning:** `START-001` and `OVERLAY-001` produce obvious user-visible behavior changes because the supplied hard mandates require behavior different from the current branch. `DATA-001` changes developer tooling semantics, not application UX.
 
 | ID | Severity | Pass/Area | Location | Basis | Scenario trigger | Description | Suggested direction |
 |---|---|---|---|---|---|---|---|
-| DATA-001 | **Critical** | A3 / D9 / Rule 1 | `create_exe.ps1:85-91` | **Reasoned but not executed** | Run `create_exe.ps1 -FreshInstall` on a real profile | The script recursively deletes `%APPDATA%\WinGlance\WinGlance\data`. This directly violates the sacred rule that user data under that directory is never deleted, and it can destroy `config.toml`, logs, and any future database/cache. “Explicit fresh-install simulation” is not a safe exception. | Remove the live-data deletion capability. If a fresh-install simulation is needed, require an explicitly supplied temporary/sandbox root and refuse any path resolving to the production data root. |
-| START-001 | **High** | Functionality / Rule 2 / D8 | `src/config.rs:618-641`; `src/main_window.rs:1384-1410` | **Reasoned but not executed** | Fresh install, or any launch where the config did not exist before startup | `Config::load_from_path` sets `first_run = true`, and main-window creation treats `first_run` as an unconditional reason to `ShowWindow(..., SW_SHOWMAXIMIZED)`. This contradicts the hard no-popup launch contract. README/config docs deliberately document the exception, but documented intent is not a defense against the mandate. | Remove the forced first-run show. Keep first-run discoverability in tray/pill affordances only. The separate question of an explicit `start_in_tray = false` opt-in is retained in the Risk Register because the hard mandate conflicts with that public setting. **Noticeable behavior change:** first launch becomes silent. |
-| OVERLAY-001 | **High** | Functionality / UX truth / Rule 5 | `src/overlay/mod.rs:185-198`; `src/overlay/mod.rs:1285-1345`; `src/overlay/mod.rs:2280-2445` | **Reasoned but not executed** | Cold start with no SMTC session; last playing source disappears with no playing successor | Overlay state initializes with `content = None` and `Phase::Hidden`; retirement/no-successor paths call `hide()`. There is no truthful idle pill state, so the pill is not always visible while the process is alive as required by the mandate/scenario 1. | Add an explicit static Idle presentation/state and make “no media” settle into Idle instead of Hidden. Preserve the passive/no-focus window contract. **Noticeable behavior change:** an idle pill remains on screen with no media. Fullscreen suppression scope must be resolved per `R-03`. |
-| DEDUP-001 | **High** | A1 / Functionality / UX truth | `src/events.rs:375-414`; callers `src/main_window.rs:2430-2535`, `src/overlay/mod.rs` receive/update paths | **Reasoned but not executed** | Same source emits a genuine new item with identical title+artist while the new/old snapshot has artwork on only one side (common during progressive thumbnail updates) | `TrackInfo::same_media` treats `(None, Some(_))` and `(Some(_), None)` as the same media without consulting duration or any other discriminator. That correctly avoids a duplicate pill for a late thumbnail, but it can also classify a genuine same-title replay/version as a metadata refresh and rewrite/update in place instead of notifying. This is exactly the “anti-spam rule can swallow a genuine user action” class called out by the audit mandate. | Separate **refresh provenance** from **media identity**. Prefer a worker-emitted refresh/new-identity disposition or an identity discriminator that uses duration/playback type/track number/timeline reset when available. Add paired tests: late thumbnail must merge; genuine same-title transition must notify. **Noticeable behavior change:** previously swallowed edge transitions can produce a pill/history row. |
-| A11Y-001 | Medium | Accessibility / Settings correctness | `src/main_window.rs:4100-4255` | **Reasoned but not executed** | Scroll Settings to a nonzero offset, then keyboard/UIA-focus a control outside the viewport | `settings_focus_targets` already builds rectangles after applying `settings_scroll_y`, so each target `cy` is a client coordinate. `focus_settings_target` then compares it against `settings_scroll_y + viewport...` and assigns `settings_scroll_y = t.cy - client_h/2`, mixing document and client coordinates. On nonzero scroll this can jump in the wrong direction or fail to bring focus into view. | Compute visibility purely in viewport/client coordinates and adjust the current scroll by the required delta before clamping. Add a pure regression covering a nonzero starting scroll and both upward/downward focus moves. |
-| A11Y-002 | Medium | Accessibility / WCAG contrast | `src/config.rs:330-390`; `src/main_window.rs:2600-2765` | **Reasoned but not executed** | Hand-edit `appearance.text_color` near the tracking window's dark background | The Activity title uses the configurable `text_color` directly. The config accepts arbitrary RGBA bytes; there is no effective contrast correction for the tracking-window title, so a black/near-black value can make primary content unreadable (down to ~1:1 on a black surface). The overlay already has shared contrast helpers, demonstrating the repo has a suitable mechanism. | Preserve the serialized user color, but derive an **effective rendered color** that meets at least WCAG AA 4.5:1 against the actual Activity background; warn once when correction is applied. **Noticeable only for low-contrast custom themes.** |
-| A11Y-003 | Medium | Accessibility / Process picker | `src/process_picker.rs:620-915` | **Reasoned but not executed** | Open Allowed apps / Auto-compact / Preferred source picker with Narrator or another UIA client | The owner-drawn native listbox stores the app's checked state only in `LB_SETITEMDATA` and paints/toggles it itself. Keyboard Space works, but there is no UIA provider exposing that custom checked/toggle state, so assistive technology can see/select list items without learning the state that will actually be persisted. | Add a small UIA fragment/Toggle provider for picker rows, reusing the Settings provider pattern and the same row/toggle source of truth. Keep mouse/keyboard semantics unchanged. |
-| HIST-001 | Medium | UX truth / Diagnostics | `src/main_window.rs:1013-1048`; `src/main_window.rs:2360-2575`; `src/main_window.rs:5070-5145` | **Reasoned but not executed** | Notifications disabled, redundant playback re-report, worker-failure row, or filtered/churned session appears in history | `HistoryEntry.accepted` is documented in one place as “passed `media_sources`”, but callers also use it for “reached the pill”. `entry_detail` renders **every** `accepted == false` row as `(filtered by allowed apps)`. This lies for allowed events muted because notifications were off/redundant, and for internal failure rows. | Split `source_allowed` from a small `HistoryDisposition`/reason (`Shown`, `Redundant`, `NotificationsOff`, `Filtered`, `ChurnExcluded`, `InternalFailure`). Highlight from “shown”; tooltip from the actual reason. |
-| TOOLTIP-001 | Medium | UI/UX / Multi-monitor | `src/main_window.rs:1935-2010` | **Reasoned but not executed** | Tracking window/cursor is on a monitor left of or above the primary display (negative virtual-screen X/Y) | Tooltip placement correctly clamps to the nearest monitor work area, then destroys that result by packing `clamped.left.max(0)` and `clamped.top.max(0)` into `TTM_TRACKPOSITION`. Negative virtual-screen coordinates are valid; clamping them to zero can jump the tooltip toward the primary origin. | Pack the signed virtual-screen coordinates using Win32 `LPARAM`/16-bit two's-complement semantics (or an equivalent helper) after monitor-work-area clamping. Add negative-X and negative-Y unit tests for the packer. |
-| MON-001 | Medium | D1/D8 / Multi-monitor contract | `src/overlay/fullscreen.rs:211-307`; `docs/configuration.md:86-108` | **Reasoned but not executed** | Configure `monitor = "index-N"`, reorder displays while running, then restart | Documentation says `index-N` resolves against the **current enumeration order every placement**. Runtime adds `resolve_target_sticky`, remembering the first device name for that index and following the same physical display for the process lifetime. That is arguably better during docking, but after restart the unchanged config returns to enumeration semantics and can target a different display. One config therefore has two meanings separated by a restart boundary. | Choose one contract. Preferred direction: persist an **additive stable monitor identity** (device name/identifier) alongside the legacy index, with index/primary fallback; update UI/docs. Do not simply delete stickiness without deciding the intended UX. **Noticeable behavior/config addition.** |
-| HOVER-001 | Medium | UX / Behavioral consistency | `src/overlay/mod.rs:67-83`, `src/overlay/mod.rs:640-675`; `docs/configuration.md:120-143` | **Reasoned but not executed** | User moves the pointer onto an Expanded pill to read it, then leaves before 500 ms; or repeatedly crosses its edge | Expanded hover is deliberately a one-way dismissal arm: remaining time is capped at 500 ms and leaving does not cancel it. Compact first-hover does the opposite (expand and hold while cursor remains), then later hover dismisses. The behavior is internally consistent and documented, but it is surprising as a readability interaction and can punish accidental edge crossing. | Keep `dismiss_on_hover` as a setting, but make the arm reversible on leave (or default it off for Expanded) unless the maintainer explicitly prefers the current “hover means I've seen it” model. **Noticeable behavior change; maintainer decision required.** |
-| SINGLE-001 | Medium | A5 / Availability / Single-instance | `src/main.rs` singleton acquisition; `docs/architecture.md:84-122` | **Reasoned but not executed** | Another same-session process pre-creates/holds `WinGlanceSingleInstance`, then WinGlance launches | The current design explicitly treats name squatting as a diagnosed availability issue and fails closed so two WinGlance instances cannot race config/log writes. That means a hostile same-user process can hold the known mutex and deny startup indefinitely, contrary to A5's desired hostile-second-instance behavior. Under the stated same-user attacker model, no predictable same-user mutex/file lock can fully prevent DoS; the attacker could also terminate the process. | Keep fail-closed data integrity as the default. If reducing accidental/synthetic squatting is important, add a verified live-instance handshake and an alternate coordination strategy only after proving it cannot create dual writers. Treat complete same-user DoS resistance as out of scope/impossible without changing the threat assumptions. |
-| CI-001 | Medium | D6/D7/D9 / Release engineering | `.github/workflows/ci.yml:1-45`; audited head status | **Unable to verify** | Treat `dev-audit-fixes` / `checkpoint` as release candidates | CI gates fmt, clippy, tests, release build, audit and deny on PR/main/manual runs, but the audited branch head has no run/status and the workflow does not gate the requested cyclomatic/cognitive/Halstead/CRAP thresholds or mutation score. Therefore the release-quality targets are not established. | Add pinned, reproducible Rust-oriented complexity/coverage/mutation gates and ensure release-candidate commits are checked (PR/manual or explicit branch policy). Do not refactor solely to satisfy an unmeasured metric; measure first, then simplify only hotspots over threshold. |
+| DATA-001 | **Critical** | A3 / D9 / Rule 1 | `create_exe.ps1:85-92`; `AGENTS.md:40-50` | **Reasoned but not executed** | A developer runs `create_exe.ps1 -FreshInstall` on a normal user profile | The script resolves the actual live data root and executes `Remove-Item -Recurse -Force` on it. The current audit contract says that directory must never be deleted/overwritten once it exists; current `AGENTS.md` independently says the same and permits deletion only of the exact randomized temp created by the current save transaction. A prior maintainer decision described this as a developer-only exception, but the supplied audit explicitly marks the data rule sacred, so this audit cannot carry that exception forward. | Remove the ability to point fresh-install simulation at live APPDATA. If the workflow is useful, require an explicit disposable/sandbox root and hard-refuse any resolved path equal to or under the production WinGlance data root. This prevents an entire sanctioned-tool data-loss class. |
+| START-001 | **High** | Functionality / Rule 2 / UX truth | `src/main_window.rs:1439-1459`; `src/config.rs` first-run load policy; `README.md` / `docs/configuration.md` first-run prose | **Reasoned but not executed** | First-ever launch where `config.toml` did not exist, or a legacy config with `start_in_tray = false` | `show_window_once` is true when `cfg.first_run || !cfg.behavior.start_in_tray`, and that path calls `ShowWindow(..., SW_SHOWMAXIMIZED)`. This is intentionally documented and tested, but the supplied hard contract says Start-menu/logon launches must produce no popup and the maximized window is optional UI opened only from the tray. Documented intent/test coverage is not a defense under this audit. | Centralize startup policy so process launch never shows the main window. Keep `start_in_tray` readable for additive/backward config compatibility, but treat it as legacy/no-op if necessary; only explicit tray/user action should raise the tracking window. **NOTICEABLE:** first launch no longer opens the setup window. |
+| OVERLAY-001 | **High** | Functionality / Rule 5 / scenario 1 / UX truth | `src/overlay/mod.rs:1473-1485`; regression tests `src/overlay/mod.rs:4966-4992`; overlay creation calls `show_idle` near `src/overlay/mod.rs:4620-4635` | **Reasoned but not executed; behavior is unit-test-pinned** | Cold start with default Expanded layout and no SMTC session; last active source retires with no playing successor; notifications are paused in a transient layout | `show_idle()` now immediately returns unless `layout == PersistentCompact`, and the current test `passive_idle_is_persistent_compact_only` explicitly requires Expanded/Compact/Auto to remain `Phase::Hidden`. This regressed the earlier truthful idle-state remediation and directly contradicts the hard “pill always visible while process is alive” rule plus scenario 1's no-media idle expectation. | Restore the passive `No media playing` / `Notifications paused` status for every configured layout, rendered as a static compact status with no dismiss deadline or continuous animation. Preserve existing explicit fullscreen/listed-foreground suppression policy only as a deliberate temporary visibility exception (see `R-01`), and restore idle when suppression clears. **NOTICEABLE:** a status pill remains present when no media is active. |
 
 ---
 
@@ -67,334 +65,239 @@ The provided starting map is stale relative to `dev-audit-fixes`: the branch add
 
 ## Threat model
 
-WinGlance is a **single-user, offline desktop app running with the user's own privileges**. There is no network service, account system, credential store, key material, or telemetry path in the audited code/dependency surface. The practical hostile input is another process in the same interactive session. Any media app can register an SMTC session and therefore controls strings, timeline values, thumbnail bytes, and session identity presented to WinGlance. A same-user process/user can also mutate `%APPDATA%` and attempt reparse-point / replacement races. The correct priorities are therefore memory/crash safety on hostile media/config, user-data integrity, bounded resources, reparse-resistant writes, and graceful behavior under hostile session churn.
+WinGlance is a single-user, offline desktop app running with the user's privileges. It has no accounts and no network/telemetry surface. The practical hostile input is another process in the same session: any media app can register SMTC and therefore controls metadata strings, timeline values and thumbnail bytes; the same user/process can also modify `%APPDATA%` and can attempt reparse-point/path races. This is an availability/integrity threat model, not a privilege boundary.
 
-### A1 — SMTC metadata is untrusted
+### A1 — SMTC metadata as untrusted input
 
-**Clean for memory/safety; one behavioral finding (`DEDUP-001`).** `smtc.rs` centralizes metadata sanitization: displayed/logged strings are capped to 256 characters; C0, DEL/C1, bidi override/isolate controls and Unicode line/paragraph separators are removed; logging uses bounded escaped previews. Combining marks and emoji/ZWJ sequences can remain (correctly) but are bounded; drawing is single-line/clipped/marquee-based and no markup/format string parser consumes them. WinRT/Rust string conversion prevents raw invalid UTF-16 from becoming an unchecked Rust `String`.
+**Clean for the inspected static paths; Reasoned but not executed live.** The worker boundary caps/sanitizes displayed/logged metadata, strips control/bidi separators, bounds thumbnail bytes before decode, decodes to a fixed output, bounds async reads, and uses generation/art identity logic so a stale late decode cannot blindly replace newer content. Timeline/progress code clamps or suppresses unusable states rather than dividing by arbitrary duration values. Current `events.rs` media identity also compares every discriminator known on both sides (duration, track numbers/count, album/subtitle/album artist, playback type and artwork generation) before accepting a one-sided-art refresh. The historical genuine-same-title suppression finding is therefore closed.
 
-Timeline data is normalized before the UI: non-finite/negative positions/rates are rejected/clamped, progress rendering guards missing/zero duration, and displayed position is bounded against duration. Rapid changes are coalesced/bounded rather than stored without limit.
+Live hostile-provider cases (100 KiB title, corrupt stream, 20000×20000 declared image, lone-surrogate-producing provider, stale completion race) were **not executed** because the audit forbids launching providers/helpers. Exact live reproduction remains in scenario 3.
 
-Thumbnail safety is strong: stream bytes are capped at 4 MiB **before** bulk allocation/read completion, decoded dimensions are capped before decode, UI receives a fixed 256×256 premultiplied buffer, corrupt data degrades to no art, decoding happens off the UI thread, and a per-source generation rejects stale late artwork. The remaining media-identity problem is semantic rather than memory unsafe: see `DEDUP-001`.
+### A2 — `config.toml` as untrusted input
 
-### A2 — `config.toml` is untrusted
+**Clean; prior unit gate verified at `d199566`, direct code trace unchanged afterward.** The loader has a 1 MiB size bound, staged parsing, per-section typed fallback with warnings, unknown-key preservation, BOM/normal text handling, normalization/clamping, and persistence disablement when an invalid section cannot be safely round-tripped. Save uses revision/conflict checking so a hand edit after load is not silently overwritten. Syntactically invalid or oversized config falls back in memory without replacing the source file.
 
-**Clean for data integrity; docs drift `DOC-001`.** Config input is capped at 1 MiB, so the requested 10 MiB torture case is rejected before parse/buffering where possible. Syntax/unreadable/oversized failures use defaults in memory, log a warning, disable persistence, and leave the file untouched. Typed-invalid sections retain valid siblings in memory but also disable persistence, intentionally fail-closed. Unknown top-level and per-section keys are captured with `#[serde(flatten)]` and round-trip on successful saves.
+### A3 — filesystem / reparse / TOCTOU
 
-Out-of-range values are normalized with warning logs. External edits are detected by an exact byte revision plus file identity; a mismatch returns Conflict and does not save. UTF-8 BOM acceptance is parser-version behavior not proven here; if rejected, the failure path remains safe/non-destructive. CRLF/LF are ordinary TOML whitespace.
+**Finding filed: `DATA-001`.** Runtime config/log write helpers use verified handles/atomic-save discipline and the app does not need startup data cleanup. The remaining unacceptable deletion surface is the sanctioned developer script's `-FreshInstall` path, which targets the real live data directory.
 
-### A3 — Filesystem / TOCTOU / reparse points
+### A4 — spawn / exec surfaces
 
-**Production app paths clean; Critical tooling violation `DATA-001`.** Config/log/crash writes use `winutil` verified-open/atomic-replace helpers that pin and validate the parent, reject final-component reparse points, verify final handle identity/path, create randomized `CREATE_NEW` temporary files, re-check target identity/bytes at commit, rename atomically, and flush the parent. That is the right same-user TOCTOU posture.
+**Clean in application code; Reasoned but not executed.** Open/copy/restart actions use app-owned paths and explicit APIs rather than interpolating arbitrary shell command strings. Failures are logged/degraded rather than showing startup dialogs. The audit did not run the packaging script or restart helper path.
 
-`create_exe.ps1 -FreshInstall`, however, directly removes the live data tree and violates the user-data mandate even without an attacker.
+### A5 — single-instance protocol
 
-### A4 — Spawn / exec surfaces
+**No code finding; risk retained as `R-03`.** The session-scoped named mutex handles abandoned ownership and restart handoff, and live duplicates fail closed before config/log side effects. A same-user hostile process can still pre-create the predictable mutex and deny launch; the code diagnoses that case. Under the stated same-user attacker model, complete DoS resistance is not achievable with a predictable same-user coordination primitive without risking two writers, so I do not recommend a fail-open “fix.”
 
-**Clean trace.** User-invoked “open config/logs” resolves the app's own known path and uses Shell execution as a file open, not a string-built shell command. Restart spawns the current executable with explicit internal arguments/nonce. No SMTC/user string is interpolated into an executable command line. Failures are logged/surfaced in-app rather than startup message boxes.
+### A6 — information disclosure / log growth
 
-### A5 — Single instance
+**Clean.** `log-Live.log` is deliberately truncated on plain startup and capped during a run; restart preserves a bounded diagnostic chain. `crash.log` has a fixed byte budget and append-only retained-handle path. Raw thumbnail buffers are not logged. Metadata previews are sanitized/escaped and bounded before logging.
 
-**Finding `SINGLE-001`; otherwise structurally strong.** The mutex is session-scoped (no `Global\`), live duplicates exit without a popup, abandoned mutex ownership is accepted, and restart uses a nonce-named ready event plus bounded waits. The deliberate fail-closed response to mutex squatting preserves data integrity but allows same-user denial of startup.
+### A7 — data integrity during saves
 
-### A6 — Information disclosure / crash logging
+**Clean.** Config persistence is atomic/revision-checked, refuses to overwrite a file externally changed since load, preserves unknown keys, and does not touch `logs/`. `DATA-001` is outside the runtime save path and must not be mistaken for a weakness in `Config::save_checked`.
 
-**Clean trace.** Logs are local-only. Hostile metadata is bounded/escaped before log formatting; no raw thumbnail bytes/tokens/file buffers were observed in logs. `log-Live.log` is capped at 1 MiB and plain-launch truncation is the documented/sacred exception. `crash.log` uses a verified retained append handle and a process-wide 8 MiB cap. The vectored access-violation path builds its record in stack buffers; panic reporting is bounded, so a hostile 100 KiB title cannot directly become a 100 KiB crash record.
+### A8 — `unsafe` / FFI boundaries
 
-### A7 — Data integrity during saves
-
-**Clean trace.** Successful saves are atomic replacements and update the revision only after replacement. External edit/replacement/growth/deletion causes a conflict, not clobber. Unknown fields are preserved on representable configs. Logs are separate and untouched by config save. Invalid typed sections intentionally disable persistence rather than canonicalizing over unknown future values.
-
-### A8 — `unsafe` boundary audit
-
-**No memory-unsafe finding identified.** Unsafe use is concentrated in Win32/COM boundaries: WNDPROCs/subclass/enumeration/timer callbacks; `GWLP_USERDATA`; GDI object calls; raw file/kernel handles; COM/UIA vtables. Important invariants are enforced as follows:
-
-- `StateClaim` distinguishes whether `WM_NCCREATE` claimed a boxed state when creation fails.
-- `release_window_state` clears `GWLP_USERDATA` before reconstructing/dropping the `Box`, preventing re-entrant second ownership.
-- OS callbacks are wrapped by `guarded_wndproc`, `guarded_subclass`, `guarded_enum`, `guarded_void`, or UIA `catch_uia`, so Rust panics do not unwind across foreign frames.
-- Timer-queue callback posts to the UI thread instead of calling window state synchronously; teardown waits/deletes the timer.
-- WinRT SMTC objects stay on the worker apartment; shell icon COM objects stay on the icon worker apartment.
-- `unsafe impl Send` on the display-cache holder only transports opaque `HMONITOR` values behind a mutex; it does not move a dereferenceable Rust/COM object across threads.
-- Raw pointer dereferences observed are message/callback state pointers guarded by the HWND/state lifecycle, not general application data structures.
-
-No unchecked external-input indexing or raw-memory write reachable from media/config was found.
+**Clean for inspected boundaries.** Window state ownership uses a claim/`WM_NCDESTROY` handshake; WNDPROCs and WinEvent callbacks are panic-contained; UIA COM methods convert panics into safe error responses; WinRT state remains worker-owned. No unchecked hostile-input pointer dereference was found outside the intended small Win32 boundaries.
 
 ---
 
-# Depth pass B — Memory, GDI/USER handle & leak audit
+# Depth pass B — Memory, GDI/USER handles & boundedness
 
-Runtime GDI/USER counts cannot be observed without launching GUI code, so **every inventory row below is Reasoned but not executed**. I am not claiming handle counts.
+GUI handle counts cannot be measured without running the app, so every row below is **Reasoned but not executed** unless it describes a pure container bound. No runtime count is claimed.
 
-| Object / class | Creation site / lifetime bucket | Owner / bound | Pairing / teardown | Status / basis |
+| Object / resource | Creation / lifetime citation | Owner / bound | Pairing / boundedness | Basis |
 |---|---|---|---|---|
-| Overlay top-level HWND + `OverlayState` | `overlay::create_window`; per-window | UI thread; one | `DestroyWindow`; `WM_NCDESTROY` clears/releases boxed state | Paired — Reasoned but not executed |
-| Main top-level HWND + `MainWindowState` | `main_window::create_window`; per-window | UI thread; one | quit/close path → destroy; `WM_NCDESTROY` releases state | Paired — Reasoned but not executed |
-| Main history listbox / tooltip child HWNDs | main-window child creation; per-window | Parent-owned; fixed count | destroyed with parent; active timers killed | Paired — Reasoned but not executed |
-| Process-picker HWND + listbox | `process_picker::open`; per user-open | global single-open slot; one popup | destroy on confirm/cancel/error; subclass removed at teardown; state released | Paired — Reasoned but not executed |
-| Positioner sample HWND | `positioner`; per adjustment | one sample | result/cancel destroys; state release | Paired — Reasoned but not executed |
-| Duration dialog + child controls | `duration_dialog::show_duration_dialog`; per invocation | modal single dialog | close/destroy before owner teardown; child windows parent-owned | Paired — Reasoned but not executed |
-| Overlay `FontProvider` HFONTs | `gdi.rs`; per overlay/DPI/font key | DPI-scoped cache | provider swap/drop deletes old fonts | Paired/bounded — Reasoned but not executed |
-| Main fonts/owned brushes | `main_window.rs`; per main window/DPI | fixed fields/caches | owned wrappers `Drop` / DPI replacement | Paired/bounded — Reasoned but not executed |
-| Main `ArtBlit` memory DC + HBITMAP | `build_art_blit`; per current artwork/icon | at most current art + icon | `Drop`: restore selected object, `DeleteObject`, `DeleteDC` | Paired — Reasoned but not executed |
-| Overlay reusable DIB DC + HBITMAP | render cache; per overlay | one current backing surface, resized/replaced | restores old bitmap; drop deletes bitmap/DC | Paired — Reasoned but not executed |
-| Overlay text scratch / marquee strips / chrome raster | render cache; per window/row/content | 4 marquee rows; one chrome cache | replaced/dropped with state/content/DPI | Bounded — Reasoned but not executed |
-| Picker fonts/brushes | picker open / DPI change | fixed small set per popup | old fonts deleted on DPI rebuild; fonts/brushes deleted at `WM_NCDESTROY` | Paired but manually owned — Reasoned but not executed |
-| Positioner pens/brushes | sample window | fixed small set | explicit teardown/error cleanup | Paired but manually owned — Reasoned but not executed |
-| Tray/menu HMENU objects | tray menu open | one menu tree per invocation | root menu destroyed after `TrackPopupMenu`; child submenus owned by root | Paired — Reasoned but not executed |
-| Tray notification icon registration | `install_tray_icon` | one `(hwnd,uID)` | `NIM_DELETE` on destroy/session end; TaskbarCreated re-add | Bounded — Reasoned but not executed |
-| Win32 window timers | overlay/main named IDs | finite fixed IDs; `SetTimer` replaces by id | `KillTimer` on state transition/destroy | Bounded — Reasoned but not executed |
-| High-resolution animation timer | overlay timer queue | one | `DeleteTimerQueueTimer` / fallback kill on teardown | Paired — Reasoned but not executed |
-| Foreground WinEvent hook | overlay creation | one | unhooked on `WM_NCDESTROY` | Paired — Reasoned but not executed |
-| Toolhelp snapshot HANDLE | `process_picker::process_names` | per enumeration | `SnapshotGuard::Drop` → `CloseHandle` | Paired — Reasoned but not executed |
-| Process-query HANDLE | `exe_name_for_pid` | per lookup | `ProcessQueryGuard::Drop` | Paired — Reasoned but not executed |
-| Singleton mutex / restart event handles | `main.rs` | fixed per process/handoff | RAII/explicit close/OS process cleanup | Bounded — Reasoned but not executed |
-| SMTC subscriptions / WinRT refs | `smtc.rs` worker | session/source admission caps | worker-owned apartment; unsubscribe/drop during resync/teardown | Bounded — Reasoned but not executed |
-| Hung SMTC worker threads | supervisor restart path | process-lifetime `MAX_LEAKED_WORKERS` budget | intentionally not forcibly joined if COM is wedged | Bounded degradation, not leak-to-infinity — Reasoned but not executed |
-| Icon worker HBITMAP/DC | `icon.rs` per job | single worker, queue cap 16 | HBITMAP delete; `DcGuard`; COM refs worker-local | Paired/bounded — Reasoned but not executed |
-| Worker event channel | `main.rs`/SMTC | cap 1024 | full → retry/coalesce, not growth | Bounded |
-| Worker retry mailbox | SMTC | cap 256 | newest authoritative value supersedes/coalesces | Bounded |
-| Main / overlay event queues | forwarder | cap 256 **each** | newest wins; failed wake clears affected queue | Bounded |
-| Overlay pending notification queue | overlay | cap 4 | oldest unshown dropped at cap; current pill never pulled | Bounded |
-| Overlay track cache | overlay | cap 8 | LRU eviction | Bounded |
-| Overlay source-state ledger | overlay | cap 64 | evicts stopped entries first | Bounded |
-| Main history | `main_window::History` | cap 400 | oldest evicted | Bounded |
-| Main per-source state | main window | cap-bounded (64 in current design) | state eviction policy | Bounded |
-| Artwork payloads across transport | `TrackInfo` lifetime token | 64 MiB in-flight budget | final `Arc<ArtworkLifetime>` drop releases reservation | Bounded |
-| `log-Live.log` | logger | 1 MiB total per plain run / preserved restart chain | stops accepting complete lines at cap | Bounded |
-| `crash.log` | main crash logger | 8 MiB total | append stops at cap | Bounded |
+| Overlay top-level HWND + `OverlayState` | `src/overlay/mod.rs:4540-4735` | UI thread; one | `WM_NCDESTROY` owns final state release; creation-failure claim handshake prevents leak/double-free | Reasoned but not executed |
+| Main HWND + `MainWindowState` | `src/main_window.rs:1390-1475` + main wndproc teardown | UI thread; one | state claim transfers at create; destroy path releases once | Reasoned but not executed |
+| Main listbox / native tooltip children | `src/main_window.rs` child-control initialization and tooltip code around `:1800-2110` | parent-owned fixed count | child HWNDs die with parent; tooltip timer/track deactivated on teardown | Reasoned but not executed |
+| Process-picker popup + listbox | `src/process_picker.rs:560-980` | at most one open picker | failed create drops unclaimed state; success destroys popup/listbox and removes subclass on teardown | Reasoned but not executed |
+| Picker fonts/brushes | `src/process_picker.rs:800-870` | fixed set per picker | DPI rebuild deletes old fonts; teardown deletes current objects | Reasoned but not executed |
+| Positioner window/GDI objects | `src/positioner.rs` | one user-invoked sample | fixed object set; explicit teardown | Reasoned but not executed |
+| Duration dialog/children | `src/duration_dialog.rs` | one modal invocation | parent/explicit destroy semantics | Reasoned but not executed |
+| Overlay fonts | `src/gdi.rs`; overlay font provider use in `src/overlay/mod.rs` | DPI/content-scoped provider | replacement/drop deletes owned fonts; no per-frame HFONT creation | Reasoned but not executed |
+| Overlay DIB/DC/backing bitmap | `src/overlay/render.rs` render cache | one reusable backing surface plus bounded text/chrome caches | selected objects restored before replacement/deletion | Reasoned but not executed |
+| Main artwork blit DC/HBITMAP | `src/main_window.rs` `ArtBlit`/`build_art_blit` | current art/icon only | `Drop` restores selection, deletes bitmap/DC | Reasoned but not executed |
+| Tray icon | `src/main_window.rs` tray install/remove + `TaskbarCreated` handler | one `(HWND,uID)` | `NIM_DELETE` on teardown; re-add on Explorer restart | Reasoned but not executed |
+| Tray menus | `src/main_window.rs` tray menu builder | one menu tree per open | root destroy owns submenu teardown | Reasoned but not executed |
+| Window timers | overlay/main fixed timer IDs | finite named IDs | same-ID `SetTimer` replaces; state transitions/destroy kill timers | Reasoned but not executed |
+| Foreground WinEvent hook | `src/overlay/mod.rs:4610-4675` | one hook | unhooked before state release; racing callback posts only through atomic HWND | Reasoned but not executed |
+| Toolhelp / process query handles | `src/process_picker.rs`, `src/overlay/fullscreen.rs`, `src/main.rs` | transient | RAII guards / explicit close | Reasoned but not executed |
+| Singleton mutex / restart event | `src/main.rs` singleton/relaunch code | fixed per process/handoff | guard/explicit close/process teardown | Reasoned but not executed |
+| SMTC subscriptions / WinRT refs | `src/smtc.rs` session table | capped sessions/sources | worker apartment owns refs; resync/teardown drops subscriptions | Reasoned but not executed |
+| Hung SMTC workers | `src/main.rs` supervisor | process-lifetime `MAX_LEAKED_WORKERS` budget | wedged COM thread may be abandoned but cannot grow without bound | Reasoned but not executed |
+| Icon jobs / shell extraction | `src/icon.rs` | bounded worker queue | one worker; per-job handles cleaned; breaker prevents unbounded blocked jobs | Reasoned but not executed |
+| Worker event channel | `src/main.rs` / `src/smtc.rs` | cap 1024 | full -> retry/coalesce rather than grow | Static bound |
+| Worker retry mailbox | `src/smtc.rs` | cap 256 | newest authoritative state supersedes/coalesces | Static bound |
+| Main + overlay forwarder queues | `src/main.rs` / `src/events.rs` | cap 256 each | newest-wins/drop policy; failed wake clears affected queue | Static bound |
+| Overlay pending notifications | `src/overlay/mod.rs` | cap 4 | oldest unshown dropped; current pill not pulled | Static bound |
+| Overlay track cache | `src/overlay/mod.rs` | cap 8 | LRU bounded | Static bound |
+| Playback/source ledger | `src/overlay/mod.rs`, `src/main_window.rs` | cap 64 | stopped-first/defined eviction | Static bound |
+| Main history | `src/main_window.rs` `History::new`/`push` | cap 400 | oldest rows evicted | Static bound |
+| Artwork in flight | `src/events.rs` artwork lifetime + `src/smtc.rs` admission | 64 MiB budget | final shared lifetime token releases reservation; over-budget art stripped while metadata survives | Static bound |
+| `log-Live.log` | `src/logging.rs` | 1 MiB run cap | stops accepting complete lines at cap | Static bound |
+| `crash.log` | `src/main.rs:100-150` and crash init | 8 MiB cap | atomic reservation prevents concurrent overrun | Static bound |
 
-**B2 pairing conclusion:** no currently unpaired GDI/USER site was found. The main-window and overlay hot objects already follow RAII. Picker/positioner have some manual fixed-object cleanup, but the paths are paired; converting them solely for stylistic purity is not a release blocker.
+**B2 conclusion:** no unpaired GDI/USER creation site was found in the inspected paths. Some auxiliary windows still use explicit manual Win32 cleanup, but it is fixed-count and paired; converting every handle to a new wrapper solely for aesthetic uniformity would increase change risk without solving an observed leak.
 
-**B3 boundedness conclusion:** the requested unbounded structures are already bounded. No High/Critical unbounded cache/channel/history/log growth finding remains.
+**B3 conclusion:** the event path, history, track caches, artwork payloads and logs are all bounded. The prompt's exemplar “replace unbounded `mpsc`” work is already materially done.
 
-**B4 shutdown conclusion:** static ordering is coherent: auxiliary modal UI is closed, tray icon removed, timers/hooks detached, windows destroyed, worker/control paths stopped/joined where join is safe, and state boxes are released at `WM_NCDESTROY`. A wedged COM worker is intentionally abandoned only within a process-lifetime budget.
+**B4 conclusion:** shutdown ordering is coherent by trace: UI-owned timers/hooks/tray/window resources are detached before state destruction; forwarder/control threads have explicit termination paths; COM worker ownership is kept on its apartment, with bounded intentional abandonment only for an irrecoverably wedged worker.
 
 ---
 
 # Depth pass C — Performance & hot paths
 
-## C1 — Hot-path trace
+## C1 — hot-path trace
 
-### Overlay tick/morph
+The current render architecture already contains the high-value optimizations the audit program asks for:
 
-- Static shown state drops to a 250 ms tick.
-- Aura-only steady playback uses a ~66 ms cadence (~15 Hz).
-- Animation uses monitor/config-limited cadence (default cap 60 Hz).
-- `should_render_this_tick` skips raster/upload when no visual stage is dirty.
-- Progress only marks a frame dirty once the painted bar moves meaningfully; z-order reassert is throttled.
-- Springs/morphs are time-based; delayed ticks do not accumulate fixed-step drift.
+- reusable layered-window DIB/backing memory rather than new bitmap/DC construction each frame;
+- reusable UTF-16/frame scratch;
+- DPI-scoped font ownership;
+- pre-resolved/cached pill text and marquee rasters;
+- static chrome caching;
+- render dirty-gating so unchanged frames skip raster/upload;
+- monitor/config-limited animation cadence, with slower static/aura cadence;
+- artwork read/decode on the worker, not the UI thread;
+- bounded/coalesced event transport using shared `Arc<MediaEvent>` payloads;
+- cached palette/art state instead of re-decoding every frame.
 
-### Per-frame rendering
+I found no evidence justifying another render rewrite before profiling.
 
-The branch already avoids the major anti-patterns the prompt asks to find:
+## C2 — order-of-magnitude frame budget
 
-- reusable DIB/backing surfaces rather than `CreateDIBSection` per frame;
-- reusable `frame_scratch`/UTF-16 text scratch;
-- DPI-scoped font cache;
-- pre-resolved pill text;
-- cached marquee rasters and static chrome;
-- progress-bar repaint separate from static chrome;
-- no UI-thread image decode;
-- one `UpdateLayeredWindow` only on dirty frames.
+These are **estimates, not measurements**. At the shipped `max_width = 340` logical px and a roughly 150–180 px expanded height, a 32-bit layered surface is about:
 
-### Artwork / palette
+- 100% DPI: ~0.2–0.3 MiB,
+- 150% DPI: ~0.45–0.65 MiB,
+- 200% DPI: ~0.8–1.1 MiB.
 
-SMTC reads/decode run on the worker. Input is capped; decode output is fixed 256² BGRA (~256 KiB). UI conversion/palette work is cached per content/art identity. App icon extraction is moved further onto its own bounded worker so shell extension stalls do not pin SMTC.
+A dirty 60 Hz animation therefore implies roughly **10–70 MiB/s** of full-surface upload traffic; a ~15 Hz visual-only cadence is roughly **3–17 MiB/s**. The important current behavior is that no-change frames can skip the upload entirely.
 
-### Event forwarding
+Warm-frame heap allocation is approximately **O(0)** in the common path because frame/text/font/chrome buffers are retained; content/DPI/cache misses allocate. A large but valid compressed image decode may plausibly cost **~10–100 ms** on commodity hardware, but current decode runs off the UI thread and emits a fixed-size decoded buffer, so the failure mode is delayed artwork, not a blocked window message pump.
 
-Transport uses `Arc<MediaEvent>` so two window queues share the event/art allocations; window drain owns/clones only as required. Every queue/mailbox has a cap, and same-key events are superseded/coalesced rather than allowed to backlog indefinitely.
+## C3 — improvement directions
 
-## C2 — Order-of-magnitude frame budget (estimates, **not measurements**)
-
-Using the shipped `max_width = 340` logical px and an expanded frame on the order of ~150–180 logical px high, a premultiplied 32-bit surface is roughly:
-
-- 100% DPI: ~0.2–0.3 MiB/frame;
-- 150% DPI: ~0.45–0.65 MiB/frame;
-- 200% DPI: ~0.8–1.1 MiB/frame.
-
-Because a dirty layered-window update copies the whole surface, a 60 Hz animation is therefore on the order of **10–70 MiB/s** of surface traffic; the ~15 Hz comet steady state is roughly **3–17 MiB/s**. These are dimensional estimates, not profiler data.
-
-Warm-frame heap allocations are approximately **O(0)** on the common render path: buffers, fonts, static chrome, text widths and marquee strips are reused. Content changes, DPI changes and cache misses allocate; steady frames generally do not. API-call count is order **tens** of drawing/composition operations plus one layered-window upload on a dirty full frame, substantially fewer on a cache-hit foreground-only pass.
-
-A large but valid compressed JPEG decode can plausibly cost **~10–100 ms** on commodity CPUs (estimate), but it occurs on the worker and produces a fixed ~256 KiB output; it should not stall the UI message loop. The price is delayed art, not frozen rendering.
-
-## C3 — Improvement directions
-
-No speculative render rewrite is justified before profiling. The biggest previously-obvious wins (cached text, reusable DIBs, no-change frame skip, reduced aura cadence, worker decode, bounded queues) are already implemented. The proposed program therefore focuses on correctness and measurement:
-
-- Add CI/perf instrumentation or a developer-only benchmark for pure render stages before changing them (**P2**, no product behavior).
-- When the mandated Idle pill is added, keep it **fully static** unless content/layout/foreground actually changes; target zero continuous raster uploads while idle. Estimate: avoids whatever 15–60 Hz layered-window traffic a naive idle implementation would introduce (~3–70 MiB/s from the dimensional range above).
-- Do not add a per-DPI artwork-variant cache unless profiling proves scaling hot: the current fixed decode + draw scaling has no variant-growth bug. An LRU that costs ~1–10 MiB would be justified only if it removes measured repeated scaling work.
+No new runtime dependency or broad cache layer is recommended. When `OVERLAY-001` is fixed, keep the idle card fully static: one upload when content/placement changes, then zero continuous repaint traffic while idle. Add developer-only/profile instrumentation only if a future performance complaint gives a concrete target.
 
 ---
 
 # Depth pass D — Architecture, structure, dependencies, docs drift
 
-### D1 — Boundaries / invariants
+### D1 — boundaries and invariants
 
-- **Passive pill:** holds. Overlay is `WS_EX_TRANSPARENT`/no-activate and has no click/keyboard action surface; hover is observational only.
-- **UI-thread Win32 ownership:** holds. SMTC emits events/control status; worker threads use `PostMessage`, not synchronous cross-thread `SendMessage` into UI ownership.
-- **Config ownership:** holds. Main window owns writes; overlay receives pushed values. `positioner.rs` posts results and does not reload config from disk.
-- **Event ordering:** per producer/session ordering is preserved through the worker and bounded channel. Fanout puts the same logical event into both per-window queues. At overload, explicit newest-wins/drop/coalesce semantics can discard intermediate reports but retain authoritative state; no unbounded FIFO is hidden behind the forwarder.
+- **Passive pill:** holds. No focus/click/keyboard interaction surface is introduced by hover; hover is observation of cursor position.
+- **UI-thread ownership:** holds. Win32 windows are UI-thread-owned; worker/forwarder communication is channel + `PostMessage`, not synchronous cross-thread `SendMessage` into UI state.
+- **Config ownership:** holds. Main window remains the writer; overlay receives pushed state; positioner returns results rather than loading config.
+- **SMTC config isolation:** holds. Worker receives seed/control-mailbox values rather than taking the shared config lock.
+- **Event ordering/bounds:** explicit bounded queues and coalesce/drop semantics replace unbounded backlog.
 
-### D2 — Dead/redundant code and drift
+### D2 — dead/redundant code
 
-No obvious orphan module or “feature parsed but never read” was found in the audited paths. The latest commit explicitly decomposes WNDPROC/control-flow hotspots. However, **Dead code = 0** and **Redundant code = 0** cannot be certified without current clippy/static-analysis output; see Quality Gates. Stale documentation findings are `DOC-001`–`DOC-003` and `MON-001`.
+No obvious dead module or parsed-but-never-used current feature remains in the inspected tree. The prior branch work removed/rewrote several stale paths. However, the absolute requirements **Dead code = 0** and **Redundant code = 0** are stronger than a static visual review can certify; current-head Clippy/metrics evidence must be attached before release. Do not force abstraction of deliberately explicit Win32 teardown code merely to make two blocks look less repetitive.
 
-### D3 — Error handling
+### D3 — error handling
 
-External-input/file errors generally log and degrade instead of `unwrap`ing. `expect` uses observed in production code are for operations such as formatting into a `String` that cannot fail, not hostile-input bounds. Lock poisoning is commonly recovered with `into_inner`; callback errors are contained. Initialization has degraded modes (missing log, missing tray retry, SMTC worker supervisor/failure note, icon worker no-icon fallback).
+External/config/file failures generally log and degrade rather than panic. Lock poisoning is usually recovered with `into_inner`; callback bodies are contained. Startup has defined degraded modes for tray installation, media worker failure and icon extraction. No hostile-input `unwrap`/index crash class was found in the audited paths.
 
-### D4 — Panic/unwind safety across FFI
+### D4 — panic/unwind safety across FFI
 
-Strong. WNDPROCs, subclass procedures, enum callbacks, timer callbacks and UIA COM methods have catch boundaries. A panic is converted to a safe default/`E_FAIL`/DefWindowProc path and logged instead of unwinding through an `extern "system"` boundary.
+Strong. Overlay/main WNDPROCs, WinEvent/subclass callbacks and UIA COM methods are wrapped so Rust panics do not cross `extern "system"`/COM ABI boundaries. UIA uses `E_FAIL` for caught callback panic rather than pretending a panic is a normal empty provider answer.
 
-### D5 — Concurrency
+### D5 — concurrency
 
-Atomics used for cross-thread lifecycle/budgets generally use Acquire/Release/AcqRel or SeqCst where a control/lifetime transition matters; Relaxed accounting is used where the value is only a bounded counter token. No thread-affine COM object was found stored in a cross-thread shared cell. The display cache's `unsafe impl Send` contains only opaque monitor handles plus owned strings/rects behind a mutex.
+Thread-affine COM/WinRT ownership remains worker-local; UI state is not stored in cross-thread globals except safe identifiers/snapshots. Atomics used for lifecycle/budget coordination are paired with appropriate stronger orderings where ordering matters; relaxed counters are accounting-only. No synchronous worker-to-UI `SendMessage` deadlock path was found.
 
-### D6 — Testability
+### D6 — testability
 
-The branch already extracts substantial pure logic: config normalize/save conflict, queue bounds, event reduction, morph math, display selection, history helpers, state ownership and reparse-safe file operations. Missing seams that are worth adding are exactly those exposed by this audit: nonzero-scroll focus math, media refresh provenance, signed tooltip coordinate packing, monitor identity persistence semantics, history disposition, and picker UIA toggle state.
+The remediation branch has useful pure seams for config normalization/save conflict, queue bounds, media identity, morph/hover math, monitor resolution, history helpers, state ownership and signed coordinate packing. `START-001` and `OVERLAY-001` already have policy/state tests, but those tests currently pin the wrong hard-contract behavior. Fix the policy, then mutate/test the corrected decision functions rather than testing only Win32 side effects.
 
-### D7 — Dependencies
+### D7 — dependency hygiene
 
-Every direct dependency in `Cargo.toml` has a visible role: `windows`/`windows-core`/`windows-future`, `anyhow`, `chrono`, `dirs`, `image` (JPEG/PNG only), `log`, `serde`, `toml`, and build-only `embed-manifest`. No unused direct crate is identified.
+Direct dependencies all have visible roles: `windows`, `windows-core`, `windows-future`, `anyhow`, `chrono`, `dirs`, `image` (JPEG/PNG), `log`, `serde`, `toml`, and build-only `embed-manifest`. `cargo-machete` is already in the metrics job, with `windows-core` documented as a macro-expansion scanner exception. `cargo audit`/`cargo deny` passed at `d199566`; current-head evidence is pending the report-triggered checkpoint run. No new runtime dependency is proposed anywhere in this plan.
 
-**Unable to verify:** `cargo tree -d`, transitive duplicate versions, current advisories, and license resolution at the audited head because no branch-head CI/artifact is available and no local cargo command was run. `deny.toml` is advisory/license/source policy by intent; no allow-listed advisory is re-flagged here.
+### D8 — docs/config drift
 
-No new runtime dependency proposed below is necessary. In particular, the fixes can use the existing standard library/Win32/windows-rs stack.
+**Finding filed: `DOC-001`.** Config example/defaults are materially aligned and the prior invalid-section/monitor/cache docs drift was fixed. Remaining drift is concentrated around idle/hover behavior plus startup wording that must change with the mandated startup fix.
 
-### D8 — Docs/config reconciliation
+### D9 — repo hygiene / CI
 
-- `config.example.toml` and the inspected defaults are materially aligned; no ignored example key was found.
-- Typed-invalid-section persistence is documented incorrectly (`DOC-001`).
-- Development cache bound is stale (`DOC-002`).
-- README CI trigger wording is stale (`DOC-003`).
-- First-run popup docs accurately describe **current** behavior but conflict with the hard product mandate (`START-001`), so docs must change with the fix.
-- `index-N` docs do not describe sticky-in-process physical-monitor behavior (`MON-001`).
-- AGENTS log-truncation exception matches code. Churn/dedup logging contracts have corresponding worker logic; live runtime lines remain Reasoned but not executed.
-
-### D9 — Repo hygiene / CI
-
-`.gitignore` covers build/data/log/package outputs; both MIT and Apache license files exist; no tracked build output was identified in the tree. CI uses a read-only token for untrusted check jobs and isolates release write permission. `CI-001` remains because this exact branch head is unchecked and the requested production metrics/mutation score are not gates.
+The repository ignores build/data/log/package outputs, contains both license files for the dual-license claim, and separates release write permission from untrusted check jobs. The release-quality evidence gap is `QUALITY-001`, not an absence of CI.
 
 ---
 
-# Depth pass E — Scenario walkthroughs
+# Depth pass E — scenario walkthroughs
 
-All GUI/SMTC scenarios are **Reasoned but not executed**. Reproduction is for the maintainer on a live Windows desktop; no executable was launched during this audit.
+Unless explicitly tied to a unit test or prior CI result, GUI/SMTC outcomes below are **Reasoned but not executed**. No app/provider/helper was launched.
 
-| # | Scenario | End-to-end trace / modules | Result | Live reproduction and expected evidence |
-|---:|---|---|---|---|
-| 1 | Cold start, no media | `main` → config → SMTC supervisor/worker → overlay state → main window/tray | **Findings filed: START-001, OVERLAY-001.** Startup can show the first-run tracking window and overlay starts Hidden rather than idle. | Delete **only in a disposable test profile/sandbox**, not real user data; launch with no media; then start/stop a compliant player ×3/2 s. Expect one startup/config line, track/state lines when media appears, source-retirement lines when it disappears. The target behavior after fixes is a silent launch + idle pill throughout. |
-| 2 | Churn storm | SMTC callbacks → debounce dirty set → resync/admission → churn exclusion → event channel | **Clean — evidence:** per-source churn accounting/exclusion occurs before event emission; compliant source identities remain independent. | Use a session-recreating source (~20/8.5 s) plus a normal player changing tracks. AGENTS-required log substrings: one `SessionsChanged/CurrentSessionChanged (debounced)` per burst, `(coalesced)` lines, one `WARN ... churning sessions ... excluding it`, and **no** `track changed`/`playback state changed` naming the excluded source during cooldown. Normal player's real track change must still appear. |
-| 3 | Hostile metadata live trace | SMTC read → `cap_meta`/timeline sanitize → bounded thumbnail read/decode → generation token → both window queues/render/history | **Finding filed: DEDUP-001; safety trace otherwise clean.** | Feed 100 KiB/control/NUL/bidi/emoji/ZWJ/RTL strings, zero/corrupt/20000×20000 art, then two fast same-source transitions. Expect bounded escaped log previews, oversized dimension/stream rejection or placeholder, no crash. A late older art generation must be dropped. Same-title/artist with one-side-missing art is the semantic regression case to verify. |
-| 4 | Playback-control storm | playback callback → per-session debounce/read → bounded channel → overlay reducer/progress → main history | **Clean — evidence:** bounded/coalesced transport and finite timeline normalization; no divide-by-zero path found. | Generate 50 play/pause/seek changes/2 s, including duration 0, negative position and position > duration. Expect latest authoritative state to settle, progress bar absent/frozen/clamped where invalid, and no unbounded queue/log growth. |
-| 5 | Hover storm | cursor sample → hover state (`hover_expand`, leave debounce, one-way dismiss arm) → animation timer → render | **Finding filed: HOVER-001.** No timer accumulation leak found. | Mouse in/out ×10/2 s, park on edge. Expanded hover currently arms ≤500 ms dismissal even if cursor leaves; compact first hover holds/expands. Expect no duplicate timer ids/oscillation after spring settles. Decide whether one-way Expanded behavior remains desired. |
-| 6 | DPI changes | `WM_DPICHANGED` → font/provider rebuild → DIB/cache invalidation; main/picker font rebuild; layout | **Clean — evidence:** old fonts/DIBs are replaced/freed and caches are invalidated; no per-DPI artwork-variant map exists to grow. | Move 100%→150%, change DPI with main/history open. Inspect text clipping and handle stability live. Expected debug evidence is DPI/layout/reposition activity, with no repeated art decode for unchanged content. |
-| 7 | Multi-monitor + fullscreen | display enumeration/cache → sticky target resolve → placement/fullscreen verdict → overlay hide/resume; main tooltip independent | **Findings filed: MON-001, TOOLTIP-001; R-03.** Overlay work-area clamping itself is sound. | Place secondary left of primary (negative X), configure `index-N`, toggle fullscreen ×5, reorder monitors, restart. Verify pill target before/after restart and history tooltip near cursor. Current tooltip can jump to x/y=0; index can mean physical device during run and enumeration slot after restart. |
-| 8 | Config torture battery | `Config::load_from_path` → staged parse/normalize → revision → save conflict/atomic replace | **Finding filed: DOC-001; implementation otherwise clean.** | (a) corrupt file → defaults + warning + no write; (b) unknown key → preserved on representable save; (c) typed bad field → section default **and persistence disabled**; (d) 10 MiB → rejected by 1 MiB cap; (e) hand-edit after load → Conflict/no clobber; (f) compare example/defaults. Log must explicitly report invalid/oversized/conflict, never silent default. |
-| 9 | Rapid restarts | singleton mutex → supervisor/UI → tray; crash handler/panic hook → bounded crash log | **Clean — evidence:** abandoned mutex takeover, restart handshake, tray teardown and bounded crash writers exist. Runtime handoff timing remains unexecuted. | Launch/kill ×5 in disposable live test. Each relaunch should acquire or `WAIT_ABANDONED` cleanly, no popup/ghost tray. Induce only a safe test panic seam if one exists; `crash.log` must remain writable/bounded. Do not corrupt real logs. |
-| 10 | Display topology changes | `WM_DISPLAYCHANGE` → display-cache invalidate → enumerate → target fallback/reposition; main layout resize | **Finding filed: MON-001 (and TOOLTIP-001 if negative topology).** | Sleep/wake monitor, unplug target, change resolution with main open, reconnect/reorder. Expect fallback-primary warning for missing index and reposition rather than orphaning off-screen; compare target after restart for sticky-contract inconsistency. |
-| 11 | Long-run log growth | `FileLogger` cap accounting; retained crash append handle/counter | **Clean — evidence:** live 1 MiB cap and crash 8 MiB cap are hard bounds. | Estimated raw generation before cap: ~150–300 B/line × 1–10 significant lines/s ≈ ~13–260 MB/day **if uncapped**. Actual writer stops at **1 MiB per plain run/preserved restart chain**; crash log stops at **8 MiB total**. Verify files stop growing at those bounds. |
-| 12 | Tray lifecycle + Explorer restart | main WNDPROC → registered `TaskbarCreated` → `NIM_ADD` retry; menu build/track/destroy; autostart helper | **Clean — evidence:** Explorer broadcast re-add and retry budget are implemented; autostart only touches its own Run value. | Restart Explorer, open/close menu rapidly, quit while menu open, toggle autostart. Expect `Explorer restarted the notification area; re-adding the tray icon` / retry success or bounded failure logging; no duplicated tray icons. |
-| 13 | Shutdown ordering | tray quit/session-end/main destroy → aux-dialog close → overlay destroy → timer/hook/state cleanup → worker/forwarder shutdown | **Clean — evidence:** destruction/state ownership is explicit and bounded; hard kill relies on kernel/process cleanup. | Exit with media, Settings, maximized window, and art activity; then `WM_QUERYENDSESSION`/`WM_ENDSESSION` in a test session; hard-kill and relaunch. In-app restart should append a restart-boundary line; ordinary launch truncates `log-Live.log` as intended. |
-| 14 | History window long-run | event → `push_history` → `VecDeque` cap400 → listbox insert/delete; precomputed cells; art stripped from history | **Finding filed: HIST-001 for reason truth; memory/perf clean.** | Generate >400 history rows across many sessions. Mirror/listbox should stay near cap 400, oldest rows evict, scrolling should not allocate/reformat each cell, and muted-row tooltips must be checked for the incorrect “filtered by allowed apps” reason. |
+| # | Scenario | Trace / result | Live reproduction + expected evidence |
+|---:|---|---|---|
+| 1 | Cold start, no media | **Findings filed: `START-001`, `OVERLAY-001`.** `main` loads config, creates overlay/main window, then current main-window startup can maximize on first run while transient layouts refuse idle content. | In a disposable Windows profile with no media session, launch normally; expect after fixes: no tracking window popup and a static `No media playing` pill. Start/stop a compliant player ×3 within 2 s; each real event replaces idle and the final retirement returns to idle. |
+| 2 | Churn storm | **Clean by static trace.** Session dirtying/resync is debounced, churn is tracked per source, excluded sources cannot emit while cooled down, and compliant sources retain independent state. | Use a session-recreating source (~20/8.5 s) plus a compliant player changing tracks. Expect debounced/coalesced log lines, one churn warning when threshold trips, no media emits for excluded source, normal source still emits. |
+| 3 | Hostile metadata live trace | **Clean by boundary trace; not live-executed.** Metadata/artwork/read bounds and stale-art defenses are present. | Feed 100 KiB title, controls/bidi/emoji, zero/corrupt image, huge declared dimensions, and out-of-order decode completions. Expect sanitized/bounded text, no crash, decode failure placeholder/retained safe state, and no late old art replacing newer track. |
+| 4 | Playback-control storm | **Clean by bounded/coalesced trace.** Newest authoritative state survives queue pressure; progress path handles absent/invalid duration defensively. | Send 50 play/pause/seek events in 2 s incl. zero duration, negative/overshoot position. Final pill/state must match latest authoritative state; no division/overflow crash. |
+| 5 | Hover storm | **Clean after remediation.** Expanded hover cap is reversible on debounced leave; Compact morph has dedicated reversal/hold logic; fixed timer IDs prevent timer accumulation. | Move in/out ×10 then park on edge. Expect no permanent stuck state or deadline extension loop; leaving before Expanded cap restores pre-hover deadline. |
+| 6 | DPI changes | **Clean by resource/geometry trace.** DPI-scoped fonts/surfaces are replaced rather than accumulated; layout uses target monitor DPI. | Move 100%→150%, change system DPI, repeat with tracking/history open. Check text clipping and GDI counts manually if desired; audit does not claim runtime counts. |
+| 7 | Multi-monitor + fullscreen | **Finding relevance: `OVERLAY-001`; risk `R-01`.** Stable monitor identity and signed tooltip fixes are present. Fullscreen/listed-foreground suppression remains a deliberate behavior. | Move between mixed-DPI monitors, toggle fullscreen ×5, remove/re-add target. Pill should clamp/recover and use stable identity. After idle fix, suppressed fullscreen may temporarily hide only according to finalized `R-01` policy, then idle/media state must restore. |
+| 8 | Config torture | **Clean by parser/save trace.** Oversize/invalid parse does not overwrite source; invalid typed section disables persistence; unknown keys survive; external edit conflicts refuse save. | Use a disposable copied config, never live production data. Test corrupt/10 MB/unknown/out-of-range/hand-edit cases; expect warning + in-memory fallback/conflict without file clobber. |
+| 9 | Rapid restarts | **Clean by singleton/handoff trace; `R-03` retained.** Abandoned mutex can be acquired; duplicate live instance fails closed; restart nonce/event handoff is bounded. | Launch/kill only in maintainer-controlled live test. Verify no stale mutex blocks recovery and crash/restart boundaries follow logging contract. Hostile same-user mutex squatting remains a diagnosed availability limitation. |
+| 10 | Display topology changes | **Clean by current monitor identity/cache invalidation trace.** `WM_DISPLAYCHANGE`, re-enumeration and persisted device identity prevent the old restart-dependent index ambiguity. | Sleep/wake/remove target/change resolution. Expect primary fallback while absent, restoration by stable identity when it returns, and no orphaned off-screen pill. |
+| 11 | Long-run log growth | **Clean.** Live log is capped at ~1 MiB; crash log at ~8 MiB. | Churn for a long session; size must plateau at caps. Plain launch truncation remains intended; restart chain preserves bounded diagnostics. |
+| 12 | Tray lifecycle + Explorer restart | **Clean by static trace.** `TaskbarCreated` handling re-adds icon; retry/backoff covers initial shell absence; autostart owns only its Run value. | Restart Explorer, open/close menu rapidly, exit with menu open. Tray icon should return and no stale menu/icon remain. |
+| 13 | Shutdown ordering | **Clean by static trace.** Hooks/timers/tray/window state have ordered teardown; worker/control paths have bounded shutdown semantics; wedged COM worker is only abandoned under a process-lifetime budget. | Quit with media/settings/history active, then Windows session end/hard kill in controlled test. Relaunch must not see stale ownership or corrupt config/log state. |
+| 14 | History long-run | **Clean.** History is cap 400; text-only history drops image payloads; per-source/track ledgers are bounded; insertion keeps reader scroll stable. | Generate >400 transitions. Row count must remain capped, scrolling remain stable, and memory must not retain art per historical row. |
 
 ---
 
-# Depth pass F — Perfect-state enhancement program
+# Depth pass F — perfect-state enhancement program
 
-## Hardening exemplars already satisfied — **do not re-implement**
+The prompt's exemplar P0/P1 work should **not** be reimplemented where the branch already solved it. Current status:
 
-The following prompt exemplars are already present in substance and should **not** generate gratuitous commits:
+| Exemplar family | Current state | Audit decision |
+|---|---|---|
+| GDI/resource ownership | Main/overlay hot resources already use owned/drop discipline; auxiliary manual objects are fixed-count and paired | **No rewrite recommended** |
+| Bounded/drop-oldest event transport | Worker channel/mailbox/window queues/pending pill queue are bounded | **Already satisfied** |
+| Artwork decode off UI + generation/stale-art defense | Worker decode and stale identity/generation defenses are present | **Already satisfied** |
+| Atomic config save / conflict detection | Temp/verified/checked save path present | **Already satisfied** |
+| Typed `GWLP_USERDATA` single teardown owner | Claim/`WM_NCDESTROY` ownership helper present | **Already satisfied** |
+| Allocation-reduced render / cached text/chrome | Reusable DIB/scratch/cache/dirty gating present | **Already satisfied** |
+| Per-DPI artwork/cache bound | Fixed decode + bounded cache; no unbounded per-size cache observed | **Do not add one without profiling** |
+| Palette caching | Current art/palette state cached | **Already satisfied** |
+| Timer/invalidate coalescing | Fixed timers + dirty render gating | **Already satisfied** |
+| Crash-log rotation/bound | Hard byte cap exists; rotation is unnecessary for the stated safety goal | **Already satisfied** |
+| Per-session/history cap | History and source/session structures bounded | **Already satisfied** |
+| Pure test seams | Substantial pure helper coverage now exists | **Extend only around remaining fixes** |
+| Docs/config parity | Mostly improved; `DOC-001` remains | **P2 active** |
 
-- **Bounded/drop/coalesce event transport:** worker channel 1024, retry mailbox 256, each window queue 256, overlay pending 4.
-- **Artwork off UI + generation token:** worker decode to fixed 256² buffer; late generations rejected; 64 MiB in-flight budget.
-- **Atomic config save:** revision/file-identity checked verified temp+rename+parent flush; external edits refuse save.
-- **Typed `GWLP_USERDATA` ownership:** `StateClaim` + clear-before-drop release discipline across windows/dialogs.
-- **GDI RAII on hot ownership:** `FontProvider`, main owned brushes/fonts, `ArtBlit`, DIB/DC guards; remaining manual popup handles are paired and bounded.
-- **Allocation-minimized render fast path:** reusable DIB/frame/text buffers, static chrome/marquee cache, dirty-frame predicate.
-- **Palette/text caching and timer coalescing:** already present.
-- **Crash-log boundedness:** hard 8 MiB cap rather than unbounded append.
-- **History cap:** 400 rows; artwork stripped from history entries.
+Active enhancement/fix program:
 
-Changing these solely to match the wording of an exemplar would add risk without fixing a present defect.
+- **[P0-01] `create_exe.ps1` — isolate fresh-install simulation from live APPDATA; prevents sanctioned-tool user-data deletion as a class; (effort S; public-surface impact: preserved, developer-tool contract changes).**
+- **[P1-01] `main_window.rs` startup policy — make every process launch main-window-hidden and require explicit tray/user action to show it; closes a hard startup-contract defect; (effort S; public-surface impact: changed, first-launch popup removed).**
+- **[P1-02] `overlay/mod.rs` idle reducer — make the truthful passive idle card layout-independent while keeping it static; closes hidden-idle state and keeps no-change render cost ~zero; (effort S/M; public-surface impact: changed, idle pill visible).**
+- **[P2-01] CI/quality scripts — publish a complete absolute complexity inventory and trustworthy coverage identity before CRAP; retain the monotonic ratchet and strict deterministic mutation gate; (effort M; public-surface impact: preserved).**
+- **[P2-02] deterministic tests/mutation scope — include corrected startup and all-layout idle policy decisions, including disabled-notification/retirement restoration; (effort S/M; public-surface impact: preserved).**
+- **[P2-03] docs — reconcile hover, idle, startup and exact quality semantics after behavior fixes; (effort S; public-surface impact: preserved).**
 
-## Proposed program
-
-- **[P0-01] `create_exe.ps1` — remove any ability to recursively delete the live data root; prevents the entire user-data-loss class represented by `DATA-001`; (effort S; public-surface impact: preserved for WinGlance users, developer-tool `-FreshInstall` semantics changed/removed).**
-- **[P0-02] `overlay/mod.rs`, render/accessibility surfaces — introduce an explicit no-media Idle pill invariant; prevents the hidden-while-process-alive class (`OVERLAY-001`); (effort M; public-surface impact: changed, required and clearly visible).** Keep the idle frame static so it does not create a new continuous upload/timer cost.
-- **[P0-03] `smtc.rs` + `events.rs` + both consumers — carry refresh-vs-new-media provenance or strengthen identity with reliable secondary fields; prevents the genuine-event-suppression class (`DEDUP-001`); (effort M; public-surface impact: changed only for transitions currently swallowed).**
-- **[P1-01] `main_window.rs` — correct Settings focus auto-scroll in one coordinate space; improves keyboard/UIA reachability; (effort S; public-surface impact: preserved except bug correction).**
-- **[P1-02] `main_window.rs` history — separate source acceptance, pill disposition and reason; fixes misleading diagnostics and makes future suppression debugging reliable; (effort S/M; public-surface impact: changed text/highlighting only where currently false).**
-- **[P1-03] `main_window.rs` tooltip — preserve signed virtual-screen coordinates; fixes negative-monitor placement; (effort S; public-surface impact: preserved except bug correction).**
-- **[P1-04] monitor configuration/fullscreen — persist a stable physical monitor identity additively (with legacy index fallback) if stable-device semantics are confirmed; eliminates restart-dependent meaning of `index-N`; (effort M; public-surface impact: changed/additive config, argued because current behavior is already inconsistent).** No new crate is needed; lighter alternative to any display-enumeration dependency is the existing Win32 device name/monitor APIs.
-- **[P1-05] `process_picker.rs` + accessibility provider — expose row checked state as UIA Toggle; gives assistive technology the state that will actually be persisted; (effort M; public-surface impact: visual behavior preserved, accessibility surface expanded).**
-- **[P1-06] main Activity rendering — derive an AA-compliant effective title color with the existing contrast helper; prevents unreadable custom themes; (effort S; public-surface impact: changed only for failing custom colors).**
-- **[P1-07] overlay hover policy — make Expanded dismiss-on-hover reversible on leave (preferred) while keeping the setting; reduces accidental dismissal without removing the feature; (effort S/M; public-surface impact: changed and noticeable; execute only after maintainer decision `R-02`).**
-- **[P2-01] CI — add pinned complexity, coverage/CRAP and mutation gates and ensure release-candidate refs get a check; converts the requested release thresholds from aspirations into evidence; (effort M; public-surface impact: preserved).** Avoid a new runtime dependency; CI-only tools are preferable to shipping analysis crates.
-- **[P2-02] tests — add pure seams/regressions for nonzero-scroll focus, refresh provenance, signed tooltip pack, monitor identity restart semantics, history disposition and picker UIA toggles; (effort M; public-surface impact: preserved).**
-- **[P2-03] docs — reconcile config persistence, cache bounds, CI triggers, startup/no-media/monitor contracts after the chosen behavior lands; kills the current D8 drift class; (effort S; public-surface impact: preserved).** A config-example/default parity test should be added if CI does not already cover the complete file; do not generate/overwrite the user's config as part of that test.
+No new runtime crate is justified. For quality tooling, CI-only pinned tools remain lighter and safer than shipping analysis dependencies in `WinGlance.exe`.
 
 ---
 
 # Release-quality metric assessment
 
-The requested thresholds are sensible **gates**, but they are not currently evidenced at the audited head. The latest commit is explicitly a control-flow-hotspot refactor, which is encouraging, not proof.
-
-| Target | Audit result at `32f27897…` | Release action |
+| Requested target | Current audit result | Release action |
 |---|---|---|
-| Cyclomatic Complexity < 22 | **Unable to verify** | Measure per function in CI; refactor only functions over threshold. |
-| Cognitive Complexity < 22 | **Unable to verify** | Same; keep callback dispatch decompositions if they measure below limit. |
-| Halstead Difficulty < 80 | **Unable to verify** | Add reproducible analyzer; do not alter Win32 wrappers merely to lower token metrics. |
-| CRAP < 25 | **Unable to verify** | Requires complexity + coverage evidence; gate changed functions first if full-repo tool is noisy. |
-| Surviving mutants = 0 | **Unable to verify** | Add mutation job; zero survivors before release for deterministic pure modules. Win32 integration mutants may need explicit equivalent-mutant review. |
-| Dead code = 0 | **Unable to certify** | Current source shows no obvious dead module; require current `clippy -D warnings` plus explicit dead-code scan. |
-| Redundant code = 0 | **Unable to certify** | Use clippy + structural review; “zero” must not force harmful abstraction of intentionally explicit Win32 teardown paths. |
-| `any` / `unknown` types = 0 | **Not directly applicable as a Rust type-system metric** | Rust has no TypeScript-style `any`/`unknown`. Audit `dyn Any`, raw opaque payloads and unchecked casts instead. **Do not** treat mandatory TOML “unknown keys” preservation as a type violation. |
+| Cyclomatic Complexity `< 22` | **Not established repo-wide.** CI ratchets against `da06088` and explicitly grandfathers existing debt. | Emit complete inventory; refactor only genuine over-threshold hotspots until the release policy is satisfied or a narrowly documented platform-boundary waiver is approved. |
+| Cognitive Complexity `< 22` | **Not established repo-wide** for the same reason. | Same. Prefer extracting pure decision helpers over reshuffling Win32 code solely for score. |
+| Halstead Difficulty `< 80` | **Not established repo-wide**; current analyzer is present but ratcheted. | Same complete-inventory policy. |
+| CRAP `< 25` | **Unable to verify.** Current docs correctly state that trustworthy per-function coverage identity is unavailable. | Add trustworthy coverage+identity first; do not fabricate CRAP. If tooling remains unreliable, record an explicit release exception rather than a fake pass. |
+| Surviving mutants `0` | **Verified only for selected deterministic remediation core at `d199566`; not repo-wide.** | Keep zero-survivor requirement for deterministic logic; expand to newly changed startup/idle helpers. Treat equivalent/platform-boundary mutants by explicit review, not blanket skips. |
+| Dead code `0` | **No obvious dead production module found; not yet certified at current head.** | Require current checkpoint Clippy + unused-dependency/static scan. |
+| Redundant code `0` | **Cannot be mechanically certified as an absolute.** | Use Clippy + architecture review; do not collapse explicit teardown/error paths when duplication improves safety. |
+| `any` / `unknown` types `0` | **Not a Rust-language metric.** | Audit `dyn Any`, raw opaque payloads and unchecked casts instead. Do not confuse required TOML unknown-key preservation with a type escape hatch. |
 
-Recommended CI interpretation: fail on measured over-threshold functions/mutants, publish the report artifact, and make metric-tool versions explicit. This keeps the goal objective without creating refactors for metric theater.
-
----
-
-# Architecture-reviewed minimal implementation plan
-
-This plan is intentionally smaller than the prompt's exemplar program because the branch already completed many of those hardening projects. Each commit is a coherent review unit; before moving to the next, perform the requested **Architect review → implementation → Architect review/amend-until-satisfied** loop. Where a commit contains a visible behavior change, it is called out.
-
-1. **`fix(tooling): make fresh-install simulation incapable of deleting live user data`**  
-   Remove the live `%APPDATA%` recursive delete path. If retained, fresh-install simulation must operate only under an explicit disposable root with a hard production-root refusal. Add a script-level guard/test that cannot touch the real data root. **No application UX change; developer tooling semantics change.**
-
-2. **`fix(startup): honor the silent first-launch contract`**  
-   Remove `first_run` as a reason to show the maximized tracking window. Keep discoverability through tray/pill only. Update first-run tests and the immediately-coupled README/config/AGENTS wording in the same commit. **NOTICEABLE:** first launch no longer opens the tracking window. Treat explicit `start_in_tray = false` per `R-04` before implementation; my preferred production contract is that only an explicit user action after launch opens the main window.
-
-3. **`feat(overlay): add a truthful no-media idle pill state`**  
-   Add an explicit Idle content/phase, show it at cold start, and settle to it when the final source retires/no playing successor exists. Keep it static (no continuous animation/render) and passive. Update pill UIA accessible name for idle. **NOTICEABLE:** pill remains visible with no media. Resolve the fullscreen-suppression scope in `R-03` during Architect review; do not accidentally remove deliberate game/fullscreen suppression without a decision.
-
-4. **`fix(events): distinguish metadata refreshes from genuine media transitions`**  
-   Replace the one-side-missing-art identity shortcut with explicit refresh provenance or a richer stable identity decision shared by worker, overlay and history. Tests must prove both sides: late art/metadata updates in place; genuine same-title transitions notify. **NOTICEABLE only in the previously swallowed edge case.**
-
-5. **`fix(accessibility): close settings, picker, and contrast gaps`**  
-   Fix nonzero-scroll focus math; expose process-picker checked state through UIA Toggle; derive an AA-compliant effective Activity title color while preserving stored config. Grouped because these are all accessibility truth/reachability fixes and share no product-state redesign. **NOTICEABLE only for broken keyboard focus, assistive technology, or low-contrast custom themes.**
-
-6. **`fix(history): make history diagnostics truthful and monitor-correct`**  
-   Split `accepted` into source acceptance + display disposition/reason; render the actual reason in tooltips/highlight. Add a signed virtual-screen coordinate pack helper and use it for track tooltips. Tests cover notifications-off/redundant/filtered/internal rows and negative X/Y monitors. **Visible correction, no intended workflow change.**
-
-7. **`fix(display): make configured monitor identity deterministic across restarts`**  
-   Preferred design: add an additive stable device-identity field resolved from the existing Win32 display data, retain legacy `index-N` as fallback/migration, and make Settings/docs show the real semantics. No dependency addition. **NOTICEABLE on dock/reorder/restart; config surface additive.** If the maintainer instead chooses pure enumeration-index semantics, remove stickiness and document that choice—but make one contract true everywhere.
-
-8. **`refine(overlay): make dismiss-on-hover recover from accidental leave`**  
-   After explicit maintainer approval of `R-02`, keep `dismiss_on_hover` but cancel/release the 500 ms arm when the pointer leaves before expiry; preserve compact first-hover hold. Add edge-jitter regression tests. **NOTICEABLE BEHAVIOR CHANGE.** If the current one-way policy is reaffirmed, skip this commit and record that decision rather than changing for taste.
-
-9. **`chore(ci): enforce release-quality and mutation gates`**  
-   Add pinned CI tooling for cyclomatic/cognitive/Halstead/CRAP and mutation; run it on the release-candidate path used by this project (PR/manual/selected branches). Keep existing fmt/clippy/test/release-build/audit/deny. Measure first; only then create follow-up hotspot refactors if a function genuinely exceeds thresholds. No runtime dependency.
-
-10. **`docs: reconcile runtime contracts and audit-facing documentation`**  
-    Sweep only remaining documentation not already updated beside its behavior: typed-invalid-section persistence, overlay cache 8, exact CI triggers, monitor model, architecture/repo map and the finalized idle/fullscreen/startup semantics. Add/confirm a CI test that validates `config.example.toml` against code defaults without touching live APPDATA.
-
-**No separate commits are recommended for** queue bounds, config atomicity, artwork decode threading/generation, crash-log rotation/cap, broad GDI RAII, frame-allocation cleanup, palette caching, history cap, or typed `GWLP_USERDATA`: those are already materially solved on this branch. Rewriting them now would be change for change's sake.
+This is deliberately strict about what is evidence versus aspiration. A release report should never print a synthetic zero for a metric the toolchain did not actually measure.
 
 ---
 
@@ -402,42 +305,24 @@ This plan is intentionally smaller than the prompt's exemplar program because th
 
 | ID | Severity | Area | Location | Issue (one line) | Scenario | Basis |
 |---|---|---|---|---|---|---|
-| DATA-001 | Critical | User data / tooling | `create_exe.ps1:85-91` | `-FreshInstall` recursively deletes the sacred live data directory. | 8 / tooling | Reasoned but not executed |
-| START-001 | High | Startup / UX | `config.rs:618-641`; `main_window.rs:1384-1410` | First run forces a maximized window, violating silent-launch mandate. | 1 | Reasoned but not executed |
-| OVERLAY-001 | High | Overlay state / UX | `overlay/mod.rs:185-198,1285-1345,2280-2445` | No-media state is Hidden, not mandated always-present Idle pill. | 1, 7 | Reasoned but not executed |
-| DEDUP-001 | High | Media identity / suppression | `events.rs:375-414` | One-side-missing artwork can make genuine same-title media look like a refresh. | 3, 4 | Reasoned but not executed |
-| A11Y-001 | Medium | Keyboard/UIA | `main_window.rs:4100-4255` | Settings focus auto-scroll mixes document and client coordinates. | 6 / Settings | Reasoned but not executed |
-| A11Y-002 | Medium | Contrast | `config.rs:330-390`; `main_window.rs:2600-2765` | Arbitrary `text_color` can make Activity title fail WCAG AA. | UI config | Reasoned but not executed |
-| A11Y-003 | Medium | Process picker UIA | `process_picker.rs:620-915` | Custom checked state is not exposed to assistive technology. | Picker | Reasoned but not executed |
-| HIST-001 | Medium | UX truth / history | `main_window.rs:1013-1048,2360-2575,5070-5145` | Muted history rows can falsely say “filtered by allowed apps”. | 14 | Reasoned but not executed |
-| TOOLTIP-001 | Medium | Multi-monitor tooltip | `main_window.rs:1935-2010` | Negative virtual-screen tooltip coordinates are clamped to zero. | 7, 10 | Reasoned but not executed |
-| MON-001 | Medium | Monitor model | `overlay/fullscreen.rs:211-307` | `index-N` means sticky physical display in-run but enumeration slot after restart. | 7, 10 | Reasoned but not executed |
-| HOVER-001 | Medium | Hover UX | `overlay/mod.rs:67-83,640-675` | Expanded hover arms one-way dismissal even after pointer leaves. | 5 | Reasoned but not executed |
-| SINGLE-001 | Medium | Single-instance availability | `main.rs` singleton; `architecture.md:84-122` | Known mutex can be squatted to deny startup; deliberate fail-closed choice. | 9 / hostile second instance | Reasoned but not executed |
-| CI-001 | Medium | CI / quality | `.github/workflows/ci.yml:1-45` | Audited head has no status and requested complexity/mutation gates do not exist. | Release gate | Unable to verify |
-| DOC-001 | Medium | Documentation | `configuration.md:1-18`; `config.rs:600-775` | Typed-invalid-section persistence behavior is documented incorrectly. | 8 | Reasoned but not executed |
-| DOC-002 | Low | Documentation | `development.md:151-160`; `overlay/mod.rs:214-231` | Development docs say track cache cap 3; branch uses 8. | 14 / memory audit | Reasoned but not executed |
-| DOC-003 | Low | Documentation | `README.md:156-164`; `ci.yml:1-11` | README says every push gets CI; workflow push is main-only. | Release gate | Reasoned but not executed |
+| DATA-001 | **Critical** | User data / developer tooling | `create_exe.ps1:85-92` | `-FreshInstall` recursively deletes the live sacred data directory. | Tooling / A3 | Reasoned but not executed |
+| START-001 | **High** | Startup / UX contract | `main_window.rs:1439-1459` | First run/legacy false can maximize the tracking window during process launch. | 1 | Reasoned but not executed |
+| OVERLAY-001 | **High** | Overlay state / UX truth | `overlay/mod.rs:1473-1485`, `4966-4992` | Transient layouts intentionally remain hidden instead of showing the mandated idle pill. | 1, 7 | Reasoned but not executed; unit-test-pinned |
+| QUALITY-001 | **Medium** | CI / release quality | `ci.yml:52-130`; `docs/quality.md:18-88` | Current gates do not establish all requested absolute complexity/CRAP/repo-wide mutation targets. | Release gate | Gate design verified; current-head run pending |
+| DOC-001 | **Medium** | Documentation | `architecture.md:33-35,352-389`; `config.rs:219-224` | Architecture/commentary contradict current idle and reversible-hover behavior. | D8 / future maintenance | Reasoned but not executed |
 
 ---
 
-# Major Refactors Table
+# Major Refactors / Improvements Table
 
 | ID | Refactor | Behavior change? | Modules touched | Effort | Priority | Why it matters |
 |---|---|---|---|---|---|---|
-| P0-01 | Remove live-data fresh-install deletion | Developer tooling only | `create_exe.ps1` | S | P0 | Makes accidental sanctioned-tool data loss impossible. |
-| P0-02 | Explicit no-media Idle pill state | **Yes** | `overlay/mod.rs`, render/UIA, startup tests | M | P0 | Makes hidden-while-alive/no-media state impossible. |
-| P0-03 | Refresh provenance / stronger media identity | **Yes, edge case** | `smtc.rs`, `events.rs`, overlay, main history | M | P0 | Makes genuine same-title event suppression substantially harder/impossible by construction. |
-| P1-01 | Settings focus coordinate fix | Bug correction | `main_window.rs` | S | P1 | Keyboard/UIA focus remains reachable at nonzero scroll. |
-| P1-02 | History disposition model | Tooltip/highlight correction | `main_window.rs` | S/M | P1 | UI tells the truth about why an event was muted. |
-| P1-03 | Signed tooltip position helper | Bug correction | `main_window.rs` | S | P1 | Correct negative-coordinate monitor support. |
-| P1-04 | Stable persisted monitor identity | **Yes/additive config** | config, fullscreen, Settings/docs | M | P1 | Removes restart-dependent monitor semantics. |
-| P1-05 | Picker UIA Toggle provider | Accessibility surface only | `process_picker.rs`, accessibility | M | P1 | Screen readers can perceive the state users persist. |
-| P1-06 | Effective AA Activity text color | **Yes for bad custom colors** | main render, shared contrast helper | S | P1 | Prevents unreadable primary title text. |
-| P1-07 | Reversible hover dismissal | **Yes** | overlay hover/morph tests/docs | S/M | P1 | Reduces accidental disappearance; requires maintainer decision. |
-| P2-01 | Complexity/coverage/mutation CI gates | No runtime | CI | M | P2 | Converts release-quality targets into reproducible evidence. |
-| P2-02 | Targeted regression seams | No | tests/pure helpers | M | P2 | Pins the exact boundary mistakes found by this audit. |
-| P2-03 | Documentation/config parity sweep | No runtime | docs/config tests | S | P2 | Prevents future contract drift. |
+| P0-01 | Make fresh-install tooling physically incapable of targeting live data | Developer tooling only | `create_exe.ps1`, optional script tests/docs | S | P0 | Prevents the data-loss class rather than relying on operator care. |
+| P1-01 | Central startup visibility policy | **Yes** | `main_window.rs`, startup policy tests, coupled docs | S | P1 | Makes launch-time popup impossible and satisfies the hard startup contract. |
+| P1-02 | Layout-independent passive idle state | **Yes** | `overlay/mod.rs`, overlay policy tests/UIA text, coupled docs | S/M | P1 | Restores truthful always-present status without continuous render cost. |
+| P2-01 | Complete quality inventory + trustworthy coverage basis | No runtime | CI/scripts/docs | M | P2 | Converts release targets into evidence while avoiding fake metrics. |
+| P2-02 | Targeted metric hotspot reductions, only where inventory proves genuine debt | No intended runtime | affected source modules discovered by inventory | M/L | P2 | Brings real maintainability hotspots under target without risky broad rewrites. |
+| P2-03 | Contract documentation sweep | No runtime | architecture/config/readme/development/quality docs | S | P2 | Prevents future auditors/maintainers from coding to stale behavior. |
 
 ---
 
@@ -445,44 +330,67 @@ This plan is intentionally smaller than the prompt's exemplar program because th
 
 | ID | Area | Open question / suspected deliberate design | Why it matters | How to confirm |
 |---|---|---|---|---|
-| R-01 | Media identity | One-side-missing art is intentionally treated as same media to absorb late thumbnails. | Tightening blindly would reintroduce duplicate pills; leaving it can swallow a genuine replay/version. | Live two-case test: same track gets art late → exactly one pill; same title/artist genuine new item with delayed/missing art → two transitions. Decide identity contract from logs. |
-| R-02 | Hover | One-way Expanded dismissal is explicitly documented as “hover means I've seen it”. | It may be intentional despite surprising UX; changing it is noticeable. | Maintainer decision + live mouse-edge test. If retained, document accessibility rationale; if changed, verify leave cancels without timer oscillation. |
-| R-03 | “Always visible” vs fullscreen | Hard rule 5 says pill always visible, while scenario 7/current config explicitly expect fullscreen/listed-foreground hide/show. | Literal enforcement would remove a deliberate gaming behavior and contradict another audit scenario. | Maintainer decision: interpret “always visible” as “never absent solely because there is no media” (my recommendation), or prohibit fullscreen hiding too. |
-| R-04 | `start_in_tray = false` | Hard no-popup startup contract conflicts with an existing explicit setting whose purpose is to open the window. | Forced first-run popup is clearly wrong; explicit user opt-in is ambiguous. | Maintainer decision. Recommended production rule: startup itself remains silent; main window opens only from tray. If retaining the key, document it as an intentional exception to the global no-popup sentence. |
-| R-05 | Monitor model | Sticky physical device during a run looks deliberate and improves docking stability. | Current docs/config name `index-N` cannot promise both stickiness and enumeration semantics across restart. | Dock/reorder/restart live test; maintainer selects stable-device vs pure-index contract. |
-| R-06 | Picker accessibility | Native owner-drawn listbox may expose label/selection but not custom `LB_SETITEMDATA` checkbox state. | Keyboard works while screen-reader truth may not. | Inspect with Narrator/Accessibility Insights: each row must announce checked/unchecked and state changes on Space. |
-| R-07 | Release metrics | No branch-head workflow/status or metric artifact exists. | Numeric production gates cannot be truthfully signed off. | Run the finalized CI on checkpoint/PR and retain complexity/coverage/mutation reports. |
-| R-08 | History semantics | `accepted` has drifted from “source allowed” into “event reached pill”. | A single boolean cannot explain all muted-row reasons. | Maintainer chooses desired row taxonomy; verify notifications-off/redundant/filter/churn/failure rows. |
-| R-09 | Singleton squat | Fail-closed is deliberate to protect config/log from dual writers. | Same-user process can deny startup, but same-user attackers can also kill the app; full DoS prevention is not a realistic security boundary. | Maintainer threat-model decision. If attempting mitigation, concurrency-test two legitimate simultaneous launches plus a fake holder before adopting it. |
+| R-01 | Always-visible rule vs fullscreen suppression | The supplied hard rule says the pill is always visible, while scenario 7 and current `hide_for_auto_compact_sources` behavior explicitly expect hide/show around fullscreen/listed foregrounds. | Literal “never hidden for any reason” would remove a deliberate gaming behavior and conflict with another required scenario. | Maintainer decision during `OVERLAY-001`: recommended interpretation is “idle/media pill is always present whenever overlay display is not explicitly suppressed by the user's fullscreen/listed-foreground policy; suppression is temporary and the correct state restores immediately afterward.” Live-toggle fullscreen and verify restore. |
+| R-02 | Exact-identical media replay identity | `same_media` now checks all known discriminators, but two genuinely distinct plays can be observationally identical if source/title/artist/all optional identity fields and cover are identical or absent. | No algorithm can distinguish events the provider makes identical without another trustworthy signal; over-tightening can reintroduce duplicate late-metadata pills. | Live provider trace. If a real swallowed replay is observed, add a worker provenance/timeline-reset discriminator backed by logs/tests. Do **not** change current identity code speculatively. |
+| R-03 | Same-user singleton name squatting | Current fail-closed named mutex is intentionally susceptible to a same-user process that holds the known name. | A fail-open workaround risks two WinGlance writers racing `config.toml` and logs; under same-user threat assumptions the attacker can also terminate the process, so full DoS resistance is not a meaningful security boundary. | Keep the diagnostic live-instance probe. Only redesign if the product threat model changes; any replacement must prove single-writer integrity before it is preferred over the current limitation. |
+| R-04 | Historical `start_in_tray = false` meaning | Additive compatibility keeps the key readable, but the hard startup contract leaves no safe launch-time meaning for `false`. | Removing the field would break additive config compatibility; honoring it would reintroduce `START-001`. | Maintainer decision: recommended contract is parse/preserve the legacy key but never auto-show on process launch. Explicit tray action remains the only main-window opening path. |
+
+---
+
+# Architecture-reviewed minimal implementation plan
+
+This plan is intentionally short. The branch already contains the hardening work that the audit prompt lists as exemplars; repeating it would add risk without production value. Execute each commit with the requested loop: **Architect review → implement → Architect review/amend until satisfied → move to next commit only when satisfied**. No source change should begin until maintainer go-ahead.
+
+1. **`fix(tooling): isolate fresh-install simulation from live app data`**  
+   Remove `-FreshInstall`'s direct `%APPDATA%\WinGlance\WinGlance\data` delete. Preferred implementation: require an explicit disposable test root, canonicalize/resolve it, and hard-refuse the production data root (and descendants/aliases that resolve there). Add a script-level pure/path guard test if practical. **Application UX: unchanged. Developer tooling behavior: intentionally changed.** This closes `DATA-001` and is first because no later audit/build workflow should retain a sanctioned data-destructive path.
+
+2. **`fix(startup): make process launch tray-only`**  
+   Centralize startup visibility so `create_window` always starts the tracking window hidden. Preserve parsing/round-tripping of legacy `start_in_tray`; do not let it re-enable launch popups. Update startup unit tests and the directly coupled README/configuration/development wording in this same commit. **NOTICEABLE USER BEHAVIOR CHANGE:** first-ever launch no longer opens the maximized setup window. This is required by the supplied hard contract, not a discretionary UX tweak.
+
+3. **`fix(overlay): restore truthful idle status across layouts`**  
+   Remove the `PersistentCompact`-only early return from the passive status policy. Expanded/Compact/Auto should settle into the same static compact `No media playing` / `Notifications paused` status when no real event is active; real events still use their configured layout. Keep the status free of dismiss deadline, marquee/progress/comet/hover actions, so it uploads once and stays cold. Preserve the finalized `R-01` fullscreen/listed-foreground suppression exception and restore the appropriate idle/media state as soon as suppression clears. Update the unit tests that currently require transient `Phase::Hidden`, and include the corrected policy in mutation scope. **NOTICEABLE USER BEHAVIOR CHANGE:** an idle status remains visible outside deliberate suppression.
+
+4. **`chore(quality): make release metrics complete and auditable`**  
+   Keep the existing monotonic complexity ratchet but also publish a complete current-head inventory of functions over cyclomatic/cognitive/Halstead targets. Add a trustworthy function-identity coverage report before enabling CRAP; if the toolchain still cannot support that join, make the release exception explicit rather than synthetic. Expand deterministic mutation selection to the startup/idle decision helpers changed above. Keep runtime dependencies unchanged. **No application behavior change.**
+
+5. **`refactor(quality): reduce genuine remaining metric hotspots`**  
+   Using commit 4's inventory, refactor only functions that actually exceed the requested thresholds *and* where extraction improves readability/testability. Prefer pure decision helpers and smaller WNDPROC/render dispatch functions. Do not alter behavior, FFI ownership ordering, or duplicate explicit teardown merely to game a score. If the inventory proves a platform-boundary function cannot be reduced safely, record a narrow reviewed waiver rather than forcing a riskier rewrite. **No intended user-visible behavior change.** Architect review may split this into one commit per unrelated module if the inventory reveals multiple independent hotspots; do not combine unrelated source rewrites merely to keep the nominal commit count low.
+
+6. **`docs: reconcile architecture and release contracts`**  
+   Final docs-only sweep after the behavior/quality commits: remove stale one-way-hover prose, make idle/fullscreen/startup semantics consistent across `architecture.md`, `configuration.md`, `development.md`, README and `config.rs` comments, update media-identity wording to reflect all known discriminators, and describe the exact quality evidence/waivers actually enforced. **No runtime behavior change.**
+
+**No implementation commits are recommended for** event-channel bounds, config atomicity, artwork threading/generation, crash-log cap, broad GDI RAII, render scratch allocation, palette caching, stable monitor identity, history cap/disposition, signed tooltip positioning, picker UIA, Settings focus math, Activity contrast, or reversible hover dismissal. Those are already materially correct on this branch; changing them again would be change for change's sake.
 
 ---
 
 # Coverage statement
 
-## Per depth pass
+## Depth passes
 
-- **Pass A — findings filed:** `DATA-001`, `DEDUP-001`, `SINGLE-001`. Clean evidence elsewhere: bounded/sanitized hostile SMTC input, fail-closed config, verified atomic production writes, bounded logs/crash log, panic-contained FFI and thread-affine COM ownership.
-- **Pass B — findings filed:** none for current leak/boundedness defects. **Clean — evidence:** explicit inventory above pairs created GDI/USER/kernel objects and all requested caches/channels/logs have finite bounds. Runtime counts are **Reasoned but not executed**.
-- **Pass C — findings filed:** none requiring a performance rewrite. **Clean — evidence:** reusable surfaces/text buffers, cached chrome/marquee, dirty-frame skip, reduced static/comet cadence, off-UI fixed-size decode, bounded fanout. Estimates supplied; no measurements claimed.
-- **Pass D — findings filed:** `START-001`, `OVERLAY-001`, `A11Y-001`, `A11Y-002`, `A11Y-003`, `HIST-001`, `TOOLTIP-001`, `MON-001`, `CI-001`, `DOC-001`, `DOC-002`, `DOC-003`. Core thread/config/state boundaries otherwise hold.
-- **Pass E — findings filed:** scenarios 1, 3, 5, 7, 8, 10 and 14 expose filed findings; every scenario is accounted for above. Scenarios 2, 4, 6, 9, 11, 12 and 13 are clean by code trace but **Reasoned but not executed**.
-- **Pass F — findings/program filed:** P0–P2 program above. Existing bounded queues, atomic save, off-UI decode/generation, crash cap, history cap, render caches and principal RAII are explicitly recognized as already satisfied so they are not duplicated.
+- **Pass A — findings filed:** `DATA-001`; singleton and exact-media ambiguity retained as risks. Evidence: hostile-input/config/filesystem/singleton/log/unsafe traces above.
+- **Pass B — clean:** no unpaired or unbounded resource class found in the inventory; runtime handle counts not executed.
+- **Pass C — clean:** major hot-path anti-patterns already addressed; no speculative rewrite justified without profiling.
+- **Pass D — findings filed:** `QUALITY-001`, `DOC-001`, plus `START-001`/`OVERLAY-001` as hard architecture/behavior contract violations.
+- **Pass E — findings filed:** scenario 1 exposes `START-001` + `OVERLAY-001`; scenario 7 depends on the `R-01` visibility interpretation; all 14 scenarios are accounted for above.
+- **Pass F — findings/program filed:** six-commit minimal production-readiness plan; exemplar hardening already present is explicitly marked no-change.
 
-## Per scenario
+## Scenario accounting
 
-1. **Findings filed:** `START-001`, `OVERLAY-001`.
-2. **Clean — evidence:** per-source debounced resync/churn exclusion before emit; independent compliant-source processing.
-3. **Findings filed:** `DEDUP-001`; hostile-input memory/decode bounds otherwise clean.
-4. **Clean — evidence:** bounded/coalesced event pipeline and normalized timeline math; no zero-duration division path found.
-5. **Finding filed:** `HOVER-001`; timer IDs/lifetime remain bounded.
-6. **Clean — evidence:** DPI swaps invalidate and free font/DIB caches; no unbounded scaled-art variant cache.
-7. **Findings filed:** `MON-001`, `TOOLTIP-001`; fullscreen-vs-always-visible ambiguity retained as `R-03`.
-8. **Finding filed:** `DOC-001`; implementation protects corrupt/oversized/external-edited config without overwrite.
-9. **Clean — evidence:** abandoned-mutex takeover, bounded crash log, tray teardown/restart handshake; live timing unexecuted. `SINGLE-001` covers hostile name squatting specifically.
-10. **Finding filed:** `MON-001` (and `TOOLTIP-001` for negative topology); cache invalidation/fallback prevents ordinary orphaning.
-11. **Clean — evidence:** 1 MiB live-log and 8 MiB crash-log hard caps.
-12. **Clean — evidence:** `TaskbarCreated` re-add + retry, per-open menu destruction, autostart own-key ownership.
-13. **Clean — evidence:** explicit timer/hook/tray/window/state teardown; hung COM worker abandonment is globally bounded.
-14. **Finding filed:** `HIST-001`; history count/memory is bounded at 400 and paint strings are precomputed.
+1. **Cold start, no media — findings filed:** `START-001`, `OVERLAY-001`.
+2. **Churn storm — clean:** per-source debounced resync + cool-down exclusion; compliant sources remain independent.
+3. **Hostile metadata — clean by trace / live unable to verify:** bounded/sanitized metadata, bounded decode, stale-art defense.
+4. **Playback-control storm — clean by trace:** bounded newest-state transport and defensive progress math.
+5. **Hover storm — clean:** reversible Expanded cap + Compact morph/leave logic; fixed timer IDs.
+6. **DPI changes — clean by trace:** DPI-scoped resources replaced, not accumulated; target-DPI placement.
+7. **Multi-monitor/fullscreen — finding/risk accounting:** overlay idle fix needed; stable identity is fixed; fullscreen visibility interpretation is `R-01`.
+8. **Config torture — clean by trace/prior tests:** staged fallback, size cap, unknown preservation, conflict-safe save.
+9. **Rapid restarts — clean by trace; risk retained:** abandoned takeover/restart handoff bounded; same-user name squatting is `R-03`.
+10. **Display topology — clean by trace:** cache invalidation + persisted stable monitor identity + fallback/recovery.
+11. **Long-run logs — clean:** live/crash logs hard-capped.
+12. **Tray lifecycle + Explorer restart — clean by trace:** TaskbarCreated re-add + retry/backoff + owned Run key.
+13. **Shutdown ordering — clean by trace:** timers/hooks/tray/windows/state teardown ordered; wedged worker abandonment bounded.
+14. **History long-run — clean:** cap 400, text-only retained rows, bounded source caches, scroll-preserving insert.
 
-**Final accounting:** all passes A–F and all 14 scenarios were performed statically. GUI/runtime observations, Windows handle counts and branch-head build/test results were not executed and are not represented as Verified.
+## Final release decision
+
+Under the supplied mandates, the current audited code should **not** ship until `DATA-001`, `START-001`, and `OVERLAY-001` are corrected. The remaining work after those is evidence/hygiene: make release-quality claims match what is actually measured, reduce only genuine measured hotspots, and reconcile stale docs. The branch does **not** need another broad hardening rewrite.
