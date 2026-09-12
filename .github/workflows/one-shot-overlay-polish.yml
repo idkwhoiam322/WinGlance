@@ -1,0 +1,533 @@
+name: One-shot overlay polish
+
+on:
+  push:
+    branches: [checkpoint]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'chore: stage overlay polish'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: checkpoint
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Reconcile remaining documentation contracts
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_exact(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected one exact match, found {count}')
+              p.write_text(text.replace(old, new), encoding='utf-8')
+
+          replace_exact(
+              'docs/architecture.md',
+              '''The overlay owns one local passive status state that is deliberately **not** a `MediaEvent`. On startup and after the last notification settles it renders a compact `No media playing` pill; when notifications are disabled (or both notification event types are disabled) the same card reads `Notifications paused` instead. The status has no dismiss deadline, progress animation, comet, or hover action. Real SMTC events replace the active no-media status immediately. Keeping this state local prevents synthetic status from entering history, deduplication, source-ledger, or worker transport semantics.''',
+              '''The overlay owns one local passive status state that is deliberately **not** a `MediaEvent`, but that state is presented only by `PersistentCompact`. Expanded, Compact, and Auto are transient notification layouts and return to `Hidden` after their last notification settles. In Persistent Compact, startup/no-media renders a compact `No media playing` card; when notifications are disabled (or both notification event types are disabled) the same card reads `Notifications paused` instead. The passive status has no dismiss deadline, progress animation, comet, marquee, or hover action. Real SMTC events replace it immediately, and the correct passive/media state is restored after any configured fullscreen/listed-foreground suppression clears. Keeping this state local prevents synthetic status from entering history, deduplication, source-ledger, or worker transport semantics.'''
+          )
+
+          replace_exact(
+              'docs/architecture.md',
+              '''- **Expanded layout** — hovering has no interaction with the pill: the
+  countdown is never deferred for the cursor, so the pill dismisses on its
+  deadline even under it. With `dismiss_on_hover` (default) the first hover
+  tick arms the one-way 500 ms dismiss (`EARLY_EXIT_MS`); without it,
+  hovering changes nothing.''',
+              '''- **Expanded layout** — the countdown is never held merely because the
+  cursor is over the pill. With `dismiss_on_hover` (default), the first hover
+  tick temporarily caps the remaining lifetime at 500 ms (`EARLY_EXIT_MS`).
+  Leaving before that hover cap fires restores the deadline that existed before
+  the hover; staying hovered lets the cap dismiss the pill, and leaving never
+  revives a deadline that had already expired. With `dismiss_on_hover` off,
+  hovering changes nothing.'''
+          )
+
+          replace_exact(
+              'src/config.rs',
+              '''    /// Hovering a pill in the *Expanded* layout arms its dismissal: the
+    /// remaining time is capped at 500 ms, one-way (see `EARLY_EXIT_MS`).
+    /// For pills in the Compact layout it makes the second hover dismiss
+    /// (see `expand_compact_on_hover`): the first hover expands, later
+    /// hovers dismiss. While off, no hover ever dismisses a pill.''',
+              '''    /// Hovering a pill in the *Expanded* layout temporarily caps the
+    /// remaining time at 500 ms (see `EARLY_EXIT_MS`); leaving before that
+    /// hover cap fires restores the deadline that existed before the hover.
+    /// For pills in the Compact layout it makes the second hover dismiss
+    /// (see `expand_compact_on_hover`): the first hover expands, later
+    /// hovers dismiss. While off, no hover ever dismisses a pill.'''
+          )
+          PY
+          cargo fmt --all
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/architecture.md src/config.rs
+          git commit -m "docs: finish contract reconciliation"
+
+      - name: Improve no-art source presentation
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/overlay/render.rs')
+          text = p.read_text(encoding='utf-8')
+
+          def repl(old, new):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'render.rs: expected one exact match, found {count}')
+              text = text.replace(old, new)
+
+          repl(
+          '''            draw_art_tile(
+              pixels,
+              width,
+              state.palette,
+              state.config.appearance.accent_color,
+              art_x,
+              art_y,
+              art_size,
+              art_radius,
+              state.decoded_art.as_deref(),
+              scale,
+              content_alpha,
+          );''',
+          '''            let (source_icon, fallback_playback, fallback_type) = match content {
+              MediaEvent::TrackChanged(track) => (
+                  track.app_icon.as_deref(),
+                  playback_state_for_track(track),
+                  track.playback_type,
+              ),
+              MediaEvent::PlaybackStateChanged(playback, source_app) => (
+                  if source_app.is_empty() {
+                      None
+                  } else {
+                      state.track_cache.get(source_app).and_then(|track| track.app_icon.as_deref())
+                  },
+                  *playback,
+                  PlaybackType::Unknown,
+              ),
+              _ => (None, PlaybackState::NowPlaying, PlaybackType::Unknown),
+          };
+          draw_art_tile(
+              pixels,
+              width,
+              state.palette,
+              state.config.appearance.accent_color,
+              art_x,
+              art_y,
+              art_size,
+              art_radius,
+              state.decoded_art.as_deref(),
+              source_icon,
+              fallback_playback,
+              fallback_type,
+              scale,
+              content_alpha,
+          );''')
+
+          repl(
+          '''    decoded_art: Option<&[u8]>,
+  scale: f32,
+  content_alpha: f32,
+) {''',
+          '''    decoded_art: Option<&[u8]>,
+  source_icon: Option<&[u8]>,
+  fallback_playback: PlaybackState,
+  fallback_type: PlaybackType,
+  scale: f32,
+  content_alpha: f32,
+) {''')
+
+          repl(
+          '''    if let Some(art) = decoded_art {
+      draw_art_scaled(pixels, width, art, art_x, art_y, art_size, accent, content_alpha);
+  } else {
+      draw_placeholder(pixels, width, art_x, art_y, art_size, dim_color(accent, content_alpha));
+  }''',
+          '''    if let Some(art) = decoded_art {
+      draw_art_scaled(pixels, width, art, art_x, art_y, art_size, accent, content_alpha);
+  } else {
+      draw_no_art_source_tile(
+          pixels,
+          width,
+          accent,
+          art_x,
+          art_y,
+          art_size,
+          art_radius,
+          source_icon,
+          fallback_playback,
+          fallback_type,
+          scale,
+          content_alpha,
+      );
+  }''')
+
+          marker = '''}
+
+/// Directional edge highlight traced on the pill's own boundary'''
+          helper = '''}
+
+/// Missing artwork should still identify the source instead of looking like a
+/// generic error placeholder. The tile keeps the same rounded footprint as real
+/// cover art, uses a restrained accent wash/rim, and centers the already-cached
+/// source-app icon. If shell icon extraction was unavailable, the current media
+/// state glyph is used as the final no-allocation fallback.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_no_art_source_tile(
+    pixels: &mut [u8],
+    width: usize,
+    accent: [u8; 4],
+    art_x: usize,
+    art_y: usize,
+    art_size: usize,
+    art_radius: f32,
+    source_icon: Option<&[u8]>,
+    fallback_playback: PlaybackState,
+    fallback_type: PlaybackType,
+    scale: f32,
+    content_alpha: f32,
+) {
+    if art_size == 0 || content_alpha <= 0.0 {
+        return;
+    }
+
+    // Keep the tile quiet enough that a real cover remains visually dominant.
+    // The source icon supplies identity; the tint only gives it a deliberate
+    // surface instead of the old solid accent circle.
+    let fill = dim_color(accent, 0.24 * content_alpha);
+    draw_rounded_rect_filled(
+        pixels,
+        width,
+        art_x as i32,
+        art_y as i32,
+        art_size as i32,
+        art_size as i32,
+        art_radius,
+        fill,
+    );
+
+    // A soft accent rim keeps the no-art tile aligned with the real-cover
+    // treatment even when no palette was available to drive the normal rim.
+    let stroke_w = (1.25 * scale).round().max(1.0);
+    for dy in 0..art_size {
+        for dx in 0..art_size {
+            let d = round_rect_signed_dist(dx as f32, dy as f32, art_size as f32, art_size as f32, art_radius);
+            if d.abs() < stroke_w {
+                let edge = 1.0 - d.abs() / stroke_w;
+                let alpha = (accent[3] as f32 * 0.55 * content_alpha * edge) as u32;
+                composite(pixels, width, art_x + dx, art_y + dy, [accent[0], accent[1], accent[2]], alpha);
+            }
+        }
+    }
+
+    let mark_size = ((art_size as f32 * 0.58).round() as usize).clamp(1, art_size);
+    let mark_x = art_x + (art_size - mark_size) / 2;
+    let mark_y = art_y + (art_size - mark_size) / 2;
+    if let Some(icon) = source_icon.filter(|icon| icon.len() >= 24 * 24 * 4) {
+        draw_icon_scaled(
+            pixels,
+            width,
+            icon,
+            24,
+            mark_x,
+            mark_y,
+            mark_size,
+            0.92 * content_alpha,
+        );
+    } else {
+        // Pick the stronger monochrome endpoint for the accent family. This is
+        // intentionally independent of the user's title color: the mark is a
+        // decorative fallback inside the tinted art tile, not a text setting.
+        let dark_accent = relative_luminance([accent[0], accent[1], accent[2]]) > 0.45;
+        let base = if dark_accent {
+            [0, 0, 0, 255]
+        } else {
+            [255, 255, 255, 255]
+        };
+        draw_symbol_pixels(
+            pixels,
+            width,
+            (mark_x + mark_size) as i32,
+            mark_y as i32,
+            mark_size as f32,
+            fallback_playback,
+            fallback_type,
+            dim_color(base, 0.86 * content_alpha),
+        );
+    }
+}
+
+/// Directional edge highlight traced on the pill's own boundary'''
+          if text.count(marker) != 1:
+              raise SystemExit(f'render.rs: helper marker count {text.count(marker)}')
+          text = text.replace(marker, helper)
+
+          compact_old = '''    // The art tile is static; the `Foreground` pass only re-composites the
+  // scrolling title, so skip it there (it is painted in the geometry pass).
+  if layer != RenderLayer::Foreground {
+      draw_art_tile(
+          pixels,
+          width as usize,
+          state.palette,
+          appearance.accent_color,
+          art_x as usize,
+          art_y as usize,
+          art_size as usize,
+          art_size as f32 * 0.2,
+          state.decoded_art.as_deref(),
+          scale,
+          content_alpha,
+      );
+  }'''
+          compact_new = '''    // The art tile is static; only the scrolling title belongs in the
+  // `Foreground` pass. Missing cover art reuses the source icon already
+  // carried by the track/cache, so it adds no shell work or retained memory.
+  if layer != RenderLayer::Foreground {
+      let (source_icon, fallback_playback, fallback_type) = match content {
+          MediaEvent::TrackChanged(track) => (
+              track.app_icon.as_deref(),
+              playback_state_for_track(track),
+              track.playback_type,
+          ),
+          MediaEvent::PlaybackStateChanged(playback, source_app) => (
+              if source_app.is_empty() {
+                  None
+              } else {
+                  state.track_cache.get(source_app).and_then(|track| track.app_icon.as_deref())
+              },
+              *playback,
+              PlaybackType::Unknown,
+          ),
+          _ => (None, PlaybackState::NowPlaying, PlaybackType::Unknown),
+      };
+      draw_art_tile(
+          pixels,
+          width as usize,
+          state.palette,
+          appearance.accent_color,
+          art_x as usize,
+          art_y as usize,
+          art_size as usize,
+          art_size as f32 * 0.2,
+          state.decoded_art.as_deref(),
+          source_icon,
+          fallback_playback,
+          fallback_type,
+          scale,
+          content_alpha,
+      );
+  }'''
+          if text.count(compact_old) != 1:
+              raise SystemExit(f'render.rs: compact art block count {text.count(compact_old)}')
+          text = text.replace(compact_old, compact_new)
+
+          p.write_text(text, encoding='utf-8')
+          PY
+          cargo fmt --all
+          git add src/overlay/render.rs
+          git commit -m "feat(overlay): improve no-art source presentation"
+
+      - name: Refine in-place art and text crossfade
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/overlay/render.rs')
+          text = p.read_text(encoding='utf-8')
+
+          old_helpers = '''/// The cross-fade's blend weight from the fade's elapsed time: a smoothstep
+/// (a symmetric ease reads best for a dissolve), pinned at 1.0 past the
+/// duration.
+pub(super) fn fade_progress(fade: &ContentFade) -> f32 {
+    let t = (fade.start.elapsed().as_secs_f32() / CONTENT_FADE_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Premultiplied per-pixel blend of `from` into `to` at `weight` (0.0 =
+/// from, 1.0 = to): the cross-fade's frame composition. The frames are
+/// tightly packed BGRA with the alpha channel included, so all four bytes
+/// lerp.
+pub(super) fn blend_frames(to: &mut [u8], from: &[u8], weight: f32) {
+    for (dst, src) in to.iter_mut().zip(from.iter()) {
+        *dst = (*dst as f32 * weight + *src as f32 * (1.0 - weight)).round() as u8;
+    }
+}
+'''
+          new_helpers = '''/// Raw 0..=1 progress through the short in-place content dissolve.
+fn fade_elapsed(fade: &ContentFade) -> f32 {
+    (fade.start.elapsed().as_secs_f32() / CONTENT_FADE_DURATION.as_secs_f32()).clamp(0.0, 1.0)
+}
+
+fn smooth_unit(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The historical whole-frame dissolve weight. Kept as the art curve so a
+/// content refresh retains the familiar 200 ms duration while the chrome and
+/// text can settle at slightly different times.
+pub(super) fn fade_progress(fade: &ContentFade) -> f32 {
+    smooth_unit(fade_elapsed(fade))
+}
+
+/// Region-specific weights for a content swap. Chrome/tint settles first,
+/// artwork follows the original dissolve, and text starts a few milliseconds
+/// later so two titles do not sit at equal opacity for most of the transition.
+/// All curves pin exactly at 0/1 and allocate nothing.
+pub(super) fn content_transition_weights_at(t: f32) -> [f32; 3] {
+    let t = t.clamp(0.0, 1.0);
+    let chrome = smooth_unit((t / 0.78).clamp(0.0, 1.0));
+    let art = smooth_unit(t);
+    let text = smooth_unit(((t - 0.08) / 0.92).clamp(0.0, 1.0));
+    [chrome, art, text]
+}
+
+/// Premultiplied per-pixel blend of `from` into `to` at `weight` (0.0 =
+/// from, 1.0 = to): retained for pure tests and callers that need one curve.
+pub(super) fn blend_frames(to: &mut [u8], from: &[u8], weight: f32) {
+    for (dst, src) in to.iter_mut().zip(from.iter()) {
+        *dst = (*dst as f32 * weight + *src as f32 * (1.0 - weight)).round() as u8;
+    }
+}
+
+/// Blends a same-size content replacement without introducing another frame
+/// buffer. The body/aura uses the early-settling chrome curve, the artwork tile
+/// uses the original dissolve, and the text/trailing-content side uses the
+/// slightly delayed text curve. The classification is deliberately coarse:
+/// these regions are perceptual groups, not clipping masks, and avoiding masks
+/// keeps the 200 ms path allocation-free.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn blend_content_transition(
+    to: &mut [u8],
+    from: &[u8],
+    width: usize,
+    height: usize,
+    config: &Config,
+    inset: usize,
+    scale: f32,
+    compact: bool,
+    weights: [f32; 3],
+) {
+    if width == 0 || height == 0 || to.len() != from.len() {
+        return;
+    }
+    let appearance = &config.appearance;
+    let padding = (appearance.padding * scale).round().max(0.0) as usize;
+    let pill_h = height.saturating_sub(inset * 2);
+    let (art_size, art_y, text_left) = if compact {
+        let metrics = compact_metrics(config);
+        let art_size = (metrics.art * scale).round().max(1.0) as usize;
+        let art_y = inset + pill_h.saturating_sub(art_size) / 2;
+        let (title_left, _) = compact_title_viewport(config);
+        let text_left = inset + (title_left * scale).round().max(0.0) as usize;
+        (art_size, art_y, text_left)
+    } else {
+        let available = pill_h.saturating_sub(padding * 2);
+        let art_size = ((appearance.art_size as f32 * scale).round().max(1.0) as usize).min(available.max(1));
+        let art_y = inset + pill_h.saturating_sub(art_size) / 2;
+        let text_left = inset + padding + art_size + (12.0 * scale).round().max(0.0) as usize;
+        (art_size, art_y, text_left)
+    };
+    let art_x = inset + padding;
+    let body_bottom = height.saturating_sub(inset);
+
+    for (i, (dst, src)) in to.chunks_exact_mut(4).zip(from.chunks_exact(4)).enumerate() {
+        let x = i % width;
+        let y = i / width;
+        let in_art = x >= art_x && x < art_x + art_size && y >= art_y && y < art_y + art_size;
+        let in_text = x >= text_left && y >= inset && y < body_bottom;
+        let weight = if in_art {
+            weights[1]
+        } else if in_text {
+            weights[2]
+        } else {
+            weights[0]
+        };
+        for channel in 0..4 {
+            dst[channel] = (dst[channel] as f32 * weight + src[channel] as f32 * (1.0 - weight)).round() as u8;
+        }
+    }
+}
+'''
+          if text.count(old_helpers) != 1:
+              raise SystemExit(f'render.rs: helper block count {text.count(old_helpers)}')
+          text = text.replace(old_helpers, new_helpers)
+
+          old_blend = '''    if let Some(fade) = &mut state.content_fade {
+      let progress = fade_progress(fade);
+      if progress >= 1.0 || fade.from_w != content_buf_w as usize || fade.from_h != content_buf_h as usize {
+          state.content_fade = None;
+      } else {
+          blend_frames(&mut scratch[..needed], &fade.from, progress);
+      }
+  }'''
+          new_blend = '''    if let Some(fade) = &mut state.content_fade {
+      let progress = fade_progress(fade);
+      if progress >= 1.0 || fade.from_w != content_buf_w as usize || fade.from_h != content_buf_h as usize {
+          state.content_fade = None;
+      } else {
+          let weights = content_transition_weights_at(fade_elapsed(fade));
+          blend_content_transition(
+              &mut scratch[..needed],
+              &fade.from,
+              content_buf_w as usize,
+              content_buf_h as usize,
+              &state.config,
+              inset as usize,
+              scale,
+              compact,
+              weights,
+          );
+      }
+  }'''
+          if text.count(old_blend) != 1:
+              raise SystemExit(f'render.rs: blend block count {text.count(old_blend)}')
+          text = text.replace(old_blend, new_blend)
+
+          test_marker = '''    #[test]
+  fn ensure_contrast_meets_wcag_for_samples() {'''
+          test_insert = '''    #[test]
+  fn content_transition_curves_are_staggered_and_pin_endpoints() {
+      assert_eq!(content_transition_weights_at(0.0), [0.0, 0.0, 0.0]);
+      assert_eq!(content_transition_weights_at(1.0), [1.0, 1.0, 1.0]);
+      let mid = content_transition_weights_at(0.5);
+      assert!(mid[0] > mid[1], "chrome should settle before artwork: {mid:?}");
+      assert!(mid[1] > mid[2], "text should trail artwork slightly: {mid:?}");
+      let early = content_transition_weights_at(0.04);
+      assert_eq!(early[2], 0.0, "text delay should suppress the first few milliseconds");
+  }
+
+  #[test]
+  fn ensure_contrast_meets_wcag_for_samples() {'''
+          if text.count(test_marker) != 1:
+              raise SystemExit(f'render.rs: test marker count {text.count(test_marker)}')
+          text = text.replace(test_marker, test_insert)
+
+          p.write_text(text, encoding='utf-8')
+          PY
+          cargo fmt --all
+          git add src/overlay/render.rs
+          git commit -m "feat(overlay): refine content crossfade"
+
+      - name: Remove one-shot workflow and push
+        shell: bash
+        run: |
+          git rm .github/workflows/one-shot-overlay-polish.yml
+          git commit -m "chore: remove one-shot patch workflow"
+          git push origin HEAD:checkpoint
