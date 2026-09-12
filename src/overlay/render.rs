@@ -45,21 +45,106 @@ pub(super) enum RenderLayer {
     Foreground,
 }
 
-/// The cross-fade's blend weight from the fade's elapsed time: a smoothstep
-/// (a symmetric ease reads best for a dissolve), pinned at 1.0 past the
-/// duration.
-pub(super) fn fade_progress(fade: &ContentFade) -> f32 {
-    let t = (fade.start.elapsed().as_secs_f32() / CONTENT_FADE_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+/// Raw 0..=1 progress through the short in-place content dissolve.
+fn fade_elapsed(fade: &ContentFade) -> f32 {
+    (fade.start.elapsed().as_secs_f32() / CONTENT_FADE_DURATION.as_secs_f32()).clamp(0.0, 1.0)
+}
+
+fn smooth_unit(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Premultiplied per-pixel blend of `from` into `to` at `weight` (0.0 =
-/// from, 1.0 = to): the cross-fade's frame composition. The frames are
-/// tightly packed BGRA with the alpha channel included, so all four bytes
-/// lerp.
+/// The historical whole-frame dissolve weight. It remains the artwork curve,
+/// preserving the existing 200 ms duration while chrome and text settle at
+/// slightly different times.
+pub(super) fn fade_progress(fade: &ContentFade) -> f32 {
+    smooth_unit(fade_elapsed(fade))
+}
+
+/// Region-specific weights for a content swap. Chrome/tint settles first,
+/// artwork follows the original dissolve, and text starts a few milliseconds
+/// later so two titles do not spend most of the transition at equal opacity.
+/// All curves pin exactly at 0/1 and allocate nothing.
+pub(super) fn content_transition_weights_at(t: f32) -> [f32; 3] {
+    let t = t.clamp(0.0, 1.0);
+    let chrome = smooth_unit((t / 0.78).clamp(0.0, 1.0));
+    let art = smooth_unit(t);
+    let text = smooth_unit(((t - 0.08) / 0.92).clamp(0.0, 1.0));
+    [chrome, art, text]
+}
+
+/// Premultiplied per-byte blend retained for tests and callers that need one
+/// curve across a whole packed frame.
 pub(super) fn blend_frames(to: &mut [u8], from: &[u8], weight: f32) {
     for (dst, src) in to.iter_mut().zip(from.iter()) {
         *dst = (*dst as f32 * weight + *src as f32 * (1.0 - weight)).round() as u8;
+    }
+}
+
+/// Blends a same-size content replacement without another frame buffer. The
+/// body/aura uses the early-settling chrome curve, artwork uses the original
+/// dissolve, and the text/trailing-content side uses the slightly delayed text
+/// curve. The regions are intentionally coarse perceptual groups, avoiding
+/// masks or retained surfaces on a path that exists for only 200 ms.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn blend_content_transition(
+    to: &mut [u8],
+    from: &[u8],
+    width: usize,
+    height: usize,
+    config: &Config,
+    inset: usize,
+    scale: f32,
+    compact: bool,
+    weights: [f32; 3],
+) {
+    if width == 0 || height == 0 || to.len() != from.len() {
+        return;
+    }
+    let appearance = &config.appearance;
+    let padding = (appearance.padding * scale).round().max(0.0) as usize;
+    let pill_h = height.saturating_sub(inset * 2);
+    let (art_size, art_y, text_left) = if compact {
+        let metrics = compact_metrics(config);
+        let art_size = (metrics.art * scale).round().max(1.0) as usize;
+        let art_y = inset + pill_h.saturating_sub(art_size) / 2;
+        let (title_left, _) = compact_title_viewport(config);
+        let text_left = inset + (title_left * scale).round().max(0.0) as usize;
+        (art_size, art_y, text_left)
+    } else {
+        let available = pill_h.saturating_sub(padding * 2);
+        let art_size = ((appearance.art_size as f32 * scale).round().max(1.0) as usize).min(available.max(1));
+        let art_y = inset + pill_h.saturating_sub(art_size) / 2;
+        let text_left = inset + padding + art_size + (12.0 * scale).round().max(0.0) as usize;
+        (art_size, art_y, text_left)
+    };
+    let art_x = inset + padding;
+    let body_bottom = height.saturating_sub(inset);
+    let row_bytes = width * 4;
+
+    for (y, (to_row, from_row)) in to
+        .chunks_exact_mut(row_bytes)
+        .zip(from.chunks_exact(row_bytes))
+        .enumerate()
+    {
+        for x in 0..width {
+            let in_art = x >= art_x && x < art_x + art_size && y >= art_y && y < art_y + art_size;
+            let in_text = x >= text_left && y >= inset && y < body_bottom;
+            let weight = if in_art {
+                weights[1]
+            } else if in_text {
+                weights[2]
+            } else {
+                weights[0]
+            };
+            let off = x * 4;
+            for channel in 0..4 {
+                to_row[off + channel] = (to_row[off + channel] as f32 * weight
+                    + from_row[off + channel] as f32 * (1.0 - weight))
+                    .round() as u8;
+            }
+        }
     }
 }
 
@@ -293,7 +378,18 @@ pub(super) fn render_layered(
         if progress >= 1.0 || fade.from_w != content_buf_w as usize || fade.from_h != content_buf_h as usize {
             state.content_fade = None;
         } else {
-            blend_frames(&mut scratch[..needed], &fade.from, progress);
+            let weights = content_transition_weights_at(fade_elapsed(fade));
+            blend_content_transition(
+                &mut scratch[..needed],
+                &fade.from,
+                content_buf_w as usize,
+                content_buf_h as usize,
+                &state.config,
+                inset as usize,
+                scale,
+                compact,
+                weights,
+            );
         }
     }
     // The aura comet sweep is painted here, after both frame paths (the
@@ -4439,6 +4535,17 @@ mod tests {
             }
             let _ = DeleteDC(hdc);
         }
+    }
+
+    #[test]
+    fn content_transition_curves_are_staggered_and_pin_endpoints() {
+        assert_eq!(content_transition_weights_at(0.0), [0.0, 0.0, 0.0]);
+        assert_eq!(content_transition_weights_at(1.0), [1.0, 1.0, 1.0]);
+        let mid = content_transition_weights_at(0.5);
+        assert!(mid[0] > mid[1], "chrome should settle before artwork: {mid:?}");
+        assert!(mid[1] > mid[2], "text should trail artwork slightly: {mid:?}");
+        let early = content_transition_weights_at(0.04);
+        assert_eq!(early[2], 0.0, "text delay should suppress the first few milliseconds");
     }
 
     #[test]
