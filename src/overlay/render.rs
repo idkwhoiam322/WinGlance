@@ -945,26 +945,7 @@ pub(super) fn draw_pixels(
         if content_alpha > 0.0 {
             let art_radius = art_size as f32 * 0.2;
             let art_x = inset + padding;
-            let (source_icon, fallback_playback, fallback_type) = match content {
-                MediaEvent::TrackChanged(track) => (
-                    track.app_icon.as_deref(),
-                    playback_state_for_track(track),
-                    track.playback_type,
-                ),
-                MediaEvent::PlaybackStateChanged(playback, source_app) => (
-                    if source_app.is_empty() {
-                        None
-                    } else {
-                        state
-                            .track_cache
-                            .get(source_app)
-                            .and_then(|track| track.app_icon.as_deref())
-                    },
-                    *playback,
-                    PlaybackType::Unknown,
-                ),
-                _ => (None, PlaybackState::NowPlaying, PlaybackType::Unknown),
-            };
+            let (source_icon, fallback_playback, fallback_type) = no_art_source_identity(state, content);
             draw_art_tile(
                 pixels,
                 width,
@@ -984,6 +965,35 @@ pub(super) fn draw_pixels(
         }
     }
     Ok(())
+}
+
+/// Returns the already-owned source identity used when album art is absent.
+/// Keeping this decision out of the large geometry functions avoids duplicating
+/// branches there and borrows the existing icon bytes without cloning them.
+fn no_art_source_identity<'a>(
+    state: &'a OverlayState,
+    content: &'a MediaEvent,
+) -> (Option<&'a [u8]>, PlaybackState, PlaybackType) {
+    match content {
+        MediaEvent::TrackChanged(track) => (
+            track.app_icon.as_deref(),
+            playback_state_for_track(track),
+            track.playback_type,
+        ),
+        MediaEvent::PlaybackStateChanged(playback, source_app) => (
+            if source_app.is_empty() {
+                None
+            } else {
+                state
+                    .track_cache
+                    .get(source_app)
+                    .and_then(|track| track.app_icon.as_deref())
+            },
+            *playback,
+            PlaybackType::Unknown,
+        ),
+        _ => (None, PlaybackState::NowPlaying, PlaybackType::Unknown),
+    }
 }
 
 /// Draws the art tile at (art_x, art_y): the accent halo behind the square,
@@ -2579,26 +2589,7 @@ pub(super) fn draw_compact_pill(
     // `Foreground` pass. Missing cover art reuses the source icon already
     // carried by the track/cache, so it adds no shell work or retained memory.
     if layer != RenderLayer::Foreground {
-        let (source_icon, fallback_playback, fallback_type) = match content {
-            MediaEvent::TrackChanged(track) => (
-                track.app_icon.as_deref(),
-                playback_state_for_track(track),
-                track.playback_type,
-            ),
-            MediaEvent::PlaybackStateChanged(playback, source_app) => (
-                if source_app.is_empty() {
-                    None
-                } else {
-                    state
-                        .track_cache
-                        .get(source_app)
-                        .and_then(|track| track.app_icon.as_deref())
-                },
-                *playback,
-                PlaybackType::Unknown,
-            ),
-            _ => (None, PlaybackState::NowPlaying, PlaybackType::Unknown),
-        };
+        let (source_icon, fallback_playback, fallback_type) = no_art_source_identity(state, content);
         draw_art_tile(
             pixels,
             width as usize,
