@@ -76,52 +76,6 @@ jobs:
       - name: Unused dependency check
         run: cargo machete
 
-  # One-shot checkpoint-only maintenance job used for the requested surgical
-  # renderer/doc edits. It restores this workflow from the triggering commit's
-  # parent and deletes its helper files before pushing the finished tree.
-  overlay-polish:
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && github.event.head_commit.message == 'chore: execute overlay patch' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: checkpoint
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      - name: Reconcile remaining docs
-        run: |
-          python scripts/one_shot_overlay_polish.py docs
-          cargo fmt --all
-          git add docs/architecture.md src/config.rs
-          git commit -m "docs: finish contract reconciliation"
-      - name: Improve no-art source presentation
-        run: |
-          python scripts/one_shot_overlay_polish.py no-art
-          cargo fmt --all
-          git add src/overlay/render.rs
-          git commit -m "feat(overlay): improve no-art source presentation"
-      - name: Refine content crossfade
-        run: |
-          python scripts/one_shot_overlay_polish.py crossfade
-          cargo fmt --all
-          git add src/overlay/render.rs
-          git commit -m "feat(overlay): refine content crossfade"
-      - name: Remove one-shot helpers and restore CI
-        run: |
-          git show "${GITHUB_SHA}^:.github/workflows/ci.yml" > .github/workflows/ci.yml
-          git rm .github/workflows/one-shot-overlay-polish.yml scripts/one_shot_overlay_polish.py
-          git add .github/workflows/ci.yml
-          git commit -m "chore: remove one-shot patch helpers"
-          git push origin HEAD:checkpoint
-
   mutation:
     if: ${{ (github.event_name == 'workflow_dispatch' && inputs.release != 'none') || (github.event_name == 'push' && github.ref == 'refs/heads/checkpoint' && contains(github.event.head_commit.message, '[mutation]')) }}
     needs: check
