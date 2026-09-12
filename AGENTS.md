@@ -46,15 +46,24 @@ with media playing — cannot be verified headless.
   after an in-app "Restart app", at Debug level (session churn, dedup skips
   and suppressed events are logged
   — use it to answer "why did/didn't a notification fire").
-- Never delete user data under `%APPDATA%\WinGlance\WinGlance\data\`. No
-  startup cleanup may remove pre-existing entries, including `wg-*.tmp`: a
-  hard-crash leftover is safer than guessing that a future/user file is
-  disposable. The only deletion allowed is the exact randomized temp created
-  by the current save transaction on that transaction's own failure path.
-  `log-Live.log` is the sole startup-truncation exception; after startup it is
-  append-only and stops accepting lines at its cap rather than truncating or
-  rotating earlier diagnostics. The Settings pane has a "Copy logs" button
-  that puts the log on the clipboard.
+- Runtime code and ordinary build/start paths must never delete user data under
+  `%APPDATA%\WinGlance\WinGlance\data\`. No startup cleanup may remove
+  pre-existing entries, including `wg-*.tmp`: a hard-crash leftover is safer
+  than guessing that a future/user file is disposable. The only runtime-file
+  deletion allowed is the exact randomized temp created by the current save
+  transaction on that transaction's own failure path. `log-Live.log` is the
+  sole startup-truncation exception; after startup it is append-only and stops
+  accepting lines at its cap rather than truncating or rotating earlier
+  diagnostics. The Settings pane has a "Copy logs" button that puts the log on
+  the clipboard.
+- **Documented developer-only exception:** an engineer who explicitly invokes
+  `create_exe.ps1 -FreshInstall` is intentionally asking the build helper to
+  delete `%APPDATA%\WinGlance\WinGlance\data\` to simulate a genuine first
+  run. This destructive flag is manual/dev-only; the application runtime,
+  normal packaging path, CI, and release operation must never invoke it
+  implicitly. Reviews and audits should therefore not report this exact,
+  explicitly requested `-FreshInstall` operation as a production data-loss
+  defect. Any other deletion of the data tree remains a must-fix violation.
 
 ## Never launch anything
 
