@@ -32,7 +32,7 @@ the top of the screen when the track or the playback state changes.
 
 ## Overlay
 
-The overlay owns one local passive status state that is deliberately **not** a `MediaEvent`. On startup and after the last notification settles it renders a compact `No media playing` pill; when notifications are disabled (or both notification event types are disabled) the same card reads `Notifications paused` instead. The status has no dismiss deadline, progress animation, comet, or hover action. Real SMTC events replace the active no-media status immediately. Keeping this state local prevents synthetic status from entering history, deduplication, source-ledger, or worker transport semantics.
+The overlay owns one local passive status state that is deliberately **not** a `MediaEvent`, but that state is presented only by `PersistentCompact`. Expanded, Compact, and Auto are transient notification layouts and return to `Hidden` after their last notification settles. In Persistent Compact, startup/no-media renders a compact `No media playing` card; when notifications are disabled (or both notification event types are disabled) the same card reads `Notifications paused` instead. The passive status has no dismiss deadline, progress animation, comet, marquee, or hover action. Real SMTC events replace it immediately, and the correct passive/media state is restored after any configured fullscreen/listed-foreground suppression clears. Keeping this state local prevents synthetic status from entering history, deduplication, source-ledger, or worker transport semantics.
 
 
 ## Threading model
@@ -359,10 +359,12 @@ clears the leave. What a hover does follows the pill's *effective* layout
 (an Auto pill follows whichever layout is currently in effect) and the two
 toggles `dismiss_on_hover` and `expand_compact_on_hover`:
 
-- **Expanded layout** — hovering has no interaction with the pill: the
-  countdown is never deferred for the cursor, so the pill dismisses on its
-  deadline even under it. With `dismiss_on_hover` (default) the first hover
-  tick arms the one-way 500 ms dismiss (`EARLY_EXIT_MS`); without it,
+- **Expanded layout** — the countdown is never held merely because the
+  cursor is over the pill. With `dismiss_on_hover` (default), the first hover
+  tick temporarily caps the remaining lifetime at 500 ms (`EARLY_EXIT_MS`).
+  Leaving before that hover cap fires restores the deadline that existed before
+  the hover; staying hovered lets the cap dismiss the pill, and leaving never
+  revives a deadline that had already expired. With `dismiss_on_hover` off,
   hovering changes nothing.
 - **Compact layout, `expand_compact_on_hover` (default)** — the first hover
   of a showing starts an in-place morph to the expanded layout (the pill's
