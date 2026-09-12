@@ -74,8 +74,11 @@ WinGlance/
   position, the expand/light/collapse state machine, the palette aura, the
   per-track fill tint, the directional edge highlight, vector playback
   glyphs (play/pause/stop/music note), marquee rows, and the hover
-  expand/dismiss interaction. The `set_*` push functions and `show_sample`
-  are the only entry points other windows reach into.
+  expand/dismiss interaction. Expanded, Compact, and Auto are transient
+  notification layouts; Persistent Compact alone owns the between-notification
+  passive status (`No media playing` / `Notifications paused`) and persistent
+  now-playing rest. The `set_*` push functions and `show_sample` are the only
+  entry points other windows reach into.
 - **icon.rs** — resolves a source app's icon from its AUMID through the shell
   (`SHCreateItemFromParsingName` + `IShellItemImageFactory`), cached per
   source. All shell calls run on one persistent bounded worker thread (16-job
@@ -144,13 +147,23 @@ default). Useful flags: `-NoRestart` leaves the previous instance stopped,
 `-SkipAudit` skips advisory/dependency checks, `-NoThrottle` uses all CPU
 cores.
 
+`-FreshInstall` is intentionally different: it is a destructive, developer-only
+first-run simulation. When an engineer explicitly supplies that flag, the build
+helper removes `%APPDATA%\WinGlance\WinGlance\data\` before building so the next
+launch behaves like a genuine first install. It is never invoked by the
+application runtime, ordinary packaging, CI, or release operation. This exact
+manual operation is the documented exception to the repository's otherwise
+strict rule that runtime/normal tooling must never delete user data; reviews
+should not reopen it as a production data-loss finding. Any implicit or runtime
+deletion of the data tree remains prohibited.
+
 ## Self-contained distribution
 
 The release build produces a single `target\release\WinGlance.exe` (profile:
 `codegen-units = 1`, `lto = "fat"`, `strip = "symbols"`). It has no data
 dependencies: config and logs are created at first run under
 `%APPDATA%\WinGlance\WinGlance\data\`, and every icon/resource is drawn with system GDI
-calls. On a genuine first-ever launch, WinGlance opens the tracking window once so the user can review Settings. Later Start-menu launches and logon starts surface only the tray icon and always-visible pill — no console or dialogs — unless the user explicitly opens the window from the tray.
+calls. On a genuine first-ever launch, WinGlance opens the tracking window once so the user can review Settings. Later Start-menu launches and logon starts surface only the tray icon plus any overlay required by the selected layout — transient layouts hide when idle, while Persistent Compact retains its passive/status pill — with no console or dialogs unless the user explicitly opens the tracking window from the tray.
 
 ## Runtime data
 
