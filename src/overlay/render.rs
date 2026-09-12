@@ -849,6 +849,26 @@ pub(super) fn draw_pixels(
         if content_alpha > 0.0 {
             let art_radius = art_size as f32 * 0.2;
             let art_x = inset + padding;
+            let (source_icon, fallback_playback, fallback_type) = match content {
+                MediaEvent::TrackChanged(track) => (
+                    track.app_icon.as_deref(),
+                    playback_state_for_track(track),
+                    track.playback_type,
+                ),
+                MediaEvent::PlaybackStateChanged(playback, source_app) => (
+                    if source_app.is_empty() {
+                        None
+                    } else {
+                        state
+                            .track_cache
+                            .get(source_app)
+                            .and_then(|track| track.app_icon.as_deref())
+                    },
+                    *playback,
+                    PlaybackType::Unknown,
+                ),
+                _ => (None, PlaybackState::NowPlaying, PlaybackType::Unknown),
+            };
             draw_art_tile(
                 pixels,
                 width,
@@ -859,6 +879,9 @@ pub(super) fn draw_pixels(
                 art_size,
                 art_radius,
                 state.decoded_art.as_deref(),
+                source_icon,
+                fallback_playback,
+                fallback_type,
                 scale,
                 content_alpha,
             );
@@ -868,8 +891,8 @@ pub(super) fn draw_pixels(
 }
 
 /// Draws the art tile at (art_x, art_y): the accent halo behind the square,
-/// the cover (or the accent placeholder when no art decoded) and the glowing
-/// rim. Shared by the track- and state-pill arms, which differ only in the
+/// the cover (or a source-identity fallback tile when no art decoded) and the
+/// glowing rim. Shared by the track- and state-pill arms, which differ only in the
 /// art-size clamp the caller applies. The mask radius must match the one
 /// `draw_art_scaled` uses for the art bitmap itself, not the pill's
 /// `corner_radius` (either pill radius — this runs on the expanded-only
@@ -886,6 +909,9 @@ pub(super) fn draw_art_tile(
     art_size: usize,
     art_radius: f32,
     decoded_art: Option<&[u8]>,
+    source_icon: Option<&[u8]>,
+    fallback_playback: PlaybackState,
+    fallback_type: PlaybackType,
     scale: f32,
     content_alpha: f32,
 ) {
@@ -909,7 +935,20 @@ pub(super) fn draw_art_tile(
     if let Some(art) = decoded_art {
         draw_art_scaled(pixels, width, art, art_x, art_y, art_size, accent, content_alpha);
     } else {
-        draw_placeholder(pixels, width, art_x, art_y, art_size, dim_color(accent, content_alpha));
+        draw_no_art_source_tile(
+            pixels,
+            width,
+            accent,
+            art_x,
+            art_y,
+            art_size,
+            art_radius,
+            source_icon,
+            fallback_playback,
+            fallback_type,
+            scale,
+            content_alpha,
+        );
     }
     // Glowing rim: thin 1.5px accent stroke around the album art.
     if let Some(c) = palette.map(|p| p.primary) {
@@ -924,6 +963,91 @@ pub(super) fn draw_art_tile(
                 }
             }
         }
+    }
+}
+
+/// Missing artwork should still identify the source instead of looking like a
+/// generic error placeholder. The tile keeps the same rounded footprint as real
+/// cover art, uses a restrained accent wash/rim, and centers the already-cached
+/// source-app icon. If shell icon extraction was unavailable, the current media
+/// state glyph is used as the final no-allocation fallback.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_no_art_source_tile(
+    pixels: &mut [u8],
+    width: usize,
+    accent: [u8; 4],
+    art_x: usize,
+    art_y: usize,
+    art_size: usize,
+    art_radius: f32,
+    source_icon: Option<&[u8]>,
+    fallback_playback: PlaybackState,
+    fallback_type: PlaybackType,
+    scale: f32,
+    content_alpha: f32,
+) {
+    if art_size == 0 || content_alpha <= 0.0 {
+        return;
+    }
+
+    // Keep the tile quiet enough that a real cover remains visually dominant.
+    // The source icon supplies identity; the tint only gives it a deliberate
+    // surface instead of the old solid accent circle.
+    let fill = dim_color(accent, 0.24 * content_alpha);
+    draw_rounded_rect_filled(
+        pixels,
+        width,
+        art_x as i32,
+        art_y as i32,
+        art_size as i32,
+        art_size as i32,
+        art_radius,
+        fill,
+    );
+
+    // A soft accent rim keeps the no-art tile aligned with the real-cover
+    // treatment even when no palette was available to drive the normal rim.
+    let stroke_w = (1.25 * scale).round().max(1.0);
+    for dy in 0..art_size {
+        for dx in 0..art_size {
+            let d = round_rect_signed_dist(dx as f32, dy as f32, art_size as f32, art_size as f32, art_radius);
+            if d.abs() < stroke_w {
+                let edge = 1.0 - d.abs() / stroke_w;
+                let alpha = (accent[3] as f32 * 0.55 * content_alpha * edge) as u32;
+                composite(
+                    pixels,
+                    width,
+                    art_x + dx,
+                    art_y + dy,
+                    [accent[0], accent[1], accent[2]],
+                    alpha,
+                );
+            }
+        }
+    }
+
+    let mark_size = ((art_size as f32 * 0.58).round() as usize).clamp(1, art_size);
+    let mark_x = art_x + (art_size - mark_size) / 2;
+    let mark_y = art_y + (art_size - mark_size) / 2;
+    if let Some(icon) = source_icon.filter(|icon| icon.len() >= 24 * 24 * 4) {
+        draw_icon_scaled(pixels, width, icon, 24, mark_x, mark_y, mark_size, 0.92 * content_alpha);
+    } else {
+        let bright_accent = relative_luminance([accent[0], accent[1], accent[2]]) > 0.45;
+        let glyph = if bright_accent {
+            [0, 0, 0, 255]
+        } else {
+            [255, 255, 255, 255]
+        };
+        draw_symbol_pixels(
+            pixels,
+            width,
+            (mark_x + mark_size) as i32,
+            mark_y as i32,
+            mark_size as f32,
+            fallback_playback,
+            fallback_type,
+            dim_color(glyph, 0.86 * content_alpha),
+        );
     }
 }
 
@@ -2348,16 +2472,37 @@ pub(super) fn draw_compact_pill(
     // Art tile: left-aligned like the expanded pill (inset + padding),
     // vertically centered on the row. This is the only place the compact
     // art is drawn — `draw_pixels` skips its art arms in compact mode, so
-    // the halo, cover and rim composite exactly once. The placeholder is
-    // drawn here too when no cover is available. During a morph this tile
-    // fades out with the compact content while the expanded tile fades in
-    // (in `draw_pixels`), so the two cross-fade like every other element.
+    // the halo, cover and rim composite exactly once. When cover art is
+    // absent, the tile carries the source icon (or the playback/media glyph
+    // as a last fallback). During a morph this tile fades with the rest of
+    // the compact/expanded content.
     let art_size = (metrics.art * scale).round() as i32;
     let art_x = inset + padding;
     let art_y = inset + (pill_h - art_size) / 2;
-    // The art tile is static; the `Foreground` pass only re-composites the
-    // scrolling title, so skip it there (it is painted in the geometry pass).
+    // The art tile is static; only the scrolling title belongs in the
+    // `Foreground` pass. Missing cover art reuses the source icon already
+    // carried by the track/cache, so it adds no shell work or retained memory.
     if layer != RenderLayer::Foreground {
+        let (source_icon, fallback_playback, fallback_type) = match content {
+            MediaEvent::TrackChanged(track) => (
+                track.app_icon.as_deref(),
+                playback_state_for_track(track),
+                track.playback_type,
+            ),
+            MediaEvent::PlaybackStateChanged(playback, source_app) => (
+                if source_app.is_empty() {
+                    None
+                } else {
+                    state
+                        .track_cache
+                        .get(source_app)
+                        .and_then(|track| track.app_icon.as_deref())
+                },
+                *playback,
+                PlaybackType::Unknown,
+            ),
+            _ => (None, PlaybackState::NowPlaying, PlaybackType::Unknown),
+        };
         draw_art_tile(
             pixels,
             width as usize,
@@ -2368,6 +2513,9 @@ pub(super) fn draw_compact_pill(
             art_size as usize,
             art_size as f32 * 0.2,
             state.decoded_art.as_deref(),
+            source_icon,
+            fallback_playback,
+            fallback_type,
             scale,
             content_alpha,
         );
