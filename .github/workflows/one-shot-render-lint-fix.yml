@@ -1,0 +1,29 @@
+name: One-shot render lint fix
+
+on:
+  push:
+    branches:
+      - checkpoint
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: contains(github.event.head_commit.message, 'run render lint fix')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: checkpoint
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Apply lint fix
+        run: python scripts/one_shot_render_lint_fix.py
+      - name: Commit and push
+        run: |
+          git add src/overlay/render.rs
+          git commit -m "fix(overlay): keep legacy blend helper test-only"
+          git push origin HEAD:checkpoint
