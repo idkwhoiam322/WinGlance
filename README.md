@@ -33,9 +33,11 @@ interrupts and never needs interaction.
   the visible band, then stop when shown.
 - **Placement** — anchor to any of six screen edges with a configurable
   margin, or drag to a custom spot with the built-in positioner.
-- **Persistent Compact layout** — the pill never fully disappears while
-  media is playing: after its duration it rests at idle opacity instead of
-  collapsing, so the now-playing info stays on screen.
+- **Persistent Compact layout** — unlike the transient Expanded, Compact, and
+  Auto layouts, Persistent Compact keeps a compact status pill present between
+  notifications. While media is active it settles to the current source at idle
+  opacity; with no active media it shows the passive `No media playing` status,
+  or `Notifications paused` when notifications are disabled.
 - **Preferred source (pin)** — with a pin set, the persistent pill returns
   to that app's current track whenever it would fade out, while that source
   is actually playing; a paused/stopped pin is never resurrected, and with
@@ -61,13 +63,18 @@ restarts stay silent in the tray. Open the tracking window again by clicking (or
 double-clicking) the tray icon. It shows the current activity and a per-source
 history on the **Now Playing** pane, plus a **Settings** pane mirroring the tray
 menu (notifications, duration, start-on-login, close-to-tray, allowed apps,
-layout, position, monitor, preferred source, logs). While no media is
-active, the passive compact pill remains visible as **No media playing**; a real
-media notification temporarily replaces it and the idle status returns after the
-notification settles. When notifications are disabled, the same passive card
-reads **Notifications paused** instead of incorrectly claiming that no media is
-playing. The passive card is static, so it does not continuously rerender or
-animate.
+layout, position, monitor, preferred source, logs).
+
+Expanded, Compact, and Auto are transient notification layouts: when their
+current notification settles and there is nothing else to show, the overlay
+hides. Persistent Compact is the always-present status layout. In that mode,
+no active media renders the passive **No media playing** card, and disabling
+notifications changes the same passive card to **Notifications paused** instead
+of incorrectly claiming that media stopped. The passive card has no dismiss
+deadline, progress movement, comet, marquee, or hover action, so it does not
+continuously rerender. Explicit fullscreen/listed-foreground suppression can
+still hide Persistent Compact when configured; the correct status/content is
+restored when that suppression clears.
 
 ### Tray menu
 
@@ -109,8 +116,10 @@ Requires the stable MSVC Rust toolchain (or use the CI/release builds):
 The script format-checks, lints, tests, builds an optimized `WinGlance.exe`,
 runs `cargo-audit`/`cargo-deny`, stops any running instance, and relaunches
 it into the tray. Flags: `-NoRestart` (don't relaunch), `-SkipAudit` (fast
-loop), `-NoThrottle` / `-Jobs N` (parallelism). Direct checks:
-`cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`,
+loop), `-NoThrottle` / `-Jobs N` (parallelism). `-FreshInstall` is an explicit,
+destructive developer-only first-run simulation: it removes WinGlance's app-data
+tree before the build and is never a normal runtime, CI, or release path. Direct
+checks: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`,
 `cargo test --locked`, `cargo build --release --locked`.
 
 ## How it works
@@ -148,7 +157,17 @@ rendering pipeline and dedup design.
 
 ## CI and releases
 
-`ci.yml` runs the Windows format/lint/test/release-build/audit/deny gate plus a pinned Rust static-metrics and unused-dependency gate on pushes to `main`/`checkpoint` and on pull requests. Cyclomatic and cognitive complexity must each stay below 22 per function/closure, and Halstead difficulty below 80. A manually dispatched release additionally runs pinned `cargo-mutants` and requires zero surviving viable mutants in the explicitly documented deterministic audit/remediation core. See `docs/quality.md` for the exact mutation scope, the monotonic complexity ratchet, and metrics that are intentionally not fabricated.
+`ci.yml` runs the Windows format/lint/test/release-build/audit/deny gate plus a
+pinned Rust static-metrics and unused-dependency gate on pushes to
+`main`/`checkpoint` and on pull requests. Cyclomatic/cognitive complexity below
+22 and Halstead difficulty below 80 are the project targets. Historical
+platform-boundary functions that already exceed a target are grandfathered by a
+monotonic ratchet: CI rejects new/worsened overages instead of forcing risky
+metric-only rewrites. Release mutation testing likewise requires zero surviving
+viable mutants in the explicitly documented deterministic audit/remediation
+core, not an unsubstantiated repository-wide claim. Metrics that cannot be
+measured credibly (for example CRAP without trustworthy function-level coverage
+mapping) are not fabricated. See `docs/quality.md` for the exact policy.
 
 ## License
 

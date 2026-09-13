@@ -216,8 +216,9 @@ pub struct OverlayConfig {
     pub compact_monitor_device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_monitor_device_index: Option<u32>,
-    /// Hovering a pill in the *Expanded* layout arms its dismissal: the
-    /// remaining time is capped at 500 ms, one-way (see `EARLY_EXIT_MS`).
+    /// Hovering a pill in the *Expanded* layout temporarily caps the
+    /// remaining time at 500 ms (see `EARLY_EXIT_MS`); leaving before that
+    /// hover cap fires restores the deadline that existed before the hover.
     /// For pills in the Compact layout it makes the second hover dismiss
     /// (see `expand_compact_on_hover`): the first hover expands, later
     /// hovers dismiss. While off, no hover ever dismisses a pill.
