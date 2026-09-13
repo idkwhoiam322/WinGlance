@@ -76,6 +76,7 @@ pub(super) fn content_transition_weights_at(t: f32) -> [f32; 3] {
 
 /// Premultiplied per-byte blend retained for tests and callers that need one
 /// curve across a whole packed frame.
+#[cfg(test)]
 pub(super) fn blend_frames(to: &mut [u8], from: &[u8], weight: f32) {
     for (dst, src) in to.iter_mut().zip(from.iter()) {
         *dst = (*dst as f32 * weight + *src as f32 * (1.0 - weight)).round() as u8;
