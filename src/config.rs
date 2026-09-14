@@ -238,6 +238,12 @@ pub struct OverlayConfig {
     /// when the source has stopped (tombstone). Fullscreen/listed-foreground
     /// hiding (`hide_for_auto_compact_sources`) applies either way. Default: `true`.
     pub fade_persistent_pill: bool,
+    /// Optional Windows 11 translucent material behind the pill. The
+    /// existing layered renderer remains responsible for all content; a
+    /// companion DWM backdrop is created lazily only while this is true.
+    /// Unsupported systems and accessibility modes fall back to the
+    /// existing solid fill. Default: false.
+    pub glass_effect: bool,
     /// Unknown keys under `[overlay]`, preserved across saves.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -431,6 +437,7 @@ impl Default for OverlayConfig {
             dismiss_on_hover: true,
             expand_compact_on_hover: true,
             fade_persistent_pill: true,
+            glass_effect: false,
             unknown: toml::Table::new(),
         }
     }

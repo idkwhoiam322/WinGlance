@@ -163,6 +163,8 @@ pub(super) fn render_layered(
     scale_factor: f32,
     orbit_angle: Option<f32>,
 ) -> Result<()> {
+    let glass_requested = state.config.overlay.glass_effect;
+    state.backdrop.prepare(glass_requested);
     let inset = state.aura_inset;
     let buf_w = (width + inset * 2).max(1);
     let buf_h = (height + inset * 2).max(1);
@@ -487,6 +489,11 @@ pub(super) fn render_layered(
             ULW_ALPHA,
         )
     };
+    if state.backdrop.active() {
+        state
+            .backdrop
+            .sync(state.hwnd, position.x + inset, position.y + inset, width, height);
+    }
     // Re-assert topmost on every upload (a foreground fullscreen window can
     // take the z-order), but let `UpdateLayeredWindow` own the geometry: when
     // position and size match the previous upload it re-applies them anyway,
@@ -1890,14 +1897,21 @@ pub(super) fn pill_fill_bg(state: &OverlayState) -> [u8; 4] {
     if crate::winutil::system_preferences().high_contrast {
         return crate::winutil::system_window_color();
     }
-    match state.palette {
+    let mut fill = match state.palette {
         Some(palette) => tinted_fill(
             state.config.appearance.background_color,
             palette.primary,
             FILL_TINT_WEIGHT,
         ),
         None => state.config.appearance.background_color,
+    };
+    if state.backdrop.active() {
+        // Keep enough tint for text contrast while allowing the system
+        // material to read through. The final alpha is also multiplied by
+        // the normal frame/persistent-fade alpha later in the pipeline.
+        fill[3] = fill[3].min(176);
     }
+    fill
 }
 
 /// The effective pill text color: the configured color normally, the system

@@ -56,6 +56,10 @@ dismiss_on_hover = true
 # off, every hover re-expands. Off: Compact pills behave exactly like
 # Expanded ones.
 expand_compact_on_hover = true
+# Optional Windows 11 Desktop Acrylic material behind the pill body. Off by
+# default. High Contrast, the system's reduced-overlap preference, or an
+# unsupported Windows build automatically keeps the existing solid material.
+glass_effect = false
 # With layout = "persistent-compact", fade the pill to idle opacity after
 # duration_ms of no cursor interaction. Off: the pill stays at full opacity
 # while media is playing or paused (no idle fade), and hides only when the

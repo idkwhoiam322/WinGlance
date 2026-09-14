@@ -7,8 +7,8 @@ use crate::events::{
 use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
     EventQueue, OverlayPos, enumerate_displays_cached, invalidate_display_cache, set_dismiss_on_hover, set_duration,
-    set_expand_compact_on_hover, set_fade_persistent_pill, set_hide_for_auto_compact_sources, set_layout,
-    set_pinned_source, set_positions, show_sample,
+    set_expand_compact_on_hover, set_fade_persistent_pill, set_glass_effect, set_hide_for_auto_compact_sources,
+    set_layout, set_pinned_source, set_positions, show_sample,
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG, PINNED_SOURCE_RESULT_MSG};
@@ -374,6 +374,7 @@ enum SettingId {
     ExpandCompactOnHover,
     HideForAutoCompactSources,
     FadePersistentPill,
+    GlassEffect,
     PinnedSource,
     CompactPosition,
     AutoCompactApps,
@@ -3180,6 +3181,16 @@ impl MainWindowState {
         });
         y += row_h + gap;
         natural.push(SettingsItem::Row {
+            id: SettingId::GlassEffect,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        natural.push(SettingsItem::Row {
             id: SettingId::FadePersistentPill,
             rect: RECT {
                 left,
@@ -3356,6 +3367,7 @@ impl MainWindowState {
         let auto_compact_sources = cfg.behavior.auto_compact_sources.join(", ");
         let hide_for_auto_compact = cfg.behavior.hide_for_auto_compact_sources;
         let fade_persistent_pill = cfg.overlay.fade_persistent_pill;
+        let glass_effect = cfg.overlay.glass_effect;
         let display_count = enumerate_displays_cached().len();
 
         let mut hdr = RECT {
@@ -3554,6 +3566,15 @@ impl MainWindowState {
                             },
                             if hide_for_auto_compact { accent } else { colors.faint },
                         ),
+                        SettingId::GlassEffect => (
+                            "Windows 11 glass effect",
+                            if glass_effect {
+                                "ON".to_string()
+                            } else {
+                                "OFF".to_string()
+                            },
+                            if glass_effect { accent } else { colors.faint },
+                        ),
                         SettingId::FadePersistentPill => (
                             "Fade Persistent Compact Pill after duration",
                             if fade_persistent_pill {
@@ -3608,6 +3629,7 @@ impl MainWindowState {
                         | SettingId::ExpandCompactOnHover
                         | SettingId::HideForAutoCompactSources
                         | SettingId::FadePersistentPill
+                        | SettingId::GlassEffect
                         | SettingId::PinnedSource
                         | SettingId::AutoCompactApps
                         | SettingId::Monitor => {
@@ -5799,6 +5821,7 @@ enum SettingAction {
     ToggleExpandCompactOnHover,
     ToggleHideForAutoCompactSources,
     ToggleFadePersistentPill,
+    ToggleGlassEffect,
     ToggleSeparateCompact,
     SetCompactAnchor(VerticalPosition, HorizontalPosition),
     ResetCompactPosition,
@@ -5864,6 +5887,7 @@ fn setting_action_at(id: SettingId, rect: &RECT, x: i32, y: i32, scale: f32) -> 
         SettingId::ExpandCompactOnHover => Some(SettingAction::ToggleExpandCompactOnHover),
         SettingId::HideForAutoCompactSources => Some(SettingAction::ToggleHideForAutoCompactSources),
         SettingId::FadePersistentPill => Some(SettingAction::ToggleFadePersistentPill),
+        SettingId::GlassEffect => Some(SettingAction::ToggleGlassEffect),
         SettingId::SeparateCompact => Some(SettingAction::ToggleSeparateCompact),
         SettingId::CompactPosition | SettingId::Position => {
             let parts = position_parts(rect, scale);
@@ -6035,6 +6059,13 @@ fn perform_setting_action(hwnd: HWND, id: SettingId, row_index: usize, rect: &RE
             state.mutate_config(|cfg| cfg.behavior.hide_for_auto_compact_sources = new_value);
             set_hide_for_auto_compact_sources(state.overlay_hwnd, new_value);
             info!("hide for auto compact sources set: {new_value}");
+            state.invalidate();
+        }
+        SettingAction::ToggleGlassEffect => {
+            let new_value = !state.cfg().overlay.glass_effect;
+            state.mutate_config(|cfg| cfg.overlay.glass_effect = new_value);
+            set_glass_effect(state.overlay_hwnd, new_value);
+            info!("glass effect set: {new_value}");
             state.invalidate();
         }
         SettingAction::ToggleFadePersistentPill => {
@@ -7545,6 +7576,7 @@ fn setting_label(id: SettingId) -> &'static str {
         SettingId::ExpandCompactOnHover => "Expand compact on hover",
         SettingId::HideForAutoCompactSources => "Hide Persistent Compact Pill for Auto-compact Apps",
         SettingId::FadePersistentPill => "Fade Persistent Compact Pill after duration",
+        SettingId::GlassEffect => "Windows 11 glass effect",
         SettingId::PinnedSource => "Pinned source",
         SettingId::Monitor => "Monitor",
         SettingId::ShowSample => "Preview Notification",
@@ -7567,6 +7599,7 @@ fn setting_is_toggle(id: SettingId) -> bool {
             | SettingId::ExpandCompactOnHover
             | SettingId::HideForAutoCompactSources
             | SettingId::FadePersistentPill
+            | SettingId::GlassEffect
     )
 }
 
@@ -7597,6 +7630,7 @@ fn setting_value(id: SettingId, cfg: &Config) -> String {
         SettingId::ExpandCompactOnHover => on_off(cfg.overlay.expand_compact_on_hover),
         SettingId::HideForAutoCompactSources => on_off(cfg.behavior.hide_for_auto_compact_sources),
         SettingId::FadePersistentPill => if cfg.overlay.fade_persistent_pill { "Yes" } else { "No" }.into(),
+        SettingId::GlassEffect => on_off(cfg.overlay.glass_effect),
         // No pin is spelled out (like the empty Auto-compact list) so the UIA
         // name never reads a bare "Pinned source:".
         SettingId::PinnedSource => cfg.behavior.pinned_source.clone().unwrap_or_else(|| "None".into()),
@@ -7667,6 +7701,7 @@ fn setting_toggle_on(id: SettingId, cfg: &Config) -> bool {
         SettingId::ExpandCompactOnHover => cfg.overlay.expand_compact_on_hover,
         SettingId::HideForAutoCompactSources => cfg.behavior.hide_for_auto_compact_sources,
         SettingId::FadePersistentPill => cfg.overlay.fade_persistent_pill,
+        SettingId::GlassEffect => cfg.overlay.glass_effect,
         _ => false,
     }
 }
@@ -9296,6 +9331,7 @@ mod tests {
             SettingId::ExpandCompactOnHover,
             SettingId::HideForAutoCompactSources,
             SettingId::FadePersistentPill,
+            SettingId::GlassEffect,
             SettingId::PinnedSource,
             SettingId::Monitor,
             SettingId::ShowSample,
