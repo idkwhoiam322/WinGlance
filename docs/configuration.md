@@ -53,6 +53,7 @@ the file itself is not rewritten (see `docs/architecture.md`).
 | `compact_monitor_device_id` / `compact_monitor_device_index` | *(managed)* | string / integer | Managed identity metadata for the independent Compact monitor slot |
 | `dismiss_on_hover` | `true` | bool | Hovering a pill in the Expanded layout arms a 500 ms dismissal cap; leaving before it fires cancels that hover cap and restores the prior deadline. For Compact pills it makes the second hover dismiss (see below) |
 | `expand_compact_on_hover` | `true` | bool | Hovering a pill in the Compact layout expands it in place; with `dismiss_on_hover` on, the second hover dismisses (see below) |
+| `glass_effect` | `false` | bool | Opt in to the Windows 11 Desktop Acrylic material behind the pill body. The existing layered renderer still draws content and the aura. Unsupported DWM backdrops, High Contrast, or the system reduced-overlap preference fall back to the existing solid material |
 | `fade_persistent_pill` | `true` | bool | With `layout = "persistent-compact"`, fade the pill to idle opacity once `duration_ms` passes without cursor interaction. Off: the pill stays at full opacity while media is playing or paused (no idle fade), and hides only when the source has stopped. Hiding for fullscreen/listed foregrounds (`hide_for_auto_compact_sources`) applies either way |
 
 `layout` accepts one of:
