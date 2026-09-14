@@ -16,15 +16,15 @@ use std::sync::OnceLock;
 use windows::Foundation::Numerics::Vector2;
 use windows::Foundation::{IPropertyValue, PropertyValue};
 use windows::Graphics::Effects::{
-    IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectSource_Impl, IGraphicsEffect_Impl,
+    IGraphicsEffect, IGraphicsEffect_Impl, IGraphicsEffectSource, IGraphicsEffectSource_Impl,
 };
 use windows::System::DispatcherQueueController;
+use windows::UI::Color;
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
     CompositionColorBrush, CompositionEffectSourceParameter, CompositionRoundedRectangleGeometry, Compositor,
     ContainerVisual, SpriteVisual,
 };
-use windows::UI::Color;
 use windows::Win32::Foundation::{E_INVALIDARG, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
@@ -132,52 +132,83 @@ struct CompositionGlass {
     opacity: u8,
 }
 
+fn create_dispatcher_queue() -> Option<DispatcherQueueController> {
+    let options = DispatcherQueueOptions {
+        dwSize: size_of::<DispatcherQueueOptions>() as u32,
+        threadType: DQTYPE_THREAD_CURRENT,
+        apartmentType: DQTAT_COM_NONE,
+    };
+    // A queue may already belong to this UI thread. In that case creation
+    // fails, but the existing queue is sufficient for the compositor.
+    unsafe { CreateDispatcherQueueController(options) }.ok()
+}
+
+fn create_composition_target(
+    hwnd: HWND,
+) -> WinResult<(Option<DispatcherQueueController>, Compositor, DesktopWindowTarget)> {
+    let queue = create_dispatcher_queue();
+    let compositor = Compositor::new()?;
+    let interop: ICompositorDesktopInterop = compositor.cast()?;
+    let target = unsafe { interop.CreateDesktopWindowTarget(hwnd, true)? };
+    Ok((queue, compositor, target))
+}
+
+fn configure_blur_visual(compositor: &Compositor, blur_visual: &SpriteVisual) -> WinResult<()> {
+    let parameter_name = HSTRING::from("backdrop");
+    let parameter = CompositionEffectSourceParameter::Create(&parameter_name)?;
+    let effect_source: IGraphicsEffectSource = parameter.cast()?;
+    let effect: IGraphicsEffect = GaussianBlurEffect {
+        source: effect_source,
+        blur_amount: BLUR_AMOUNT,
+    }
+    .into();
+    let factory = compositor.CreateEffectFactory(&effect)?;
+    let effect_brush = factory.CreateBrush()?;
+    // HostBackdrop samples behind the HWND before this window is drawn. The
+    // ordinary Backdrop brush only samples visuals already inside the target,
+    // which is not the desktop/game content this companion window needs.
+    let backdrop_brush = compositor.CreateHostBackdropBrush()?;
+    effect_brush.SetSourceParameter(&parameter_name, &backdrop_brush)?;
+    blur_visual.SetBrush(&effect_brush)?;
+    Ok(())
+}
+
+fn create_glass_visuals(
+    compositor: &Compositor,
+    target: &DesktopWindowTarget,
+    tint: [u8; 3],
+) -> WinResult<(
+    ContainerVisual,
+    SpriteVisual,
+    SpriteVisual,
+    CompositionColorBrush,
+    CompositionRoundedRectangleGeometry,
+)> {
+    let root = compositor.CreateContainerVisual()?;
+    let blur_visual = compositor.CreateSpriteVisual()?;
+    let tint_visual = compositor.CreateSpriteVisual()?;
+    configure_blur_visual(compositor, &blur_visual)?;
+
+    let tint_brush = compositor.CreateColorBrushWithColor(glass_color(tint))?;
+    tint_visual.SetBrush(&tint_brush)?;
+
+    let clip_geometry = compositor.CreateRoundedRectangleGeometry()?;
+    let clip = compositor.CreateGeometricClipWithGeometry(&clip_geometry)?;
+    root.SetClip(&clip)?;
+
+    let children = root.Children()?;
+    children.InsertAtBottom(&blur_visual)?;
+    children.InsertAtTop(&tint_visual)?;
+    target.SetRoot(&root)?;
+    Ok((root, blur_visual, tint_visual, tint_brush, clip_geometry))
+}
+
 impl CompositionGlass {
     fn new(hwnd: HWND) -> WinResult<Self> {
-        let options = DispatcherQueueOptions {
-            dwSize: size_of::<DispatcherQueueOptions>() as u32,
-            threadType: DQTYPE_THREAD_CURRENT,
-            apartmentType: DQTAT_COM_NONE,
-        };
-        // A queue may already belong to this UI thread. In that case the
-        // creation call fails, but the existing queue is sufficient for the
-        // compositor, so retain a controller only when WinGlance created it.
-        let queue = unsafe { CreateDispatcherQueueController(options) }.ok();
-        let compositor = Compositor::new()?;
-        let interop: ICompositorDesktopInterop = compositor.cast()?;
-        let target = unsafe { interop.CreateDesktopWindowTarget(hwnd, true)? };
-
-        let root = compositor.CreateContainerVisual()?;
-        let blur_visual = compositor.CreateSpriteVisual()?;
-        let tint_visual = compositor.CreateSpriteVisual()?;
-
-        let parameter_name = HSTRING::from("backdrop");
-        let parameter = CompositionEffectSourceParameter::Create(&parameter_name)?;
-        let effect_source: IGraphicsEffectSource = parameter.cast()?;
-        let effect: IGraphicsEffect = GaussianBlurEffect {
-            source: effect_source,
-            blur_amount: BLUR_AMOUNT,
-        }
-        .into();
-        let factory = compositor.CreateEffectFactory(&effect)?;
-        let effect_brush = factory.CreateBrush()?;
-        let backdrop_brush = compositor.CreateBackdropBrush()?;
-        effect_brush.SetSourceParameter(&parameter_name, &backdrop_brush)?;
-        blur_visual.SetBrush(&effect_brush)?;
-
+        let (queue, compositor, target) = create_composition_target(hwnd)?;
         let tint = [48, 48, 52];
-        let tint_brush = compositor.CreateColorBrushWithColor(glass_color(tint))?;
-        tint_visual.SetBrush(&tint_brush)?;
-
-        let clip_geometry = compositor.CreateRoundedRectangleGeometry()?;
-        let clip = compositor.CreateGeometricClipWithGeometry(&clip_geometry)?;
-        root.SetClip(&clip)?;
-
-        let children = root.Children()?;
-        children.InsertAtBottom(&blur_visual)?;
-        children.InsertAtTop(&tint_visual)?;
-        target.SetRoot(&root)?;
-
+        let (root, blur_visual, tint_visual, tint_brush, clip_geometry) =
+            create_glass_visuals(&compositor, &target, tint)?;
         Ok(Self {
             _queue: queue,
             _compositor: compositor,
@@ -354,11 +385,7 @@ fn create_backdrop_window() -> WinResult<HWND> {
 
     unsafe {
         crate::winapi::create_window(
-            WS_EX_TRANSPARENT
-                | WS_EX_TOOLWINDOW
-                | WS_EX_NOACTIVATE
-                | WS_EX_TOPMOST
-                | WS_EX_NOREDIRECTIONBITMAP,
+            WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP,
             PCWSTR(class_name.as_ptr()),
             PCWSTR(wide("WinGlance glass").as_ptr()),
             WS_POPUP,

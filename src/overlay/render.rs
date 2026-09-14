@@ -191,6 +191,23 @@ pub(super) fn render_layered(
     } else {
         (height as f32 / scale_factor).round().max(1.0) as i32
     };
+    // Keep the custom Composition material in exact lockstep with the body,
+    // including morph/bounce radius, palette tint and the foreground fade.
+    // Sync happens before rasterization so a Composition failure can disable
+    // the material immediately and this same frame falls back to the normal
+    // solid renderer rather than flashing an under-filled pill.
+    let glass_radius = frame_radius(&state.config, scale, compact, morph) * scale_factor;
+    let glass_fill = pill_fill_bg(state);
+    state.backdrop.sync(
+        state.hwnd,
+        position.x + inset,
+        position.y + inset,
+        width,
+        height,
+        glass_radius,
+        [glass_fill[0], glass_fill[1], glass_fill[2]],
+        alpha,
+    );
     let content_buf_w = (content_w + inset * 2).max(1);
     let content_buf_h = (content_h + inset * 2).max(1);
     // Every morph resolves to the expanded pill, so its final body bottom is
@@ -489,9 +506,6 @@ pub(super) fn render_layered(
             ULW_ALPHA,
         )
     };
-    state
-        .backdrop
-        .sync(state.hwnd, position.x + inset, position.y + inset, width, height);
     // Re-assert topmost on every upload (a foreground fullscreen window can
     // take the z-order), but let `UpdateLayeredWindow` own the geometry: when
     // position and size match the previous upload it re-applies them anyway,
@@ -896,7 +910,16 @@ pub(super) fn draw_pixels(
 
     // Directional edge highlight: white stroke on the pill's own boundary,
     // brighter along the top-left than the bottom-right.
-    draw_edge_stroke(pixels, width, inset, pill_w, pill_h, radius, scale);
+    draw_edge_stroke(
+        pixels,
+        width,
+        inset,
+        pill_w,
+        pill_h,
+        radius,
+        scale,
+        material_edge_strength(state),
+    );
 
     // The compact pill draws its own smaller art tile (plus the title row
     // and the trailing icon/symbol) in `draw_compact_pill`; drawing it here
@@ -1225,6 +1248,10 @@ fn edge_stroke_ranges(pill_w: usize, pill_h: usize, radius: f32, stroke_w: f32, 
     }
 }
 
+fn material_edge_strength(state: &OverlayState) -> f32 {
+    if state.backdrop.active() { 0.48 } else { 1.0 }
+}
+
 pub(super) fn draw_edge_stroke(
     pixels: &mut [u8],
     width: usize,
@@ -1233,6 +1260,7 @@ pub(super) fn draw_edge_stroke(
     pill_h: usize,
     radius: f32,
     scale: f32,
+    alpha_scale: f32,
 ) {
     const STROKE_COLOR: [u8; 3] = [255, 255, 255];
     const PEAK_ALPHA: f32 = 90.0;
@@ -1271,7 +1299,7 @@ pub(super) fn draw_edge_stroke(
                 // at bottom-right (pill_w, pill_h), normalized to [0, 1].
                 let t = ((x as f32 / pill_w.max(1) as f32) + (y as f32 / pill_h.max(1) as f32)) * 0.5;
                 let peak = PEAK_ALPHA - (PEAK_ALPHA - MIN_ALPHA) * t;
-                let alpha = (peak * coverage).round() as u32;
+                let alpha = (peak * coverage * alpha_scale).round() as u32;
                 composite(pixels, width, inset + x, inset + y, STROKE_COLOR, alpha);
             }
         }
@@ -1904,10 +1932,10 @@ pub(super) fn pill_fill_bg(state: &OverlayState) -> [u8; 4] {
         None => state.config.appearance.background_color,
     };
     if state.backdrop.active() {
-        // Keep enough tint for text contrast while allowing the system
-        // material to read through. The final alpha is also multiplied by
-        // the normal frame/persistent-fade alpha later in the pipeline.
-        fill[3] = fill[3].min(176);
+        // Composition owns the material. This foreground layer contributes
+        // only a faint palette-aware wash; a mostly-opaque fill would bury
+        // the live blur and recreate the grey-card look glass mode replaces.
+        fill[3] = fill[3].min(36);
     }
     fill
 }
