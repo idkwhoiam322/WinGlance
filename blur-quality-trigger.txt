@@ -1,1 +1,1 @@
-composition-lock-v2
+validate-composition-glass-v2
