@@ -5981,6 +5981,134 @@ fn visual_setting_value(id: SettingId, cfg: &Config) -> String {
 
 fn perform_visual_toggle(state: &mut MainWindowState, action: SettingAction) {
     match action {
+        SettingAction::ToggleGlassEffect => {
+            let new_value = !state.cfg().overlay.glass_effect;
+            state.mutate_config(|cfg| cfg.overlay.glass_effect = new_value);
+            set_glass_effect(state.overlay_hwnd, new_value);
+            info!("glass effect set: {new_value}");
+        }
+        _ => {
+            let new_value = !state.cfg().overlay.fade_persistent_pill;
+            state.mutate_config(|cfg| cfg.overlay.fade_persistent_pill = new_value);
+            set_fade_persistent_pill(state.overlay_hwnd, new_value);
+            info!("fade persistent pill set: {new_value}");
+        }
+    }
+}
+
+/// Pure Settings-pane hit test shared by the mouse path. Row indexing counts
+/// only interactive rows, matching UIA runtime ids and focus targets.
+fn hit_test_settings(
+    items: &[SettingsItem],
+    x: i32,
+    y: i32,
+    scale: f32,
+) -> Option<(SettingId, usize, RECT, SettingAction)> {
+    let mut row_index = 0usize;
+    for item in items {
+        if let SettingsItem::Row { id, rect } = item {
+            if y >= rect.top && y < rect.bottom {
+                let action = setting_action_at(*id, rect, x, y, scale)?;
+                return Some((*id, row_index, *rect, action));
+            }
+            row_index += 1;
+        }
+    }
+    None
+}
+
+/// Executes a pre-resolved Settings action. Persistence, Win32 calls, worker
+/// control and restart stay here; geometry and action selection stay pure.
+fn perform_setting_action(hwnd: HWND, id: SettingId, row_index: usize, rect: &RECT, action: SettingAction, scale: f32) {
+    let state_ptr = window_state::<MainWindowState>(hwnd);
+    if state_ptr.is_null() {
+        return;
+    }
+    let state = unsafe { &mut *state_ptr };
+    let control_rect = row_split(rect, scale).control;
+    let toggle_before = setting_toggle_on(id, &state.cfg());
+    let before_name = setting_row_name(id, &state.cfg());
+    match action {
+        SettingAction::ToggleNotifications => {
+            let new_value = !state.cfg().behavior.notifications_enabled;
+            if unsafe { post_message(state.overlay_hwnd, TOGGLE_MSG, WPARAM(0), LPARAM(0)) }.is_err() {
+                error!("posting the notifications toggle to the overlay failed");
+            } else {
+                state.mutate_config(|cfg| cfg.behavior.notifications_enabled = new_value);
+                push_control(
+                    &state.control_mailbox,
+                    &state.control_tx,
+                    ControlCommand::SetNotificationsEnabled(new_value),
+                );
+            }
+            state.invalidate();
+        }
+        SettingAction::ToggleStartOnLogin => {
+            let new_value = !state.cfg().behavior.start_on_login;
+            state.toggle_autostart(new_value);
+            state.invalidate();
+        }
+        SettingAction::ToggleCloseToTray => {
+            let new_value = !state.cfg().behavior.close_to_tray;
+            state.mutate_config(|cfg| cfg.behavior.close_to_tray = new_value);
+            info!("close to tray {}", if new_value { "enabled" } else { "disabled" });
+            state.invalidate();
+        }
+        SettingAction::SetDuration(duration) => {
+            state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
+            state.push_effective_duration();
+            state.invalidate();
+        }
+        SettingAction::CustomDuration => {
+            let current_ms = state.cfg().overlay.duration_ms;
+            let chosen = crate::duration_dialog::show_duration_dialog(hwnd, current_ms);
+            let state_ptr = window_state::<MainWindowState>(hwnd);
+            if !state_ptr.is_null() {
+                let state = unsafe { &mut *state_ptr };
+                if let Some(duration) = chosen {
+                    state.mutate_config(|cfg| cfg.overlay.duration_ms = duration);
+                    state.push_effective_duration();
+                    info!("custom overlay duration set to {duration} ms");
+                }
+                state.invalidate();
+                raise_settings_name_changed(hwnd, row_index, &before_name, &setting_row_name(id, &state.cfg()));
+            }
+            return;
+        }
+        SettingAction::ToggleRespectSystemDuration => {
+            let new_value = !state.cfg().overlay.respect_system_message_duration;
+            state.mutate_config(|cfg| cfg.overlay.respect_system_message_duration = new_value);
+            state.push_effective_duration();
+            info!("respect system message duration set: {new_value}");
+            state.invalidate();
+        }
+        SettingAction::SetLayout(mode) => {
+            state.mutate_config(|cfg| cfg.overlay.layout = mode);
+            set_layout(state.overlay_hwnd, mode);
+            info!("layout mode set: {mode:?}");
+            state.invalidate();
+        }
+        SettingAction::ToggleDismissOnHover => {
+            let new_value = !state.cfg().overlay.dismiss_on_hover;
+            state.mutate_config(|cfg| cfg.overlay.dismiss_on_hover = new_value);
+            set_dismiss_on_hover(state.overlay_hwnd, new_value);
+            info!("dismiss on hover set: {new_value}");
+            state.invalidate();
+        }
+        SettingAction::ToggleExpandCompactOnHover => {
+            let new_value = !state.cfg().overlay.expand_compact_on_hover;
+            state.mutate_config(|cfg| cfg.overlay.expand_compact_on_hover = new_value);
+            set_expand_compact_on_hover(state.overlay_hwnd, new_value);
+            info!("expand compact on hover set: {new_value}");
+            state.invalidate();
+        }
+        SettingAction::ToggleHideForAutoCompactSources => {
+            let new_value = !state.cfg().behavior.hide_for_auto_compact_sources;
+            state.mutate_config(|cfg| cfg.behavior.hide_for_auto_compact_sources = new_value);
+            set_hide_for_auto_compact_sources(state.overlay_hwnd, new_value);
+            info!("hide for auto compact sources set: {new_value}");
+            state.invalidate();
+        }
         action @ (SettingAction::ToggleGlassEffect | SettingAction::ToggleFadePersistentPill) => {
             perform_visual_toggle(state, action);
             state.invalidate();

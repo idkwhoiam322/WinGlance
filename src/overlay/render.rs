@@ -489,11 +489,9 @@ pub(super) fn render_layered(
             ULW_ALPHA,
         )
     };
-    if state.backdrop.active() {
-        state
-            .backdrop
-            .sync(state.hwnd, position.x + inset, position.y + inset, width, height);
-    }
+    state
+        .backdrop
+        .sync(state.hwnd, position.x + inset, position.y + inset, width, height);
     // Re-assert topmost on every upload (a foreground fullscreen window can
     // take the z-order), but let `UpdateLayeredWindow` own the geometry: when
     // position and size match the previous upload it re-applies them anyway,
