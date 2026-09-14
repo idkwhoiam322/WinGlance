@@ -13,7 +13,6 @@ use crate::winutil::{register_class_once, system_preferences, wide};
 use log::{debug, warn};
 use std::mem::size_of;
 use std::sync::OnceLock;
-use windows::Foundation::Numerics::Vector2;
 use windows::Foundation::{IPropertyValue, PropertyValue};
 use windows::Graphics::Effects::{
     IGraphicsEffect, IGraphicsEffect_Impl, IGraphicsEffectSource, IGraphicsEffectSource_Impl,
@@ -41,6 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{Error, GUID, HSTRING, Interface, PCWSTR, Result as WinResult};
+use windows_numerics::Vector2;
 
 static BACKDROP_CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
 const BLUR_AMOUNT: f32 = 24.0;
