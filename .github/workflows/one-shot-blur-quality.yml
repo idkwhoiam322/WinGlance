@@ -1,0 +1,36 @@
+name: One-shot blur quality refactor
+
+on:
+  push:
+    branches: [blur-effect]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ contains(github.event.head_commit.message, 'run blur quality refactor') }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply guarded quality refactor
+        run: python scripts/one_shot_blur_quality.py
+      - name: Format Rust
+        run: cargo fmt --all
+      - name: Commit refactor
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/main_window.rs src/overlay/render.rs docs/configuration.md
+          if (git diff --cached --quiet) {
+            Write-Host "No changes to commit"
+            exit 0
+          }
+          git commit -m "refactor(settings): isolate glass toggle decisions"
+          git push origin HEAD:blur-effect
