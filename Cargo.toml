@@ -17,6 +17,9 @@ ignored = ["windows-core"]
 # exact crate transitively; promoting it to a direct dependency only makes the
 # codegen support crate nameable. No new behavioral dependency.
 windows-core = "0.62"
+# Composition vector properties are projected through the split numerics crate
+# in windows-rs 0.62, so name it directly for Vector2.
+windows-numerics = "0.3"
 # Direct dependency so the `windows_future` async bindings (IAsyncOperation and
 # friends, which the refreshed metadata moved out of `windows::Foundation`)
 # are nameable from src/smtc.rs. `windows` pulls in this exact crate
