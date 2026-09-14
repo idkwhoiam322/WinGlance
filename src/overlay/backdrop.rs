@@ -31,6 +31,7 @@ static BACKDROP_CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
 pub(super) struct Backdrop {
     hwnd: HWND,
     unavailable: bool,
+    enabled: bool,
 }
 
 impl Backdrop {
@@ -45,19 +46,23 @@ impl Backdrop {
             return false;
         }
         if !self.hwnd.0.is_null() {
+            self.enabled = true;
             return true;
         }
         if self.unavailable {
+            self.enabled = false;
             return false;
         }
         match create_backdrop_window() {
             Ok(hwnd) => {
                 self.hwnd = hwnd;
+                self.enabled = true;
                 debug!("Windows 11 acrylic backdrop initialized");
                 true
             }
             Err(error) => {
                 self.unavailable = true;
+                self.enabled = false;
                 warn!("Windows 11 acrylic backdrop unavailable; keeping solid pill: {error}");
                 false
             }
@@ -65,14 +70,14 @@ impl Backdrop {
     }
 
     pub(super) fn active(&self) -> bool {
-        !self.hwnd.0.is_null()
+        self.enabled && !self.hwnd.0.is_null()
     }
 
     /// Places the body-only backdrop directly below the layered overlay.
     /// `x/y/w/h` exclude the aura inset so the glow can continue to bleed
     /// beyond the glass boundary while the material stays clipped to the pill.
     pub(super) fn sync(&mut self, overlay: HWND, x: i32, y: i32, w: i32, h: i32) {
-        if self.hwnd.0.is_null() || w <= 0 || h <= 0 {
+        if !self.active() || w <= 0 || h <= 0 {
             return;
         }
         unsafe {
@@ -80,7 +85,8 @@ impl Backdrop {
         }
     }
 
-    pub(super) fn hide(&self) {
+    pub(super) fn hide(&mut self) {
+        self.enabled = false;
         if !self.hwnd.0.is_null() {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
