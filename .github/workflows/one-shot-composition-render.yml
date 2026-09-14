@@ -27,10 +27,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/overlay/render.rs
+          git add src/overlay/render.rs src/overlay/backdrop.rs
           if (git diff --cached --quiet) {
             Write-Host "No changes to commit"
             exit 0
           }
-          git commit -m "feat(overlay): tune luminous glass material"
+          git commit -m "feat(overlay): tune luminous composition glass"
           git push origin HEAD:blur-effect
