@@ -19,7 +19,7 @@ jobs:
         with:
           components: rustfmt
       - name: Apply guarded quality refactor
-        run: python scripts/one_shot_blur_quality.py
+        run: python scripts/one_shot_blur_quality2.py
       - name: Format Rust
         run: cargo fmt --all
       - name: Commit refactor
