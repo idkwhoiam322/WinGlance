@@ -1255,7 +1255,7 @@ fn material_edge_strength(state: &OverlayState) -> f32 {
 }
 
 #[derive(Clone, Copy)]
-struct EdgeStrokeStyle {
+pub(super) struct EdgeStrokeStyle {
     radius: f32,
     scale: f32,
     alpha_scale: f32,
