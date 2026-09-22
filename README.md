@@ -48,9 +48,10 @@ interrupts and never needs interaction.
 - **Accessible** — the pill exposes the current track as an accessible name
   (UI Automation), and the tracking window's Settings pane is
   keyboard-navigable and exposes a full UIA provider.
-- **Small footprint** — raw Win32 + GDI, no UI framework, no webview, no GPU
-  runtime. Five isolated threads: SMTC worker, supervisor watchdog, event
-  forwarder, icon worker, and the UI thread; the pill repaints only while
+- **Small footprint** — raw Win32 + GDI for the foreground, with an optional
+  Windows Composition glass layer; no bundled UI framework or webview. Five
+  isolated threads: SMTC worker, supervisor watchdog, event forwarder, icon
+  worker, and the UI thread; the pill repaints only while
   animating or scrolling — and while media plays, the aura comet sweep keeps
   the tick loop alive at a reduced ~15 Hz cadence for its duration.
 
@@ -96,9 +97,10 @@ restored when that suppression clears.
 
 Config lives at `%APPDATA%\WinGlance\WinGlance\data\config.toml` (created on first
 run; see [`config.example.toml`](config.example.toml)). It controls pill
-duration/animation, edge anchor and margin, which source apps notify, and the
-appearance: background, accent color, corner radius, padding, art size and
-fonts. Hand-edits apply after a restart; tray-menu changes apply immediately.
+duration/animation, edge anchor and margin, which source apps notify, the
+optional Windows 11 Composition glass material, and the appearance: background,
+accent color, corner radius, padding, art size and fonts. Hand-edits apply after
+a restart; tray-menu changes apply immediately.
 See [`docs/configuration.md`](docs/configuration.md) for the full reference.
 
 Logs: `%APPDATA%\WinGlance\WinGlance\data\logs\log-Live.log` (current run, truncated
@@ -132,10 +134,11 @@ checks: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings
   worker.
 - `src/overlay/` — the raw Win32 layered pill, split into `mod` (state,
   tick, window glue), `morph` (springs, hover decisions, geometry),
-  `render` (frame composition, text, vector primitives) and `fullscreen`
-  (display enumeration and fullscreen detection): expand/light/collapse
-  animation, palette + aura rendering, vector glyphs, marquee rows,
-  hover expand/dismiss, the persistent-compact idle rest, the progress bar.
+  `render` (frame composition, text, vector primitives), `backdrop`
+  (optional Windows Composition glass), and `fullscreen` (display enumeration
+  and fullscreen detection): expand/light/collapse animation, palette + aura
+  rendering, vector glyphs, marquee rows, hover expand/dismiss, the
+  persistent-compact idle rest, and the progress bar.
 - `src/accessibility.rs` — the UI Automation providers: the pill's read-only
   name provider and the Settings-pane fragment provider.
 - `src/palette.rs` / `src/icon.rs` — the color quantizer and the shell icon
@@ -149,9 +152,15 @@ checks: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings
   copies).
 - `src/positioner.rs` — the drag-to-place sample window.
 
-The overlay is a click-through layered window rendered with GDI and
-`UpdateLayeredWindow`; the `image` crate only decodes the SMTC artwork.
-Events cross the worker/UI boundary through a channel. See
+The foreground overlay is a click-through layered window rendered with GDI and
+`UpdateLayeredWindow`. When `overlay.glass_effect` is enabled and supported,
+a non-activating Windows Composition companion HWND sits directly behind the
+pill body and supplies live HostBackdrop Gaussian blur plus a restrained tint;
+the GDI foreground keeps artwork, text, progress, edge light, aura and comet
+sharp, so the palette aura can bleed outside the glass clip. Unsupported or
+accessibility-restricted systems fail closed to the existing solid pill. The
+`image` crate only decodes the SMTC artwork. Events cross the worker/UI
+boundary through a channel. See
 [`docs/architecture.md`](docs/architecture.md) for the threading model,
 rendering pipeline and dedup design.
 

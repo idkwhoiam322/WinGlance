@@ -30,7 +30,7 @@ WinGlance/
     ├── events.rs           Shared event types + WM_APP message ids
     ├── logging.rs          Single-file logger (log-Live.log, current run)
     ├── smtc.rs             Isolated SMTC listener on its own COM thread
-    ├── overlay/            Pill overlay: mod/morph/render/fullscreen (see below)
+    ├── overlay/            Pill overlay: mod/morph/render/backdrop/fullscreen (see below)
     ├── accessibility.rs    UI Automation providers (pill name, Settings pane)
     ├── icon.rs             Source-app icon extraction (shell COM, worker thread)
     ├── palette.rs          Vibrant-color quantizer for the accent/aura
@@ -68,11 +68,14 @@ WinGlance/
   burns the supervisor's global restart budget.
 - **overlay/** — the passive pill, split into `mod` (state, tick, events,
   hover handling, window/timer glue), `morph` (springs, hover decisions,
-  pill geometry), `render` (frame composition, text rasterization, vector
-  primitives) and `fullscreen` (display enumeration, target resolution,
-  fullscreen detection). Rendering: `UpdateLayeredWindow`, DPI-aware
-  position, the expand/light/collapse state machine, the palette aura, the
-  per-track fill tint, the directional edge highlight, vector playback
+  pill geometry), `render` (foreground frame composition, text rasterization,
+  vector primitives), `backdrop` (optional HostBackdrop + Gaussian-blur
+  Windows Composition body), and `fullscreen` (display enumeration, target
+  resolution, fullscreen detection). Rendering: `UpdateLayeredWindow` for the
+  sharp GDI foreground, an optional non-activating Composition companion behind
+  the pill body, DPI-aware position, the expand/light/collapse state machine,
+  the palette aura, the per-track fill tint, the directional edge highlight,
+  vector playback
   glyphs (play/pause/stop/music note), marquee rows, and the hover
   expand/dismiss interaction. Expanded, Compact, and Auto are transient
   notification layouts; Persistent Compact alone owns the between-notification

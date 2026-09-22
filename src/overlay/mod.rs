@@ -751,7 +751,7 @@ struct OverlayState {
     /// before the text draw). Read by the text-drawing helpers so the marquee
     /// `Foreground` pass only re-composites the scrolling rows.
     render_layer: render::RenderLayer,
-    /// Lazily-created DWM material window that sits below the layered pill.
+    /// Lazily-created Windows Composition material window below the layered pill.
     backdrop: backdrop::Backdrop,
     /// Whether the persistent-compact pill is currently in the faded (idle)
     /// state. The alpha drops to the idle level (0.25 * 255 = 64) after the

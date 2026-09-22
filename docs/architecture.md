@@ -312,22 +312,33 @@ filter. The pill itself is fully passive (no focus, no clicks, no input).
 
 ## Rendering pipeline
 
-Each frame is rendered into an in-memory premultiplied-BGRA buffer:
+Each frame keeps the sharp foreground in an in-memory
+premultiplied-BGRA buffer. The optional glass body is a separate Windows
+Composition surface behind that foreground:
 
-1. `draw_pixels` resolves the artwork and converts the worker's decoded
+1. `render_layered` prepares and synchronizes the optional companion HWND.
+   When `overlay.glass_effect` is enabled and system preferences permit
+   translucent decoration, `backdrop.rs` hosts a live `HostBackdrop` source,
+   Gaussian blur, restrained palette-aware tint and rounded clip. The companion
+   excludes the aura margin, never activates or accepts input, and fails closed
+   to the normal solid renderer if Composition setup/update fails.
+2. `draw_pixels` resolves the artwork and converts the worker's decoded
    premultiplied-BGRA buffer once per unique cover (`ensure_art`, keyed by
-   the decoded pixels), then draws — in order — the
-   palette aura ring in the DIB margin, the near-opaque palette-tinted rounded-rect
-   body (fill alpha from `background_color[3]`, default 235) with its directional edge highlight, the album art with its accent
-   glow and rim, and the vector playback glyph.
-2. `draw_text_pixels` paints the title/artist/meta/source-app rows with GDI
+   the decoded pixels), then draws the palette aura in the DIB margin, the body
+   wash and directional edge highlight, album art with its accent glow/rim, and
+   the vector playback glyph. In solid mode the body uses
+   `background_color[3]` (default 235); while Composition glass is active the
+   foreground body alpha is capped at a faint wash so it does not bury the live
+   blur. The aura/comet remain in the GDI foreground outside the glass clip.
+3. `draw_text_pixels` paints the title/artist/meta/source-app rows with GDI
    `DrawTextW` into a scratch DIB and composites them alpha-correctly; rows
    marquee-scroll only while their text overflows the visible band.
-3. `UpdateLayeredWindow` with `ULW_ALPHA` composites the window; the window
-   uses per-monitor DPI-aware scaling: sizes, fonts and margins come from
-`GetDpiForMonitor(MDT_EFFECTIVE_DPI)` of the *target* display (see "Placement
-and resolution" below), so the first frame after a display switch is already
-scaled correctly.
+4. `UpdateLayeredWindow` with `ULW_ALPHA` composites the sharp foreground;
+   the foreground and Composition companion are positioned in lockstep. Sizes,
+   fonts and margins use per-monitor DPI-aware scaling from
+   `GetDpiForMonitor(MDT_EFFECTIVE_DPI)` of the *target* display (see
+   "Placement and resolution" below), so the first frame after a display switch
+   is already scaled correctly.
 
 The window is created with `WS_EX_LAYERED | WS_EX_TRANSPARENT |
 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`, returns `HTTRANSPARENT` from
