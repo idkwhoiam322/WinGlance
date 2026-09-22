@@ -916,9 +916,11 @@ pub(super) fn draw_pixels(
         inset,
         pill_w,
         pill_h,
-        radius,
-        scale,
-        material_edge_strength(state),
+        EdgeStrokeStyle {
+            radius,
+            scale,
+            alpha_scale: material_edge_strength(state),
+        },
     );
 
     // The compact pill draws its own smaller art tile (plus the title row
@@ -1252,19 +1254,29 @@ fn material_edge_strength(state: &OverlayState) -> f32 {
     if state.backdrop.active() { 0.48 } else { 1.0 }
 }
 
+#[derive(Clone, Copy)]
+struct EdgeStrokeStyle {
+    radius: f32,
+    scale: f32,
+    alpha_scale: f32,
+}
+
 pub(super) fn draw_edge_stroke(
     pixels: &mut [u8],
     width: usize,
     inset: usize,
     pill_w: usize,
     pill_h: usize,
-    radius: f32,
-    scale: f32,
-    alpha_scale: f32,
+    style: EdgeStrokeStyle,
 ) {
     const STROKE_COLOR: [u8; 3] = [255, 255, 255];
     const PEAK_ALPHA: f32 = 90.0;
     const MIN_ALPHA: f32 = 30.0;
+    let EdgeStrokeStyle {
+        radius,
+        scale,
+        alpha_scale,
+    } = style;
     let stroke_w = (1.25 * scale).round().max(1.0);
     // Ring coverage = outer rounded-rect coverage minus the same shape
     // inset by stroke_w, both supersampled — the same technique the pill
