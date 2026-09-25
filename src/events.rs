@@ -37,7 +37,7 @@ pub const RESTART_RESULT_MSG: u32 = WM_APP + 14;
 /// too, and the picker UIA action message is tracked here as well.
 /// Maintenance contract: adding (or renumbering) any app-private message id
 /// must update this list — the compiler only checks ids it can see.
-pub(crate) const APP_PRIVATE_MESSAGE_IDS: [u32; 15] = [
+pub(crate) const APP_PRIVATE_MESSAGE_IDS: [u32; 16] = [
     MEDIA_EVENT_MSG,
     TOGGLE_MSG,
     POSITION_MSG,
@@ -47,6 +47,7 @@ pub(crate) const APP_PRIVATE_MESSAGE_IDS: [u32; 15] = [
     crate::main_window::WM_SETTINGS_ACTIVATE_MSG,
     crate::main_window::WM_SETTINGS_SNAPSHOT_MSG,
     crate::main_window::WM_SETTINGS_FOCUS_MSG,
+    crate::main_window::WM_SETTINGS_PREVIEW_MSG,
     crate::overlay::TIMER_ANIMATION_MSG,
     crate::overlay::FOREGROUND_CHANGE_MSG,
     crate::process_picker::PICKER_RESULT_MSG,
