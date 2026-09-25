@@ -228,15 +228,7 @@ impl CompositionGlass {
         })
     }
 
-    fn sync(
-        &mut self,
-        w: i32,
-        h: i32,
-        radius: f32,
-        tint: [u8; 3],
-        tint_alpha: u8,
-        opacity: u8,
-    ) -> WinResult<()> {
+    fn sync(&mut self, w: i32, h: i32, radius: f32, tint: [u8; 3], tint_alpha: u8, opacity: u8) -> WinResult<()> {
         let radius = radius.clamp(0.0, w.min(h).max(0) as f32 * 0.5);
         let radius_key = radius.to_bits();
         if self.geometry != Some((w, h, radius_key)) {
