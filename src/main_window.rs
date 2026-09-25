@@ -6166,7 +6166,7 @@ fn show_glass_tuning_guide(hwnd: HWND) {
     let title = wide("WinGlance glass tuning guide");
     unsafe {
         let _ = MessageBoxW(
-            hwnd,
+            Some(hwnd),
             PCWSTR(body.as_ptr()),
             PCWSTR(title.as_ptr()),
             MB_OK | MB_ICONINFORMATION,
