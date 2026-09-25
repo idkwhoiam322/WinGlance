@@ -98,7 +98,7 @@ pub(crate) const WM_SETTINGS_FOCUS_MSG: u32 = WM_APP + 8;
 /// Deferred live-preview pass posted after a Settings mutation. Running on the
 /// next message-loop turn lets the setting's specialized overlay push finish
 /// first, then forces one coherent repaint with a fresh dismiss deadline.
-pub(crate) const WM_SETTINGS_PREVIEW_MSG: u32 = WM_APP + 15;
+pub(crate) const WM_SETTINGS_PREVIEW_MSG: u32 = WM_APP + 16;
 const TRAY_ID: u32 = 1;
 const MENU_OPEN_ID: usize = 1001;
 const MENU_PREVIEW_NOTIFY_ID: usize = 1029;
