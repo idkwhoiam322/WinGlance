@@ -5909,10 +5909,9 @@ fn setting_action_at(id: SettingId, rect: &RECT, x: i32, y: i32, scale: f32) -> 
         SettingId::DismissOnHover => Some(SettingAction::ToggleDismissOnHover),
         SettingId::ExpandCompactOnHover => Some(SettingAction::ToggleExpandCompactOnHover),
         SettingId::HideForAutoCompactSources => Some(SettingAction::ToggleHideForAutoCompactSources),
-        SettingId::FadePersistentPill
-        | SettingId::GlassEffect
-        | SettingId::GlassBlur
-        | SettingId::GlassOpacity => Some(visual_setting_action(id)),
+        SettingId::FadePersistentPill | SettingId::GlassEffect | SettingId::GlassBlur | SettingId::GlassOpacity => {
+            Some(visual_setting_action(id))
+        }
         SettingId::SeparateCompact => Some(SettingAction::ToggleSeparateCompact),
         SettingId::CompactPosition | SettingId::Position => {
             let parts = position_parts(rect, scale);
@@ -5980,7 +5979,11 @@ fn next_tuning_preset(current: u8, presets: &[u8]) -> u8 {
     if let Some(index) = presets.iter().position(|value| *value == current) {
         presets[(index + 1) % presets.len()]
     } else {
-        presets.iter().copied().find(|value| *value < current).unwrap_or(presets[0])
+        presets
+            .iter()
+            .copied()
+            .find(|value| *value < current)
+            .unwrap_or(presets[0])
     }
 }
 
@@ -6000,11 +6003,7 @@ fn visual_setting_row(
             if glass_effect { "ON" } else { "OFF" }.to_string(),
             if glass_effect { accent } else { faint },
         ),
-        SettingId::GlassBlur => (
-            "Glass blur (click to cycle)",
-            format!("{glass_blur_amount} px"),
-            muted,
-        ),
+        SettingId::GlassBlur => ("Glass blur (click to cycle)", format!("{glass_blur_amount} px"), muted),
         SettingId::GlassOpacity => (
             "Glass opacity (click to cycle)",
             format!("{glass_opacity_percent}%"),
@@ -7697,10 +7696,9 @@ fn setting_label(id: SettingId) -> &'static str {
         SettingId::DismissOnHover => "Dismiss on hover",
         SettingId::ExpandCompactOnHover => "Expand compact on hover",
         SettingId::HideForAutoCompactSources => "Hide Persistent Compact Pill for Auto-compact Apps",
-        SettingId::FadePersistentPill
-        | SettingId::GlassEffect
-        | SettingId::GlassBlur
-        | SettingId::GlassOpacity => visual_setting_label(id),
+        SettingId::FadePersistentPill | SettingId::GlassEffect | SettingId::GlassBlur | SettingId::GlassOpacity => {
+            visual_setting_label(id)
+        }
         SettingId::PinnedSource => "Pinned source",
         SettingId::Monitor => "Monitor",
         SettingId::ShowSample => "Preview Notification",
@@ -7753,10 +7751,9 @@ fn setting_value(id: SettingId, cfg: &Config) -> String {
         SettingId::DismissOnHover => on_off(cfg.overlay.dismiss_on_hover),
         SettingId::ExpandCompactOnHover => on_off(cfg.overlay.expand_compact_on_hover),
         SettingId::HideForAutoCompactSources => on_off(cfg.behavior.hide_for_auto_compact_sources),
-        SettingId::FadePersistentPill
-        | SettingId::GlassEffect
-        | SettingId::GlassBlur
-        | SettingId::GlassOpacity => visual_setting_value(id, cfg),
+        SettingId::FadePersistentPill | SettingId::GlassEffect | SettingId::GlassBlur | SettingId::GlassOpacity => {
+            visual_setting_value(id, cfg)
+        }
         // No pin is spelled out (like the empty Auto-compact list) so the UIA
         // name never reads a bare "Pinned source:".
         SettingId::PinnedSource => cfg.behavior.pinned_source.clone().unwrap_or_else(|| "None".into()),
