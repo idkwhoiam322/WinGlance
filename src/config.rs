@@ -244,12 +244,12 @@ pub struct OverlayConfig {
     /// while this is true. Unsupported systems and accessibility preferences
     /// fall back to the existing solid fill. Default: false.
     pub glass_effect: bool,
-    /// Temporary live-tuning value for the Composition Gaussian blur standard
-    /// deviation, in pixels. Default: 24. Clamped to 0..=64.
+    /// User-tunable Composition Gaussian blur standard deviation, in pixels.
+    /// Default: 16. Clamped to 0..=64.
     pub glass_blur_amount: u8,
-    /// Temporary live-tuning density control for the glass material. This
-    /// percentage drives both the Composition tint alpha and the faint GDI
-    /// body wash, so the control matches perceived transparency. Default: 14.
+    /// User-tunable density control for the glass material. This percentage
+    /// drives both the Composition tint alpha and the faint GDI body wash, so
+    /// the control matches perceived transparency. Default: 10.
     pub glass_opacity_percent: u8,
     /// Unknown keys under `[overlay]`, preserved across saves.
     #[serde(flatten)]
@@ -445,8 +445,8 @@ impl Default for OverlayConfig {
             expand_compact_on_hover: true,
             fade_persistent_pill: true,
             glass_effect: false,
-            glass_blur_amount: 24,
-            glass_opacity_percent: 14,
+            glass_blur_amount: 16,
+            glass_opacity_percent: 10,
             unknown: toml::Table::new(),
         }
     }
