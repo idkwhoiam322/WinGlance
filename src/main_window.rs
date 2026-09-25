@@ -66,12 +66,13 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CreatePopupMenu, DefWindowProcW, DestroyMenu, DestroyWindow, GetClientRect,
-    GetCursorPos, GetForegroundWindow, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindowVisible, IsZoomed,
+    GetCursorPos, GetForegroundWindow, HICON, HMENU, HWND_TOP, IDI_APPLICATION, IsWindowVisible, IsZoomed, MessageBoxW,
     LB_ADDSTRING, LB_DELETESTRING, LB_GETCOUNT, LB_GETITEMRECT, LB_GETTOPINDEX, LB_INSERTSTRING, LB_ITEMFROMPOINT,
     LB_SETITEMHEIGHT, LB_SETTOPINDEX, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_OWNERDRAWFIXED, LoadIconW, MF_CHECKED,
     MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, PostQuitMessage, RegisterWindowMessageW, SB_BOTTOM,
     SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT,
-    SCROLLBAR_COMMAND, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SW_HIDE, SW_SHOW, SW_SHOWMAXIMIZED, SWP_NOACTIVATE,
+    MB_ICONINFORMATION, MB_OK, SCROLLBAR_COMMAND, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SW_HIDE, SW_SHOW,
+    SW_SHOWMAXIMIZED, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CREATE, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_DRAWITEM, WM_ENDSESSION, WM_GETOBJECT, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
@@ -381,6 +382,7 @@ enum SettingId {
     GlassEffect,
     GlassBlur,
     GlassOpacity,
+    GlassGuide,
     PinnedSource,
     CompactPosition,
     AutoCompactApps,
@@ -3231,6 +3233,16 @@ impl MainWindowState {
         });
         y += row_h + gap;
         natural.push(SettingsItem::Row {
+            id: SettingId::GlassGuide,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        natural.push(SettingsItem::Row {
             id: SettingId::FadePersistentPill,
             rect: RECT {
                 left,
@@ -3623,6 +3635,7 @@ impl MainWindowState {
                                 muted: colors.muted,
                             },
                         ),
+                        SettingId::GlassGuide => ("Glass tuning guide", String::new(), colors.muted),
                         SettingId::PinnedSource => (
                             "Pinned source",
                             match &cfg.behavior.pinned_source {
@@ -4018,6 +4031,25 @@ impl MainWindowState {
                                 label_color,
                                 true,
                                 true,
+                            );
+                        }
+                        SettingId::GlassGuide => {
+                            let btn_rect = RECT {
+                                left: control_rect.left,
+                                top: control_rect.top,
+                                right: control_rect.right,
+                                bottom: control_rect.bottom,
+                            };
+                            let hovered = self.settings_hover == Some((current_row, SettingSub::None));
+                            draw_small_button(
+                                &self.fonts,
+                                hdc,
+                                &btn_rect,
+                                "Open guide",
+                                accent,
+                                hovered,
+                                scale,
+                                brushes,
                             );
                         }
                         SettingId::ShowSample => {
@@ -5866,6 +5898,7 @@ enum SettingAction {
     ToggleGlassEffect,
     CycleGlassBlur,
     CycleGlassOpacity,
+    ShowGlassGuide,
     ToggleSeparateCompact,
     SetCompactAnchor(VerticalPosition, HorizontalPosition),
     ResetCompactPosition,
@@ -5933,6 +5966,7 @@ fn setting_action_at(id: SettingId, rect: &RECT, x: i32, y: i32, scale: f32) -> 
         SettingId::FadePersistentPill | SettingId::GlassEffect | SettingId::GlassBlur | SettingId::GlassOpacity => {
             Some(visual_setting_action(id))
         }
+        SettingId::GlassGuide => Some(SettingAction::ShowGlassGuide),
         SettingId::SeparateCompact => Some(SettingAction::ToggleSeparateCompact),
         SettingId::CompactPosition | SettingId::Position => {
             let parts = position_parts(rect, scale);
@@ -6129,6 +6163,30 @@ fn hit_test_settings(
     None
 }
 
+fn show_glass_tuning_guide(hwnd: HWND) {
+    let body = wide(
+        "Recommended glass presets (blur / opacity)\n\n\
+         Balanced glass — 16 px / 10%  [default]\n\
+         Cleaner / more transparent — 12 px / 5%\n\
+         Soft premium glass — 20 px / 10%\n\
+         Very subtle tint — 16 px / 5%\n\
+         Frosted look — 20 px / 14%\n\
+         Ultra-light glass — 8 px / 5%\n\
+         Blur-forward, almost no tint — 24 px / 5%\n\
+         Near-clear baseline — 12 px / 0%\n\n\
+         Use Glass blur and Glass opacity in Settings to customize further.",
+    );
+    let title = wide("WinGlance glass tuning guide");
+    unsafe {
+        let _ = MessageBoxW(
+            hwnd,
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
 /// Executes a pre-resolved Settings action. Persistence, Win32 calls, worker
 /// control and restart stay here; geometry and action selection stay pure.
 fn perform_setting_action(hwnd: HWND, id: SettingId, row_index: usize, rect: &RECT, action: SettingAction, scale: f32) {
@@ -6228,6 +6286,7 @@ fn perform_setting_action(hwnd: HWND, id: SettingId, row_index: usize, rect: &RE
             perform_visual_setting(state, action);
             state.invalidate();
         }
+        SettingAction::ShowGlassGuide => show_glass_tuning_guide(hwnd),
         SettingAction::ToggleSeparateCompact => {
             let new_value = !state.cfg().overlay.compact_position_separate;
             state.set_compact_separate(new_value);
@@ -7751,6 +7810,7 @@ fn setting_label(id: SettingId) -> &'static str {
         SettingId::FadePersistentPill | SettingId::GlassEffect | SettingId::GlassBlur | SettingId::GlassOpacity => {
             visual_setting_label(id)
         }
+        SettingId::GlassGuide => "Glass tuning guide",
         SettingId::PinnedSource => "Pinned source",
         SettingId::Monitor => "Monitor",
         SettingId::ShowSample => "Preview Notification",
@@ -7831,7 +7891,7 @@ fn setting_value(id: SettingId, cfg: &Config) -> String {
             }
         }
         // The painted row is the bare "Preview Notification" button.
-        SettingId::ShowSample => String::new(),
+        SettingId::ShowSample | SettingId::GlassGuide => String::new(),
         // The Layout row is a segmented control: the painted row carries no
         // value text (the segments show it), so the UIA name is the label
         // alone — never a Rust Debug spelling.
@@ -9509,6 +9569,7 @@ mod tests {
             SettingId::GlassEffect,
             SettingId::GlassBlur,
             SettingId::GlassOpacity,
+            SettingId::GlassGuide,
             SettingId::PinnedSource,
             SettingId::Monitor,
             SettingId::ShowSample,
@@ -9527,7 +9588,7 @@ mod tests {
             // The Layout row (segmented control) and the Preview button
             // intentionally carry no painted value text — the UIA name is
             // the label alone, mirroring the paint.
-            if !matches!(id, SettingId::Layout | SettingId::ShowSample) {
+            if !matches!(id, SettingId::Layout | SettingId::ShowSample | SettingId::GlassGuide) {
                 assert!(
                     !setting_value(id, &cfg).is_empty(),
                     "empty value for {}",
