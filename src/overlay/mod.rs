@@ -1040,6 +1040,60 @@ pub(crate) fn dpi_for_position(hwnd: HWND, compact: bool) -> u32 {
 
 /// Updates the live overlay's placement from the resolved expanded and
 /// compact positions.
+/// Temporary tuning hook: apply the latest Settings snapshot to the live
+/// overlay, repaint immediately, and grant a fresh dismiss window. This keeps
+/// visual iteration stable while settings are being tuned: a click never races
+/// the pill's old deadline, and hidden/idle pills surface the normal sample so
+/// every change has visible feedback.
+pub(crate) fn preview_settings_change(hwnd: HWND, config: Config) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = window_state::<OverlayState>(hwnd);
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        state.position = OverlayPos::from_config(&config);
+        state.compact_position = OverlayPos::compact_from_config(&config);
+        state.enabled = config.behavior.notifications_enabled;
+        state.config = Box::new(config);
+
+        // A settings preview is a hard visual refresh. Drop caches/morph state
+        // that could otherwise carry geometry or chrome from the old config.
+        state.chrome_cache = None;
+        state.marquee_strips = [None, None, None, None];
+        state.reset_scroll();
+        state.hover_dismiss_at = None;
+        state.hover_dismiss_resume_at = None;
+        state.hover_expand = None;
+        state.hover_expanded_once = false;
+        state.hover_leave_at = None;
+        state.persistent_faded = false;
+        state.persistent_collapse_on_dismiss = false;
+        state.content_fade = None;
+
+        if !state.config.overlay.glass_effect {
+            state.backdrop.hide();
+        }
+
+        // Hidden and passive-idle states already have a shared preview path
+        // that resolves layout/content and starts a fresh sample deadline.
+        if state.preview_if_hidden() {
+            return;
+        }
+
+        state.refresh_layout();
+        let now = Instant::now();
+        state.dismiss_at = Some(now + sample_duration(&state.config));
+        state.phase = Phase::Shown;
+        state.sync_anim_timer();
+        let _ = ShowWindow(state.hwnd, SW_SHOWNOACTIVATE);
+        state.render();
+    }
+}
+
 pub(crate) fn set_positions(hwnd: HWND, pos: OverlayPos, compact_pos: OverlayPos) {
     if hwnd.0.is_null() {
         return;
