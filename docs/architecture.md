@@ -318,7 +318,7 @@ Composition surface behind that foreground:
 
 1. `render_layered` prepares and synchronizes the optional companion HWND.
    When `overlay.glass_effect` is enabled and system preferences permit
-   translucent decoration, `backdrop.rs` hosts a live `HostBackdrop` source,
+   translucent decoration, `backdrop.rs` hosts a live `desktop Backdrop` source,
    Gaussian blur, restrained palette-aware tint and rounded clip. The companion
    excludes the aura margin, never activates or accepts input, and fails closed
    to the normal solid renderer if Composition setup/update fails.

@@ -69,7 +69,7 @@ WinGlance/
 - **overlay/** — the passive pill, split into `mod` (state, tick, events,
   hover handling, window/timer glue), `morph` (springs, hover decisions,
   pill geometry), `render` (foreground frame composition, text rasterization,
-  vector primitives), `backdrop` (optional HostBackdrop + Gaussian-blur
+  vector primitives), `backdrop` (optional desktop Backdrop + Gaussian-blur
   Windows Composition body), and `fullscreen` (display enumeration, target
   resolution, fullscreen detection). Rendering: `UpdateLayeredWindow` for the
   sharp GDI foreground, an optional non-activating Composition companion behind

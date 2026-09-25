@@ -240,7 +240,7 @@ pub struct OverlayConfig {
     pub fade_persistent_pill: bool,
     /// Optional Windows 11 Composition glass behind the pill. The existing
     /// layered renderer remains responsible for sharp content and the aura;
-    /// a companion HostBackdrop + Gaussian-blur window is created lazily only
+    /// a companion desktop Backdrop + Gaussian-blur window is created lazily only
     /// while this is true. Unsupported systems and accessibility preferences
     /// fall back to the existing solid fill. Default: false.
     pub glass_effect: bool,

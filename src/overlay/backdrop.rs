@@ -2,7 +2,7 @@
 //!
 //! The existing layered HWND remains the foreground/content renderer. This
 //! companion HWND sits directly behind it and hosts a Windows.UI.Composition
-//! visual tree: live backdrop -> Gaussian blur -> restrained color tint. The
+//! visual tree: live desktop backdrop -> Gaussian blur -> restrained color tint. The
 //! foreground renderer keeps artwork, text, progress, edge light and the
 //! aura/comet, so the aura can bleed outside the clipped glass silhouette.
 //! The companion is created only when the user enables the feature, never
@@ -164,10 +164,11 @@ fn configure_blur_visual(compositor: &Compositor, blur_visual: &SpriteVisual) ->
     .into();
     let factory = compositor.CreateEffectFactory(&effect)?;
     let effect_brush = factory.CreateBrush()?;
-    // HostBackdrop samples behind the HWND before this window is drawn. The
-    // ordinary Backdrop brush only samples visuals already inside the target,
-    // which is not the desktop/game content this companion window needs.
-    let backdrop_brush = compositor.CreateHostBackdropBrush()?;
+    // CompositionBackdropBrush samples the pixels directly behind a desktop
+    // app window and is the documented source for a frosted-glass effect.
+    // HostBackdrop can resolve to an opaque black surface in classic Win32
+    // hosting, which defeats the glass material entirely.
+    let backdrop_brush = compositor.CreateBackdropBrush()?;
     effect_brush.SetSourceParameter(&parameter_name, &backdrop_brush)?;
     blur_visual.SetBrush(&effect_brush)?;
     Ok(())

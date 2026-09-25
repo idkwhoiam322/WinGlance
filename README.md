@@ -155,7 +155,7 @@ checks: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings
 The foreground overlay is a click-through layered window rendered with GDI and
 `UpdateLayeredWindow`. When `overlay.glass_effect` is enabled and supported,
 a non-activating Windows Composition companion HWND sits directly behind the
-pill body and supplies live HostBackdrop Gaussian blur plus a restrained tint;
+pill body and supplies live desktop Backdrop Gaussian blur plus a restrained tint;
 the GDI foreground keeps artwork, text, progress, edge light, aura and comet
 sharp, so the palette aura can bleed outside the glass clip. Unsupported or
 accessibility-restricted systems fail closed to the existing solid pill. The
