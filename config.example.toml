@@ -62,11 +62,12 @@ expand_compact_on_hover = true
 # the system's reduced-overlap preference, or unavailable Composition support
 # automatically keeps the existing solid material.
 glass_effect = false
-# Temporary live glass-tuning controls mirrored in Settings. Blur is the
-# Composition Gaussian standard deviation in pixels; opacity drives both the
-# material tint and the faint foreground wash.
-glass_blur_amount = 24
-glass_opacity_percent = 14
+# Glass customization controls mirrored in Settings. Blur is the Composition
+# Gaussian standard deviation in pixels; opacity drives both the material tint
+# and the faint foreground wash. 16 px / 10% is the balanced default; Settings
+# also includes a tuning guide with alternative presets.
+glass_blur_amount = 16
+glass_opacity_percent = 10
 # With layout = "persistent-compact", fade the pill to idle opacity after
 # duration_ms of no cursor interaction. Off: the pill stays at full opacity
 # while media is playing or paused (no idle fade), and hides only when the
