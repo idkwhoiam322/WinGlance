@@ -1058,7 +1058,7 @@ pub(crate) fn preview_settings_change(hwnd: HWND, config: Config) {
         state.position = OverlayPos::from_config(&config);
         state.compact_position = OverlayPos::compact_from_config(&config);
         state.enabled = config.behavior.notifications_enabled;
-        state.config = Box::new(config);
+        *state.config = config;
 
         // A settings preview is a hard visual refresh. Drop caches/morph state
         // that could otherwise carry geometry or chrome from the old config.
