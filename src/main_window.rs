@@ -3590,17 +3590,17 @@ impl MainWindowState {
                             },
                             if hide_for_auto_compact { accent } else { colors.faint },
                         ),
-                        SettingId::GlassEffect | SettingId::FadePersistentPill => {
-                            visual_toggle_row(*id, fade_persistent_pill, glass_effect, accent, colors.faint)
-                        }
-                        SettingId::GlassBlur => (
-                            "Glass blur (click to cycle)",
-                            format!("{glass_blur_amount} px"),
-                            colors.muted,
-                        ),
-                        SettingId::GlassOpacity => (
-                            "Glass opacity (click to cycle)",
-                            format!("{glass_opacity_percent}%"),
+                        SettingId::GlassEffect
+                        | SettingId::GlassBlur
+                        | SettingId::GlassOpacity
+                        | SettingId::FadePersistentPill => visual_setting_row(
+                            *id,
+                            fade_persistent_pill,
+                            glass_effect,
+                            glass_blur_amount,
+                            glass_opacity_percent,
+                            accent,
+                            colors.faint,
                             colors.muted,
                         ),
                         SettingId::PinnedSource => (
@@ -5909,9 +5909,10 @@ fn setting_action_at(id: SettingId, rect: &RECT, x: i32, y: i32, scale: f32) -> 
         SettingId::DismissOnHover => Some(SettingAction::ToggleDismissOnHover),
         SettingId::ExpandCompactOnHover => Some(SettingAction::ToggleExpandCompactOnHover),
         SettingId::HideForAutoCompactSources => Some(SettingAction::ToggleHideForAutoCompactSources),
-        SettingId::FadePersistentPill | SettingId::GlassEffect => Some(visual_toggle_action(id)),
-        SettingId::GlassBlur => Some(SettingAction::CycleGlassBlur),
-        SettingId::GlassOpacity => Some(SettingAction::CycleGlassOpacity),
+        SettingId::FadePersistentPill
+        | SettingId::GlassEffect
+        | SettingId::GlassBlur
+        | SettingId::GlassOpacity => Some(visual_setting_action(id)),
         SettingId::SeparateCompact => Some(SettingAction::ToggleSeparateCompact),
         SettingId::CompactPosition | SettingId::Position => {
             let parts = position_parts(rect, scale);
@@ -5983,18 +5984,31 @@ fn next_tuning_preset(current: u8, presets: &[u8]) -> u8 {
     }
 }
 
-fn visual_toggle_row(
+fn visual_setting_row(
     id: SettingId,
     fade_persistent_pill: bool,
     glass_effect: bool,
+    glass_blur_amount: u8,
+    glass_opacity_percent: u8,
     accent: [u8; 4],
     faint: [u8; 4],
+    muted: [u8; 4],
 ) -> (&'static str, String, [u8; 4]) {
     match id {
         SettingId::GlassEffect => (
             "Windows 11 glass effect",
             if glass_effect { "ON" } else { "OFF" }.to_string(),
             if glass_effect { accent } else { faint },
+        ),
+        SettingId::GlassBlur => (
+            "Glass blur (click to cycle)",
+            format!("{glass_blur_amount} px"),
+            muted,
+        ),
+        SettingId::GlassOpacity => (
+            "Glass opacity (click to cycle)",
+            format!("{glass_opacity_percent}%"),
+            muted,
         ),
         _ => (
             "Fade Persistent Compact Pill after duration",
@@ -6004,39 +6018,55 @@ fn visual_toggle_row(
     }
 }
 
-fn visual_toggle_action(id: SettingId) -> SettingAction {
-    if id == SettingId::GlassEffect {
-        SettingAction::ToggleGlassEffect
-    } else {
-        SettingAction::ToggleFadePersistentPill
+fn visual_setting_action(id: SettingId) -> SettingAction {
+    match id {
+        SettingId::GlassEffect => SettingAction::ToggleGlassEffect,
+        SettingId::GlassBlur => SettingAction::CycleGlassBlur,
+        SettingId::GlassOpacity => SettingAction::CycleGlassOpacity,
+        _ => SettingAction::ToggleFadePersistentPill,
     }
 }
 
 fn visual_setting_label(id: SettingId) -> &'static str {
-    if id == SettingId::GlassEffect {
-        "Windows 11 glass effect"
-    } else {
-        "Fade Persistent Compact Pill after duration"
+    match id {
+        SettingId::GlassEffect => "Windows 11 glass effect",
+        SettingId::GlassBlur => "Glass blur (click to cycle)",
+        SettingId::GlassOpacity => "Glass opacity (click to cycle)",
+        _ => "Fade Persistent Compact Pill after duration",
     }
 }
 
 fn visual_setting_value(id: SettingId, cfg: &Config) -> String {
-    if id == SettingId::GlassEffect {
-        on_off(cfg.overlay.glass_effect)
-    } else if cfg.overlay.fade_persistent_pill {
-        "Yes".into()
-    } else {
-        "No".into()
+    match id {
+        SettingId::GlassEffect => on_off(cfg.overlay.glass_effect),
+        SettingId::GlassBlur => format!("{} px", cfg.overlay.glass_blur_amount),
+        SettingId::GlassOpacity => format!("{}%", cfg.overlay.glass_opacity_percent),
+        _ if cfg.overlay.fade_persistent_pill => "Yes".into(),
+        _ => "No".into(),
     }
 }
 
-fn perform_visual_toggle(state: &mut MainWindowState, action: SettingAction) {
+fn perform_visual_setting(state: &mut MainWindowState, action: SettingAction) {
     match action {
         SettingAction::ToggleGlassEffect => {
             let new_value = !state.cfg().overlay.glass_effect;
             state.mutate_config(|cfg| cfg.overlay.glass_effect = new_value);
             set_glass_effect(state.overlay_hwnd, new_value);
             info!("glass effect set: {new_value}");
+        }
+        SettingAction::CycleGlassBlur => {
+            let opacity = state.cfg().overlay.glass_opacity_percent;
+            let next = next_tuning_preset(state.cfg().overlay.glass_blur_amount, &GLASS_BLUR_PRESETS);
+            state.mutate_config(|cfg| cfg.overlay.glass_blur_amount = next);
+            set_glass_tuning(state.overlay_hwnd, next, opacity);
+            info!("glass blur tuning set: {next} px");
+        }
+        SettingAction::CycleGlassOpacity => {
+            let blur = state.cfg().overlay.glass_blur_amount;
+            let next = next_tuning_preset(state.cfg().overlay.glass_opacity_percent, &GLASS_OPACITY_PRESETS);
+            state.mutate_config(|cfg| cfg.overlay.glass_opacity_percent = next);
+            set_glass_tuning(state.overlay_hwnd, blur, next);
+            info!("glass opacity tuning set: {next}%");
         }
         _ => {
             let new_value = !state.cfg().overlay.fade_persistent_pill;
@@ -6160,24 +6190,11 @@ fn perform_setting_action(hwnd: HWND, id: SettingId, row_index: usize, rect: &RE
             info!("hide for auto compact sources set: {new_value}");
             state.invalidate();
         }
-        action @ (SettingAction::ToggleGlassEffect | SettingAction::ToggleFadePersistentPill) => {
-            perform_visual_toggle(state, action);
-            state.invalidate();
-        }
-        SettingAction::CycleGlassBlur => {
-            let opacity = state.cfg().overlay.glass_opacity_percent;
-            let next = next_tuning_preset(state.cfg().overlay.glass_blur_amount, &GLASS_BLUR_PRESETS);
-            state.mutate_config(|cfg| cfg.overlay.glass_blur_amount = next);
-            set_glass_tuning(state.overlay_hwnd, next, opacity);
-            info!("glass blur tuning set: {next} px");
-            state.invalidate();
-        }
-        SettingAction::CycleGlassOpacity => {
-            let blur = state.cfg().overlay.glass_blur_amount;
-            let next = next_tuning_preset(state.cfg().overlay.glass_opacity_percent, &GLASS_OPACITY_PRESETS);
-            state.mutate_config(|cfg| cfg.overlay.glass_opacity_percent = next);
-            set_glass_tuning(state.overlay_hwnd, blur, next);
-            info!("glass opacity tuning set: {next}%");
+        action @ (SettingAction::ToggleGlassEffect
+        | SettingAction::ToggleFadePersistentPill
+        | SettingAction::CycleGlassBlur
+        | SettingAction::CycleGlassOpacity) => {
+            perform_visual_setting(state, action);
             state.invalidate();
         }
         SettingAction::ToggleSeparateCompact => {
@@ -7680,9 +7697,10 @@ fn setting_label(id: SettingId) -> &'static str {
         SettingId::DismissOnHover => "Dismiss on hover",
         SettingId::ExpandCompactOnHover => "Expand compact on hover",
         SettingId::HideForAutoCompactSources => "Hide Persistent Compact Pill for Auto-compact Apps",
-        SettingId::FadePersistentPill | SettingId::GlassEffect => visual_setting_label(id),
-        SettingId::GlassBlur => "Glass blur (click to cycle)",
-        SettingId::GlassOpacity => "Glass opacity (click to cycle)",
+        SettingId::FadePersistentPill
+        | SettingId::GlassEffect
+        | SettingId::GlassBlur
+        | SettingId::GlassOpacity => visual_setting_label(id),
         SettingId::PinnedSource => "Pinned source",
         SettingId::Monitor => "Monitor",
         SettingId::ShowSample => "Preview Notification",
@@ -7735,9 +7753,10 @@ fn setting_value(id: SettingId, cfg: &Config) -> String {
         SettingId::DismissOnHover => on_off(cfg.overlay.dismiss_on_hover),
         SettingId::ExpandCompactOnHover => on_off(cfg.overlay.expand_compact_on_hover),
         SettingId::HideForAutoCompactSources => on_off(cfg.behavior.hide_for_auto_compact_sources),
-        SettingId::FadePersistentPill | SettingId::GlassEffect => visual_setting_value(id, cfg),
-        SettingId::GlassBlur => format!("{} px", cfg.overlay.glass_blur_amount),
-        SettingId::GlassOpacity => format!("{}%", cfg.overlay.glass_opacity_percent),
+        SettingId::FadePersistentPill
+        | SettingId::GlassEffect
+        | SettingId::GlassBlur
+        | SettingId::GlassOpacity => visual_setting_value(id, cfg),
         // No pin is spelled out (like the empty Auto-compact list) so the UIA
         // name never reads a bare "Pinned source:".
         SettingId::PinnedSource => cfg.behavior.pinned_source.clone().unwrap_or_else(|| "None".into()),
