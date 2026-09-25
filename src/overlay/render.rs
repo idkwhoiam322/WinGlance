@@ -380,7 +380,12 @@ pub(super) fn render_layered(
             state.aura_inset as usize,
             (content_buf_w as usize).saturating_sub(state.aura_inset as usize * 2),
             (content_buf_h as usize).saturating_sub(state.aura_inset as usize * 2),
-            state.config.appearance.effective_corner_radius(compact),
+            // The bar lives on the rounded bottom edge, so its clip must
+            // follow the exact same radius interpolation as the body. Using
+            // the static compact/expanded radius here makes the visible bar
+            // edge jump at hover-morph start, then appear to fill/retract as
+            // the pill geometry catches up.
+            frame_radius(&state.config, scale, compact, morph),
             scale,
             aura_palette,
             state.estimated_position_secs,
