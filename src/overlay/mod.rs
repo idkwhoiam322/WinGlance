@@ -1235,8 +1235,7 @@ pub(crate) fn set_glass_tuning(hwnd: HWND, blur_amount: u8, opacity_percent: u8)
         state.config.overlay.glass_opacity_percent = opacity_percent.min(100);
         info!(
             "overlay glass tuning set: blur={} opacity={}%",
-            state.config.overlay.glass_blur_amount,
-            state.config.overlay.glass_opacity_percent
+            state.config.overlay.glass_blur_amount, state.config.overlay.glass_opacity_percent
         );
         if !matches!(state.phase, Phase::Hidden | Phase::Collapsing(_)) {
             state.render();
