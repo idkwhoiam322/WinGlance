@@ -54,6 +54,8 @@ the file itself is not rewritten (see `docs/architecture.md`).
 | `dismiss_on_hover` | `true` | bool | Hovering a pill in the Expanded layout arms a 500 ms dismissal cap; leaving before it fires cancels that hover cap and restores the prior deadline. For Compact pills it makes the second hover dismiss (see below) |
 | `expand_compact_on_hover` | `true` | bool | Hovering a pill in the Compact layout expands it in place; with `dismiss_on_hover` on, the second hover dismisses (see below) |
 | `glass_effect` | `false` | bool | Opt in to the Windows 11 Composition glass body: live desktop Backdrop Gaussian blur with a restrained tint behind the existing sharp layered foreground. Artwork/text/progress remain unblurred and the palette aura/comet bleed outside the rounded glass clip. High Contrast, the system reduced-overlap preference, or unavailable Composition support fall back to the existing solid material |
+| `glass_blur_amount` | `24` | 0–64 | Temporary live-tuning value for the Composition Gaussian blur amount, in pixels. The Settings row cycles 32 → 24 → 20 → 16 → 12 → 8 |
+| `glass_opacity_percent` | `14` | 0–100 | Temporary live-tuning density percentage shared by the Composition tint and faint foreground wash. The Settings row cycles 30 → 20 → 14 → 10 → 5 → 0 |
 | `fade_persistent_pill` | `true` | bool | With `layout = "persistent-compact"`, fade the pill to idle opacity once `duration_ms` passes without cursor interaction. Off: the pill stays at full opacity while media is playing or paused (no idle fade), and hides only when the source has stopped. Hiding for fullscreen/listed foregrounds (`hide_for_auto_compact_sources`) applies either way |
 
 `layout` accepts one of:

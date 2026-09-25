@@ -164,7 +164,9 @@ pub(super) fn render_layered(
     orbit_angle: Option<f32>,
 ) -> Result<()> {
     let glass_requested = state.config.overlay.glass_effect;
-    state.backdrop.prepare(glass_requested);
+    state
+        .backdrop
+        .prepare(glass_requested, state.config.overlay.glass_blur_amount);
     let inset = state.aura_inset;
     let buf_w = (width + inset * 2).max(1);
     let buf_h = (height + inset * 2).max(1);
@@ -206,6 +208,7 @@ pub(super) fn render_layered(
         height,
         glass_radius,
         [glass_fill[0], glass_fill[1], glass_fill[2]],
+        state.config.overlay.glass_opacity_alpha(),
         alpha,
     );
     let content_buf_w = (content_w + inset * 2).max(1);
@@ -1947,7 +1950,7 @@ pub(super) fn pill_fill_bg(state: &OverlayState) -> [u8; 4] {
         // Composition owns the material. This foreground layer contributes
         // only a faint palette-aware wash; a mostly-opaque fill would bury
         // the live blur and recreate the grey-card look glass mode replaces.
-        fill[3] = fill[3].min(36);
+        fill[3] = fill[3].min(state.config.overlay.glass_opacity_alpha());
     }
     fill
 }

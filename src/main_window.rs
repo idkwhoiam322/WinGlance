@@ -7,8 +7,8 @@ use crate::events::{
 use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
     EventQueue, OverlayPos, enumerate_displays_cached, invalidate_display_cache, set_dismiss_on_hover, set_duration,
-    set_expand_compact_on_hover, set_fade_persistent_pill, set_glass_effect, set_hide_for_auto_compact_sources,
-    set_layout, set_pinned_source, set_positions, show_sample,
+    set_expand_compact_on_hover, set_fade_persistent_pill, set_glass_effect, set_glass_tuning,
+    set_hide_for_auto_compact_sources, set_layout, set_pinned_source, set_positions, show_sample,
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG, PINNED_SOURCE_RESULT_MSG};
@@ -375,6 +375,8 @@ enum SettingId {
     HideForAutoCompactSources,
     FadePersistentPill,
     GlassEffect,
+    GlassBlur,
+    GlassOpacity,
     PinnedSource,
     CompactPosition,
     AutoCompactApps,
@@ -3191,6 +3193,26 @@ impl MainWindowState {
         });
         y += row_h + gap;
         natural.push(SettingsItem::Row {
+            id: SettingId::GlassBlur,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        natural.push(SettingsItem::Row {
+            id: SettingId::GlassOpacity,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        natural.push(SettingsItem::Row {
             id: SettingId::FadePersistentPill,
             rect: RECT {
                 left,
@@ -3368,6 +3390,8 @@ impl MainWindowState {
         let hide_for_auto_compact = cfg.behavior.hide_for_auto_compact_sources;
         let fade_persistent_pill = cfg.overlay.fade_persistent_pill;
         let glass_effect = cfg.overlay.glass_effect;
+        let glass_blur_amount = cfg.overlay.glass_blur_amount;
+        let glass_opacity_percent = cfg.overlay.glass_opacity_percent;
         let display_count = enumerate_displays_cached().len();
 
         let mut hdr = RECT {
@@ -3569,6 +3593,16 @@ impl MainWindowState {
                         SettingId::GlassEffect | SettingId::FadePersistentPill => {
                             visual_toggle_row(*id, fade_persistent_pill, glass_effect, accent, colors.faint)
                         }
+                        SettingId::GlassBlur => (
+                            "Glass blur (click to cycle)",
+                            format!("{glass_blur_amount} px"),
+                            colors.muted,
+                        ),
+                        SettingId::GlassOpacity => (
+                            "Glass opacity (click to cycle)",
+                            format!("{glass_opacity_percent}%"),
+                            colors.muted,
+                        ),
                         SettingId::PinnedSource => (
                             "Pinned source",
                             match &cfg.behavior.pinned_source {
@@ -3615,6 +3649,8 @@ impl MainWindowState {
                         | SettingId::HideForAutoCompactSources
                         | SettingId::FadePersistentPill
                         | SettingId::GlassEffect
+                        | SettingId::GlassBlur
+                        | SettingId::GlassOpacity
                         | SettingId::PinnedSource
                         | SettingId::AutoCompactApps
                         | SettingId::Monitor => {
@@ -5807,6 +5843,8 @@ enum SettingAction {
     ToggleHideForAutoCompactSources,
     ToggleFadePersistentPill,
     ToggleGlassEffect,
+    CycleGlassBlur,
+    CycleGlassOpacity,
     ToggleSeparateCompact,
     SetCompactAnchor(VerticalPosition, HorizontalPosition),
     ResetCompactPosition,
@@ -5872,6 +5910,8 @@ fn setting_action_at(id: SettingId, rect: &RECT, x: i32, y: i32, scale: f32) -> 
         SettingId::ExpandCompactOnHover => Some(SettingAction::ToggleExpandCompactOnHover),
         SettingId::HideForAutoCompactSources => Some(SettingAction::ToggleHideForAutoCompactSources),
         SettingId::FadePersistentPill | SettingId::GlassEffect => Some(visual_toggle_action(id)),
+        SettingId::GlassBlur => Some(SettingAction::CycleGlassBlur),
+        SettingId::GlassOpacity => Some(SettingAction::CycleGlassOpacity),
         SettingId::SeparateCompact => Some(SettingAction::ToggleSeparateCompact),
         SettingId::CompactPosition | SettingId::Position => {
             let parts = position_parts(rect, scale);
@@ -5929,6 +5969,17 @@ fn setting_action_at(id: SettingId, rect: &RECT, x: i32, y: i32, scale: f32) -> 
             }
         }
         SettingId::AllowedApps => Some(SettingAction::OpenAllowedApps),
+    }
+}
+
+const GLASS_BLUR_PRESETS: [u8; 6] = [32, 24, 20, 16, 12, 8];
+const GLASS_OPACITY_PRESETS: [u8; 6] = [30, 20, 14, 10, 5, 0];
+
+fn next_tuning_preset(current: u8, presets: &[u8]) -> u8 {
+    if let Some(index) = presets.iter().position(|value| *value == current) {
+        presets[(index + 1) % presets.len()]
+    } else {
+        presets.iter().copied().find(|value| *value < current).unwrap_or(presets[0])
     }
 }
 
@@ -6111,6 +6162,22 @@ fn perform_setting_action(hwnd: HWND, id: SettingId, row_index: usize, rect: &RE
         }
         action @ (SettingAction::ToggleGlassEffect | SettingAction::ToggleFadePersistentPill) => {
             perform_visual_toggle(state, action);
+            state.invalidate();
+        }
+        SettingAction::CycleGlassBlur => {
+            let opacity = state.cfg().overlay.glass_opacity_percent;
+            let next = next_tuning_preset(state.cfg().overlay.glass_blur_amount, &GLASS_BLUR_PRESETS);
+            state.mutate_config(|cfg| cfg.overlay.glass_blur_amount = next);
+            set_glass_tuning(state.overlay_hwnd, next, opacity);
+            info!("glass blur tuning set: {next} px");
+            state.invalidate();
+        }
+        SettingAction::CycleGlassOpacity => {
+            let blur = state.cfg().overlay.glass_blur_amount;
+            let next = next_tuning_preset(state.cfg().overlay.glass_opacity_percent, &GLASS_OPACITY_PRESETS);
+            state.mutate_config(|cfg| cfg.overlay.glass_opacity_percent = next);
+            set_glass_tuning(state.overlay_hwnd, blur, next);
+            info!("glass opacity tuning set: {next}%");
             state.invalidate();
         }
         SettingAction::ToggleSeparateCompact => {
@@ -7614,6 +7681,8 @@ fn setting_label(id: SettingId) -> &'static str {
         SettingId::ExpandCompactOnHover => "Expand compact on hover",
         SettingId::HideForAutoCompactSources => "Hide Persistent Compact Pill for Auto-compact Apps",
         SettingId::FadePersistentPill | SettingId::GlassEffect => visual_setting_label(id),
+        SettingId::GlassBlur => "Glass blur (click to cycle)",
+        SettingId::GlassOpacity => "Glass opacity (click to cycle)",
         SettingId::PinnedSource => "Pinned source",
         SettingId::Monitor => "Monitor",
         SettingId::ShowSample => "Preview Notification",
@@ -7667,6 +7736,8 @@ fn setting_value(id: SettingId, cfg: &Config) -> String {
         SettingId::ExpandCompactOnHover => on_off(cfg.overlay.expand_compact_on_hover),
         SettingId::HideForAutoCompactSources => on_off(cfg.behavior.hide_for_auto_compact_sources),
         SettingId::FadePersistentPill | SettingId::GlassEffect => visual_setting_value(id, cfg),
+        SettingId::GlassBlur => format!("{} px", cfg.overlay.glass_blur_amount),
+        SettingId::GlassOpacity => format!("{}%", cfg.overlay.glass_opacity_percent),
         // No pin is spelled out (like the empty Auto-compact list) so the UIA
         // name never reads a bare "Pinned source:".
         SettingId::PinnedSource => cfg.behavior.pinned_source.clone().unwrap_or_else(|| "None".into()),
@@ -9368,6 +9439,8 @@ mod tests {
             SettingId::HideForAutoCompactSources,
             SettingId::FadePersistentPill,
             SettingId::GlassEffect,
+            SettingId::GlassBlur,
+            SettingId::GlassOpacity,
             SettingId::PinnedSource,
             SettingId::Monitor,
             SettingId::ShowSample,

@@ -43,8 +43,6 @@ use windows::core::{Error, GUID, HSTRING, Interface, PCWSTR, Result as WinResult
 use windows_numerics::Vector2;
 
 static BACKDROP_CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
-const BLUR_AMOUNT: f32 = 24.0;
-const TINT_ALPHA: u8 = 34;
 
 #[windows::core::implement(IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectD2D1Interop)]
 struct GaussianBlurEffect {
@@ -129,6 +127,7 @@ struct CompositionGlass {
     clip_geometry: CompositionRoundedRectangleGeometry,
     geometry: Option<(i32, i32, u32)>,
     tint: [u8; 3],
+    tint_alpha: u8,
     opacity: u8,
 }
 
@@ -153,13 +152,13 @@ fn create_composition_target(
     Ok((queue, compositor, target))
 }
 
-fn configure_blur_visual(compositor: &Compositor, blur_visual: &SpriteVisual) -> WinResult<()> {
+fn configure_blur_visual(compositor: &Compositor, blur_visual: &SpriteVisual, blur_amount: f32) -> WinResult<()> {
     let parameter_name = HSTRING::from("backdrop");
     let parameter = CompositionEffectSourceParameter::Create(&parameter_name)?;
     let effect_source: IGraphicsEffectSource = parameter.cast()?;
     let effect: IGraphicsEffect = GaussianBlurEffect {
         source: effect_source,
-        blur_amount: BLUR_AMOUNT,
+        blur_amount,
     }
     .into();
     let factory = compositor.CreateEffectFactory(&effect)?;
@@ -178,6 +177,8 @@ fn create_glass_visuals(
     compositor: &Compositor,
     target: &DesktopWindowTarget,
     tint: [u8; 3],
+    tint_alpha: u8,
+    blur_amount: f32,
 ) -> WinResult<(
     ContainerVisual,
     SpriteVisual,
@@ -188,9 +189,9 @@ fn create_glass_visuals(
     let root = compositor.CreateContainerVisual()?;
     let blur_visual = compositor.CreateSpriteVisual()?;
     let tint_visual = compositor.CreateSpriteVisual()?;
-    configure_blur_visual(compositor, &blur_visual)?;
+    configure_blur_visual(compositor, &blur_visual, blur_amount)?;
 
-    let tint_brush = compositor.CreateColorBrushWithColor(glass_color(tint))?;
+    let tint_brush = compositor.CreateColorBrushWithColor(glass_color(tint, tint_alpha))?;
     tint_visual.SetBrush(&tint_brush)?;
 
     let clip_geometry = compositor.CreateRoundedRectangleGeometry()?;
@@ -205,11 +206,12 @@ fn create_glass_visuals(
 }
 
 impl CompositionGlass {
-    fn new(hwnd: HWND) -> WinResult<Self> {
+    fn new(hwnd: HWND, blur_amount: u8) -> WinResult<Self> {
         let (queue, compositor, target) = create_composition_target(hwnd)?;
         let tint = [48, 48, 52];
+        let tint_alpha = 0;
         let (root, blur_visual, tint_visual, tint_brush, clip_geometry) =
-            create_glass_visuals(&compositor, &target, tint)?;
+            create_glass_visuals(&compositor, &target, tint, tint_alpha, blur_amount as f32)?;
         Ok(Self {
             _queue: queue,
             _compositor: compositor,
@@ -221,11 +223,20 @@ impl CompositionGlass {
             clip_geometry,
             geometry: None,
             tint,
+            tint_alpha,
             opacity: 255,
         })
     }
 
-    fn sync(&mut self, w: i32, h: i32, radius: f32, tint: [u8; 3], opacity: u8) -> WinResult<()> {
+    fn sync(
+        &mut self,
+        w: i32,
+        h: i32,
+        radius: f32,
+        tint: [u8; 3],
+        tint_alpha: u8,
+        opacity: u8,
+    ) -> WinResult<()> {
         let radius = radius.clamp(0.0, w.min(h).max(0) as f32 * 0.5);
         let radius_key = radius.to_bits();
         if self.geometry != Some((w, h, radius_key)) {
@@ -241,9 +252,10 @@ impl CompositionGlass {
             self.clip_geometry.SetCornerRadius(corner)?;
             self.geometry = Some((w, h, radius_key));
         }
-        if self.tint != tint {
-            self.tint_brush.SetColor(glass_color(tint))?;
+        if self.tint != tint || self.tint_alpha != tint_alpha {
+            self.tint_brush.SetColor(glass_color(tint, tint_alpha))?;
             self.tint = tint;
+            self.tint_alpha = tint_alpha;
         }
         if self.opacity != opacity {
             self.root.SetOpacity(opacity as f32 / 255.0)?;
@@ -259,26 +271,30 @@ pub(super) struct Backdrop {
     composition: Option<CompositionGlass>,
     unavailable: bool,
     enabled: bool,
+    blur_amount: Option<u8>,
 }
 
 impl Backdrop {
     /// Ensures a usable Composition backdrop exists when the user request and
     /// system accessibility preferences permit translucent decoration.
-    pub(super) fn prepare(&mut self, requested: bool) -> bool {
+    pub(super) fn prepare(&mut self, requested: bool, blur_amount: u8) -> bool {
         let prefs = system_preferences();
         if !requested || prefs.high_contrast || prefs.disable_overlapped_content {
             self.hide();
             return false;
         }
-        if !self.hwnd.0.is_null() && self.composition.is_some() {
+        if !self.hwnd.0.is_null() && self.composition.is_some() && self.blur_amount == Some(blur_amount) {
             self.enabled = true;
             return true;
+        }
+        if !self.hwnd.0.is_null() && self.blur_amount != Some(blur_amount) {
+            self.destroy_material();
         }
         if self.unavailable {
             self.enabled = false;
             return false;
         }
-        match create_backdrop_window().and_then(|hwnd| match CompositionGlass::new(hwnd) {
+        match create_backdrop_window().and_then(|hwnd| match CompositionGlass::new(hwnd, blur_amount) {
             Ok(composition) => Ok((hwnd, composition)),
             Err(error) => {
                 unsafe {
@@ -290,6 +306,7 @@ impl Backdrop {
             Ok((hwnd, composition)) => {
                 self.hwnd = hwnd;
                 self.composition = Some(composition);
+                self.blur_amount = Some(blur_amount);
                 self.enabled = true;
                 debug!("Windows 11 Composition glass initialized");
                 true
@@ -320,6 +337,7 @@ impl Backdrop {
         h: i32,
         radius: f32,
         tint: [u8; 3],
+        tint_alpha: u8,
         opacity: u8,
     ) {
         if !self.active() || w <= 0 || h <= 0 {
@@ -329,7 +347,7 @@ impl Backdrop {
             .composition
             .as_mut()
             .expect("active backdrop has composition")
-            .sync(w, h, radius, tint, opacity);
+            .sync(w, h, radius, tint, tint_alpha, opacity);
         if let Err(error) = visual_result {
             warn!("Composition glass update failed; reverting to solid pill: {error}");
             self.unavailable = true;
@@ -339,6 +357,18 @@ impl Backdrop {
         unsafe {
             let _ = set_window_pos(self.hwnd, overlay, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
+    }
+
+    fn destroy_material(&mut self) {
+        self.composition = None;
+        if !self.hwnd.0.is_null() {
+            unsafe {
+                let _ = DestroyWindow(self.hwnd);
+            }
+            self.hwnd = HWND::default();
+        }
+        self.blur_amount = None;
+        self.enabled = false;
     }
 
     pub(super) fn hide(&mut self) {
@@ -353,19 +383,13 @@ impl Backdrop {
 
 impl Drop for Backdrop {
     fn drop(&mut self) {
-        self.composition = None;
-        if !self.hwnd.0.is_null() {
-            unsafe {
-                let _ = DestroyWindow(self.hwnd);
-            }
-            self.hwnd = HWND::default();
-        }
+        self.destroy_material();
     }
 }
 
-fn glass_color(rgb: [u8; 3]) -> Color {
+fn glass_color(rgb: [u8; 3], alpha: u8) -> Color {
     Color {
-        A: TINT_ALPHA,
+        A: alpha,
         R: rgb[0],
         G: rgb[1],
         B: rgb[2],

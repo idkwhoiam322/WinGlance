@@ -1221,6 +1221,29 @@ pub(crate) fn set_glass_effect(hwnd: HWND, enabled: bool) {
     }
 }
 
+pub(crate) fn set_glass_tuning(hwnd: HWND, blur_amount: u8, opacity_percent: u8) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = window_state::<OverlayState>(hwnd);
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        state.config.overlay.glass_blur_amount = blur_amount.min(64);
+        state.config.overlay.glass_opacity_percent = opacity_percent.min(100);
+        info!(
+            "overlay glass tuning set: blur={} opacity={}%",
+            state.config.overlay.glass_blur_amount,
+            state.config.overlay.glass_opacity_percent
+        );
+        if !matches!(state.phase, Phase::Hidden | Phase::Collapsing(_)) {
+            state.render();
+        }
+    }
+}
+
 pub(crate) fn set_fade_persistent_pill(hwnd: HWND, enabled: bool) {
     if hwnd.0.is_null() {
         return;
