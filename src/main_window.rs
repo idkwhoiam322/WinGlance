@@ -8,7 +8,8 @@ use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
     EventQueue, OverlayPos, enumerate_displays_cached, invalidate_display_cache, set_dismiss_on_hover, set_duration,
     set_expand_compact_on_hover, set_fade_persistent_pill, set_glass_effect, set_glass_tuning,
-    set_hide_for_auto_compact_sources, set_layout, set_pinned_source, set_positions, show_sample,
+    preview_settings_change, set_hide_for_auto_compact_sources, set_layout, set_pinned_source, set_positions,
+    show_sample,
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG, PINNED_SOURCE_RESULT_MSG};
@@ -95,6 +96,10 @@ pub(crate) const WM_SETTINGS_SNAPSHOT_MSG: u32 = WM_APP + 10;
 /// A UIA `SetFocus` handoff: the focus state lives in the window-state box,
 /// so provider threads post this instead of mutating it themselves.
 pub(crate) const WM_SETTINGS_FOCUS_MSG: u32 = WM_APP + 8;
+/// Deferred live-preview pass posted after a Settings mutation. Running on the
+/// next message-loop turn lets the setting's specialized overlay push finish
+/// first, then forces one coherent repaint with a fresh dismiss deadline.
+pub(crate) const WM_SETTINGS_PREVIEW_MSG: u32 = WM_APP + 15;
 const TRAY_ID: u32 = 1;
 const MENU_OPEN_ID: usize = 1001;
 const MENU_PREVIEW_NOTIFY_ID: usize = 1029;
@@ -1520,6 +1525,20 @@ impl MainWindowState {
             cfg.clone()
         };
         self.persist_change(&mut changed);
+        self.schedule_settings_preview();
+    }
+
+    /// Queue the temporary live-preview pass instead of running it inline.
+    /// Most settings have a dedicated overlay push immediately after
+    /// `mutate_config`; deferring by one message-loop turn preserves those
+    /// semantics, then refreshes the complete snapshot and timer once.
+    fn schedule_settings_preview(&self) {
+        if self.hwnd.0.is_null() {
+            return;
+        }
+        if unsafe { post_message(self.hwnd, WM_SETTINGS_PREVIEW_MSG, WPARAM(0), LPARAM(0)) }.is_err() {
+            debug!("posting the settings live-preview refresh failed");
+        }
     }
 
     /// Runs `save_checked` on the already-mutated clone and mirrors the
@@ -4819,6 +4838,7 @@ impl MainWindowState {
             cfg.clone()
         };
         self.persist_change(&mut changed);
+        self.schedule_settings_preview();
         // The log keeps the raw field value (greppable) and the displayed
         // polarity (ON = follows Expanded = field false).
         info!(
@@ -6488,7 +6508,8 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
         | COMPACT_POSITION_MSG
         | PICKER_RESULT_MSG
         | AUTO_SOURCES_RESULT_MSG
-        | PINNED_SOURCE_RESULT_MSG => dispatch_app_message(hwnd, message, wparam, lparam, state_ptr),
+        | PINNED_SOURCE_RESULT_MSG
+        | WM_SETTINGS_PREVIEW_MSG => dispatch_app_message(hwnd, message, wparam, lparam, state_ptr),
         WM_DISPLAYCHANGE | WM_CLOSE | WM_SETTINGCHANGE | WM_DESTROY => {
             dispatch_window_state_message(hwnd, message, wparam, lparam, state_ptr)
         }
@@ -7334,8 +7355,27 @@ unsafe fn dispatch_app_message(
         PICKER_RESULT_MSG => handle_picker_result_message(hwnd, message, wparam, lparam, state_ptr),
         AUTO_SOURCES_RESULT_MSG => handle_auto_sources_result_message(hwnd, message, wparam, lparam, state_ptr),
         PINNED_SOURCE_RESULT_MSG => handle_pinned_source_result_message(hwnd, message, wparam, lparam, state_ptr),
+        WM_SETTINGS_PREVIEW_MSG => handle_settings_preview_message(state_ptr),
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
+}
+
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn handle_settings_preview_message(state_ptr: *mut MainWindowState) -> LRESULT {
+    if !state_ptr.is_null() {
+        let state = &mut *state_ptr;
+        let mut config = state.cfg().clone();
+        // The overlay stores the effective duration in its private snapshot,
+        // while the main config retains the user's raw value. Preserve that
+        // contract when refreshing the whole snapshot.
+        config.overlay.duration_ms = crate::config::effective_display_duration(
+            config.overlay.duration_ms,
+            crate::winutil::system_preferences().message_duration_ms,
+            config.overlay.respect_system_message_duration,
+        );
+        preview_settings_change(state.overlay_hwnd, config);
+    }
+    LRESULT(0)
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
