@@ -3595,13 +3595,15 @@ impl MainWindowState {
                         | SettingId::GlassOpacity
                         | SettingId::FadePersistentPill => visual_setting_row(
                             *id,
-                            fade_persistent_pill,
-                            glass_effect,
-                            glass_blur_amount,
-                            glass_opacity_percent,
-                            accent,
-                            colors.faint,
-                            colors.muted,
+                            VisualSettingRowValues {
+                                fade_persistent_pill,
+                                glass_effect,
+                                glass_blur_amount,
+                                glass_opacity_percent,
+                                accent,
+                                faint: colors.faint,
+                                muted: colors.muted,
+                            },
                         ),
                         SettingId::PinnedSource => (
                             "Pinned source",
@@ -5987,8 +5989,8 @@ fn next_tuning_preset(current: u8, presets: &[u8]) -> u8 {
     }
 }
 
-fn visual_setting_row(
-    id: SettingId,
+#[derive(Clone, Copy)]
+struct VisualSettingRowValues {
     fade_persistent_pill: bool,
     glass_effect: bool,
     glass_blur_amount: u8,
@@ -5996,7 +5998,18 @@ fn visual_setting_row(
     accent: [u8; 4],
     faint: [u8; 4],
     muted: [u8; 4],
-) -> (&'static str, String, [u8; 4]) {
+}
+
+fn visual_setting_row(id: SettingId, values: VisualSettingRowValues) -> (&'static str, String, [u8; 4]) {
+    let VisualSettingRowValues {
+        fade_persistent_pill,
+        glass_effect,
+        glass_blur_amount,
+        glass_opacity_percent,
+        accent,
+        faint,
+        muted,
+    } = values;
     match id {
         SettingId::GlassEffect => (
             "Windows 11 glass effect",
