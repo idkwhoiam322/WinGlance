@@ -6,10 +6,9 @@ use crate::events::{
 };
 use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
-    EventQueue, OverlayPos, enumerate_displays_cached, invalidate_display_cache, set_dismiss_on_hover, set_duration,
-    set_expand_compact_on_hover, set_fade_persistent_pill, set_glass_effect, set_glass_tuning,
-    preview_settings_change, set_hide_for_auto_compact_sources, set_layout, set_pinned_source, set_positions,
-    show_sample,
+    EventQueue, OverlayPos, enumerate_displays_cached, invalidate_display_cache, preview_settings_change,
+    set_dismiss_on_hover, set_duration, set_expand_compact_on_hover, set_fade_persistent_pill, set_glass_effect,
+    set_glass_tuning, set_hide_for_auto_compact_sources, set_layout, set_pinned_source, set_positions, show_sample,
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG, PINNED_SOURCE_RESULT_MSG};
