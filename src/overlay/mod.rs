@@ -36,6 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
+mod backdrop;
 mod fullscreen;
 mod morph;
 mod render;
@@ -750,6 +751,8 @@ struct OverlayState {
     /// before the text draw). Read by the text-drawing helpers so the marquee
     /// `Foreground` pass only re-composites the scrolling rows.
     render_layer: render::RenderLayer,
+    /// Lazily-created Windows Composition material window below the layered pill.
+    backdrop: backdrop::Backdrop,
     /// Whether the persistent-compact pill is currently in the faded (idle)
     /// state. The alpha drops to the idle level (0.25 * 255 = 64) after the
     /// dismiss timeout. Reset on hover, track change, or playback change.
@@ -1037,6 +1040,60 @@ pub(crate) fn dpi_for_position(hwnd: HWND, compact: bool) -> u32 {
 
 /// Updates the live overlay's placement from the resolved expanded and
 /// compact positions.
+/// Temporary tuning hook: apply the latest Settings snapshot to the live
+/// overlay, repaint immediately, and grant a fresh dismiss window. This keeps
+/// visual iteration stable while settings are being tuned: a click never races
+/// the pill's old deadline, and hidden/idle pills surface the normal sample so
+/// every change has visible feedback.
+pub(crate) fn preview_settings_change(hwnd: HWND, config: Config) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = window_state::<OverlayState>(hwnd);
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        state.position = OverlayPos::from_config(&config);
+        state.compact_position = OverlayPos::compact_from_config(&config);
+        state.enabled = config.behavior.notifications_enabled;
+        *state.config = config;
+
+        // A settings preview is a hard visual refresh. Drop caches/morph state
+        // that could otherwise carry geometry or chrome from the old config.
+        state.chrome_cache = None;
+        state.marquee_strips = [None, None, None, None];
+        state.reset_scroll();
+        state.hover_dismiss_at = None;
+        state.hover_dismiss_resume_at = None;
+        state.hover_expand = None;
+        state.hover_expanded_once = false;
+        state.hover_leave_at = None;
+        state.persistent_faded = false;
+        state.persistent_collapse_on_dismiss = false;
+        state.content_fade = None;
+
+        if !state.config.overlay.glass_effect {
+            state.backdrop.hide();
+        }
+
+        // Hidden and passive-idle states already have a shared preview path
+        // that resolves layout/content and starts a fresh sample deadline.
+        if state.preview_if_hidden() {
+            return;
+        }
+
+        state.refresh_layout();
+        let now = Instant::now();
+        state.dismiss_at = Some(now + sample_duration(&state.config));
+        state.phase = Phase::Shown;
+        state.sync_anim_timer();
+        let _ = ShowWindow(state.hwnd, SW_SHOWNOACTIVATE);
+        state.render();
+    }
+}
+
 pub(crate) fn set_positions(hwnd: HWND, pos: OverlayPos, compact_pos: OverlayPos) {
     if hwnd.0.is_null() {
         return;
@@ -1194,6 +1251,52 @@ pub(crate) fn set_expand_compact_on_hover(hwnd: HWND, enabled: bool) {
 /// to full opacity immediately, so the change is visible right away; a
 /// hidden pill stays hidden (no preview — the setting only affects what
 /// happens once the next dismiss deadline fires).
+/// Pushes the optional glass-material toggle to the live overlay. The
+/// renderer keeps ownership of content and input behavior; this only changes
+/// the body material underneath it.
+pub(crate) fn set_glass_effect(hwnd: HWND, enabled: bool) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = window_state::<OverlayState>(hwnd);
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        state.config.overlay.glass_effect = enabled;
+        if !enabled {
+            state.backdrop.hide();
+        }
+        info!("overlay glass_effect set to {enabled}");
+        if !matches!(state.phase, Phase::Hidden | Phase::Collapsing(_)) {
+            state.render();
+        }
+    }
+}
+
+pub(crate) fn set_glass_tuning(hwnd: HWND, blur_amount: u8, opacity_percent: u8) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = window_state::<OverlayState>(hwnd);
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = &mut *state_ptr;
+        state.config.overlay.glass_blur_amount = blur_amount.min(64);
+        state.config.overlay.glass_opacity_percent = opacity_percent.min(100);
+        info!(
+            "overlay glass tuning set: blur={} opacity={}%",
+            state.config.overlay.glass_blur_amount, state.config.overlay.glass_opacity_percent
+        );
+        if !matches!(state.phase, Phase::Hidden | Phase::Collapsing(_)) {
+            state.render();
+        }
+    }
+}
+
 pub(crate) fn set_fade_persistent_pill(hwnd: HWND, enabled: bool) {
     if hwnd.0.is_null() {
         return;
@@ -1424,6 +1527,7 @@ impl OverlayState {
             chrome_cache: None,
             content_rev: 0,
             render_layer: render::RenderLayer::Full,
+            backdrop: backdrop::Backdrop::default(),
             last_tick: Instant::now(),
             last_reassert: None,
             period_cache: None,
@@ -3827,6 +3931,10 @@ impl OverlayState {
     /// existing aura inset no longer matches; a later real render repairs that
     /// case. This is the geometry-only half of the render gate.
     fn reposition_current_upload(&mut self) {
+        if self.backdrop.active() {
+            self.render();
+            return;
+        }
         if self.last_upload_w <= self.aura_inset * 2 || self.last_upload_h <= self.aura_inset * 2 {
             return;
         }
@@ -4090,6 +4198,13 @@ impl OverlayState {
         if matches!(self.phase, Phase::Hidden) {
             return;
         }
+        // The companion backdrop has its own HWND, so the geometry-only fast
+        // path would move just the layered foreground. Re-render while glass
+        // is active; render_layered moves both windows from one placement.
+        if self.backdrop.active() {
+            self.render();
+            return;
+        }
         let Some(target) = self.target() else {
             return;
         };
@@ -4218,6 +4333,7 @@ impl OverlayState {
     }
 
     fn hide(&mut self) {
+        self.backdrop.hide();
         debug!("pill hidden");
         self.content_rev += 1;
         self.content = None;

@@ -163,6 +163,10 @@ pub(super) fn render_layered(
     scale_factor: f32,
     orbit_angle: Option<f32>,
 ) -> Result<()> {
+    let glass_requested = state.config.overlay.glass_effect;
+    state
+        .backdrop
+        .prepare(glass_requested, state.config.overlay.glass_blur_amount);
     let inset = state.aura_inset;
     let buf_w = (width + inset * 2).max(1);
     let buf_h = (height + inset * 2).max(1);
@@ -189,6 +193,24 @@ pub(super) fn render_layered(
     } else {
         (height as f32 / scale_factor).round().max(1.0) as i32
     };
+    // Keep the custom Composition material in exact lockstep with the body,
+    // including morph/bounce radius, palette tint and the foreground fade.
+    // Sync happens before rasterization so a Composition failure can disable
+    // the material immediately and this same frame falls back to the normal
+    // solid renderer rather than flashing an under-filled pill.
+    let glass_radius = frame_radius(&state.config, scale, compact, morph) * scale_factor;
+    let glass_fill = pill_fill_bg(state);
+    state.backdrop.sync(
+        state.hwnd,
+        position.x + inset,
+        position.y + inset,
+        width,
+        height,
+        glass_radius,
+        [glass_fill[0], glass_fill[1], glass_fill[2]],
+        state.config.overlay.glass_opacity_alpha(),
+        alpha,
+    );
     let content_buf_w = (content_w + inset * 2).max(1);
     let content_buf_h = (content_h + inset * 2).max(1);
     // Every morph resolves to the expanded pill, so its final body bottom is
@@ -358,7 +380,12 @@ pub(super) fn render_layered(
             state.aura_inset as usize,
             (content_buf_w as usize).saturating_sub(state.aura_inset as usize * 2),
             (content_buf_h as usize).saturating_sub(state.aura_inset as usize * 2),
-            state.config.appearance.effective_corner_radius(compact),
+            // The bar lives on the rounded bottom edge, so its clip must
+            // follow the exact same radius interpolation as the body. Using
+            // the static compact/expanded radius here makes the visible bar
+            // edge jump at hover-morph start, then appear to fill/retract as
+            // the pill geometry catches up.
+            frame_radius(&state.config, scale, compact, morph),
             scale,
             aura_palette,
             state.estimated_position_secs,
@@ -393,34 +420,22 @@ pub(super) fn render_layered(
             );
         }
     }
-    // The aura comet sweep is painted here, after both frame paths (the
-    // cached-marquee copy and a full rebuild) and after the content
-    // cross-fade: it never bakes into the chrome cache, so the cache stays
-    // valid while the sweep advances, and a dissolving content swap cannot
-    // smear a stale comet. The shadow and every layer beneath ride below it.
-    if let Some(angle) = orbit_angle {
-        let cw = content_buf_w as usize;
-        let ch = content_buf_h as usize;
-        let inset_c = inset as usize;
-        if cw > inset_c * 2 && ch > inset_c * 2 {
-            let comet_palette = state.palette.unwrap_or(Palette {
-                primary: state.config.appearance.accent_color,
-                secondary: state.config.appearance.accent_color,
-            });
-            draw_comet(
-                &mut scratch[..needed],
-                cw,
-                ch,
-                comet_palette,
-                inset_c,
-                cw - inset_c * 2,
-                ch - inset_c * 2,
-                frame_radius(&state.config, scale, compact, morph),
-                scale,
-                angle,
-            );
-        }
-    }
+    // The moving aura is composed after cached/static chrome and content
+    // transitions so neither the outer sweep nor its glass-only inner light
+    // can bake into the chrome cache.
+    draw_orbit_comet_layer(
+        state,
+        &mut scratch[..needed],
+        OrbitCometFrame {
+            width: content_buf_w as usize,
+            height: content_buf_h as usize,
+            inset: inset as usize,
+            scale,
+            compact,
+            morph,
+            angle: orbit_angle,
+        },
+    );
     // A single oversized metadata string (huge title/album) can inflate the
     // retained UTF-16 scratch far beyond any real row; shrink it back so the
     // capacity does not stay bloated for the rest of the run.
@@ -881,6 +896,24 @@ pub(super) fn draw_pixels(
         }
     }
 
+    // Glass-only inner aura bleed: the outer palette halo should look like it
+    // is illuminating the translucent material, not merely sitting behind it.
+    // Keep this separate from the global material tint: it is strongest right
+    // at the rounded boundary and fades to zero toward the center, leaving the
+    // backdrop blur readable. Solid fallback mode intentionally keeps its
+    // existing appearance.
+    if state.backdrop.active() {
+        draw_inner_aura_bleed(
+            pixels,
+            width,
+            inset,
+            pill_w,
+            pill_h,
+            aura_palette,
+            InnerAuraStyle { radius, scale },
+        );
+    }
+
     // Progress bar: a thin accent fill at the pill's bottom edge, masked to
     // the rounded body so it never paints into the transparent aura ring at
     // the corners. Present only when the source reports both a position and
@@ -891,7 +924,18 @@ pub(super) fn draw_pixels(
 
     // Directional edge highlight: white stroke on the pill's own boundary,
     // brighter along the top-left than the bottom-right.
-    draw_edge_stroke(pixels, width, inset, pill_w, pill_h, radius, scale);
+    draw_edge_stroke(
+        pixels,
+        width,
+        inset,
+        pill_w,
+        pill_h,
+        EdgeStrokeStyle {
+            radius,
+            scale,
+            alpha_scale: material_edge_strength(state),
+        },
+    );
 
     // The compact pill draws its own smaller art tile (plus the title row
     // and the trailing icon/symbol) in `draw_compact_pill`; drawing it here
@@ -946,6 +990,7 @@ pub(super) fn draw_pixels(
         if content_alpha > 0.0 {
             let art_radius = art_size as f32 * 0.2;
             let art_x = inset + padding;
+            let rim_stroke_w = art_rim_stroke_width(&state.config, art_size, scale);
             let (source_icon, fallback_playback, fallback_type) = no_art_source_identity(state, content);
             draw_art_tile(
                 pixels,
@@ -961,6 +1006,7 @@ pub(super) fn draw_pixels(
                 fallback_playback,
                 fallback_type,
                 scale,
+                rim_stroke_w,
                 content_alpha,
             );
         }
@@ -997,6 +1043,23 @@ fn no_art_source_identity<'a>(
     }
 }
 
+/// Optical album-art rim width. Compact uses a lighter 1.0 logical-px
+/// stroke, Expanded uses 1.5, and morph frames interpolate from the *actual*
+/// art size so the rim grows continuously with the cover instead of snapping
+/// between layouts. If a custom config makes both art targets the same size,
+/// keep the full expanded treatment because there is no size transition.
+fn art_rim_stroke_width(config: &Config, art_size: usize, scale: f32) -> f32 {
+    let scale = scale.max(0.01);
+    let compact_px = compact_metrics(config).art * scale;
+    let expanded_px = config.appearance.art_size as f32 * scale;
+    let t = if (expanded_px - compact_px).abs() < 0.01 {
+        1.0
+    } else {
+        ((art_size as f32 - compact_px) / (expanded_px - compact_px)).clamp(0.0, 1.0)
+    };
+    (1.0 + 0.5 * t) * scale
+}
+
 /// Draws the art tile at (art_x, art_y): the accent halo behind the square,
 /// the cover (or a source-identity fallback tile when no art decoded) and the
 /// glowing rim. Shared by the track- and state-pill arms, which differ only in the
@@ -1020,6 +1083,7 @@ pub(super) fn draw_art_tile(
     fallback_playback: PlaybackState,
     fallback_type: PlaybackType,
     scale: f32,
+    rim_stroke_w: f32,
     content_alpha: f32,
 ) {
     // Album art halo: subtle accent glow behind the art square.
@@ -1057,9 +1121,10 @@ pub(super) fn draw_art_tile(
             content_alpha,
         );
     }
-    // Glowing rim: thin 1.5px accent stroke around the album art.
+    // Glowing rim: optically scales from 1.0 logical px in Compact to
+    // 1.5 in Expanded, following the cover size continuously through morphs.
     if let Some(c) = palette.map(|p| p.primary) {
-        let stroke_w = (1.5 * scale).round().max(1.0);
+        let stroke_w = rim_stroke_w.max(0.5);
         for dy in 0..art_size {
             for dx in 0..art_size {
                 let d = round_rect_signed_dist(dx as f32, dy as f32, art_size as f32, art_size as f32, art_radius);
@@ -1220,18 +1285,33 @@ fn edge_stroke_ranges(pill_w: usize, pill_h: usize, radius: f32, stroke_w: f32, 
     }
 }
 
+fn material_edge_strength(state: &OverlayState) -> f32 {
+    if state.backdrop.active() { 0.48 } else { 1.0 }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct EdgeStrokeStyle {
+    radius: f32,
+    scale: f32,
+    alpha_scale: f32,
+}
+
 pub(super) fn draw_edge_stroke(
     pixels: &mut [u8],
     width: usize,
     inset: usize,
     pill_w: usize,
     pill_h: usize,
-    radius: f32,
-    scale: f32,
+    style: EdgeStrokeStyle,
 ) {
     const STROKE_COLOR: [u8; 3] = [255, 255, 255];
     const PEAK_ALPHA: f32 = 90.0;
     const MIN_ALPHA: f32 = 30.0;
+    let EdgeStrokeStyle {
+        radius,
+        scale,
+        alpha_scale,
+    } = style;
     let stroke_w = (1.25 * scale).round().max(1.0);
     // Ring coverage = outer rounded-rect coverage minus the same shape
     // inset by stroke_w, both supersampled — the same technique the pill
@@ -1266,7 +1346,7 @@ pub(super) fn draw_edge_stroke(
                 // at bottom-right (pill_w, pill_h), normalized to [0, 1].
                 let t = ((x as f32 / pill_w.max(1) as f32) + (y as f32 / pill_h.max(1) as f32)) * 0.5;
                 let peak = PEAK_ALPHA - (PEAK_ALPHA - MIN_ALPHA) * t;
-                let alpha = (peak * coverage).round() as u32;
+                let alpha = (peak * coverage * alpha_scale).round() as u32;
                 composite(pixels, width, inset + x, inset + y, STROKE_COLOR, alpha);
             }
         }
@@ -1890,14 +1970,21 @@ pub(super) fn pill_fill_bg(state: &OverlayState) -> [u8; 4] {
     if crate::winutil::system_preferences().high_contrast {
         return crate::winutil::system_window_color();
     }
-    match state.palette {
+    let mut fill = match state.palette {
         Some(palette) => tinted_fill(
             state.config.appearance.background_color,
             palette.primary,
             FILL_TINT_WEIGHT,
         ),
         None => state.config.appearance.background_color,
+    };
+    if state.backdrop.active() {
+        // Composition owns the material. This foreground layer contributes
+        // only a faint palette-aware wash; a mostly-opaque fill would bury
+        // the live blur and recreate the grey-card look glass mode replaces.
+        fill[3] = fill[3].min(state.config.overlay.glass_opacity_alpha());
     }
+    fill
 }
 
 /// The effective pill text color: the configured color normally, the system
@@ -2590,6 +2677,8 @@ pub(super) fn draw_compact_pill(
     // `Foreground` pass. Missing cover art reuses the source icon already
     // carried by the track/cache, so it adds no shell work or retained memory.
     if layer != RenderLayer::Foreground {
+        let art_size = art_size as usize;
+        let rim_stroke_w = art_rim_stroke_width(&state.config, art_size, scale);
         let (source_icon, fallback_playback, fallback_type) = no_art_source_identity(state, content);
         draw_art_tile(
             pixels,
@@ -2598,13 +2687,14 @@ pub(super) fn draw_compact_pill(
             appearance.accent_color,
             art_x as usize,
             art_y as usize,
-            art_size as usize,
+            art_size,
             art_size as f32 * 0.2,
             state.decoded_art.as_deref(),
             source_icon,
             fallback_playback,
             fallback_type,
             scale,
+            rim_stroke_w,
             content_alpha,
         );
     }
@@ -3874,6 +3964,14 @@ pub(super) const AURA_HALO_LOGICAL: f32 = 6.0;
 /// so the glow stays soft beneath the pill body's supersampled edge instead
 /// of producing a hard 0→255 step at the boundary.
 pub(super) const AURA_PEAK_ALPHA: f32 = 140.0;
+/// How far the palette light washes inward through active Composition glass,
+/// in logical pixels. This is deliberately independent of the outer halo:
+/// changing the desktop glow must not recolor the whole material.
+pub(super) const INNER_AURA_FALLOFF_LOGICAL: f32 = 20.0;
+/// Peak alpha of the inner glass illumination at the pill boundary. About
+/// 22.7% opacity gives the approved visible edge wash while still fading to
+/// a neutral center and preserving the normal 10% glass material density.
+pub(super) const INNER_AURA_PEAK_ALPHA: f32 = 58.0;
 /// Exponential decay constant. The falloff is exp(-AURA_DECAY * d /
 /// (AURA_MARGIN_LOGICAL * scale)) per physical px, so the curve's per-px
 /// rate is fixed by these two constants and does not change when the halo
@@ -3894,6 +3992,11 @@ pub(super) const ORBIT_COMET_HALF_SPAN_DEG: f32 = 55.0;
 /// ring (which peaks at `AURA_PEAK_ALPHA` ≈ 140). The composite caps at 255,
 /// so the sweep is clearly brighter without burning out.
 pub(super) const ORBIT_COMET_PEAK_ALPHA: f32 = 210.0;
+/// Additional glass-only illumination under the moving outer comet. Match the
+/// outer comet's relative boost over its static aura closely enough that the
+/// moving counterpart is visibly readable through the glass without altering
+/// the established outer sweep itself.
+pub(super) const INNER_COMET_PEAK_ALPHA: f32 = 88.0;
 
 /// Per-row evaluation windows for the aura sweep, as two `[start, end)`
 /// pixel ranges (the second empty when the bands merge or the row is full).
@@ -4045,6 +4148,168 @@ pub(super) fn draw_aura(
     }
 }
 
+#[derive(Clone, Copy)]
+struct InnerAuraStyle {
+    radius: f32,
+    scale: f32,
+}
+
+#[derive(Clone, Copy)]
+struct InnerAuraContext {
+    inset: usize,
+    pill_w: usize,
+    pill_h: usize,
+    radius: f32,
+    falloff: f32,
+    primary: [u8; 4],
+    secondary: [u8; 4],
+}
+
+/// Palette light that appears to pass through the glass from its perimeter.
+/// Unlike `draw_aura`, this contributes only *inside* the rounded pill and
+/// only over a shallow edge band. The work is split by row/pixel so this
+/// decorative pass stays below the repository's complexity ratchet.
+fn draw_inner_aura_bleed(
+    pixels: &mut [u8],
+    width: usize,
+    inset: usize,
+    pill_w: usize,
+    pill_h: usize,
+    palette: Palette,
+    style: InnerAuraStyle,
+) {
+    if pill_w == 0 || pill_h == 0 {
+        return;
+    }
+    let ctx = InnerAuraContext {
+        inset,
+        pill_w,
+        pill_h,
+        radius: style.radius,
+        falloff: (INNER_AURA_FALLOFF_LOGICAL * style.scale).max(1.0),
+        primary: palette.primary,
+        secondary: palette.secondary,
+    };
+    for y in 0..pill_h {
+        draw_inner_aura_row(pixels, width, y, ctx);
+    }
+}
+
+fn draw_inner_aura_row(pixels: &mut [u8], width: usize, y: usize, ctx: InnerAuraContext) {
+    for (start, end) in edge_stroke_ranges(ctx.pill_w, ctx.pill_h, ctx.radius, ctx.falloff, y) {
+        for x in start..end {
+            if let Some((rgb, strength)) = inner_aura_sample(x, y, ctx) {
+                let alpha = (INNER_AURA_PEAK_ALPHA * strength).round() as u32;
+                if alpha > 0 {
+                    composite(pixels, width, ctx.inset + x, ctx.inset + y, rgb, alpha);
+                }
+            }
+        }
+    }
+}
+
+fn inner_aura_sample(x: usize, y: usize, ctx: InnerAuraContext) -> Option<([u8; 3], f32)> {
+    let d = round_rect_signed_dist(x as f32, y as f32, ctx.pill_w as f32, ctx.pill_h as f32, ctx.radius);
+    // Signed distance is negative inside the pill. Pixels outside the
+    // silhouette belong to the ordinary outer aura, never the inner bleed.
+    if d > 0.0 || d < -ctx.falloff {
+        return None;
+    }
+
+    let coverage =
+        round_rect_coverage_supersampled(x as f32, y as f32, ctx.pill_w as f32, ctx.pill_h as f32, ctx.radius);
+    if coverage <= 0.0 {
+        return None;
+    }
+
+    // 1 at the boundary -> 0 at the inner edge of the band. A smoothstep
+    // keeps both endpoints derivative-flat, avoiding a visible second ring.
+    let t = (1.0 + d / ctx.falloff).clamp(0.0, 1.0);
+    let glow = t * t * (3.0 - 2.0 * t);
+    if glow <= 0.0 {
+        return None;
+    }
+
+    // Match the outer aura's left->right palette interpolation so the glow
+    // reads as one continuous light source crossing the glass boundary.
+    let mix = (x as f32 / ctx.pill_w.max(1) as f32).clamp(0.0, 1.0);
+    let rgb = [
+        (ctx.primary[0] as f32 * (1.0 - mix) + ctx.secondary[0] as f32 * mix).round() as u8,
+        (ctx.primary[1] as f32 * (1.0 - mix) + ctx.secondary[1] as f32 * mix).round() as u8,
+        (ctx.primary[2] as f32 * (1.0 - mix) + ctx.secondary[2] as f32 * mix).round() as u8,
+    ];
+    let strength = glow * coverage;
+    (strength > 0.0).then_some((rgb, strength))
+}
+
+#[derive(Clone, Copy)]
+struct InnerCometContext {
+    aura: InnerAuraContext,
+    angle: f32,
+    half_span: f32,
+}
+
+#[derive(Clone, Copy)]
+struct InnerCometSpec {
+    inset: usize,
+    pill_w: usize,
+    pill_h: usize,
+    palette: Palette,
+    style: InnerAuraStyle,
+    angle: f32,
+}
+
+/// Moving counterpart to the static inner aura. It reuses the exact same
+/// palette/radial falloff and only adds the outer comet's angular bump, so the
+/// passing light appears to continue through the glass instead of stopping at
+/// the rim. The ordinary outer comet is untouched.
+fn draw_inner_comet_bleed(pixels: &mut [u8], width: usize, spec: InnerCometSpec) {
+    if spec.pill_w == 0 || spec.pill_h == 0 {
+        return;
+    }
+    let aura = InnerAuraContext {
+        inset: spec.inset,
+        pill_w: spec.pill_w,
+        pill_h: spec.pill_h,
+        radius: spec.style.radius,
+        falloff: (INNER_AURA_FALLOFF_LOGICAL * spec.style.scale).max(1.0),
+        primary: spec.palette.primary,
+        secondary: spec.palette.secondary,
+    };
+    let ctx = InnerCometContext {
+        aura,
+        angle: spec.angle,
+        half_span: ORBIT_COMET_HALF_SPAN_DEG.to_radians(),
+    };
+    for y in 0..spec.pill_h {
+        draw_inner_comet_row(pixels, width, y, ctx);
+    }
+}
+
+fn draw_inner_comet_row(pixels: &mut [u8], width: usize, y: usize, ctx: InnerCometContext) {
+    let aura = ctx.aura;
+    for (start, end) in edge_stroke_ranges(aura.pill_w, aura.pill_h, aura.radius, aura.falloff, y) {
+        for x in start..end {
+            if let Some((rgb, alpha)) = inner_comet_sample(x, y, ctx) {
+                composite(pixels, width, aura.inset + x, aura.inset + y, rgb, alpha);
+            }
+        }
+    }
+}
+
+fn inner_comet_sample(x: usize, y: usize, ctx: InnerCometContext) -> Option<([u8; 3], u32)> {
+    let (rgb, strength) = inner_aura_sample(x, y, ctx.aura)?;
+    let px = x as f32 + 0.5 - ctx.aura.pill_w as f32 * 0.5;
+    let py = y as f32 + 0.5 - ctx.aura.pill_h as f32 * 0.5;
+    let angle = py.atan2(px) - ctx.angle;
+    let diff = ((angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI).abs();
+    let t = (diff / ctx.half_span).clamp(0.0, 1.0);
+    let s = 1.0 - t;
+    let bump = s * s * (3.0 - 2.0 * s);
+    let alpha = (INNER_COMET_PEAK_ALPHA * strength * bump).round() as u32;
+    (alpha > 0).then_some((rgb, alpha))
+}
+
 /// Quantized exp-falloff table for the aura ring and comet sweep: the
 /// falloff depends only on the signed distance and the scale, so a per-call
 /// table (0.25 px steps over the band the sweeps evaluate, linearly
@@ -4160,6 +4425,68 @@ pub(super) fn draw_comet(
                 composite(pixels, buf_w, x, y, rgb, alpha);
             }
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OrbitCometFrame {
+    width: usize,
+    height: usize,
+    inset: usize,
+    scale: f32,
+    compact: bool,
+    morph: Option<MorphProgress>,
+    angle: Option<f32>,
+}
+
+/// Paint the active-playback orbit without adding another branch to the large
+/// frame compositor. The established outer comet remains unchanged; active
+/// Composition glass receives only the additional low-alpha inward shimmer.
+fn draw_orbit_comet_layer(state: &OverlayState, pixels: &mut [u8], frame: OrbitCometFrame) {
+    let Some(angle) = frame.angle else {
+        return;
+    };
+    if frame.width <= frame.inset * 2 || frame.height <= frame.inset * 2 {
+        return;
+    }
+
+    let pill_w = frame.width - frame.inset * 2;
+    let pill_h = frame.height - frame.inset * 2;
+    let palette = state.palette.unwrap_or(Palette {
+        primary: state.config.appearance.accent_color,
+        secondary: state.config.appearance.accent_color,
+    });
+    let radius = frame_radius(&state.config, frame.scale, frame.compact, frame.morph);
+
+    draw_comet(
+        pixels,
+        frame.width,
+        frame.height,
+        palette,
+        frame.inset,
+        pill_w,
+        pill_h,
+        radius,
+        frame.scale,
+        angle,
+    );
+
+    if state.backdrop.active() {
+        draw_inner_comet_bleed(
+            pixels,
+            frame.width,
+            InnerCometSpec {
+                inset: frame.inset,
+                pill_w,
+                pill_h,
+                palette,
+                style: InnerAuraStyle {
+                    radius,
+                    scale: frame.scale,
+                },
+                angle,
+            },
+        );
     }
 }
 

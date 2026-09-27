@@ -238,6 +238,19 @@ pub struct OverlayConfig {
     /// when the source has stopped (tombstone). Fullscreen/listed-foreground
     /// hiding (`hide_for_auto_compact_sources`) applies either way. Default: `true`.
     pub fade_persistent_pill: bool,
+    /// Optional Windows 11 Composition glass behind the pill. The existing
+    /// layered renderer remains responsible for sharp content and the aura;
+    /// a companion desktop Backdrop + Gaussian-blur window is created lazily only
+    /// while this is true. Unsupported systems and accessibility preferences
+    /// fall back to the existing solid fill. Default: false.
+    pub glass_effect: bool,
+    /// User-tunable Composition Gaussian blur standard deviation, in pixels.
+    /// Default: 16. Clamped to 0..=64.
+    pub glass_blur_amount: u8,
+    /// User-tunable density control for the glass material. This percentage
+    /// drives both the Composition tint alpha and the faint GDI body wash, so
+    /// the control matches perceived transparency. Default: 10.
+    pub glass_opacity_percent: u8,
     /// Unknown keys under `[overlay]`, preserved across saves.
     #[serde(flatten)]
     pub unknown: toml::Table,
@@ -431,6 +444,9 @@ impl Default for OverlayConfig {
             dismiss_on_hover: true,
             expand_compact_on_hover: true,
             fade_persistent_pill: true,
+            glass_effect: false,
+            glass_blur_amount: 16,
+            glass_opacity_percent: 10,
             unknown: toml::Table::new(),
         }
     }
@@ -476,6 +492,12 @@ impl OverlayConfig {
     /// The position the Compact layout resolves to, per the separation rule:
     /// independent fields when `compact_position_separate` is set, otherwise
     /// the live Expanded position.
+    /// Converts the user-facing glass opacity percentage into the byte alpha
+    /// consumed by both the Composition tint and the foreground body wash.
+    pub(crate) fn glass_opacity_alpha(&self) -> u8 {
+        ((self.glass_opacity_percent as u16 * 255 + 50) / 100) as u8
+    }
+
     pub fn compact_effective(&self) -> CompactPosition {
         if self.compact_position_separate {
             CompactPosition {
@@ -970,6 +992,8 @@ impl Config {
         self.overlay.max_tick_hz = self.overlay.max_tick_hz.map(|hz| hz.clamp(60, 1000));
         self.overlay.margin = self.overlay.margin.clamp(0, 500);
         self.overlay.compact_margin = self.overlay.compact_margin.clamp(0, 500);
+        self.overlay.glass_blur_amount = self.overlay.glass_blur_amount.min(64);
+        self.overlay.glass_opacity_percent = self.overlay.glass_opacity_percent.min(100);
         self.behavior.debounce_ms = self.behavior.debounce_ms.clamp(150, 250);
         self.behavior.history_tooltip_dwell_ms = self.behavior.history_tooltip_dwell_ms.clamp(0, 2_000);
         // `pinned_source` is a single source pattern: trim it (a hand-edited
@@ -1073,6 +1097,16 @@ impl Config {
                 "overlay.compact_margin",
                 before.overlay.compact_margin,
                 after.overlay.compact_margin,
+            ),
+            diff(
+                "overlay.glass_blur_amount",
+                before.overlay.glass_blur_amount,
+                after.overlay.glass_blur_amount,
+            ),
+            diff(
+                "overlay.glass_opacity_percent",
+                before.overlay.glass_opacity_percent,
+                after.overlay.glass_opacity_percent,
             ),
             diff(
                 "behavior.debounce_ms",
