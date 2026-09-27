@@ -53,6 +53,9 @@ the file itself is not rewritten (see `docs/architecture.md`).
 | `compact_monitor_device_id` / `compact_monitor_device_index` | *(managed)* | string / integer | Managed identity metadata for the independent Compact monitor slot |
 | `dismiss_on_hover` | `true` | bool | Hovering a pill in the Expanded layout arms a 500 ms dismissal cap; leaving before it fires cancels that hover cap and restores the prior deadline. For Compact pills it makes the second hover dismiss (see below) |
 | `expand_compact_on_hover` | `true` | bool | Hovering a pill in the Compact layout expands it in place; with `dismiss_on_hover` on, the second hover dismisses (see below) |
+| `glass_effect` | `false` | bool | Opt in to the Windows 11 Composition glass body: live desktop Backdrop Gaussian blur with a restrained tint behind the existing sharp layered foreground. Artwork/text/progress remain unblurred and the palette aura/comet bleed outside the rounded glass clip. High Contrast, the system reduced-overlap preference, or unavailable Composition support fall back to the existing solid material |
+| `glass_blur_amount` | `16` | 0–64 | Composition Gaussian blur amount, in pixels. The Settings row cycles 32 → 24 → 20 → 16 → 12 → 8; the glass tuning guide includes recommended blur/opacity combinations |
+| `glass_opacity_percent` | `10` | 0–100 | Material-density percentage shared by the Composition tint and faint foreground wash. The Settings row cycles 30 → 20 → 14 → 10 → 5 → 0; the default pair is 16 px / 10% |
 | `fade_persistent_pill` | `true` | bool | With `layout = "persistent-compact"`, fade the pill to idle opacity once `duration_ms` passes without cursor interaction. Off: the pill stays at full opacity while media is playing or paused (no idle fade), and hides only when the source has stopped. Hiding for fullscreen/listed foregrounds (`hide_for_auto_compact_sources`) applies either way |
 
 `layout` accepts one of:
@@ -121,10 +124,12 @@ cap, and values above 1000 are clamped to 1000. It is configurable only via
 > preference and the "minimize translucent overlapped content" preference
 > (System Parameters `SPI_GETCLIENTAREAANIMATION` /
 > `SPI_GETDISABLEOVERLAPPEDCONTENT`) both disable the pill's *motion*: all
-> animations complete instantly and the pill behaves statically. They do not
-> touch the pill's translucency itself — the pill's identity is a translucent
-> overlay, so the alpha fill, the aura halo, and the layered-window
-> composition stay as configured even when either preference is on.
+> animations complete instantly and the pill behaves statically. The
+> reduced-overlap preference also suppresses the optional Composition glass
+> companion, because it explicitly asks applications to avoid translucent
+> overlapped content; WinGlance falls back to the existing solid pill. High
+> Contrast does the same. The ordinary layered-window alpha fill and aura
+> remain available in that fallback.
 
 Hovering behavior follows the pill's *effective* layout (for `"auto"`, the
 layout currently in effect — an Auto pill in the expanded layout follows the
@@ -213,7 +218,7 @@ playing track through the normal event path.
 
 | Key                | Default       | Range    | Effect                                  |
 |--------------------|---------------|----------|-----------------------------------------|
-| `background_color` | `[18, 20, 28, 235]` | RGBA 0–255 | Near-opaque dark-slate pill background (alpha 235 ≈ 92%; lower for more translucency) |
+| `background_color` | `[18, 20, 28, 235]` | RGBA 0–255 | Solid-mode dark-slate pill background (alpha 235 ≈ 92%). With Composition glass active, its RGB still supplies the restrained palette-aware material tint but the GDI foreground body alpha is capped to a faint wash so the live blur stays visible |
 | `text_color`       | `[255, 255, 255, 255]` | RGBA 0–255 | Stored title/state color; the Activity title is rendered with the minimum lightening needed for 4.5:1 contrast on its black surface |
 | `accent_color`     | `[240, 110, 155, 255]` | RGBA 0–255 | Playback symbols, music note, album-art rim; aura fallback when the artwork palette has no vibrant color |
 | `corner_radius`    | `26.0`     | 4–48    | Corner rounding in logical pixels       |
@@ -256,14 +261,23 @@ Beyond these knobs the pill derives its look from the playing track:
   cover's hue. When the artwork yields no qualifying color, the accent
   above is used.
 - **Aura** — a soft C₁→C₂ glow around the pill boundary, brighter on the left
-  where the art sits, fading exponentially over a ~6 px halo. Intensity is
-  hardcoded, not in the config.
+  where the art sits, fading exponentially over a ~6 px outer halo. With
+  Composition glass active, a separate ~20 px inner palette bleed peaks at
+  alpha 58 (~22.7%) on the boundary and fades into the glass, leaving the
+  center/backdrop blur largely untouched. During active playback, the outer
+  comet also adds a visible moving inner boost under the same arc (peak alpha
+  88), so its light appears to continue through the glass. Aura intensity,
+  inner-bleed strength, and the inner-comet boost are currently hardcoded, not
+  in the config.
 - **Edge highlight** — a subtle white stroke along the pill's own boundary,
   brighter at the top-left than the bottom-right, so the pill reads as a
   physical cut edge. Not configurable.
 - **App icon** — the source app's icon (from its AUMID) renders next to the
   source-app name.
-- **Album-art rim** — a thin accent stroke around the art square.
+- **Album-art rim** — an accent stroke around the art square that scales
+  optically with the cover: about 1.0 logical px in Compact and 1.5 px in
+  Expanded, interpolating continuously with the artwork size during the
+  Compact ↔ Expanded morph.
 - **Content type** — the type SMTC reports for the session (music, video,
   image) does two things, with no config knob:
   - Track-change pills from sources that report `Video` swap the music note
@@ -337,12 +351,15 @@ pill:
   `compact_position_separate = false`, Compact tracks the live Expanded
   placement; enabling separation copies the current Expanded position in and
   lets the compact anchor diverge.
-- **Visuals**: rounded rect at `compact_corner_radius` (12 px), filled with
-  `background_color` (`[0x12, 0x14, 0x1C]`, alpha 235 ≈ 92 % opaque) so a hint of
-  the backdrop shows through; a palette aura ring in the DIB margin (the cover's
-  primary/secondary hues, falling back to the hardcoded pink `accent_color`
-  `[240, 110, 155]` when no palette is extracted) brighter on the artwork side,
-  and a white top-left→bottom-right directional edge highlight. Title and meta
-  text render white with per-track accent coloring.
+- **Visuals**: rounded rect at `compact_corner_radius` (12 px). In the
+  default solid mode it is filled with `background_color`
+  (`[0x12, 0x14, 0x1C]`, alpha 235 ≈ 92 % opaque). With
+  `glass_effect = true` on supported Windows 11 systems, the body instead
+  exposes a full live Composition backdrop blur under a restrained tint and
+  faint GDI wash. In both modes the palette aura ring lives in the DIB margin
+  outside the body (cover primary/secondary hues, falling back to the hardcoded
+  pink `accent_color` `[240, 110, 155]`) with a white
+  top-left→bottom-right directional edge highlight. Artwork and text stay
+  sharp above the material.
 
 All of these can be widened or recolored here.
