@@ -485,7 +485,7 @@ pub(super) fn compact_size(config: &Config) -> (f32, f32) {
     let metrics = compact_metrics(config);
     let max_w = config.overlay.max_width.max(180) as f32;
     let title = (max_w * 0.5).clamp(180.0, (max_w - 160.0).max(180.0));
-    let width = (2.0 * appearance.padding + metrics.art + 12.0 + title + 6.0 + metrics.icon + 16.0 + metrics.symbol)
+    let width = (2.0 * appearance.padding + metrics.art + 12.0 + title + 6.0 + metrics.icon + 8.0 + metrics.symbol)
         .min(max_w)
         .max(1.0);
     let height = (appearance.font_size_title * ROW_HEIGHT + 2.0 * appearance.padding).max(1.0);
@@ -501,7 +501,7 @@ pub(super) fn compact_title_viewport(config: &Config) -> (f32, f32) {
     let appearance = &config.appearance;
     let (pill_w, _) = compact_size(config);
     let left = appearance.padding + metrics.art + 12.0;
-    let right = pill_w - appearance.padding - metrics.symbol - 16.0 - metrics.icon - 6.0;
+    let right = pill_w - appearance.padding - metrics.symbol - 8.0 - metrics.icon - 6.0;
     // Extreme-but-valid configs (max padding + title font at the minimum
     // max_width) can squeeze the band past inversion; keep a minimal
     // positive viewport so the row renders — and marquees — instead of
@@ -600,7 +600,7 @@ pub(super) fn morph_symbol_pos(
     let viewport_right = inset + (vp_right * scale).round() as i32;
     let gap = (6.0 * scale).round() as i32;
     let icon = (16.0 * scale).round() as i32;
-    let symbol_gap = (16.0 * scale).round() as i32;
+    let symbol_gap = (8.0 * scale).round() as i32;
     let compact_right = viewport_right + gap + icon + symbol_gap + symbol;
     let compact_y = inset + (compact_h - symbol) / 2;
     let expanded_right = width - inset - padding;

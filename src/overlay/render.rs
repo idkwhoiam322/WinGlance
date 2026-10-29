@@ -2779,12 +2779,12 @@ pub(super) fn draw_compact_pill(
     );
 
     // Trailing elements, from the title viewport's right edge outward:
-    // 6 px gap, app icon, 16 px gap (the expanded symbol gap), playback
+    // 6 px gap, app icon, 8 px compact gap, playback
     // symbol. The chain mirrors `compact_title_viewport`, so the viewport
     // and the elements can never overlap.
     let icon_size = (metrics.icon * scale).round() as i32;
     let gap = (6.0 * scale).round() as i32;
-    let symbol_gap = (16.0 * scale).round() as i32;
+    let symbol_gap = (8.0 * scale).round() as i32;
     let symbol = (metrics.symbol * scale).round() as i32;
     let viewport_right = inset + (title_vp_right * scale).round() as i32;
     let icon_x = viewport_right + gap;

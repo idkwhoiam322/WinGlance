@@ -6673,9 +6673,9 @@ mod tests {
         let (pill_w, _) = compact_size(&config);
         let (left, right) = compact_title_viewport(&config);
         // The viewport sits between the art tile (with its 12 px gap) and
-        // the trailing chain: 6 px gap, app icon, 16 px gap, playback
+        // the trailing chain: 6 px gap, app icon, 8 px gap, playback
         // symbol, padding — the marquee band can never reach them.
-        let expected_right = pill_w - config.appearance.padding - metrics.symbol - 16.0 - metrics.icon - 6.0;
+        let expected_right = pill_w - config.appearance.padding - metrics.symbol - 8.0 - metrics.icon - 6.0;
         assert_eq!(right, expected_right, "the viewport must end before the icon chain");
         assert_eq!(left, config.appearance.padding + metrics.art + 12.0);
         assert!(
@@ -10724,7 +10724,7 @@ mod tests {
         let viewport_right = inset + (vp_right * scale).round() as i32;
         let gap = (6.0 * scale).round() as i32;
         let icon = (16.0 * scale).round() as i32;
-        let symbol_gap = (16.0 * scale).round() as i32;
+        let symbol_gap = (8.0 * scale).round() as i32;
         let at0 = morph_symbol_pos(
             &config,
             inset,
