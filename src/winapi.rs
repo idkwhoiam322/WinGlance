@@ -30,9 +30,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, HCURSOR, HMENU, IsWindow, KillTimer, MSG, PEEK_MESSAGE_REMOVE_TYPE, PeekMessageW, PostMessageW,
-    SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD, SendMessageW, SetCursor, SetTimer, SetWindowPos, TIMERPROC,
-    TRACK_POPUP_MENU_FLAGS, TrackPopupMenu, UPDATE_LAYERED_WINDOW_FLAGS, UpdateLayeredWindow, WINDOW_EX_STYLE,
-    WINDOW_STYLE,
+    SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD, SendMessageW, SetCursor, SetTimer, SetWindowDisplayAffinity, SetWindowPos,
+    TIMERPROC, TRACK_POPUP_MENU_FLAGS, TrackPopupMenu, UPDATE_LAYERED_WINDOW_FLAGS, UpdateLayeredWindow,
+    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 use windows::core::{PCWSTR, Result};
 
@@ -82,6 +82,17 @@ pub unsafe fn set_window_pos(
     flags: SET_WINDOW_POS_FLAGS,
 ) -> Result<()> {
     unsafe { SetWindowPos(hwnd, Some(after), x, y, w, h, flags) }
+}
+
+/// `SetWindowDisplayAffinity`: exclude the window from supported capture APIs
+/// when `exclude_from_capture` is set, otherwise clear the restriction.
+pub unsafe fn set_window_display_affinity(hwnd: HWND, exclude_from_capture: bool) -> Result<()> {
+    let affinity = if exclude_from_capture {
+        WDA_EXCLUDEFROMCAPTURE
+    } else {
+        WDA_NONE
+    };
+    unsafe { SetWindowDisplayAffinity(hwnd, affinity) }
 }
 
 /// `InvalidateRect`; true when the invalidation was queued.

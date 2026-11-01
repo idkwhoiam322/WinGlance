@@ -12,7 +12,10 @@ use crate::events::{
 };
 use crate::gdi::FontProvider;
 use crate::palette::Palette;
-use crate::winapi::{delete_object, kill_timer, post_message, select_object, set_timer, set_window_pos, validate_rect};
+use crate::winapi::{
+    delete_object, kill_timer, post_message, select_object, set_timer, set_window_display_affinity, set_window_pos,
+    validate_rect,
+};
 use crate::winutil::{StateClaim, release_window_state, set_window_state, wide, window_state};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
@@ -1140,6 +1143,33 @@ pub(crate) fn set_duration(hwnd: HWND, duration_ms: u64) {
         state.config.overlay.duration_ms = duration_ms.clamp(500, 60_000);
         info!("overlay duration set to {} ms", state.config.overlay.duration_ms);
     }
+}
+
+/// Applies the capture-exclusion affinity to the overlay window. The overlay
+/// uses one HWND for both the Compact and Expanded layouts, so one affinity
+/// covers both. A failed call is logged; the overlay stays capturable.
+fn apply_capture_exclusion(hwnd: HWND, enabled: bool) {
+    match unsafe { set_window_display_affinity(hwnd, enabled) } {
+        Ok(()) => debug!("overlay capture exclusion applied: {enabled}"),
+        Err(error) => warn!("SetWindowDisplayAffinity failed while setting capture exclusion to {enabled}: {error}"),
+    }
+}
+
+/// Pushes the capture-exclusion setting to the live overlay (which keeps its
+/// own config snapshot) and applies it immediately.
+pub(crate) fn set_capture_exclusion(hwnd: HWND, enabled: bool) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let state_ptr = window_state::<OverlayState>(hwnd);
+        if state_ptr.is_null() {
+            return;
+        }
+        (*state_ptr).config.overlay.exclude_from_capture = enabled;
+    }
+    apply_capture_exclusion(hwnd, enabled);
+    info!("overlay capture exclusion set to {enabled}");
 }
 
 /// Pushes a layout-mode change to the live overlay (which keeps its own config
@@ -4745,6 +4775,10 @@ pub(crate) fn create_window(
                     (*state_ptr).hook = Some(hook);
                 }
             }
+            // One overlay HWND serves both layouts; apply the persisted
+            // capture exclusion before the first frame.
+            let exclude_from_capture = unsafe { (*state_ptr).config.overlay.exclude_from_capture };
+            apply_capture_exclusion(hwnd, exclude_from_capture);
             unsafe {
                 (*state_ptr).show_idle();
             }

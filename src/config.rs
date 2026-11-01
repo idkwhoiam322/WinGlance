@@ -238,6 +238,14 @@ pub struct OverlayConfig {
     /// when the source has stopped (tombstone). Fullscreen/listed-foreground
     /// hiding (`hide_for_auto_compact_sources`) applies either way. Default: `true`.
     pub fade_persistent_pill: bool,
+    /// Exclude the overlay window from supported screen-capture APIs while
+    /// keeping it visible on the local desktop. Uses
+    /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`, which requires
+    /// Windows 10 version 2004 or later; support varies by capture method and
+    /// this is not DRM or a guarantee against every capture path. The single
+    /// overlay HWND renders both the Compact and Expanded layouts, so one
+    /// affinity applies to both. Default: `false`.
+    pub exclude_from_capture: bool,
     /// Optional Windows 11 Composition glass behind the pill. The existing
     /// layered renderer remains responsible for sharp content and the aura;
     /// a companion desktop Backdrop + Gaussian-blur window is created lazily only
@@ -444,6 +452,7 @@ impl Default for OverlayConfig {
             dismiss_on_hover: true,
             expand_compact_on_hover: true,
             fade_persistent_pill: true,
+            exclude_from_capture: false,
             glass_effect: false,
             glass_blur_amount: 16,
             glass_opacity_percent: 10,
@@ -1281,6 +1290,15 @@ mod tests {
         assert!(!config.behavior.start_on_login);
         assert!(config.behavior.start_in_tray);
         assert!(config.behavior.close_to_tray);
+    }
+
+    #[test]
+    fn capture_exclusion_defaults_off_and_loads_an_explicit_on() {
+        let config = Config::default();
+        assert!(!config.overlay.exclude_from_capture);
+
+        let explicit_on: Config = toml::from_str("[overlay]\nexclude_from_capture = true\n").unwrap();
+        assert!(explicit_on.overlay.exclude_from_capture);
     }
 
     #[test]

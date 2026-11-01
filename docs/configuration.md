@@ -57,6 +57,7 @@ the file itself is not rewritten (see `docs/architecture.md`).
 | `glass_blur_amount` | `16` | 0–64 | Composition Gaussian blur amount, in pixels. The Settings row cycles 32 → 24 → 20 → 16 → 12 → 8; the glass tuning guide includes recommended blur/opacity combinations |
 | `glass_opacity_percent` | `10` | 0–100 | Material-density percentage shared by the Composition tint and faint foreground wash. The Settings row cycles 30 → 20 → 14 → 10 → 5 → 0; the default pair is 16 px / 10% |
 | `fade_persistent_pill` | `true` | bool | With `layout = "persistent-compact"`, fade the pill to idle opacity once `duration_ms` passes without cursor interaction. Off: the pill stays at full opacity while media is playing or paused (no idle fade), and hides only when the source has stopped. Hiding for fullscreen/listed foregrounds (`hide_for_auto_compact_sources`) applies either way |
+| `exclude_from_capture` | `false` | bool | Exclude the overlay from supported screen-capture APIs while keeping it visible on the local desktop. The single overlay window serves both the Compact and Expanded layouts, so the setting covers both. Uses `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`; requires Windows 10 version 2004 or later. Support varies by capture method, and this is not DRM or a guarantee against every capture path |
 
 `layout` accepts one of:
 

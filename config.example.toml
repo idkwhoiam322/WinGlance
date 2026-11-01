@@ -74,6 +74,11 @@ glass_opacity_percent = 10
 # source has stopped (the tombstone). Hiding for fullscreen/listed
 # foregrounds (hide_for_auto_compact_sources) applies either way.
 fade_persistent_pill = true
+# Exclude the overlay from supported screen-capture APIs while keeping it
+# visible locally. Uses SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE),
+# which requires Windows 10 version 2004 or later; capture-method support
+# varies, and this is not DRM.
+exclude_from_capture = false
 
 [behavior]
 enable_track_change = true

@@ -7,8 +7,9 @@ use crate::events::{
 use crate::gdi::{FontProvider, draw_string};
 use crate::overlay::{
     EventQueue, OverlayPos, enumerate_displays_cached, invalidate_display_cache, preview_settings_change,
-    set_dismiss_on_hover, set_duration, set_expand_compact_on_hover, set_fade_persistent_pill, set_glass_effect,
-    set_glass_tuning, set_hide_for_auto_compact_sources, set_layout, set_pinned_source, set_positions, show_sample,
+    set_capture_exclusion, set_dismiss_on_hover, set_duration, set_expand_compact_on_hover, set_fade_persistent_pill,
+    set_glass_effect, set_glass_tuning, set_hide_for_auto_compact_sources, set_layout, set_pinned_source,
+    set_positions, show_sample,
 };
 use crate::process_picker;
 use crate::process_picker::{AUTO_SOURCES_RESULT_MSG, PICKER_RESULT_MSG, PINNED_SOURCE_RESULT_MSG};
@@ -378,6 +379,7 @@ enum SettingId {
     ExpandCompactOnHover,
     HideForAutoCompactSources,
     FadePersistentPill,
+    ExcludeFromCapture,
     GlassEffect,
     GlassBlur,
     GlassOpacity,
@@ -3252,6 +3254,16 @@ impl MainWindowState {
         });
         y += row_h + gap;
         natural.push(SettingsItem::Row {
+            id: SettingId::ExcludeFromCapture,
+            rect: RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + row_h,
+            },
+        });
+        y += row_h + gap;
+        natural.push(SettingsItem::Row {
             id: SettingId::PinnedSource,
             rect: RECT {
                 left,
@@ -3619,6 +3631,19 @@ impl MainWindowState {
                             },
                             if hide_for_auto_compact { accent } else { colors.faint },
                         ),
+                        SettingId::ExcludeFromCapture => (
+                            "Exclude from screen capture",
+                            if cfg.overlay.exclude_from_capture {
+                                "ON".to_string()
+                            } else {
+                                "OFF".to_string()
+                            },
+                            if cfg.overlay.exclude_from_capture {
+                                accent
+                            } else {
+                                colors.faint
+                            },
+                        ),
                         SettingId::GlassEffect
                         | SettingId::GlassBlur
                         | SettingId::GlassOpacity
@@ -3680,6 +3705,7 @@ impl MainWindowState {
                         | SettingId::ExpandCompactOnHover
                         | SettingId::HideForAutoCompactSources
                         | SettingId::FadePersistentPill
+                        | SettingId::ExcludeFromCapture
                         | SettingId::GlassEffect
                         | SettingId::GlassBlur
                         | SettingId::GlassOpacity
@@ -5875,6 +5901,7 @@ enum SettingAction {
     ToggleDismissOnHover,
     ToggleExpandCompactOnHover,
     ToggleHideForAutoCompactSources,
+    ToggleExcludeFromCapture,
     ToggleFadePersistentPill,
     ToggleGlassEffect,
     CycleGlassBlur,
@@ -5944,6 +5971,7 @@ fn setting_action_at(id: SettingId, rect: &RECT, x: i32, y: i32, scale: f32) -> 
         SettingId::DismissOnHover => Some(SettingAction::ToggleDismissOnHover),
         SettingId::ExpandCompactOnHover => Some(SettingAction::ToggleExpandCompactOnHover),
         SettingId::HideForAutoCompactSources => Some(SettingAction::ToggleHideForAutoCompactSources),
+        SettingId::ExcludeFromCapture => Some(SettingAction::ToggleExcludeFromCapture),
         SettingId::FadePersistentPill
         | SettingId::GlassEffect
         | SettingId::GlassBlur
@@ -6264,6 +6292,13 @@ fn perform_setting_action(hwnd: HWND, id: SettingId, row_index: usize, rect: &RE
             state.mutate_config(|cfg| cfg.behavior.hide_for_auto_compact_sources = new_value);
             set_hide_for_auto_compact_sources(state.overlay_hwnd, new_value);
             info!("hide for auto compact sources set: {new_value}");
+            state.invalidate();
+        }
+        SettingAction::ToggleExcludeFromCapture => {
+            let new_value = !state.cfg().overlay.exclude_from_capture;
+            state.mutate_config(|cfg| cfg.overlay.exclude_from_capture = new_value);
+            set_capture_exclusion(state.overlay_hwnd, new_value);
+            info!("exclude from screen capture set: {new_value}");
             state.invalidate();
         }
         action @ (SettingAction::ToggleGlassEffect
@@ -7794,6 +7829,7 @@ fn setting_label(id: SettingId) -> &'static str {
         SettingId::DismissOnHover => "Dismiss on hover",
         SettingId::ExpandCompactOnHover => "Expand compact on hover",
         SettingId::HideForAutoCompactSources => "Hide Persistent Compact Pill for Auto-compact Apps",
+        SettingId::ExcludeFromCapture => "Exclude from screen capture",
         SettingId::FadePersistentPill
         | SettingId::GlassEffect
         | SettingId::GlassBlur
@@ -7821,6 +7857,7 @@ fn setting_is_toggle(id: SettingId) -> bool {
             | SettingId::ExpandCompactOnHover
             | SettingId::HideForAutoCompactSources
             | SettingId::FadePersistentPill
+            | SettingId::ExcludeFromCapture
             | SettingId::GlassEffect
     )
 }
@@ -7851,6 +7888,7 @@ fn setting_value(id: SettingId, cfg: &Config) -> String {
         SettingId::DismissOnHover => on_off(cfg.overlay.dismiss_on_hover),
         SettingId::ExpandCompactOnHover => on_off(cfg.overlay.expand_compact_on_hover),
         SettingId::HideForAutoCompactSources => on_off(cfg.behavior.hide_for_auto_compact_sources),
+        SettingId::ExcludeFromCapture => on_off(cfg.overlay.exclude_from_capture),
         SettingId::FadePersistentPill
         | SettingId::GlassEffect
         | SettingId::GlassBlur
@@ -7925,6 +7963,7 @@ fn setting_toggle_on(id: SettingId, cfg: &Config) -> bool {
         SettingId::DismissOnHover => cfg.overlay.dismiss_on_hover,
         SettingId::ExpandCompactOnHover => cfg.overlay.expand_compact_on_hover,
         SettingId::HideForAutoCompactSources => cfg.behavior.hide_for_auto_compact_sources,
+        SettingId::ExcludeFromCapture => cfg.overlay.exclude_from_capture,
         SettingId::FadePersistentPill => cfg.overlay.fade_persistent_pill,
         SettingId::GlassEffect => cfg.overlay.glass_effect,
         _ => false,
@@ -8773,6 +8812,16 @@ mod tests {
             setting_row_name(SettingId::DismissOnHover, &cfg),
             "Dismiss on hover: ON"
         );
+        cfg.overlay.exclude_from_capture = false;
+        assert_eq!(
+            setting_row_name(SettingId::ExcludeFromCapture, &cfg),
+            "Exclude from screen capture: OFF"
+        );
+        cfg.overlay.exclude_from_capture = true;
+        assert_eq!(
+            setting_row_name(SettingId::ExcludeFromCapture, &cfg),
+            "Exclude from screen capture: ON"
+        );
 
         // Formatted values. Duration mirrors the painted row: the configured
         // value, plus the "(system Ns)" suffix when the system preference
@@ -9556,6 +9605,7 @@ mod tests {
             SettingId::ExpandCompactOnHover,
             SettingId::HideForAutoCompactSources,
             SettingId::FadePersistentPill,
+            SettingId::ExcludeFromCapture,
             SettingId::GlassEffect,
             SettingId::GlassBlur,
             SettingId::GlassOpacity,
