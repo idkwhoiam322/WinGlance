@@ -19,20 +19,31 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::BOOL;
 use windows::core::PCWSTR;
 
-/// Samples the monitor's current refresh period in ms, so the animation timer
-/// can tick once per presented frame on any display (60 Hz → 16 ms, 120 Hz → 8 ms,
-/// 144 Hz → 7 ms, 240 Hz → 4 ms). The pill can target a display other than the
-/// foreground window's (see `MonitorMode`), so when a target was resolved the
-/// DWM query runs against the overlay window itself: DWM reports the compose
-/// rate of the monitor the queried window is on, and while animating the
-/// overlay sits on the target display. Prefers DWM's live compose rate, which
-/// stays correct on variable-refresh-rate monitors; falls back to the display
-/// mode's nominal frequency of the target (resolved by device name, so no
-/// window is needed); last resort is 16 ms (60 Hz).
+/// The shortest and longest refresh period accepted from the OS. A
+/// pathological ratio must not produce a zero-length or multi-second tick.
+const MIN_REFRESH_PERIOD: Duration = Duration::from_millis(1);
+const MAX_REFRESH_PERIOD: Duration = Duration::from_millis(100);
+/// Fallback when no display rate is readable: 60 Hz, expressed exactly. A
+/// whole-millisecond 16 ms fallback would run at 62.5 Hz, which beats against
+/// a 60 Hz composition.
+const DEFAULT_REFRESH_PERIOD: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+/// Samples the monitor's current refresh period, so the animation clock can
+/// tick once per presented frame on any display (60 Hz → 16.666… ms, 120 Hz →
+/// 8.333… ms, 144 Hz → 6.944… ms). The pill can target a display other than
+/// the foreground window's (see `MonitorMode`), so when a target was resolved
+/// the DWM query runs against the overlay window itself: DWM reports the
+/// compose rate of the monitor the queried window is on, and while animating
+/// the overlay sits on the target display. Prefers DWM's live compose rate,
+/// which stays correct on variable-refresh-rate monitors; falls back to the
+/// display mode's nominal frequency of the target (resolved by device name, so
+/// no window is needed); last resort is 60 Hz.
 ///
-/// This returns the raw monitor period only. `sync_anim_timer` caps it to
-/// `config.overlay.max_tick_hz` (default 60 Hz) before arming the timer.
-pub(super) fn refresh_period_ms(target: Option<&TargetMonitor>, overlay_hwnd: HWND) -> u32 {
+/// The period keeps nanosecond precision: rounding it to whole milliseconds
+/// changes the update rate enough to beat against the display. The result is
+/// clamped to 1..=100 ms. `frame_clock::frame_period` applies the
+/// `config.overlay.max_tick_hz` cap.
+pub(super) fn refresh_period(target: Option<&TargetMonitor>, overlay_hwnd: HWND) -> Duration {
     let dwm_hwnd = match target {
         Some(_) => overlay_hwnd,
         None => unsafe { GetForegroundWindow() },
@@ -42,50 +53,61 @@ pub(super) fn refresh_period_ms(target: Option<&TargetMonitor>, overlay_hwnd: HW
         timing.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
         DwmGetCompositionTimingInfo(dwm_hwnd, &mut timing).ok().and_then(|()| {
             let ratio = timing.rateRefresh;
-            // Refresh rate = numerator / denominator (Hz); 0/0 means DWM
-            // did not report a rate (e.g. composition paused).
-            if ratio.uiNumerator != 0 && ratio.uiDenominator != 0 {
-                // Widen before multiplying: a pathological denominator must
-                // not overflow the u32 math (debug builds would panic). The
-                // caller clamps the period to 1..=100 ms, so an absurd ratio
-                // saturating to u32::MAX is indistinguishable from "very
-                // high refresh" and lands on the same clamped value.
-                Some((1000u64 * ratio.uiDenominator as u64 / ratio.uiNumerator as u64).min(u32::MAX as u64) as u32)
-            } else {
-                None
-            }
+            refresh_ratio_period(ratio.uiNumerator, ratio.uiDenominator)
         })
     };
     if let Some(period) = dwm_period {
-        return period.clamp(1, 100);
+        return clamp_refresh_period(period);
     }
     // Fallback: the monitor's nominal frequency, resolved by device name so
     // it hits the same display the pill will be shown on.
     let mode_period = match target {
-        Some(target) => monitor_frequency_ms(target.handle),
+        Some(target) => monitor_frequency_hz(target.handle).and_then(frequency_period),
         None => {
             let foreground = unsafe { GetForegroundWindow() };
             let monitor = unsafe { MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST) };
             if monitor.0.is_null() {
                 None
             } else {
-                monitor_frequency_ms(monitor)
+                monitor_frequency_hz(monitor).and_then(frequency_period)
             }
         }
     };
-    mode_period.unwrap_or(16).clamp(1, 100)
+    clamp_refresh_period(mode_period.unwrap_or(DEFAULT_REFRESH_PERIOD))
 }
 
-/// The display's nominal frame period in ms from its current display mode;
-/// `None` when the mode cannot be read.
-pub(super) fn monitor_frequency_ms(monitor: HMONITOR) -> Option<u32> {
+/// Converts a refresh rate expressed as a ratio in Hz to its exact frame
+/// period. `None` when DWM did not report a rate (`0/0`, or either component
+/// zero, e.g. while composition is paused).
+fn refresh_ratio_period(numerator: u32, denominator: u32) -> Option<Duration> {
+    if numerator == 0 || denominator == 0 {
+        return None;
+    }
+    // Widen before multiplying: a pathological denominator must not overflow.
+    // 1e9 ns / (numerator / denominator) = 1e9 * denominator / numerator.
+    let nanos = (1_000_000_000u128 * denominator as u128) / numerator as u128;
+    Some(Duration::from_nanos(nanos.min(u64::MAX as u128) as u64))
+}
+
+/// Converts a display mode frequency in Hz to its frame period.
+fn frequency_period(hz: u32) -> Option<Duration> {
+    (hz != 0).then(|| Duration::from_nanos((1_000_000_000 / hz as u64).max(1)))
+}
+
+fn clamp_refresh_period(period: Duration) -> Duration {
+    period.clamp(MIN_REFRESH_PERIOD, MAX_REFRESH_PERIOD)
+}
+
+/// The display's nominal refresh frequency in Hz from its current display
+/// mode; `None` when the mode cannot be read.
+pub(super) fn monitor_frequency_hz(monitor: HMONITOR) -> Option<u32> {
     if monitor.0.is_null() {
         return None;
     }
     let mut info = MONITORINFOEXW::default();
     // cbSize must cover the extended structure (with szDevice), or Windows
     // may not populate the device name and the refresh-rate fallback below
-    // silently degrades to 16 ms.
+    // silently degrades to the default period.
     info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
     if !unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
         return None;
@@ -97,7 +119,47 @@ pub(super) fn monitor_frequency_ms(monitor: HMONITOR) -> Option<u32> {
     if !read {
         return None;
     }
-    1000u32.checked_div(devmode.dmDisplayFrequency as u32)
+    let hz = devmode.dmDisplayFrequency;
+    // 0 and 1 are the "hardware default" sentinels, not real rates.
+    (hz > 1).then_some(hz)
+}
+
+#[cfg(test)]
+mod refresh_period_tests {
+    use super::*;
+
+    #[test]
+    fn a_reported_ratio_becomes_an_exact_period() {
+        assert_eq!(refresh_ratio_period(60, 1), Some(Duration::from_nanos(16_666_666)));
+        assert_eq!(refresh_ratio_period(300, 1), Some(Duration::from_nanos(3_333_333)));
+        assert_eq!(refresh_ratio_period(144, 1), Some(Duration::from_nanos(6_944_444)));
+        // 59.94 Hz (60000/1001) must not collapse to 60 Hz.
+        assert_eq!(
+            refresh_ratio_period(60_000, 1_001),
+            Some(Duration::from_nanos(16_683_333))
+        );
+    }
+
+    #[test]
+    fn an_unreported_ratio_is_rejected() {
+        assert_eq!(refresh_ratio_period(0, 0), None);
+        assert_eq!(refresh_ratio_period(0, 1), None);
+        assert_eq!(refresh_ratio_period(60, 0), None);
+    }
+
+    #[test]
+    fn a_frequency_becomes_a_period_and_zero_is_rejected() {
+        assert_eq!(frequency_period(60), Some(Duration::from_nanos(16_666_666)));
+        assert_eq!(frequency_period(300), Some(Duration::from_nanos(3_333_333)));
+        assert_eq!(frequency_period(0), None);
+    }
+
+    #[test]
+    fn pathological_periods_are_clamped() {
+        assert_eq!(clamp_refresh_period(Duration::ZERO), MIN_REFRESH_PERIOD);
+        assert_eq!(clamp_refresh_period(Duration::from_secs(5)), MAX_REFRESH_PERIOD);
+        assert_eq!(clamp_refresh_period(DEFAULT_REFRESH_PERIOD), DEFAULT_REFRESH_PERIOD);
+    }
 }
 
 /// A snapshot of one active display, in `EnumDisplayMonitors` order — the

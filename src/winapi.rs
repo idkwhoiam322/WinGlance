@@ -24,7 +24,6 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::DataExchange::SetClipboardData;
 use windows::Win32::System::Registry::{HKEY, REG_VALUE_TYPE, RegSetValueExW};
-use windows::Win32::System::Threading::DeleteTimerQueueTimer;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, WINEVENTPROC};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -167,11 +166,6 @@ pub unsafe fn set_win_event_hook(
     flags: u32,
 ) -> HWINEVENTHOOK {
     unsafe { SetWinEventHook(min, max, module, proc, process, thread, flags) }
-}
-
-/// `DeleteTimerQueueTimer` (waits for in-flight callbacks when `completion` is set).
-pub unsafe fn delete_timer_queue_timer(queue: Option<HANDLE>, timer: HANDLE, completion: Option<HANDLE>) -> Result<()> {
-    unsafe { DeleteTimerQueueTimer(queue, timer, completion) }
 }
 
 /// `CreateFileW`.

@@ -58,7 +58,7 @@ SystemMediaTransportControls  (cap 1024)              drain → overlay queue│
   │
   │  MEDIA_EVENT_MSG → receive_events()  (pill + main)
   │  WM_TIMER (debounce) → flush_pending()  (pill)
-  │  WM_TIMER (16 ms) → tick() → render()   (pill)
+  │  TIMER_ANIMATION_MSG (frame clock) → tick() → render()  (pill)
   │  TOGGLE_MSG → toggle_enabled()         (pill, from tray menu)
 
 icon worker thread
@@ -347,18 +347,39 @@ be clicked through to, activated, or tabbed to.
 
 Animation runs through three phases — expanding (grow + fade in), light (a
 short 120 ms fade for playback-state changes), collapsing (shrink + fade out)
-— on the spring model described in "Morph springs" below, driven by a
-high-resolution timer matched to the monitor's refresh rate while the pill
-animates or a text line scrolls. The aura comet sweep keeps playing content
-alive too, but at its own coarse cadence: once nothing else animates, the
-timer drops to `COMET_TICK_MS` (66 ms, ~15 Hz), which cuts a playing pill's
-steady-state render load to about a quarter (the period is additionally
-capped by `max_tick_hz`). A fully static pill drops to a coarse 250 ms tick — the
-dismiss countdown and hover polling do not need frame rate — and the pill
-repaints only while animating or marquee-scrolling; a static pill does no
-per-frame drawing. Queueing a newer notification caps the remaining display
-time at 500 ms. What hovering does to the pill is described in "Hover
-behavior" below.
+— on the spring model described in "Morph springs" below, driven by a frame
+clock matched to the monitor's refresh rate while the pill animates or a text
+line scrolls (see "Frame clock" below). The aura comet sweep keeps playing
+content alive too, but at its own coarse cadence: once nothing else animates,
+the clock drops to `COMET_TICK_MS` (66 ms, ~15 Hz), which cuts a playing
+pill's steady-state render load to about a quarter (the period is
+additionally capped by `max_tick_hz`). A fully static pill drops to a coarse
+250 ms tick — the dismiss countdown and hover polling do not need frame rate
+— and the pill repaints only while animating or marquee-scrolling; a static
+pill does no per-frame drawing. Queueing a newer notification caps the
+remaining display time at 500 ms. What hovering does to the pill is described
+in "Hover behavior" below.
+
+### Frame clock
+
+`src/overlay/frame_clock.rs` posts `TIMER_ANIMATION_MSG` from a dedicated
+thread that waits on a high-resolution waitable timer
+(`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`). The previous
+`CreateTimerQueueTimer` approach asked for a whole-millisecond period, which
+the system timer queue services at the platform clock tick (15.625 ms by
+default): a requested 16 ms period delivered 13.96–30.24 ms intervals on the
+development machine, so the moving edge advanced by uneven distances and
+periodically skipped a frame. Two rounding losses compounded it: 60 Hz is
+16.666… ms rather than 16 ms, and the queue cannot express a sub-millisecond
+period at all.
+
+The clock keeps the period in nanoseconds, re-arms each one-shot wait against
+an absolute schedule (so late wake-ups never accumulate drift), and skips
+missed deadlines instead of bursting a backlog. It changes no global
+timer-resolution setting and does not busy-wait. The thread only posts the
+tick message; all window state stays on the UI thread. When the OS or the
+thread cannot be created, `ensure_anim_timer` falls back to a plain
+`SetTimer` with the same tick handler.
 
 ## Hover behavior
 
@@ -507,11 +528,11 @@ display's work area.
 DPI for sizing, fonts, and the margin comes from the target display via
 `GetDpiForMonitor(MDT_EFFECTIVE_DPI)` (`overlay::monitor_dpi()`), not from
 the monitor the overlay window currently sits on — the first frame after a
-display switch is already scaled correctly. The animation timer's refresh
+display switch is already scaled correctly. The frame clock's refresh
 period is queried against the overlay window itself (it sits on the target
 while animating), falling back to the target's display-mode frequency.
 
-Because the 16 ms `WM_TIMER` recomputes geometry each tick while the pill is
+Because every animation tick recomputes geometry while the pill is
 shown, a monitor removal or resolution change moves the pill back onto the
 new work area on the next frame; `WM_DISPLAYCHANGE` additionally repositions
 a visible pill immediately. The **Adjust position…** command in the Settings

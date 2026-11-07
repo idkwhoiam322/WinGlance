@@ -24,10 +24,9 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DeleteDC, HBITMAP, HDC, HFONT, HGDIOBJ};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateTimerQueueTimer, WT_EXECUTEDEFAULT};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, UiaReturnRawElementProvider, UiaRootObjectId, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, DefWindowProcW, EVENT_SYSTEM_FOREGROUND, GetCursorPos, GetForegroundWindow,
@@ -40,6 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 mod backdrop;
+mod frame_clock;
 mod fullscreen;
 mod morph;
 mod render;
@@ -51,10 +51,11 @@ pub(crate) use render::{TEXT_CONTRAST_AA, ensure_contrast, pm_bgra_to_rgba};
 #[cfg(test)]
 pub(crate) use render::contrast_ratio;
 
+use frame_clock::{FrameClock, frame_period, period_change_is_significant};
 use fullscreen::{
     DisplayInfo, ForegroundVerdict, TargetMonitor, anchor_unchanged, decide_layout, effective_position_rect,
-    foreground_fullscreens_target, foreground_monitor_index, log_target_once, monitor_dpi, placement,
-    refresh_period_ms, resolve_target_persisted, window_is_fullscreen,
+    foreground_fullscreens_target, foreground_monitor_index, log_target_once, monitor_dpi, placement, refresh_period,
+    resolve_target_persisted, window_is_fullscreen,
 };
 use morph::{
     ENTRANCE_GROW, HoverExpand, HoverStep, HoverTick, MorphDirection, MorphProgress, animation_duration,
@@ -84,7 +85,7 @@ struct ContentFade {
 }
 
 const TIMER_DEBOUNCE: usize = 1;
-/// Window-timer ID used only when the timer-queue fallback is active.
+/// Window-timer ID used only when the high-resolution clock fallback is active.
 const ANIM_TIMER_ID: usize = 2;
 /// One-shot window-timer ID that releases the frame pipeline buffers after
 /// the pill has stayed hidden for `IDLE_BUFFER_RELEASE_MS` (see `hide`).
@@ -180,21 +181,6 @@ struct DibCache {
     bits: *mut c_void,
     width: i32,
     height: i32,
-}
-
-/// Animation tick driver. Fires from the timer queue and dispatches the tick
-/// to the UI thread. `PostMessageW` (not `SendMessageW`) keeps the callback
-/// non-blocking, so the timer can be deleted with a completion wait at
-/// teardown without deadlocking (a blocking callback would wait on the very
-/// thread that is deleting the timer).
-unsafe extern "system" fn animation_timer_proc(parameter: *mut c_void, _fired: bool) {
-    // A contained panic no-ops the tick; the next tick retries.
-    crate::winutil::guarded_void("the animation timer callback", || {
-        let hwnd = HWND(parameter);
-        unsafe {
-            let _ = post_message(hwnd, TIMER_ANIMATION_MSG, WPARAM(0), LPARAM(0));
-        }
-    });
 }
 
 /// Incoming event transport shared with the main window: an event is
@@ -684,10 +670,10 @@ struct OverlayState {
     /// shown (static), the re-assert is throttled to 1 Hz instead of running
     /// on every animation tick.
     last_reassert: Option<Instant>,
-    /// Cached monitor refresh period (ms), re-sampled at most once per
-    /// second. `sync_anim_timer` runs on every animation tick; the underlying
+    /// Cached monitor refresh period, re-sampled at most once per second.
+    /// `sync_anim_timer` runs on every animation tick; the underlying
     /// DWM/display-mode queries are far more expensive than the tick itself.
-    period_cache: Option<(Instant, u32)>,
+    period_cache: Option<(Instant, Duration)>,
     /// Estimated live playback position (seconds), advanced each animation
     /// tick from `progress_anchor`. None when the source reports no position.
     estimated_position_secs: Option<f64>,
@@ -734,10 +720,11 @@ struct OverlayState {
     last_upload_y: i32,
     last_upload_w: i32,
     last_upload_h: i32,
-    /// Animation tick period in ms, capped to `config.overlay.max_tick_hz`
-    /// (default 60 Hz). Re-detected on every show; the timer is recreated only
-    /// when it changes.
-    tick_period: u32,
+    /// Animation tick period, capped to `config.overlay.max_tick_hz`
+    /// (default 60 Hz). Kept as a `Duration` in nanoseconds: 60 Hz is
+    /// 16.666… ms, and a whole-millisecond period would run at 62.5 Hz.
+    /// Re-detected on every show; the clock is recreated only when it changes.
+    tick_period: Duration,
     /// Whether the pill already expanded via hover during this showing. With
     /// `dismiss_on_hover` enabled, the first hover over the compact pill
     /// expands and later hovers dismiss instead (the second hover
@@ -833,10 +820,11 @@ struct OverlayState {
     /// `tick_hidden_watchdog`. False while the pill is visible or hidden
     /// without a hold.
     hidden_watchdog: bool,
-    /// High-resolution timer driving the pill animation.
-    /// Animation timer from the timer queue; when creation fails, a plain
-    /// window timer with `ANIM_TIMER_ID` drives the animation instead.
-    anim_timer: HANDLE,
+    /// High-resolution timer driving the pill animation. `None` while the
+    /// clock thread could not be created; in that case a plain window timer
+    /// with `ANIM_TIMER_ID` drives the animation instead (see
+    /// `anim_timer_fallback`).
+    frame_clock: Option<FrameClock>,
     anim_timer_fallback: bool,
     /// Cached decoded artwork for the current track (RGBA8 at the full art
     /// size), so animation frames never re-decode or re-convert the cover.
@@ -1538,9 +1526,9 @@ impl OverlayState {
             hidden_watchdog: false,
             scroll: [LineScroll::default(); 4],
             marquee_strips: [None, None, None, None],
-            anim_timer: HANDLE::default(),
+            frame_clock: None,
             anim_timer_fallback: false,
-            tick_period: 16,
+            tick_period: Duration::from_nanos(1_000_000_000 / 60),
             decoded_art: None,
             decoded_art_source: None,
             palette: None,
@@ -1783,41 +1771,29 @@ impl OverlayState {
     }
 
     fn ensure_anim_timer(&mut self) {
-        if !self.anim_timer.0.is_null() || self.anim_timer_fallback {
+        if self.frame_clock.is_some() || self.anim_timer_fallback {
             return;
         }
-        let mut handle = HANDLE::default();
-        let created = unsafe {
-            CreateTimerQueueTimer(
-                &mut handle,
-                None,
-                Some(animation_timer_proc),
-                Some(self.hwnd.0 as *const c_void),
-                self.tick_period,
-                self.tick_period,
-                WT_EXECUTEDEFAULT,
-            )
-            .is_ok()
-        };
-        if created {
-            self.anim_timer = handle;
+        if let Some(clock) = FrameClock::start(self.hwnd, self.tick_period) {
+            self.frame_clock = Some(clock);
             return;
         }
         // Rare (handle exhaustion or a low-resource condition): without a
         // timer the pill freezes at its first frame and never dismisses.
         // Fall back to a plain window timer that drives the same tick.
-        error!("CreateTimerQueueTimer failed; falling back to SetTimer");
-        if unsafe { set_timer(self.hwnd, ANIM_TIMER_ID, self.tick_period, None) } != 0 {
+        error!("high-resolution frame clock unavailable; falling back to SetTimer");
+        let period_ms = self.tick_period.as_millis().clamp(1, 1000) as u32;
+        if unsafe { set_timer(self.hwnd, ANIM_TIMER_ID, period_ms, None) } != 0 {
             self.anim_timer_fallback = true;
         }
     }
 
     /// Re-samples the monitor's refresh period and recreates the animation
-    /// timer when it changed (display switched, DPI changed, VRR kicked in).
+    /// clock when it changed (display switched, DPI changed, VRR kicked in).
     /// The tick cadence only affects how many frames the UI thread gets asked
     /// to paint; the easing is time-based, so motion is identical either way.
     /// While the pill is fully static (no animation, no marquee line) the
-    /// timer drops to `STATIC_TICK_MS`: the dismiss countdown and hover
+    /// clock drops to `STATIC_TICK_MS`: the dismiss countdown and hover
     /// polling do not need frame rate, so a shown pill stops waking the UI
     /// thread at monitor refresh rate.
     fn sync_anim_timer(&mut self) {
@@ -1832,7 +1808,7 @@ impl OverlayState {
         let marquee_active = self.scroll.iter().any(|line| line.scrolling);
         let now = Instant::now();
         let raw = if animating || marquee_active {
-            // The monitor queries behind `refresh_period_ms` (DWM timing,
+            // The monitor queries behind `refresh_period` (DWM timing,
             // display-mode enumeration) are not free to run every tick; a
             // 1-second cache is far fresher than any real rate change. The
             // target is re-resolved only when a fresh period is actually
@@ -1840,31 +1816,30 @@ impl OverlayState {
             match self.period_cache {
                 Some((cached_at, cached)) if now.duration_since(cached_at) < Duration::from_secs(1) => cached,
                 _ => {
-                    let fresh = refresh_period_ms(self.target().as_ref(), self.hwnd);
+                    let fresh = refresh_period(self.target().as_ref(), self.hwnd);
                     self.period_cache = Some((now, fresh));
                     fresh
                 }
             }
         } else if comet_only {
-            COMET_TICK_MS
+            Duration::from_millis(COMET_TICK_MS as u64)
         } else {
-            STATIC_TICK_MS
+            Duration::from_millis(STATIC_TICK_MS as u64)
         };
         let period = if animating || marquee_active {
             // `max_tick_hz` caps the repaint rate; the raw monitor period is
             // raised to at least the cap's period so, e.g., a 144 Hz display
             // still animates at most at the configured Hz. Motion is
             // time-based (driven by `dt`), so only the frame count changes.
-            let hz = self.config.overlay.max_tick_hz.unwrap_or(60).clamp(60, 1000);
-            let cap_ms = (1000u32 / hz).max(1);
-            raw.max(cap_ms).clamp(1, 100)
+            frame_period(raw, self.config.overlay.max_tick_hz)
         } else {
             raw
         };
-        if period != self.tick_period {
+        if period_change_is_significant(self.tick_period, period) {
             debug!(
-                "animation tick {period}ms = {} Hz ({})",
-                1000 / period.max(1),
+                "animation tick {:.3}ms = {:.1} Hz ({})",
+                period.as_secs_f64() * 1000.0,
+                1.0 / period.as_secs_f64(),
                 if animating || marquee_active {
                     "refresh-rate matched"
                 } else if comet_only {
@@ -1924,22 +1899,11 @@ impl OverlayState {
     }
 
     fn delete_anim_timer(&mut self) {
-        if !self.anim_timer.0.is_null() {
-            // Wait for any in-flight callback to complete
-            // (INVALID_HANDLE_VALUE): the callback is a single non-blocking
-            // PostMessageW, so the wait cannot deadlock, and no stale tick
-            // message can be posted to a window that is being torn down.
-            // A failed deletion keeps the handle: zeroing it would orphan
-            // the timer (still posting ticks) with no way to ever delete
-            // it — the next delete attempt and teardown retry instead.
-            let deleted =
-                unsafe { crate::winapi::delete_timer_queue_timer(None, self.anim_timer, Some(INVALID_HANDLE_VALUE)) };
-            if deleted.is_ok() {
-                self.anim_timer = HANDLE::default();
-            } else {
-                warn!("animation timer deletion failed; retrying on the next delete/teardown");
-            }
-        }
+        // Dropping the clock signals its stop event and joins the timer
+        // thread: no tick can be posted after this returns. The thread only
+        // posts a message and never waits on the UI thread, so the join
+        // cannot deadlock.
+        drop(self.frame_clock.take());
         if self.anim_timer_fallback {
             unsafe {
                 let _ = kill_timer(self.hwnd, ANIM_TIMER_ID);
@@ -2338,7 +2302,7 @@ impl OverlayState {
         // resource exhaustion), every received event retries arming it — a
         // shown pill must never sit frozen just because no phase transition
         // re-ran `sync_anim_timer`.
-        if !matches!(self.phase, Phase::Hidden) && self.anim_timer.0.is_null() && !self.anim_timer_fallback {
+        if !matches!(self.phase, Phase::Hidden) && self.frame_clock.is_none() && !self.anim_timer_fallback {
             debug!("animation timer missing; retrying after received events");
             self.ensure_anim_timer();
         }
@@ -4469,7 +4433,7 @@ impl OverlayState {
             && self.held_content.is_some()
             && matches!(self.phase, Phase::Hidden);
         if self.hidden_watchdog {
-            self.tick_period = 1000;
+            self.tick_period = Duration::from_secs(1);
             self.ensure_anim_timer();
         }
     }
@@ -4992,11 +4956,10 @@ unsafe fn window_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
         TIMER_ANIMATION_MSG => {
-            // The timer-queue callback posts one tick message per period;
-            // when the UI thread stalls, those accumulate. Drain the queue so
-            // one dispatch consumes every queued tick (the animation is
-            // time-based, so a dropped tick changes nothing and the backlog
-            // cannot pile up).
+            // The frame clock posts one tick message per period; when the UI
+            // thread stalls, those accumulate. Drain the queue so one dispatch
+            // consumes every queued tick (the animation is time-based, so a
+            // dropped tick changes nothing and the backlog cannot pile up).
             unsafe {
                 let mut msg = MSG::default();
                 while crate::winapi::peek_message(&mut msg, hwnd, TIMER_ANIMATION_MSG, TIMER_ANIMATION_MSG, PM_REMOVE) {

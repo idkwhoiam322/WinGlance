@@ -117,9 +117,11 @@ display's work area.
 
 `max_tick_hz` caps how often the pill's animation refreshes; on higher-refresh
 monitors the UI thread is throttled down to it. Motion stays time-based — the
-cap only limits repaint frequency. Values at or below 60 keep the default 60 Hz
-cap, and values above 1000 are clamped to 1000. It is configurable only via
-`config.toml`, not the Settings UI.
+cap only limits repaint frequency. The period is derived in nanoseconds, so
+the default 60 Hz cap really is 16.666… ms rather than a rounded 16 ms, which
+would beat against a 60 Hz composition and read as periodic judder. Values at
+or below 60 keep the default 60 Hz cap, and values above 1000 are clamped to
+1000. It is configurable only via `config.toml`, not the Settings UI.
 
 > **Windows animation/transparency preferences.** The "animation effects"
 > preference and the "minimize translucent overlapped content" preference
