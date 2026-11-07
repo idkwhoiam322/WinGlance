@@ -670,8 +670,16 @@ fn decode_limited(data: &[u8]) -> Option<image::DynamicImage> {
 /// draw the cached bitmap with a single blit instead of re-converting per
 /// paint. Runs on the SMTC worker thread, never on a UI thread.
 pub(crate) fn decode_artwork_pm(data: &[u8], size: usize) -> Option<Vec<u8>> {
-    let image = decode_limited(data)?.to_rgba8();
-    let image = image::imageops::resize(&image, size as u32, size as u32, image::imageops::FilterType::Triangle);
+    let image = decode_limited(data)?;
+    if image.width() == 0 || image.height() == 0 {
+        return None;
+    }
+    // The tile is square. `resize_to_fill` scales to cover the square and
+    // center-crops the overflow, so rectangular covers keep their proportions
+    // instead of being stretched.
+    let image = image
+        .resize_to_fill(size as u32, size as u32, image::imageops::FilterType::Triangle)
+        .to_rgba8();
     let raw = image.into_raw();
     let mut pm = Vec::with_capacity(raw.len());
     for px in raw.as_chunks::<4>().0 {
@@ -1086,5 +1094,100 @@ mod tests {
         assert!(twice.decoded_art.is_none());
         assert!(twice.palette.is_none());
         assert!(twice.app_icon.is_none());
+    }
+
+    fn encode_png(image: &image::RgbaImage) -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(
+                image.as_raw(),
+                image.width(),
+                image.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("encode test PNG");
+        bytes
+    }
+
+    fn bgra_at(pixels: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
+        let offset = (y * width + x) * 4;
+        pixels[offset..offset + 4].try_into().expect("four BGRA bytes")
+    }
+
+    #[test]
+    fn decode_artwork_center_crops_wide_images() {
+        use image::Rgba;
+        let red = Rgba([255, 0, 0, 255]);
+        let green = Rgba([0, 255, 0, 255]);
+        let blue = Rgba([0, 0, 255, 255]);
+        let yellow = Rgba([255, 255, 0, 255]);
+        let mut image = image::RgbaImage::new(4, 2);
+        for y in 0..2 {
+            for (x, color) in [(0, red), (1, green), (2, blue), (3, yellow)] {
+                image.put_pixel(x, y, color);
+            }
+        }
+        let pixels = decode_artwork_pm(&encode_png(&image), 2).expect("decode");
+        // The centered 2x2 crop is columns 1 and 2 (green, blue). A stretch
+        // would blend the outer columns into the result instead.
+        assert_eq!(bgra_at(&pixels, 2, 0, 0), [0, 255, 0, 255]);
+        assert_eq!(bgra_at(&pixels, 2, 1, 0), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn decode_artwork_center_crops_tall_images() {
+        use image::Rgba;
+        let red = Rgba([255, 0, 0, 255]);
+        let green = Rgba([0, 255, 0, 255]);
+        let blue = Rgba([0, 0, 255, 255]);
+        let yellow = Rgba([255, 255, 0, 255]);
+        let mut image = image::RgbaImage::new(2, 4);
+        for x in 0..2 {
+            for (y, color) in [(0, red), (1, green), (2, blue), (3, yellow)] {
+                image.put_pixel(x, y, color);
+            }
+        }
+        let pixels = decode_artwork_pm(&encode_png(&image), 2).expect("decode");
+        // The centered 2x2 crop is rows 1 and 2 (green, blue).
+        assert_eq!(bgra_at(&pixels, 2, 0, 0), [0, 255, 0, 255]);
+        assert_eq!(bgra_at(&pixels, 2, 0, 1), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn decode_artwork_leaves_square_images_unchanged() {
+        use image::Rgba;
+        let mut image = image::RgbaImage::new(2, 2);
+        image.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        image.put_pixel(1, 0, Rgba([0, 255, 0, 255]));
+        image.put_pixel(0, 1, Rgba([0, 0, 255, 255]));
+        image.put_pixel(1, 1, Rgba([255, 255, 0, 255]));
+        let pixels = decode_artwork_pm(&encode_png(&image), 2).expect("decode");
+        assert_eq!(bgra_at(&pixels, 2, 0, 0), [0, 0, 255, 255]);
+        assert_eq!(bgra_at(&pixels, 2, 1, 0), [0, 255, 0, 255]);
+        assert_eq!(bgra_at(&pixels, 2, 0, 1), [255, 0, 0, 255]);
+        assert_eq!(bgra_at(&pixels, 2, 1, 1), [0, 255, 255, 255]);
+    }
+
+    #[test]
+    fn decode_artwork_premultiplies_alpha() {
+        use image::Rgba;
+        let mut image = image::RgbaImage::new(1, 1);
+        image.put_pixel(0, 0, Rgba([200, 100, 50, 128]));
+        let pixels = decode_artwork_pm(&encode_png(&image), 1).expect("decode");
+        assert_eq!(pixels, vec![25, 50, 100, 128]);
+    }
+
+    #[test]
+    fn decode_artwork_upscales_a_single_pixel() {
+        use image::Rgba;
+        let mut image = image::RgbaImage::new(1, 1);
+        image.put_pixel(0, 0, Rgba([10, 20, 30, 255]));
+        let pixels = decode_artwork_pm(&encode_png(&image), 2).expect("decode");
+        for y in 0..2 {
+            for x in 0..2 {
+                assert_eq!(bgra_at(&pixels, 2, x, y), [30, 20, 10, 255]);
+            }
+        }
     }
 }
