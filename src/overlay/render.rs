@@ -1,7 +1,7 @@
 //! Pill rendering: frame composition, text rasterization and vector primitives.
 
 use super::morph::{
-    MorphProgress, art_edge_gate, compact_alpha, compact_metrics, compact_size, compact_title_viewport,
+    MorphProgress, TextTransform, art_edge_gate, compact_alpha, compact_metrics, compact_size, compact_title_viewport,
     content_size_of, dim_color, expanded_alpha, morph_art_tile, morph_icon_pos, morph_radius, morph_symbol_pos,
     morph_title_band, row_unveil_alpha,
 };
@@ -178,11 +178,11 @@ pub(super) fn render_layered(
     } else {
         1.0
     };
-    // The settle-bounce renders the final layout at its true size and scales
-    // the composed frame about the anchor into the window-sized buffer (see
-    // `scale_frame_about`); the content's own pill size is the window size
-    // divided by the scale factor. Outside the bounce (`scale_factor == 1`)
-    // the content size is the window size, as always.
+    // The expand's over-bounce renders the final layout at its true size and
+    // scales the composed frame about the anchor into the window-sized buffer
+    // (see `scale_frame_about`); the content's own pill size is the window
+    // size divided by the scale factor. Outside the bounce
+    // (`scale_factor == 1`) the content size is the window size, as always.
     let content_w = if scale_factor == 1.0 {
         width
     } else {
@@ -463,10 +463,10 @@ pub(super) fn render_layered(
             content_buf_h as usize,
         );
     } else {
-        // The settle-bounce: scale the composed final-layout frame into the
-        // window-sized DIB region, so the whole pill scales 1:1. The on-screen
-        // anchor is produced by `placement()` repositioning the window as the
-        // size changes — not by the resample pivot here.
+        // The expand's over-bounce: scale the composed final-layout frame into
+        // the window-sized DIB region, so the whole pill scales 1:1. The
+        // on-screen anchor is produced by `placement()` repositioning the
+        // window as the size changes — not by the resample pivot here.
         scale_frame_about(
             dib_slice,
             alloc_w * 4,
@@ -570,7 +570,7 @@ pub(super) fn blit_packed_rows(dst: &mut [u8], dst_stride_bytes: usize, src: &[u
     }
 }
 
-/// Whether the settle-bounce needs a bilinear resample. Inside two percent of
+/// Whether the over-bounce needs a bilinear resample. Inside two percent of
 /// rest size the resample costs a full destination-sized four-tap pass for a
 /// sub-pixel/one-pixel visual difference; render directly at the current window
 /// dimensions instead. This is intentionally a visually-equivalent threshold,
@@ -1427,7 +1427,7 @@ pub(super) fn draw_art_scaled(
     // bilinear-averaging straight RGB across a transparent neighbor bleeds
     // that neighbor's zero RGB into the result — a dark fringe just inside
     // the rounded mask on downscaled art. Premultiply, filter, then
-    // un-premultiply, matching the premultiplied filtering the settle-bounce
+    // un-premultiply, matching the premultiplied filtering the over-bounce
     // resample performs.
     let premultiply = |p: usize| -> [f32; 4] {
         let a = art[p + 3] as f32;
@@ -2246,7 +2246,8 @@ pub(super) fn draw_pill_text_rows(
             } else {
                 title_rect
             };
-            draw_text_line_pixels(
+            let transform = state.text_transform;
+            draw_text_line_pixels_transformed(
                 &mut state.text_scratch,
                 &mut state.scratch_utf16,
                 pixels,
@@ -2266,6 +2267,7 @@ pub(super) fn draw_pill_text_rows(
                     strip: &mut state.marquee_strips[0],
                 }),
                 layer,
+                transform,
             );
             if layer != RenderLayer::Foreground
                 && let Some(playback) = playback
@@ -2552,7 +2554,8 @@ pub(super) fn draw_expanded_pill_text(
                                 right: title_rect.right - label_w,
                                 bottom: title_rect.bottom,
                             };
-                            draw_text_line_pixels(
+                            let transform = state.text_transform;
+                            draw_text_line_pixels_transformed(
                                 &mut state.text_scratch,
                                 &mut state.scratch_utf16,
                                 pixels,
@@ -2565,6 +2568,7 @@ pub(super) fn draw_expanded_pill_text(
                                 scale,
                                 None,
                                 layer,
+                                transform,
                             );
                             if layer != RenderLayer::Foreground {
                                 draw_symbol_pixels(
@@ -2760,7 +2764,8 @@ pub(super) fn draw_compact_pill(
         }
     };
 
-    draw_text_line_pixels(
+    let transform = state.text_transform;
+    draw_text_line_pixels_transformed(
         &mut state.text_scratch,
         &mut state.scratch_utf16,
         pixels,
@@ -2776,6 +2781,7 @@ pub(super) fn draw_compact_pill(
             strip: &mut state.marquee_strips[0],
         }),
         layer,
+        transform,
     );
 
     // Trailing elements, from the title viewport's right edge outward:
@@ -2929,7 +2935,8 @@ pub(super) fn draw_morph_content(
         let band = morph_title_band(&state.config, inset, width, scale, progress);
         let fs_title = appearance.font_size_title * scale;
         let (font_title, h_title) = state.fonts.font_for(fs_title as i32, true);
-        draw_text_line_pixels(
+        let transform = state.text_transform;
+        draw_text_line_pixels_transformed(
             &mut state.text_scratch,
             &mut state.scratch_utf16,
             pixels,
@@ -2945,6 +2952,7 @@ pub(super) fn draw_morph_content(
                 strip: &mut state.marquee_strips[0],
             }),
             layer,
+            transform,
         );
     }
 
@@ -3078,6 +3086,77 @@ pub(super) fn draw_text_line_pixels(
     scale: f32,
     marquee: Option<MarqueeCtx<'_>>,
     layer: RenderLayer,
+) {
+    draw_text_line_pixels_impl(
+        text_scratch,
+        scratch_utf16,
+        pixels,
+        width,
+        value,
+        rect,
+        font,
+        font_height,
+        color,
+        scale,
+        marquee,
+        layer,
+        None,
+    );
+}
+
+/// `draw_text_line_pixels` with the title's landing transform applied to the
+/// composited glyphs. The glyphs are still rasterized once at rest; the
+/// transform resamples the coverage about the row's bottom edge, so
+/// the impact never re-measures or re-rasterizes text and the rest path
+/// (`None` or identity) stays bit-exact.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_text_line_pixels_transformed(
+    text_scratch: &mut Option<TextScratch>,
+    scratch_utf16: &mut Vec<u16>,
+    pixels: &mut [u8],
+    width: usize,
+    value: &str,
+    rect: &RECT,
+    font: HFONT,
+    font_height: i32,
+    color: [u8; 4],
+    scale: f32,
+    marquee: Option<MarqueeCtx<'_>>,
+    layer: RenderLayer,
+    transform: Option<TextTransform>,
+) {
+    draw_text_line_pixels_impl(
+        text_scratch,
+        scratch_utf16,
+        pixels,
+        width,
+        value,
+        rect,
+        font,
+        font_height,
+        color,
+        scale,
+        marquee,
+        layer,
+        transform,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text_line_pixels_impl(
+    text_scratch: &mut Option<TextScratch>,
+    scratch_utf16: &mut Vec<u16>,
+    pixels: &mut [u8],
+    width: usize,
+    value: &str,
+    rect: &RECT,
+    font: HFONT,
+    font_height: i32,
+    color: [u8; 4],
+    scale: f32,
+    marquee: Option<MarqueeCtx<'_>>,
+    layer: RenderLayer,
+    transform: Option<TextTransform>,
 ) {
     if value.is_empty() || rect.right <= rect.left || rect.bottom <= rect.top {
         return;
@@ -3262,7 +3341,14 @@ pub(super) fn draw_text_line_pixels(
                     } else {
                         (fade_w, fade_w)
                     };
-                    composite_marquee_strip(pixels, width, rect, strip, color, off, total, fade_left, fade_right);
+                    match transform.filter(|transform| !transform.is_identity()) {
+                        Some(transform) => composite_marquee_strip_transformed(
+                            pixels, width, rect, strip, color, off, total, fade_left, fade_right, transform,
+                        ),
+                        None => composite_marquee_strip(
+                            pixels, width, rect, strip, color, off, total, fade_left, fade_right,
+                        ),
+                    }
                 }
                 return;
             }
@@ -3291,18 +3377,33 @@ pub(super) fn draw_text_line_pixels(
     // make GDI pre-dim the scratch, and reading that dimmed value as coverage
     // would render gray text at ~brightness² opacity. The edge mask never
     // applies here: only the marquee strip composite (above) fades, relative
-    // to the visible band.
-    composite_glyphs(
-        pixels,
-        width,
-        rect.left,
-        rect.top,
-        bits,
-        sw as usize,
-        rw as usize,
-        rh as usize,
-        color,
-    );
+    // to the visible band. A live title impact resamples the same coverage
+    // about the row's bottom edge; the identity path is bit-exact.
+    match transform.filter(|transform| !transform.is_identity()) {
+        Some(transform) => composite_glyphs_transformed(
+            pixels,
+            width,
+            rect.left,
+            rect.top,
+            bits,
+            sw as usize,
+            rw as usize,
+            rh as usize,
+            color,
+            transform,
+        ),
+        None => composite_glyphs(
+            pixels,
+            width,
+            rect.left,
+            rect.top,
+            bits,
+            sw as usize,
+            rw as usize,
+            rh as usize,
+            color,
+        ),
+    }
 }
 
 /// Rasterizes the scrolling line once at its natural width and caches it as
@@ -3563,6 +3664,193 @@ pub(super) fn composite_glyphs(
             );
         }
     }
+}
+
+/// The title impact's transformed composite: the rest glyph raster `src`
+/// (`src_w × src_h`, 4 bytes per pixel, coverage in the RGB channels) is
+/// sampled about the row's bottom edge into `dest`. Pure over the coverage
+/// slice, so the pivot and inverse mapping are testable without a GDI
+/// scratch. `wrap` is the marquee's `(offset, total)` two-copy loop for a
+/// scrolling title; `None` for a static row. The transform is vertical-only,
+/// so each destination column reads exactly its rest column: the impact can
+/// never move or widen the text sideways. The pivot is the row's bottom
+/// edge, so vertical compression and the drop/lift read as the text landing
+/// on its baseline instead of scaling about the row center.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn composite_coverage_transformed(
+    dest: &mut [u8],
+    dest_width: usize,
+    rect: &RECT,
+    src: &[u8],
+    src_stride: usize,
+    src_w: usize,
+    src_h: usize,
+    color: [u8; 4],
+    transform: TextTransform,
+    wrap: Option<(i32, i32)>,
+    fade_left: f32,
+    fade_right: f32,
+) {
+    let scale_y = transform.scale_y;
+    if scale_y <= 0.0 || dest_width == 0 {
+        return;
+    }
+    let dest_height = dest.len() / (dest_width * 4);
+    if dest_height == 0 {
+        return;
+    }
+    let left = rect.left as f32;
+    let top = rect.top as f32;
+    let right = rect.right as f32;
+    let bottom = rect.bottom as f32;
+    // Destination vertical span of the transformed row, padded one pixel for
+    // the bilinear taps. The horizontal span is the rest row exactly.
+    let y0 = bottom + (top - bottom) * scale_y + transform.dy;
+    let y1 = bottom + transform.dy;
+    let bx0 = rect.left.max(0).min(dest_width as i32);
+    let bx1 = rect.right.max(0).min(dest_width as i32);
+    let by0 = (y0.min(y1).floor() as i32 - 1).max(0);
+    let by1 = (y0.max(y1).ceil() as i32 + 1).min(dest_height as i32);
+    // Coverage at a rest-space pixel index. Integer indices are pixel
+    // centers; out-of-row taps contribute zero so the resample cannot bleed
+    // outside the glyph raster. A marquee source wraps through its two-copy
+    // loop, with the gap between copies empty.
+    let coverage = |x: i32, y: i32| -> f32 {
+        if y < 0 || y >= src_h as i32 {
+            return 0.0;
+        }
+        let sx = match wrap {
+            None => x,
+            Some((off, total)) => {
+                let first = x + off;
+                let second = first - total;
+                if first >= 0 && first < src_w as i32 {
+                    first
+                } else if second >= 0 && second < src_w as i32 {
+                    second
+                } else {
+                    return 0.0;
+                }
+            }
+        };
+        if sx < 0 || sx >= src_w as i32 {
+            return 0.0;
+        }
+        let p = y as usize * src_stride + sx as usize * 4;
+        src[p].max(src[p + 1]).max(src[p + 2]) as f32
+    };
+    for py in by0..by1 {
+        for px in bx0..bx1 {
+            // The horizontal mapping is the identity; only the destination
+            // pixel center's vertical position is inverse-mapped into rest
+            // space, where integer indices are source pixel centers.
+            let u = px - rect.left;
+            let v = bottom + (py as f32 + 0.5 - bottom - transform.dy) / scale_y - top - 0.5;
+            let iv = v.floor() as i32;
+            let fv = v - iv as f32;
+            let c0 = coverage(u, iv);
+            let c1 = coverage(u, iv + 1);
+            let cov = c0 + (c1 - c0) * fv;
+            if cov <= 0.0 {
+                continue;
+            }
+            // The fade follows the rest position, so the masked edges stay
+            // glued to the text instead of scaling with it.
+            let fade = if fade_left > 0.0 || fade_right > 0.0 {
+                edge_fade_factor(px as f32, left, right, fade_left, fade_right)
+            } else {
+                1.0
+            };
+            let alpha = ((cov * fade).round() as u32) * color[3] as u32 / 255;
+            if alpha == 0 {
+                continue;
+            }
+            composite_pm(
+                dest,
+                dest_width,
+                px as usize,
+                py as usize,
+                [
+                    (color[0] as u32 * alpha / 255) as u8,
+                    (color[1] as u32 * alpha / 255) as u8,
+                    (color[2] as u32 * alpha / 255) as u8,
+                ],
+                alpha,
+            );
+        }
+    }
+}
+
+/// `composite_glyphs` with the title's landing transform applied about the
+/// row's bottom edge. The scratch raster is the same white-on-black
+/// coverage the rest path reads.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn composite_glyphs_transformed(
+    dest: &mut [u8],
+    dest_width: usize,
+    left: i32,
+    top: i32,
+    bits: *mut c_void,
+    sw: usize,
+    rw: usize,
+    rh: usize,
+    color: [u8; 4],
+    transform: TextTransform,
+) {
+    let src = unsafe { std::slice::from_raw_parts(bits.cast::<u8>(), sw * rh * 4) };
+    let rect = RECT {
+        left,
+        top,
+        right: left + rw as i32,
+        bottom: top + rh as i32,
+    };
+    composite_coverage_transformed(
+        dest,
+        dest_width,
+        &rect,
+        src,
+        sw * 4,
+        rw,
+        rh,
+        color,
+        transform,
+        None,
+        0.0,
+        0.0,
+    );
+}
+
+/// `composite_marquee_strip` with the title's landing transform applied. The
+/// strip is the rest raster of the full text; the transform resamples the
+/// visible band's window into it, so a scrolling title lands with the same
+/// impact as a static one.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn composite_marquee_strip_transformed(
+    pixels: &mut [u8],
+    width: usize,
+    rect: &RECT,
+    strip: &MarqueeStrip,
+    color: [u8; 4],
+    off: i32,
+    total: i32,
+    fade_left: f32,
+    fade_right: f32,
+    transform: TextTransform,
+) {
+    composite_coverage_transformed(
+        pixels,
+        width,
+        rect,
+        &strip.pixels,
+        strip.text_w as usize * 4,
+        strip.text_w as usize,
+        strip.rh as usize,
+        color,
+        transform,
+        Some((off, total)),
+        fade_left,
+        fade_right,
+    );
 }
 
 /// RAII restore of a previously-selected GDI object into its DC. Restores in

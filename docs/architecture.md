@@ -429,13 +429,18 @@ response is evaluated at normalized leg time. `value_at` pins the endpoint:
 at or past the leg end the curve is exactly 1.0, so the resting pill always
 renders at the exact compact/expanded size, never a hair short. The renderers clamp the curve into the endpoint interval, so the expand
 spring's ~5 % overshoot (ζ = 0.7, 2.8π) never reaches the hover morph's
-geometry, while the entrance bounce and the settle-bounce scale the rendered
-pill as a whole (`BOUNCE_OVER` past the endpoint, and on compaction the whole
-pill dips to (1 − `BOUNCE_UNDER`) of its final size). The collapse spring
-(ζ = 0.6) undershoots below compact by ~9.5 % of the remaining distance, and
-because that undershoot spreads over the tail of a leg running 4/5 of the
-entrance duration, the compaction bounce reads as a slow, pronounced settle
-rather than a fast blip.
+geometry, and the traveling title band clamps each axis the same way, so the
+text can never run past its final band and come back. The hover expand also
+scales the rendered pill as a whole (`BOUNCE_OVER` past the endpoint), so
+the bounce reads as one 1:1 card settling instead of per-element overshoots.
+Neither the entrance nor the collapse legs do: the entrance's landing is the
+text-only impact below, and the collapse spring is critically damped
+(ζ = 1), so the return is monotonic — it decelerates into the compact size
+and pins there, with no undershoot below compact and therefore no squeeze of
+the finished pill. An under-damped return would reach compact early and then
+keep shrinking and recover; on the static compact bar the width is the
+visible axis, so that reversal reads as a lateral wobble rather than
+momentum. The collapse leg runs 4/5 of the entrance duration.
 
 The width axis leads and the height axis chases it with `MORPH_LAG` (0.12 of
 the leg): the follower evaluates the leader's curve at a delayed, compressed
@@ -462,6 +467,29 @@ out over 0.05..0.20 of the shape progress and the expanded extra rows
 directions, so the icon and the app row never coexist. The content is drawn
 progressively into the single reusable DIB, and the expanded extra rows
 unveil as the pill's animated bottom edge sweeps past their bands.
+
+## Text landing impact
+
+The entrance and a genuine title change on a shown pill start a one-shot,
+280 ms text impact (`TextImpact` in `overlay/morph.rs`): a 90 ms accelerating
+5-logical-pixel drop into the row, a 45 ms impact compression (scale_y 0.92),
+a 75 ms smoothstep rebound through rest to a 3.5-pixel lift (scale_y 1.03),
+and a 70 ms smoothstep settle to exact identity. The transform is
+vertical-only by construction — no horizontal scale and no horizontal offset
+— so the text cannot shift, widen, or vibrate sideways; each destination
+column reads exactly its rest column. The pivot is the title band's bottom
+edge, so the compression reads as the text landing on its baseline. The
+rebound starts with zero velocity because the compression comes to rest at
+its extreme; an ease-out there would launch the text upward the instant the
+squash stops and read as a snap. The glyphs are rasterized once at rest and
+the coverage is resampled (bilinear, vertically) at composite time, so no
+frame re-measures or re-rasterizes text. A retrigger while an impact is
+running inherits the current sample instead of restarting; the impact is
+cancelled on hide, collapse start, idle card, sample preview, and a genuine
+DPI change. The transform is sampled once per frame and collapses to `None`
+at exact identity, so the rest path stays bit-exact and no drift survives
+disposal. Reduced-motion disables the impact entirely, like every other
+animation.
 
 ## Palette and aura
 

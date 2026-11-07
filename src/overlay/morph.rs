@@ -1,6 +1,6 @@
 //! Morph springs, hover decisions and pill geometry.
 
-use super::{BOUNCE_OVER, BOUNCE_UNDER, COLLAPSE_TROUGH, EXPAND_SPRING_PEAK, LEAVE_DEBOUNCE, MORPH_LAG, ROW_HEIGHT};
+use super::{BOUNCE_OVER, EXPAND_SPRING_PEAK, LEAVE_DEBOUNCE, MORPH_LAG, ROW_HEIGHT};
 use crate::config::Config;
 use crate::events::MediaEvent;
 use std::time::{Duration, Instant};
@@ -164,13 +164,12 @@ pub(super) fn content_size_of(config: &Config, content: &MediaEvent, compact: bo
 /// The shown content's pixel size for one frame at `dpi`: the hover morph's
 /// size while one is in flight (progress supplied by the caller — the render
 /// path has it precomputed from the tick), else the entrance/exit leg's
-/// size, else the applied layout's size — with the settle-bounce scale
-/// applied. Single source shared by the render path and the hover hitbox,
-/// so the visible window and the cursor hitbox can never drift apart. The
-/// bounce direction is the hover morph's own, Collapse while collapsing,
-/// Expand otherwise — the exact decision both call sites made inline.
-/// Returns the size plus the bounce scale, which the upload path needs for
-/// the frame resample.
+/// size, else the applied layout's size — with the hover expand's
+/// over-bounce scale applied. The collapse legs never rescale the frame
+/// (see `bounce_scale`). Single source shared by the render path and the
+/// hover hitbox, so the visible window and the cursor hitbox can never
+/// drift apart. Returns the size plus the bounce scale, which the upload
+/// path needs for the frame resample.
 pub(super) fn frame_content_size(
     config: &Config,
     content: &MediaEvent,
@@ -211,7 +210,21 @@ pub(super) fn frame_content_size(
             }
         }
     };
-    let scale_factor = bounce_scale(morph_progress, direction);
+    // Only the expand's over-bounce scales the frame. The entrance's landing
+    // is the text impact (a text-only drop, squash and rebound), and a frame
+    // scale on top would double the impact and deform the artwork and glass.
+    // The collapse legs (the hover return and the exit shrink) land on the
+    // critically damped spring, which reaches compact monotonically: a frame
+    // scale there would squeeze the finished compact bar narrower and back
+    // after it has already landed, reading as a lateral wobble on a static
+    // pill. The entrance is the only expand leg with no hover morph, an
+    // active frame morph and no collapse phase.
+    let entrance = hover.is_none() && frame_morph.is_some() && !phase_collapsing;
+    let scale_factor = if entrance || direction == MorphDirection::Collapse {
+        1.0
+    } else {
+        bounce_scale(morph_progress)
+    };
     (
         (logical_width * scale_factor * dpi).round().max(1.0) as i32,
         (logical_height * scale_factor * dpi).round().max(1.0) as i32,
@@ -219,45 +232,138 @@ pub(super) fn frame_content_size(
     )
 }
 
-/// The whole-pill scale factor of the settle-bounce, as a pure function of
-/// the leg's progress — there is no appended phase, so the bounce starts the
+/// The whole-pill over-bounce of the hover expand, as a pure function of the
+/// leg's progress — there is no appended phase, so the bounce starts the
 /// instant the size completes and there is never a still pause before it.
 /// Exactly 1.0 whenever the spring is inside its endpoints (and again at the
 /// pinned end), so the window and content hand off to the steady frame at
 /// the final size. The expand rides the spring's own overshoot past 1.0,
-/// normalized to peak at (1 + `BOUNCE_OVER`) when the spring peaks. The
-/// compaction dips to (1 - `BOUNCE_UNDER`) at the spring's undershoot
-/// trough and recovers straight to exactly 1.0 when the spring pins — the
-/// shrink-below-minimum return, with no over-bounce past the final size.
-pub(super) fn bounce_scale(progress: MorphProgress, direction: MorphDirection) -> f32 {
-    match direction {
-        MorphDirection::Expand => {
-            let excess = ((progress.width - 1.0) / (EXPAND_SPRING_PEAK - 1.0)).clamp(0.0, 1.0);
-            1.0 + BOUNCE_OVER * excess
-        }
-        MorphDirection::Collapse => {
-            let dip = if progress.width < 0.0 {
-                (progress.width / COLLAPSE_TROUGH).clamp(0.0, 1.0)
-            } else {
-                0.0
+/// normalized to peak at (1 + `BOUNCE_OVER`) when the spring peaks, so the
+/// bounce reads as momentum against the growth. Only the expand uses it: the
+/// collapse legs land on the critically damped spring and never rescale the
+/// frame (see `frame_content_size`).
+pub(super) fn bounce_scale(progress: MorphProgress) -> f32 {
+    let excess = ((progress.width - 1.0) / (EXPAND_SPRING_PEAK - 1.0)).clamp(0.0, 1.0);
+    1.0 + BOUNCE_OVER * excess
+}
+
+/// Total duration of the title's landing impact: approach + impact +
+/// rebound + settle. One shot, time-based, and exactly rest at the end.
+pub(super) const TEXT_IMPACT_DURATION: Duration = Duration::from_millis(280);
+/// The approach: the text starts `TEXT_IMPACT_DROP` above its row and
+/// accelerates down into it.
+const TEXT_IMPACT_APPROACH_MS: f32 = 90.0;
+/// The impact: the row compresses vertically as it absorbs the landing.
+const TEXT_IMPACT_IMPACT_MS: f32 = 45.0;
+/// The rebound: decompression through rest into a small lift.
+const TEXT_IMPACT_REBOUND_MS: f32 = 75.0;
+/// The settle: the rebound peak eases back to exact identity.
+const TEXT_IMPACT_SETTLE_MS: f32 = 70.0;
+/// Logical-pixel drop of the approach and lift of the rebound.
+const TEXT_IMPACT_DROP: f32 = 5.0;
+const TEXT_IMPACT_LIFT: f32 = 3.5;
+/// Vertical scale at the end of the impact and at the rebound peak.
+const TEXT_IMPACT_SQUASH_Y: f32 = 0.92;
+const TEXT_IMPACT_REBOUND_Y: f32 = 1.03;
+
+/// One sample of the title's landing transform, applied about the title
+/// band's bottom edge. `dy` is in physical pixels, positive downward.
+/// The transform is vertical-only by construction — no horizontal scale and
+/// no horizontal offset — so the landing can never shift or widen the text
+/// sideways, and every frame keeps the rest raster's exact columns.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct TextTransform {
+    pub(super) scale_y: f32,
+    pub(super) dy: f32,
+}
+
+impl TextTransform {
+    pub(super) const IDENTITY: Self = Self { scale_y: 1.0, dy: 0.0 };
+
+    pub(super) fn is_identity(self) -> bool {
+        self.scale_y == 1.0 && self.dy == 0.0
+    }
+}
+
+/// The title's landing impact: a deterministic one-shot timeline started on
+/// the entrance and on a genuine title change while the pill is shown. The
+/// text approaches from above, compresses at the landing, rebounds, and
+/// settles to exact identity, so a disposed or cancelled impact can never
+/// leave residual drift.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TextImpact {
+    started_at: Instant,
+}
+
+impl TextImpact {
+    pub(super) fn new(now: Instant) -> Self {
+        Self { started_at: now }
+    }
+
+    pub(super) fn is_done(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started_at) >= TEXT_IMPACT_DURATION
+    }
+
+    /// Samples the transform `now`, `dpi` physical pixels per logical pixel.
+    /// Phase boundaries are continuous, and every phase ends at the next
+    /// phase's start value, so a frame-rate change cannot alter the motion.
+    pub(super) fn sample(&self, now: Instant, dpi: f32) -> TextTransform {
+        let elapsed_ms = now.saturating_duration_since(self.started_at).as_secs_f32() * 1000.0;
+        if elapsed_ms < TEXT_IMPACT_APPROACH_MS {
+            // Accelerating fall: starts at rest above the row and arrives
+            // with the highest speed, so the contact reads as a landing.
+            let u = elapsed_ms / TEXT_IMPACT_APPROACH_MS;
+            return TextTransform {
+                scale_y: 1.0,
+                dy: -TEXT_IMPACT_DROP * (1.0 - u * u) * dpi,
             };
-            // The dip rides the spring's undershoot straight back to 1.0 —
-            // the pill shrinks below the compact minimum and returns, with
-            // no over-bounce past the steady size. Exactly 1.0 when the
-            // spring pins, so there is no seam at the steady handoff.
-            1.0 - BOUNCE_UNDER * dip
         }
+        let after_approach = elapsed_ms - TEXT_IMPACT_APPROACH_MS;
+        if after_approach < TEXT_IMPACT_IMPACT_MS {
+            // Compression: fast at contact, slowing as the row absorbs it.
+            let e = ease_out_quint(after_approach / TEXT_IMPACT_IMPACT_MS);
+            return TextTransform {
+                scale_y: 1.0 + (TEXT_IMPACT_SQUASH_Y - 1.0) * e,
+                dy: 0.0,
+            };
+        }
+        let after_impact = after_approach - TEXT_IMPACT_IMPACT_MS;
+        if after_impact < TEXT_IMPACT_REBOUND_MS {
+            // Rebound: decompress through rest into a small lift. The squash
+            // has come to rest at its extreme, so this leg starts with zero
+            // velocity too — an ease-out here would launch the text upward
+            // at full speed the instant the compression stops, which reads
+            // as a snap rather than a spring returning.
+            let u = after_impact / TEXT_IMPACT_REBOUND_MS;
+            let e = u * u * (3.0 - 2.0 * u);
+            return TextTransform {
+                scale_y: TEXT_IMPACT_SQUASH_Y + (TEXT_IMPACT_REBOUND_Y - TEXT_IMPACT_SQUASH_Y) * e,
+                dy: -TEXT_IMPACT_LIFT * e * dpi,
+            };
+        }
+        let after_rebound = after_impact - TEXT_IMPACT_REBOUND_MS;
+        if after_rebound < TEXT_IMPACT_SETTLE_MS {
+            // Settle: ease the rebound peak back to exactly rest.
+            let u = (after_rebound / TEXT_IMPACT_SETTLE_MS).clamp(0.0, 1.0);
+            let e = u * u * (3.0 - 2.0 * u);
+            return TextTransform {
+                scale_y: TEXT_IMPACT_REBOUND_Y + (1.0 - TEXT_IMPACT_REBOUND_Y) * e,
+                dy: -TEXT_IMPACT_LIFT * (1.0 - e) * dpi,
+            };
+        }
+        TextTransform::IDENTITY
     }
 }
 
 /// Duration of one hover-morph leg. The expand leg gets the full animation
-/// duration — room for the spring to play out — while the collapse leg runs
-/// shorter at 4/5: still a confident close, but long enough that the
-/// undershoot tail (the settle-bounce) has time to read. Shared by the
-/// completion check in `tick` and the progress curve, so a leg always
-/// settles exactly when its animation is done. The settle-bounce is not
-/// appended: it rides the spring's own overshoot/undershoot (see
-/// `bounce_scale`), so the leg duration is the spring duration.
+/// duration — room for the spring's overshoot to play out — while the
+/// collapse leg runs shorter at 4/5: a confident close that still gives the
+/// critically damped return time to decelerate into compact instead of
+/// stopping dead. Shared by the completion check in `tick` and the progress
+/// curve, so a leg always settles exactly when its animation is done. The
+/// expand's over-bounce is not appended: it rides the spring's own
+/// overshoot (see `bounce_scale`), so the leg duration is the spring
+/// duration.
 pub(super) fn morph_duration(config: &Config, direction: MorphDirection) -> Duration {
     match direction {
         MorphDirection::Expand => animation_duration(config),
@@ -365,8 +471,8 @@ pub(super) fn morph_size(config: &Config, content: &MediaEvent, progress: MorphP
 /// The pill's corner radius during a morph: the compact and expanded radii
 /// lerped by the leading (width) axis's progress, so the corner curvature
 /// follows the silhouette the eye is tracking. Clamped between both
-/// endpoints; the appended settle-bounce scales the rendered frame as a
-/// whole (`render_layered`), so the corners ride it without this lerp
+/// endpoints; the expand's whole-pill over-bounce scales the rendered frame
+/// as a whole (`render_layered`), so the corners ride it without this lerp
 /// overshooting.
 pub(super) fn morph_radius(compact_radius: f32, expanded_radius: f32, progress: MorphProgress) -> f32 {
     let p = progress.width.clamp(0.0, 1.0);
@@ -571,19 +677,42 @@ pub(super) fn morph_title_band(config: &Config, inset: i32, width: i32, scale: f
         right: width - inset - padding - label_w,
         bottom: inset + padding + row_h,
     };
+    // The expand spring overshoots its endpoint by design (the peak is
+    // ~4.6 %), and a seeded collapse reversal can continue the expand motion
+    // for a beat before turning. The title band must never follow that past
+    // the layout band, or the text visibly runs beyond its final edges and
+    // comes back; the clamp pins each axis inside Compact..Expanded so the
+    // travel reads as one clean move.
+    let width_t = progress.width.clamp(0.0, 1.0);
+    let height_t = progress.height.clamp(0.0, 1.0);
     RECT {
-        left: lerp_edge(compact.left, expanded.left, progress.width),
-        top: lerp_edge(compact.top, expanded.top, progress.height),
-        right: lerp_edge(compact.right, expanded.right, progress.width),
-        bottom: lerp_edge(compact.bottom, expanded.bottom, progress.height),
+        left: lerp_edge(compact.left, expanded.left, width_t),
+        top: lerp_edge(compact.top, expanded.top, height_t),
+        right: lerp_edge(compact.right, expanded.right, width_t),
+        bottom: lerp_edge(compact.bottom, expanded.bottom, height_t),
     }
 }
 
-/// The morph playback symbol: the compact trailing-chain position (right of
-/// the app icon, vertically centered in the compact row) travels to the
-/// expanded title row's right slot — the same right edge the steady
-/// expanded symbol uses (`title_rect.right`; the `label_w` narrowing applies
-/// to the title text, not the symbol). Both layouts draw the same symbol
+/// The morph playback symbol: the compact trailing-chain slot (right of the
+/// app icon, vertically centered in the compact row) and the expanded title
+/// row's right slot (`title_rect.right`; the `label_w` narrowing applies to
+/// the title text, not the symbol) are both pinned to the pill body's right
+/// content edge. So the symbol rides that edge for the whole morph.
+/// `width` is the content buffer width, which carries the aura inset on both
+/// sides: the body's right edge is `width - inset`, and the compact body's is
+/// `compact_w + inset` — comparing a buffer-coordinate slot against a
+/// body-coordinate edge would shift the compact end by `2 * inset` and snap
+/// at the handoff. Lerping between the two endpoint positions would apply
+/// the width progress twice — the expanded endpoint already moves with the
+/// body — racing the symbol ahead of the edge mid-leg. The compact chain
+/// rounds its parts independently and can sit a pixel off the body's rounded
+/// edge, so its exact slot anchors the compact end and that sub-pixel
+/// difference fades out as the pill expands. The steady layouts disagree on
+/// padding rounding (compact rounds, expanded truncates), so each end uses
+/// its own convention and the morph blends between them: the handoff stays
+/// exact at fractional DPI instead of jumping a pixel. The vertical axis
+/// travels from the compact row's center to the expanded title row's
+/// top-packed slot on the height progress. Both layouts draw the same symbol
 /// size, so only the position travels.
 pub(super) fn morph_symbol_pos(
     config: &Config,
@@ -593,9 +722,12 @@ pub(super) fn morph_symbol_pos(
     progress: MorphProgress,
 ) -> (i32, i32, f32) {
     let appearance = &config.appearance;
-    let padding = (appearance.padding * scale).round() as i32;
+    let compact_padding = (appearance.padding * scale).round() as i32;
+    let expanded_padding = (appearance.padding * scale) as i32;
     let symbol = (compact_metrics(config).symbol * scale).round() as i32;
-    let compact_h = (compact_size(config).1 * scale).round() as i32;
+    let (compact_w, compact_h) = compact_size(config);
+    let compact_w = (compact_w * scale).round() as i32;
+    let compact_h = (compact_h * scale).round() as i32;
     let (_, vp_right) = compact_title_viewport(config);
     let viewport_right = inset + (vp_right * scale).round() as i32;
     let gap = (6.0 * scale).round() as i32;
@@ -603,10 +735,17 @@ pub(super) fn morph_symbol_pos(
     let symbol_gap = (8.0 * scale).round() as i32;
     let compact_right = viewport_right + gap + icon + symbol_gap + symbol;
     let compact_y = inset + (compact_h - symbol) / 2;
-    let expanded_right = width - inset - padding;
-    let expanded_y = inset + padding;
+    // The expanded draw truncates the padding (`draw_pill_text_rows`), so
+    // the symbol's y matches that truncation at shape 1.
+    let expanded_y = (inset as f32 + appearance.padding * scale) as i32;
+    // The compact slot's offset from the compact body edge, both in buffer
+    // coordinates (0 or ±1 px from independent rounding); it fades out as
+    // the body reaches full width.
+    let compact_offset = (compact_right - (compact_w + inset - compact_padding)) as f32;
+    let offset = (compact_offset * (1.0 - progress.width).clamp(0.0, 1.0)).round() as i32;
+    let padding = lerp_edge(compact_padding, expanded_padding, progress.width.clamp(0.0, 1.0));
     (
-        lerp_edge(compact_right, expanded_right, progress.width),
+        width - inset - padding + offset,
         lerp_edge(compact_y, expanded_y, progress.height),
         symbol as f32,
     )
@@ -655,8 +794,8 @@ pub(super) fn normalized_elapsed(start: &Instant, total: Duration) -> f32 {
 }
 
 /// The exit leg's duration: shorter than the entrance — a confident close
-/// (the same 4/5 ratio the hover collapse uses) that still gives the release
-/// spring's undershoot tail room to play out.
+/// (the same 4/5 ratio the hover collapse uses) that still gives the
+/// critically damped return time to decelerate into compact.
 pub(super) fn collapse_duration(config: &Config) -> Duration {
     Duration::from_millis((animation_duration(config).as_millis() * 4 / 5) as u64)
 }
@@ -773,15 +912,16 @@ pub(super) const ENTRANCE_GROW: Spring = Spring {
     omega: 2.8 * std::f32::consts::PI,
 };
 
-/// The collapse spring, shared by the hover return and the exit shrink: the
-/// expand spring's shape family mirrored (see `spring_collapse`), with ζ=0.6
-/// undershooting below compact by ~9.5 % of the remaining distance. The
-/// undershoot spreads over the tail of the leg — `bounce_scale` renders it
-/// as the whole-pill settle-bounce, and `morph_size` clamps it out of the
-/// geometry — so the return lands with a slow, pronounced bounce instead of
-/// a dead stop.
+/// The collapse spring, shared by the hover return and the exit shrink:
+/// critically damped (ζ = 1), so the return is monotonic — it decelerates
+/// into the compact size and pins there, with no undershoot below compact
+/// and therefore no reversal at the end. An under-damped return would reach
+/// compact early, then keep shrinking and recover; on the finished compact
+/// bar that reads as a lateral squeeze (the width is the visible axis), not
+/// as momentum, because the pill has already landed. Matching the expand's
+/// 2.8π keeps both legs in the same motion family.
 pub(super) const COLLAPSE_SPRING: Spring = Spring {
-    zeta: 0.6,
+    zeta: 1.0,
     omega: 2.8 * std::f32::consts::PI,
 };
 

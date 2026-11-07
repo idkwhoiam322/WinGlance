@@ -58,9 +58,9 @@ use fullscreen::{
     resolve_target_persisted, window_is_fullscreen,
 };
 use morph::{
-    ENTRANCE_GROW, HoverExpand, HoverStep, HoverTick, MorphDirection, MorphProgress, animation_duration,
-    collapse_duration, ease_out_quint, frame_content_size, hover_engaged, hover_progress, hover_step, lagged_collapse,
-    lagged_expand, morph_duration, normalized_elapsed, reversal_seed, spring_collapse,
+    ENTRANCE_GROW, HoverExpand, HoverStep, HoverTick, MorphDirection, MorphProgress, TextImpact, TextTransform,
+    animation_duration, collapse_duration, ease_out_quint, frame_content_size, hover_engaged, hover_progress,
+    hover_step, lagged_collapse, lagged_expand, morph_duration, normalized_elapsed, reversal_seed, spring_collapse,
 };
 use render::{AURA_HALO_LOGICAL, ORBIT_PERIOD_SECS, pill_text_from_track, playback_state_for_track, render_layered};
 
@@ -113,28 +113,20 @@ const REVERSAL_MIN_PROGRESS: f32 = 0.05;
 /// detaches from the width.
 const MORPH_LAG: f32 = 0.12;
 
-/// The whole-pill settle-bounce: after the size spring passes its endpoint,
-/// the entire pill scales about its anchor past the final size and back
-/// (expand: 1 -> 1.05 -> 1; compaction: 1 -> 0.95 -> 1), so the
-/// bounce reads as one 1:1 card settling instead of per-element overshoots.
-/// The compaction leg is the slow half: ζ=0.6's ~9.5 % undershoot spreads
-/// over the tail of a leg that runs 4/5 of the entrance duration, so the
-/// dip reads as a pronounced settle instead of a thud. The amplitudes are
-/// the first tuning knobs if the bounce reads too weak or too wild.
+/// The whole-pill over-bounce of the hover expand: after the size spring
+/// passes its endpoint, the entire pill scales about its anchor past the
+/// final size and back (1 -> 1.05 -> 1), so the bounce reads as one 1:1 card
+/// settling instead of per-element overshoots. Only the expand uses it: the
+/// entrance's landing is the text-only impact (see `TextImpact`), and the
+/// collapse legs land on the critically damped spring, so neither rescales
+/// the frame. The amplitude is the first tuning knob if the bounce reads too
+/// weak or too wild.
 const BOUNCE_OVER: f32 = 0.05;
-/// Under-bounce amplitude (compaction only): the pill shrinks to
-/// (1 - UNDER) of its final size at the spring's undershoot trough.
-const BOUNCE_UNDER: f32 = 0.05;
 /// The expand spring's peak progress (ζ = 0.7, 2.8π, from rest): the
 /// bounce's excess is normalized against it, so the over-bounce peaks at
 /// exactly `BOUNCE_OVER` when the spring peaks. Pinned by
 /// `spring_expand_overshoots_then_settles_exactly`.
 const EXPAND_SPRING_PEAK: f32 = 1.045988;
-/// The collapse spring's undershoot below compact (ζ = 0.6, released from
-/// rest): the compaction's dip is normalized against it, so the pill shrinks
-/// to exactly (1 - `BOUNCE_UNDER`) at the trough. Pinned by
-/// `spring_collapse_release_from_expanded_undershoots_once_then_pins_compact`.
-const COLLAPSE_TROUGH: f32 = -0.094780;
 /// Tick period while the pill is fully static (no animation, no marquee
 /// scrolling). The dismiss countdown and hover polling do not need frame
 /// rate; the refresh-rate timer is restored the moment the pill animates or
@@ -350,6 +342,12 @@ struct ChromeKey {
     /// row's is omitted for the strip pass — so the flip must rebuild, or
     /// the reused raster ghosts the old static text under the strip.
     scrolling: [bool; 4],
+    /// The title impact transform baked into this background, when the title
+    /// row is drawn statically. A scrolling title is composited in the
+    /// foreground pass and omitted from the background, so its transform is
+    /// deliberately not part of the key — that keeps the cached background
+    /// reusable across every impact frame.
+    text_transform: Option<(f32, f32)>,
 }
 
 /// The retained static-background raster produced by a `RenderLayer::Background`
@@ -643,6 +641,15 @@ struct OverlayState {
     /// The in-place content cross-fade, while one is in flight (see
     /// `ContentFade`).
     content_fade: Option<ContentFade>,
+    /// The title's landing impact, while one is in flight (see
+    /// `morph::TextImpact`). Text-only: it never changes the window geometry,
+    /// and it is cleared the moment its 280 ms timeline completes.
+    text_impact: Option<TextImpact>,
+    /// This frame's sampled impact transform, resolved once in `render()` so
+    /// the chrome-cache key and the title composite always agree on the exact
+    /// values. `None` at exact rest, which keeps the identity draw path
+    /// bit-exact.
+    text_transform: Option<TextTransform>,
     content: Option<MediaEvent>,
     /// True only for the overlay-local no-media status card. The backing
     /// `MediaEvent` is a private render sentinel and never enters the event
@@ -1503,6 +1510,8 @@ impl OverlayState {
             persistent_faded: false,
             persistent_collapse_on_dismiss: false,
             content_fade: None,
+            text_impact: None,
+            text_transform: None,
             last_frame_w: 0,
             last_frame_h: 0,
             last_upload_x: i32::MIN,
@@ -1630,6 +1639,9 @@ impl OverlayState {
         self.persistent_faded = false;
         self.persistent_collapse_on_dismiss = false;
         self.content_fade = None;
+        // The idle card is not a notification entrance: no landing impact.
+        self.text_impact = None;
+        self.text_transform = None;
         self.resolve_pill_text();
         self.reset_scroll();
         self.phase = Phase::Shown;
@@ -1669,6 +1681,16 @@ impl OverlayState {
             self.fonts = FontProvider::new(raw_dpi);
             self.reset_scroll();
             self.marquee_strips = [None, None, None, None];
+            // The impact's pixel offset is DPI-scaled, so a genuine display
+            // switch mid-impact would jump the text; drop it and let the next
+            // frame draw the title at rest in the new DPI. The initial build
+            // (dpi 0) is not a switch — no frame has sampled an offset yet —
+            // and dropping it there would silently cancel the first pill's
+            // landing.
+            if old_dpi != 0 {
+                self.text_impact = None;
+                self.text_transform = None;
+            }
             // Shrink DIB if it was allocated for a much larger DPI (e.g., 144→96 drag).
             // Compare against new bound *1.3 with hysteresis to avoid thrash on 96↔120
             // toggle (1.25x) while still shrinking after a 144→96 visit (1.5x).
@@ -1767,6 +1789,15 @@ impl OverlayState {
                 self.scroll[2].scrolling,
                 self.scroll[3].scrolling,
             ],
+            // The title is row 0 in every layout. A scrolling title is drawn
+            // in the foreground pass and omitted from the background, so its
+            // transform never contaminates the cache; a static title is baked
+            // in and the transform must key the raster.
+            text_transform: if self.scroll[0].scrolling {
+                None
+            } else {
+                self.text_transform.map(|t| (t.scale_y, t.dy))
+            },
         }
     }
 
@@ -1800,6 +1831,7 @@ impl OverlayState {
         let animating = !matches!(self.phase, Phase::Shown)
             || self.hover_expand.is_some()
             || self.content_fade.is_some()
+            || self.text_impact.is_some()
             || self.persistent_fade_active();
         // The comet alone no longer buys refresh-rate frames: a slow glow
         // reads just as smoothly at ~15 Hz, which cuts a playing pill's
@@ -2906,6 +2938,10 @@ impl OverlayState {
         {
             self.held_content = Some(event.clone());
         }
+        // Capture the displayed title before the swap: only a genuine text
+        // change on a fully-shown pill starts a landing impact. A state or
+        // artwork refresh of the same title must not retrigger it.
+        let previous_title = self.pill_text.as_ref().map(|pill| pill.title.clone());
         self.content_rev += 1;
         self.content = Some(event);
         self.publish_now_showing();
@@ -2914,6 +2950,19 @@ impl OverlayState {
             _ => None,
         };
         self.resolve_pill_text();
+        let title_changed = self.pill_text.as_ref().map(|pill| pill.title.as_str()) != previous_title.as_deref();
+        if title_changed
+            && matches!(self.phase, Phase::Shown)
+            && crate::winutil::animations_enabled()
+            && self.text_impact.is_none()
+            && self.pill_text.as_ref().is_some_and(|pill| !pill.title.is_empty())
+        {
+            // A repeat while an impact is already running deliberately
+            // inherits its current sample instead of restarting: a restart
+            // would snap the new text back to the approach height.
+            self.text_impact = Some(TextImpact::new(Instant::now()));
+            self.sync_anim_timer();
+        }
         self.reset_scroll();
         // Persistent-compact: a content refresh restores full opacity and
         // restarts the fade timer.
@@ -2930,7 +2979,13 @@ impl OverlayState {
         // grows back smoothly to full visibility for the extended time, instead
         // of snapping to the full size on the next frame.
         if matches!(self.phase, Phase::Collapsing(_)) {
-            self.phase = Phase::Expanding(Instant::now());
+            let now = Instant::now();
+            self.phase = Phase::Expanding(now);
+            // The revived entrance lands like any other entrance: its
+            // whole-frame bounce is gone, so the text impact carries it.
+            self.text_impact = crate::winutil::animations_enabled().then(|| TextImpact::new(now));
+            self.text_transform = None;
+            self.sync_anim_timer();
         }
         self.render();
     }
@@ -3102,6 +3157,11 @@ impl OverlayState {
         } else {
             Phase::Light(now)
         };
+        // The entrance's landing is the title impact, not a whole-frame
+        // bounce (see `frame_content_size`). A light reveal has no entrance
+        // to land, and reduced-motion must stay still.
+        self.text_impact = (full_animation && crate::winutil::animations_enabled()).then(|| TextImpact::new(now));
+        self.text_transform = None;
         self.sync_anim_timer();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
@@ -3328,8 +3388,10 @@ impl OverlayState {
         // ShowWindow calls; re-assert visibility and topmost z-order while a
         // pill should be up. While the pill is fully shown this is throttled
         // to 1 Hz — the window state cannot meaningfully change every 4 ms.
-        let animating =
-            !matches!(self.phase, Phase::Shown) || self.hover_expand.is_some() || self.content_fade.is_some();
+        let animating = !matches!(self.phase, Phase::Shown)
+            || self.hover_expand.is_some()
+            || self.content_fade.is_some()
+            || self.text_impact.is_some();
         if !matches!(self.phase, Phase::Hidden)
             && (animating || self.last_reassert.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)))
         {
@@ -3657,6 +3719,10 @@ impl OverlayState {
             && !matches!(&self.hover_expand, Some(m) if m.direction == MorphDirection::Collapse)
         {
             self.phase = Phase::Collapsing(now);
+            // The exit owns the motion from here: a landing impact would
+            // ride the shrinking pill and fight the collapse, so drop it and
+            // let the next frame draw the title at exact rest.
+            self.text_impact = None;
             // An in-flight hover *expand* leg loses to the dismiss: the pill
             // collapses from the plain compact shape instead of freezing at
             // whatever size the morph had reached (e.g. a queued update caps
@@ -3793,6 +3859,12 @@ impl OverlayState {
             .scroll
             .iter()
             .any(|line| line.scrolling && (line.offset as i32) != line.rendered_offset);
+        // Retire a finished impact before the gate. `animating` was sampled at
+        // the top of the tick with the impact still present, so this tick
+        // still paints the final rest frame; the next tick is static again.
+        if self.text_impact.as_ref().is_some_and(|impact| impact.is_done(now)) {
+            self.text_impact = None;
+        }
         if should_render_this_tick(
             layout_flipped,
             animating,
@@ -3834,6 +3906,15 @@ impl OverlayState {
         let raw_dpi = monitor_dpi(target.handle);
         self.refresh_fonts(raw_dpi);
         let dpi = raw_dpi as f32 / 96.0;
+        // One impact sample per frame, shared by the chrome-cache key and the
+        // title composite so the cached raster can never disagree with the
+        // pixels it is keyed for. Identity samples collapse to `None`, which
+        // keeps the rest draw path bit-exact.
+        self.text_transform = self
+            .text_impact
+            .as_ref()
+            .map(|impact| impact.sample(Instant::now(), dpi))
+            .filter(|transform| !transform.is_identity());
         let compact = self.layout == LayoutMode::Compact;
         // One morph per frame, resolved by construction: the hover leg and
         // the entrance/exit grow are mutually exclusive — the hover morph is
@@ -3868,10 +3949,11 @@ impl OverlayState {
         // the pill grows in place. The entrance/exit grow uses the same
         // reveal. Every other frame uses the plain size of the applied
         // layout.
-        // The settle-bounce scale rides the spring itself and multiplies the
-        // size (window and hitbox alike) — see `frame_content_size`, the
-        // single source shared with the hover hitbox so the visible window
-        // and the cursor hitbox can never drift apart.
+        // The expand's over-bounce scale rides the spring itself and
+        // multiplies the size (window and hitbox alike) — see
+        // `frame_content_size`, the single source shared with the hover
+        // hitbox so the visible window and the cursor hitbox can never drift
+        // apart.
         let (width, height, scale_factor) = frame_content_size(
             &self.config,
             &content,
@@ -4032,13 +4114,12 @@ impl OverlayState {
             Phase::Collapsing(start) => {
                 let t = normalized_elapsed(&start, collapse_duration(&self.config));
                 // The exit runs the reveal backwards: the pill springs closed
-                // to its compact shape on the mirrored release curve — the
-                // width collapsing first, the height lingering behind it —
-                // and fades in the last stretch: a cubic fade across the
+                // to its compact shape on the critically damped release curve
+                // — the width collapsing first, the height lingering behind
+                // it — and fades in the last stretch: a cubic fade across the
                 // final 75 % of the leg, so the exit stays readable while it
-                // closes and never disappears early (the undershoot bounce
-                // still shows through the tail of the fade). A compact
-                // layout pill just fades out.
+                // closes and never disappears early. A compact layout pill
+                // just fades out.
                 let shrink = spring_collapse(t, 1.0, 0.0);
                 let fade_t = (t / 0.75).min(1.0);
                 FrameState {
@@ -4338,6 +4419,10 @@ impl OverlayState {
         self.hover_expanded_once = false;
         self.hover_leave_at = None;
         self.content_fade = None;
+        // The impact belongs to the shown pill: the next show starts its own
+        // (or none), and the sampled transform must never survive a hide.
+        self.text_impact = None;
+        self.text_transform = None;
         // Deliberately keep `orbit_angle`: the comet resumes from its last
         // position when the sweep next comes alive (a fresh show, an un-fade,
         // or a resume after pause), instead of snapping back to zero. Only a
@@ -4624,6 +4709,9 @@ impl OverlayState {
         self.hover_expanded_once = false;
         self.hover_leave_at = None;
         self.content_fade = None;
+        // A preview is a light reveal, not a notification entrance.
+        self.text_impact = None;
+        self.text_transform = None;
         self.phase = Phase::Light(now);
         self.sync_anim_timer();
         unsafe {
@@ -5049,18 +5137,18 @@ mod tests {
     }
 
     use super::morph::{
-        EXPAND_SPRING, animation_duration_with, art_edge_gate, bounce_scale, compact_alpha, compact_metrics,
-        compact_size, compact_title_viewport, content_size, content_size_of, dim_color, expanded_alpha, lag_progress,
-        morph_art_tile, morph_icon_pos, morph_radius, morph_size, morph_symbol_pos, morph_title_band, row_unveil_alpha,
-        spring_expand,
+        EXPAND_SPRING, TEXT_IMPACT_DURATION, TextImpact, TextTransform, animation_duration_with, art_edge_gate,
+        bounce_scale, compact_alpha, compact_metrics, compact_size, compact_title_viewport, content_size,
+        content_size_of, dim_color, expanded_alpha, lag_progress, morph_art_tile, morph_icon_pos, morph_radius,
+        morph_size, morph_symbol_pos, morph_title_band, row_unveil_alpha, spring_expand,
     };
     use super::render::{
         FILL_TINT_WEIGHT, RenderLayer, blend_frames, blit_packed_rows, circle_coverage, clear_frame_scratch,
-        clock_icon_coverage, composite_marquee_strip, contrast_ratio, draw_aura, draw_clock_icon_pixels, draw_comet,
-        draw_compact_pill, draw_icon_scaled, draw_pixels, draw_symbol_pixels, draw_text_line_pixels, draw_text_pixels,
-        edge_fade_factor, muted_accent, playback_state_for_track, round_rect_coverage, round_rect_coverage_fast,
-        round_rect_coverage_supersampled, rounded_triangle_coverage, scale_frame_about, shrink_frame_scratch,
-        tinted_fill,
+        clock_icon_coverage, composite_coverage_transformed, composite_glyphs, composite_marquee_strip, contrast_ratio,
+        draw_aura, draw_clock_icon_pixels, draw_comet, draw_compact_pill, draw_icon_scaled, draw_pixels,
+        draw_symbol_pixels, draw_text_line_pixels, draw_text_pixels, edge_fade_factor, muted_accent,
+        playback_state_for_track, round_rect_coverage, round_rect_coverage_fast, round_rect_coverage_supersampled,
+        rounded_triangle_coverage, scale_frame_about, shrink_frame_scratch, tinted_fill,
     };
     use crate::events::{ARTWORK_DECODE, PlaybackType};
     use std::ptr::null_mut;
@@ -10399,42 +10487,38 @@ mod tests {
     }
 
     #[test]
-    fn lagged_collapse_release_trails_the_leader() {
+    fn lagged_collapse_release_trails_the_leader_and_pins_compact() {
         // The release case (leave after the expansion pinned, and the exit
         // shrink): from rest the follower holds at expanded during the lag,
         // then lingers above the width while both descend to compact — the
-        // height visibly stays behind the collapsing width. Once the leader
-        // enters the undershoot below compact, the delayed follower trails
-        // deeper into the dip and recovers later, so the trailing assertion
-        // applies only to the descent; both stay within the pinned trough
-        // and pin at compact.
-        let mut min_leader = f32::INFINITY;
-        let mut min_follower = f32::INFINITY;
-        let mut descending = true;
+        // height visibly stays behind the collapsing width. Both axes are
+        // monotonic on the critically damped curve and pin at compact, with
+        // no undershoot: the finished pill never shrinks below its final
+        // size and recovers.
+        let mut prev_leader = f32::INFINITY;
+        let mut prev_follower = f32::INFINITY;
         for i in 0..=200 {
             let t = i as f32 / 200.0;
             let leader = spring_collapse(t, 1.0, 0.0);
             let follower = lagged_collapse(t, MORPH_LAG, 1.0, 0.0);
-            if leader < 0.0 {
-                descending = false;
-            }
-            if descending {
+            assert!(leader <= prev_leader + 1e-6, "the leader must never rise at t={t}");
+            assert!(
+                follower <= prev_follower + 1e-6,
+                "the follower must never rise at t={t}"
+            );
+            assert!(
+                leader >= 0.0 && follower >= 0.0,
+                "the release must not undershoot compact at t={t}"
+            );
+            if i > 0 && leader > 0.0 {
                 assert!(
                     follower >= leader - 5e-3,
                     "the follower must trail (stay above) the leader at t={t}: {follower} < {leader}"
                 );
             }
-            min_leader = min_leader.min(leader);
-            min_follower = min_follower.min(follower);
+            prev_leader = leader;
+            prev_follower = follower;
         }
-        assert!(
-            (min_leader - COLLAPSE_TROUGH).abs() < 1e-3,
-            "the leader must dip to the pinned trough, got {min_leader}"
-        );
-        assert!(
-            (min_follower - COLLAPSE_TROUGH).abs() < 1e-3,
-            "the follower must dip to the same trough, got {min_follower}"
-        );
         assert_eq!(lagged_collapse(1.0, MORPH_LAG, 1.0, 0.0), 0.0);
     }
 
@@ -10442,9 +10526,10 @@ mod tests {
     fn morph_radius_lerps_between_the_two_radii() {
         // The radius morphs continuously between the compact and expanded
         // radii on the leading (width) axis, clamped so the eased spring can
-        // never render the shape over-rounded or pinched. The settle-bounce
-        // scales the composed frame as a whole (see `scale_frame_about`), so
-        // the corners ride it without this lerp overshooting.
+        // never render the shape over-rounded or pinched. The expand's
+        // whole-pill over-bounce scales the composed frame as a whole (see
+        // `scale_frame_about`), so the corners ride it without this lerp
+        // overshooting.
         let (compact_r, expanded_r) = (8.0, 16.0);
         assert_eq!(
             morph_radius(
@@ -10706,40 +10791,18 @@ mod tests {
     }
 
     #[test]
-    fn morph_symbol_pos_lands_exactly_on_the_layout_positions_at_both_ends() {
-        // The traveling symbol: the compact trailing chain at shape 0, the
-        // expanded title row's right slot at shape 1, same size throughout.
+    fn morph_title_band_clamps_the_expand_overshoot_and_below_compact() {
+        // The expand spring overshoots its endpoint by design, and a seeded
+        // collapse reversal can briefly continue that motion; the title band
+        // must not follow either past the layout band, or the text visibly
+        // runs beyond its final edges and comes back. Both axes are clamped
+        // independently, so the overshoot peak lands exactly on the expanded
+        // band and any below-compact progress clamps to the compact band.
         let config = Config::default();
         let inset = 0;
         let scale = 1.0;
         let width = (content_size(&config).0 * scale).round() as i32;
-        let appearance = &config.appearance;
-        let padding = (appearance.padding * scale).round() as i32;
-        let symbol = (compact_metrics(&config).symbol * scale).round() as i32;
-        let compact_h = (compact_size(&config).1 * scale).round() as i32;
-        let (_, vp_right) = compact_title_viewport(&config);
-        let viewport_right = inset + (vp_right * scale).round() as i32;
-        let gap = (6.0 * scale).round() as i32;
-        let icon = (16.0 * scale).round() as i32;
-        let symbol_gap = (8.0 * scale).round() as i32;
-        let at0 = morph_symbol_pos(
-            &config,
-            inset,
-            width,
-            scale,
-            MorphProgress {
-                width: 0.0,
-                height: 0.0,
-            },
-        );
-        assert_eq!(
-            at0.0,
-            viewport_right + gap + icon + symbol_gap + symbol,
-            "shape-0 right"
-        );
-        assert_eq!(at0.1, inset + (compact_h - symbol) / 2, "shape-0 y");
-        assert_eq!(at0.2, symbol as f32, "shape-0 size");
-        let at1 = morph_symbol_pos(
+        let expanded = morph_title_band(
             &config,
             inset,
             width,
@@ -10749,9 +10812,403 @@ mod tests {
                 height: 1.0,
             },
         );
-        assert_eq!(at1.0, width - inset - padding, "shape-1 right");
-        assert_eq!(at1.1, inset + padding, "shape-1 y");
+        let overshoot = morph_title_band(
+            &config,
+            inset,
+            width,
+            scale,
+            MorphProgress {
+                width: EXPAND_SPRING_PEAK,
+                height: EXPAND_SPRING_PEAK,
+            },
+        );
+        assert_eq!(overshoot, expanded, "the expand peak must clamp to the expanded band");
+        let compact = morph_title_band(
+            &config,
+            inset,
+            width,
+            scale,
+            MorphProgress {
+                width: 0.0,
+                height: 0.0,
+            },
+        );
+        let trough = morph_title_band(
+            &config,
+            inset,
+            width,
+            scale,
+            MorphProgress {
+                width: -0.1,
+                height: -0.1,
+            },
+        );
+        assert_eq!(
+            trough, compact,
+            "a below-compact progress must clamp to the compact band"
+        );
+    }
+
+    #[test]
+    fn text_impact_starts_above_the_row_and_lands_exactly_at_rest() {
+        let start = Instant::now();
+        let impact = TextImpact::new(start);
+        let dpi = 1.5;
+        let first = impact.sample(start, dpi);
+        assert_eq!(first.scale_y, 1.0);
+        assert!(
+            (first.dy + 5.0 * dpi).abs() < 1e-4,
+            "the title must start above its row, got dy={}",
+            first.dy
+        );
+        assert!(!impact.is_done(start));
+        // The timeline ends at exact identity, not near it: a completed or
+        // disposed impact can never leave residual drift.
+        let end = start + TEXT_IMPACT_DURATION;
+        assert!(impact.is_done(end));
+        assert!(impact.sample(end, dpi).is_identity());
+        assert!(impact.sample(end + Duration::from_secs(1), dpi).is_identity());
+    }
+
+    #[test]
+    fn text_impact_phases_join_continuously_and_stay_bounded() {
+        let start = Instant::now();
+        let impact = TextImpact::new(start);
+        let at = |ms: f32| impact.sample(start + Duration::from_secs_f32(ms / 1000.0), 1.0);
+        // Approach, impact, rebound and settle are separate curves; each seam
+        // must join without a visible snap at any frame rate.
+        for seam in [90.0f32, 135.0, 210.0] {
+            let before = at(seam - 0.05);
+            let after = at(seam + 0.05);
+            assert!((before.scale_y - after.scale_y).abs() < 1e-3, "y seam at {seam}");
+            assert!((before.dy - after.dy).abs() < 2e-2, "dy seam at {seam}");
+        }
+        // The whole timeline stays inside the approved envelope: a small drop,
+        // a grounded squash, a small rebound — never large travel or a
+        // theatrical bounce.
+        for i in 0..=2800 {
+            let t = at(i as f32 / 10.0);
+            assert!(
+                (0.9..=1.06).contains(&t.scale_y),
+                "scale_y {} out of envelope at {} ms",
+                t.scale_y,
+                i as f32 / 10.0
+            );
+            assert!(
+                (-5.0..=0.0).contains(&t.dy),
+                "dy {} out of envelope at {} ms",
+                t.dy,
+                i as f32 / 10.0
+            );
+        }
+    }
+
+    #[test]
+    fn transformed_composite_identity_is_bit_exact_with_the_rest_composite() {
+        // A synthetic coverage raster: every channel equals the coverage, the
+        // same contract GDI writes into the scratch DIB. The identity
+        // transform must produce exactly the rest pixels, so the rest path
+        // (which keeps calling `composite_glyphs`) stays bit-exact.
+        let (sw, sh) = (6usize, 4usize);
+        let mut src = vec![0u8; sw * sh * 4];
+        for y in 0..sh {
+            for x in 0..sw {
+                let coverage = (40 + x * 30 + y * 10) as u8;
+                let p = (y * sw + x) * 4;
+                src[p] = coverage;
+                src[p + 1] = coverage;
+                src[p + 2] = coverage;
+                src[p + 3] = coverage;
+            }
+        }
+        let rect = RECT {
+            left: 4,
+            top: 5,
+            right: 10,
+            bottom: 9,
+        };
+        let color = [200u8, 120, 60, 220];
+        let (dw, dh) = (20usize, 16usize);
+        let mut rest = vec![0u8; dw * dh * 4];
+        composite_glyphs(
+            &mut rest,
+            dw,
+            rect.left,
+            rect.top,
+            src.as_mut_ptr().cast(),
+            sw,
+            sw,
+            sh,
+            color,
+        );
+        let mut transformed = vec![0u8; dw * dh * 4];
+        composite_coverage_transformed(
+            &mut transformed,
+            dw,
+            &rect,
+            &src,
+            sw * 4,
+            sw,
+            sh,
+            color,
+            TextTransform::IDENTITY,
+            None,
+            0.0,
+            0.0,
+        );
+        assert_eq!(transformed, rest, "identity must not touch a single pixel");
+    }
+
+    #[test]
+    fn transformed_composite_squashes_about_the_lower_edge_without_lateral_motion() {
+        // A solid 10x10 rest block. The impact peak is 8 % shorter, pivoting
+        // on the row's bottom edge: the block shrinks upward (grounded) and
+        // keeps its exact columns, so the text never shifts or widens
+        // sideways.
+        let (sw, sh) = (10usize, 10usize);
+        let src = vec![255u8; sw * sh * 4];
+        let rect = RECT {
+            left: 5,
+            top: 5,
+            right: 15,
+            bottom: 15,
+        };
+        let (dw, dh) = (24usize, 24usize);
+        let mut dest = vec![0u8; dw * dh * 4];
+        composite_coverage_transformed(
+            &mut dest,
+            dw,
+            &rect,
+            &src,
+            sw * 4,
+            sw,
+            sh,
+            [255, 255, 255, 255],
+            TextTransform { scale_y: 0.92, dy: 0.0 },
+            None,
+            0.0,
+            0.0,
+        );
+        let alpha = |x: usize, y: usize| dest[(y * dw + x) * 4 + 3];
+        // Vertically: the rest top row is no longer fully covered, the rest
+        // bottom row is still fully covered, and nothing spills below it.
+        assert_eq!(alpha(10, 4), 0, "nothing may spill above the compressed block");
+        assert!(alpha(10, 5) > 0 && alpha(10, 5) < 255, "the top edge must ramp");
+        assert_eq!(alpha(10, 6), 255, "the block must be solid below the ramp");
+        assert_eq!(alpha(10, 14), 255, "the bottom edge must stay pinned at rest");
+        assert_eq!(alpha(10, 15), 0, "nothing may spill below the pivot");
+        // Horizontally: the rest columns stay exactly as they were — no
+        // widening, no shift. This is the invariant that keeps the landing
+        // from jiggling left and right.
+        assert_eq!(alpha(3, 10), 0);
+        assert_eq!(alpha(4, 10), 0);
+        assert_eq!(alpha(5, 10), 255);
+        assert_eq!(alpha(14, 10), 255);
+        assert_eq!(alpha(15, 10), 0);
+        assert_eq!(alpha(16, 10), 0);
+        let (mut sum, mut weight) = (0.0f64, 0.0f64);
+        for y in 0..dh {
+            for x in 0..dw {
+                let a = alpha(x, y) as f64;
+                if a > 0.0 {
+                    sum += (x as f64 + 0.5) * a;
+                    weight += a;
+                }
+            }
+        }
+        assert!(
+            (sum / weight - 10.0).abs() < 1e-6,
+            "the impact must not bias the text left or right: centroid {}",
+            sum / weight
+        );
+    }
+
+    #[test]
+    fn chrome_key_tracks_the_title_transform_only_while_the_title_is_static() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.text_transform = Some(TextTransform {
+            scale_y: 0.92,
+            dy: -2.0,
+        });
+        let key = |state: &OverlayState| state.chrome_cache_key(320, 96, 96, 1.0, false, None);
+        let static_key = key(&state);
+        assert_eq!(
+            static_key.text_transform,
+            Some((0.92, -2.0)),
+            "a static title bakes its transform into the background"
+        );
+        // A different transform must invalidate the baked background...
+        state.text_transform = Some(TextTransform { scale_y: 0.95, dy: 0.0 });
+        assert_ne!(key(&state), static_key);
+        // ...but a scrolling title is composited in the foreground and omitted
+        // from the background, so its transform must NOT invalidate the cache.
+        state.scroll[0].scrolling = true;
+        let scrolling = key(&state);
+        assert_eq!(scrolling.text_transform, None);
+        state.text_transform = Some(TextTransform {
+            scale_y: 1.03,
+            dy: -3.5,
+        });
+        assert_eq!(key(&state), scrolling);
+    }
+
+    #[test]
+    fn completed_text_impact_is_retired_so_the_tick_goes_idle() {
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Shown;
+        state.content = Some(MediaEvent::TrackChanged(brave_track("Song")));
+        state.dismiss_at = Some(Instant::now() + Duration::from_secs(30));
+        state.test_cursor_over = Some(false);
+        // Still running: the impact survives the tick.
+        state.text_impact = Some(TextImpact::new(Instant::now()));
+        state.tick();
+        assert!(state.text_impact.is_some(), "an active impact must keep animating");
+        // Past its timeline: the tick retires it, so the next tick is static.
+        state.text_impact = Some(TextImpact::new(Instant::now() - TEXT_IMPACT_DURATION));
+        state.tick();
+        assert!(
+            state.text_impact.is_none(),
+            "a completed impact must not keep the frame clock busy"
+        );
+        assert!(state.text_transform.is_none(), "the rest state must be exact");
+    }
+
+    #[test]
+    fn title_change_lands_the_text_but_same_title_refreshes_do_not() {
+        // The trigger is intentionally suppressed under reduced motion; a
+        // machine with animations disabled cannot exercise it.
+        if !crate::winutil::animations_enabled() {
+            return;
+        }
+        let mut state = OverlayState::new(Config::default(), EventQueue::default());
+        state.phase = Phase::Shown;
+        state.content = Some(MediaEvent::TrackChanged(brave_track("Song A")));
+        state.pill_text = Some(pill_text("Song A", "Artist", "Brave"));
+        state.dismiss_at = Some(Instant::now() + Duration::from_secs(30));
+        state.test_cursor_over = Some(false);
+
+        state.update_content(
+            MediaEvent::TrackChanged(brave_track("Song B")),
+            Duration::from_millis(500),
+        );
+        assert!(
+            state.text_impact.is_some(),
+            "a genuine title change must land the new text"
+        );
+
+        // A repeat while the impact runs inherits the current sample: no
+        // restart (which would snap the text back to the approach height) and
+        // no second impact queued. An impact that is 10 ms from done proves
+        // inheritance: a restart would not be done 20 ms later.
+        state.text_impact = Some(TextImpact::new(
+            Instant::now() - TEXT_IMPACT_DURATION + Duration::from_millis(10),
+        ));
+        state.update_content(
+            MediaEvent::TrackChanged(brave_track("Song C")),
+            Duration::from_millis(500),
+        );
+        let inherited = state.text_impact.expect("the running impact must be inherited");
+        assert!(
+            inherited.is_done(Instant::now() + Duration::from_millis(20)),
+            "a retrigger must not restart the timeline"
+        );
+
+        // A same-title refresh (artwork arrival, dedup re-emit) must not
+        // retrigger the landing.
+        state.text_impact = None;
+        state.update_content(
+            MediaEvent::TrackChanged(brave_track("Song C")),
+            Duration::from_millis(500),
+        );
+        assert!(
+            state.text_impact.is_none(),
+            "a same-title refresh must not retrigger the landing"
+        );
+    }
+
+    #[test]
+    fn morph_symbol_pos_lands_exactly_on_the_layout_positions_at_both_ends() {
+        // The traveling symbol: the compact trailing chain at shape 0, the
+        // expanded title row's right slot at shape 1, same size throughout.
+        // The function takes the content BUFFER width (body + the aura inset
+        // on both sides), so this uses a real nonzero inset and a fractional
+        // DPI: a buffer-coordinate slot compared against a body-coordinate
+        // edge shifts the compact end by 2 * inset, and the steady layouts'
+        // differing padding rounding shows up at fractional DPI.
+        let config = Config::default();
+        let scale = 1.25;
+        let inset = 8; // round(AURA_HALO_LOGICAL * scale)
+        let appearance = &config.appearance;
+        let compact_body_w = (compact_size(&config).0 * scale).round() as i32;
+        let expanded_body_w = (content_size(&config).0 * scale).round() as i32;
+        let compact_buf_w = compact_body_w + 2 * inset;
+        let expanded_buf_w = expanded_body_w + 2 * inset;
+        let compact_padding = (appearance.padding * scale).round() as i32;
+        let expanded_padding = (appearance.padding * scale) as i32;
+        let symbol = (compact_metrics(&config).symbol * scale).round() as i32;
+        let compact_h = (compact_size(&config).1 * scale).round() as i32;
+        let (_, vp_right) = compact_title_viewport(&config);
+        let viewport_right = inset + (vp_right * scale).round() as i32;
+        let gap = (6.0 * scale).round() as i32;
+        let icon = (16.0 * scale).round() as i32;
+        let symbol_gap = (8.0 * scale).round() as i32;
+        let compact_slot = viewport_right + gap + icon + symbol_gap + symbol;
+        let at0 = morph_symbol_pos(
+            &config,
+            inset,
+            compact_buf_w,
+            scale,
+            MorphProgress {
+                width: 0.0,
+                height: 0.0,
+            },
+        );
+        assert_eq!(at0.0, compact_slot, "shape-0 right must match the compact chain");
+        assert_eq!(at0.1, inset + (compact_h - symbol) / 2, "shape-0 y");
+        assert_eq!(at0.2, symbol as f32, "shape-0 size");
+        let at1 = morph_symbol_pos(
+            &config,
+            inset,
+            expanded_buf_w,
+            scale,
+            MorphProgress {
+                width: 1.0,
+                height: 1.0,
+            },
+        );
+        assert_eq!(
+            at1.0,
+            expanded_buf_w - inset - expanded_padding,
+            "shape-1 right must match the expanded title row"
+        );
+        assert_eq!(
+            at1.1,
+            (inset as f32 + appearance.padding * scale) as i32,
+            "shape-1 y must match the expanded row's truncation"
+        );
         assert_eq!(at1.2, symbol as f32, "shape-1 size");
+        // Mid-leg the symbol must ride the body's right content edge — not
+        // lag inward between the two endpoint positions (which would
+        // double-apply the width progress). The compact chain's independent
+        // rounding contributes at most 1 px, fading out as the pill expands.
+        let mid_buf_w = (compact_buf_w + expanded_buf_w) / 2;
+        let mid = morph_symbol_pos(
+            &config,
+            inset,
+            mid_buf_w,
+            scale,
+            MorphProgress {
+                width: 0.5,
+                height: 0.5,
+            },
+        );
+        assert!(
+            (mid.0 - (mid_buf_w - inset - compact_padding)).abs() <= 1,
+            "mid-leg right must ride the body edge, got {} vs {}",
+            mid.0,
+            mid_buf_w - inset - compact_padding
+        );
+        assert_eq!(mid.2, symbol as f32, "mid-leg size");
     }
 
     #[test]
@@ -10847,47 +11304,89 @@ mod tests {
     }
 
     #[test]
-    fn bounce_scale_pins_at_one_and_hits_the_configured_amplitudes() {
-        // The whole-pill settle-bounce, driven by the spring progress
+    fn bounce_scale_is_exactly_one_outside_the_expand_overshoot() {
+        // The whole-pill over-bounce, driven by the expand spring's progress
         // itself: exactly 1.0 whenever the spring is inside its endpoints
-        // (and at the pinned end), an expand that overshoots once to
-        // 1 + BOUNCE_OVER at the spring's peak, and a compaction that dips
-        // to 1 - BOUNCE_UNDER at the undershoot trough and recovers
-        // straight to 1.0 at the pin — the shrink-below-minimum return.
+        // (and at the pinned end), and exactly 1 + BOUNCE_OVER at the
+        // spring's peak, clamped beyond it. Only the expand calls it; the
+        // collapse legs land on the critically damped spring, so the
+        // finished compact pill is never rescaled.
         let at = |width: f32| MorphProgress { width, height: 0.0 };
-        // Expand: no scale inside the endpoints, exactly 1 + OVER at the
-        // spring's peak, clamped beyond it.
-        assert_eq!(bounce_scale(at(0.0), MorphDirection::Expand), 1.0);
-        assert_eq!(bounce_scale(at(0.5), MorphDirection::Expand), 1.0);
-        assert_eq!(bounce_scale(at(1.0), MorphDirection::Expand), 1.0);
+        assert_eq!(bounce_scale(at(0.0)), 1.0);
+        assert_eq!(bounce_scale(at(0.5)), 1.0);
+        assert_eq!(bounce_scale(at(1.0)), 1.0);
         assert!(
-            (bounce_scale(at(EXPAND_SPRING_PEAK), MorphDirection::Expand) - (1.0 + BOUNCE_OVER)).abs() < 1e-5,
+            (bounce_scale(at(EXPAND_SPRING_PEAK)) - (1.0 + BOUNCE_OVER)).abs() < 1e-5,
             "the expand must peak at 1 + BOUNCE_OVER, got {}",
-            bounce_scale(at(EXPAND_SPRING_PEAK), MorphDirection::Expand)
+            bounce_scale(at(EXPAND_SPRING_PEAK))
         );
-        assert_eq!(bounce_scale(at(1.3), MorphDirection::Expand), 1.0 + BOUNCE_OVER);
-        // Compaction: exactly 1.0 at the zero crossings (the pill reaches
-        // compact and the pin lands at compact), 1 - UNDER at the trough,
-        // and a straight recovery (1 - UNDER/2) mid-way back — no over-bounce.
-        assert_eq!(bounce_scale(at(0.6), MorphDirection::Collapse), 1.0);
-        assert_eq!(bounce_scale(at(0.0), MorphDirection::Collapse), 1.0);
+        assert_eq!(bounce_scale(at(1.3)), 1.0 + BOUNCE_OVER);
+    }
+
+    #[test]
+    fn frame_content_size_rescales_only_the_hover_expand() {
+        // The whole-pill over-bounce belongs to the hover expand alone. The
+        // entrance lands with the text-only impact, and both collapse legs —
+        // the hover return and the exit shrink — land on the critically
+        // damped spring, so their frames must never be rescaled: the
+        // finished compact bar must not squeeze narrower and back after it
+        // has already landed.
+        let config = Config::default();
+        let content = MediaEvent::TrackChanged(TrackInfo {
+            source_app: "youtube-music".into(),
+            title: "A reasonably long title".into(),
+            ..TrackInfo::default()
+        });
+        let dpi = 1.0;
+        let progress = MorphProgress {
+            width: 0.5,
+            height: 0.4,
+        };
+        let hover_collapse = HoverExpand {
+            start: Instant::now(),
+            direction: MorphDirection::Collapse,
+            from: 1.0,
+            velocity: 0.0,
+            done: false,
+        };
+        let (_, _, scale) = frame_content_size(
+            &config,
+            &content,
+            true,
+            Some((&hover_collapse, progress)),
+            None,
+            false,
+            dpi,
+        );
+        assert_eq!(scale, 1.0, "the hover collapse must not rescale the frame");
+        // The exit shrink: an active frame morph while the phase collapses.
+        let (_, _, scale) = frame_content_size(&config, &content, true, None, Some(progress), true, dpi);
+        assert_eq!(scale, 1.0, "the exit shrink must not rescale the frame");
+        // The entrance: an active frame morph outside the collapse phase.
+        let (_, _, scale) = frame_content_size(&config, &content, false, None, Some(progress), false, dpi);
+        assert_eq!(scale, 1.0, "the entrance must not rescale the frame");
+        // The hover expand keeps the over-bounce at the spring's peak, and
+        // the reported size is the logical size times that scale.
+        let peak = MorphProgress {
+            width: EXPAND_SPRING_PEAK,
+            height: EXPAND_SPRING_PEAK,
+        };
+        let hover_expand = HoverExpand {
+            start: Instant::now(),
+            direction: MorphDirection::Expand,
+            from: 0.0,
+            velocity: 0.0,
+            done: false,
+        };
+        let (width, height, scale) =
+            frame_content_size(&config, &content, true, Some((&hover_expand, peak)), None, false, dpi);
         assert!(
-            (bounce_scale(at(COLLAPSE_TROUGH), MorphDirection::Collapse) - (1.0 - BOUNCE_UNDER)).abs() < 1e-5,
-            "the compaction must dip to 1 - BOUNCE_UNDER, got {}",
-            bounce_scale(at(COLLAPSE_TROUGH), MorphDirection::Collapse)
+            (scale - (1.0 + BOUNCE_OVER)).abs() < 1e-5,
+            "the hover expand must keep the over-bounce, got {scale}"
         );
-        assert!(
-            (bounce_scale(at(COLLAPSE_TROUGH / 2.0), MorphDirection::Collapse) - (1.0 - BOUNCE_UNDER / 2.0)).abs()
-                < 1e-5,
-            "the compaction must recover to 1 - BOUNCE_UNDER/2 mid-recovery, got {}",
-            bounce_scale(at(COLLAPSE_TROUGH / 2.0), MorphDirection::Collapse)
-        );
-        // The scale is a pure function of the progress: a below-trough dip
-        // clamps at the configured minimum rather than overshooting it.
-        assert_eq!(
-            bounce_scale(at(COLLAPSE_TROUGH * 2.0), MorphDirection::Collapse),
-            1.0 - BOUNCE_UNDER
-        );
+        let (logical_w, logical_h) = morph_size(&config, &content, peak);
+        assert_eq!(width, (logical_w * scale).round() as i32);
+        assert_eq!(height, (logical_h * scale).round() as i32);
     }
 
     #[test]
@@ -11097,38 +11596,24 @@ mod tests {
     }
 
     #[test]
-    fn spring_collapse_release_from_expanded_undershoots_once_then_pins_compact() {
+    fn spring_collapse_release_settles_monotonically_and_pins_compact() {
         // The release case (cursor leaves the pinned-expanded pill, and the
-        // exit shrink): from rest the mirrored spring returns to compact,
-        // undershooting below it to the pinned `COLLAPSE_TROUGH` (ζ=0.6's
-        // ~9.5 % step undershoot — the tail that drives the slow
-        // settle-bounce), then recovering to pin exactly at 0 at the leg
-        // end. The recovery may overshoot a hair above compact (the raw
-        // spring's second oscillation, ~0.9 %), which `morph_size`'s clamp
-        // keeps out of the geometry and `bounce_scale` ignores.
-        let mut min = f32::INFINITY;
-        let mut min_i = 0usize;
+        // exit shrink): from rest the critically damped spring returns to
+        // compact monotonically — no undershoot below compact, so the
+        // finished pill never shrinks past its final size and comes back —
+        // and pins exactly at 0 at the leg end. The approach decelerates into
+        // the endpoint, so the pin is not a velocity snap.
+        let mut prev = f32::INFINITY;
         for i in 0..=200 {
             let t = i as f32 / 200.0;
             let p = spring_collapse(t, 1.0, 0.0);
-            if p < min {
-                min = p;
-                min_i = i;
-            }
+            assert!(p <= prev + 1e-6, "the release must never rise at t={t}");
+            assert!(p >= 0.0, "the release must never undershoot compact, got {p} at t={t}");
+            prev = p;
         }
-        assert!(
-            (min - COLLAPSE_TROUGH).abs() < 1e-3,
-            "release must dip to the pinned trough, got {min}"
-        );
-        let mut max_after = f32::NEG_INFINITY;
-        for i in min_i..=200 {
-            let t = i as f32 / 200.0;
-            max_after = max_after.max(spring_collapse(t, 1.0, 0.0));
-        }
-        assert!(
-            max_after <= 0.01,
-            "the recovery must overshoot compact only by a hair, got {max_after}"
-        );
+        // The motion is essentially over before the pin, so the endpoint
+        // handoff cannot read as a snap.
+        assert!(spring_collapse(0.8, 1.0, 0.0) < 0.01);
         assert_eq!(
             spring_collapse(1.0, 1.0, 0.0),
             0.0,
@@ -12092,7 +12577,7 @@ mod tests {
     }
 
     #[test]
-    fn collapse_leg_is_shorter_and_settles_with_a_controlled_undershoot() {
+    fn collapse_leg_is_shorter_and_lands_monotonically_at_compact() {
         let config = Config::default();
         let expand = morph_duration(&config, MorphDirection::Expand);
         let collapse = morph_duration(&config, MorphDirection::Collapse);
@@ -12101,16 +12586,11 @@ mod tests {
             "collapse must be faster than expand: {collapse:?} vs {expand:?}"
         );
         // Sampled over its whole leg, the collapse runs back to compact on
-        // both axes: never rising above the progress it reversed from,
-        // dipping once below compact to the pinned trough (ζ=0.6's
-        // undershoot, scaled by the remaining distance `from` — the tail the
-        // settle-bounce renders), and pinning exactly at compact at the leg
-        // end. After its own trough each axis recovers, overshooting a hair
-        // above compact at most (the raw spring's second oscillation), which
-        // the geometry clamp hides. The height axis holds at `from` through
-        // the lag before it starts moving.
+        // both axes: monotonic — never rising above the progress it reversed
+        // from and never dipping below compact — decelerating into the
+        // endpoint, and pinning exactly at compact at the leg end. The height
+        // axis holds at `from` through the lag before it starts moving.
         let from = 0.6;
-        let expected_trough = COLLAPSE_TROUGH * from;
         let mut samples = Vec::with_capacity(201);
         for i in 0..=200 {
             let elapsed = Duration::from_millis((collapse.as_millis() as u64 * i / 200).max(1));
@@ -12132,34 +12612,22 @@ mod tests {
                 "collapse must not rise above its start: height {0} at step {i}",
                 progress.height
             );
+            assert!(
+                progress.width >= 0.0 && progress.height >= 0.0,
+                "collapse must not undershoot compact at step {i}: {progress:?}"
+            );
+            if let Some(&(prev_w, prev_h)) = samples.last() {
+                assert!(
+                    progress.width <= prev_w + 1e-6,
+                    "width must fall monotonically at step {i}"
+                );
+                assert!(
+                    progress.height <= prev_h + 1e-6,
+                    "height must fall monotonically at step {i}"
+                );
+            }
             samples.push((progress.width, progress.height));
         }
-        let min_width = samples.iter().map(|(w, _)| *w).fold(f32::INFINITY, f32::min);
-        let min_height = samples.iter().map(|(_, h)| *h).fold(f32::INFINITY, f32::min);
-        assert!(
-            (min_width - expected_trough).abs() < 1e-3,
-            "collapse must dip to the pinned trough, got {min_width}"
-        );
-        assert!(
-            (min_height - expected_trough).abs() < 1e-3,
-            "the lagged height must dip to the same trough, got {min_height}"
-        );
-        let min_w_i = samples.iter().position(|(w, _)| *w == min_width).unwrap();
-        let min_h_i = samples.iter().position(|(_, h)| *h == min_height).unwrap();
-        // After its own trough each axis recovers; the recovery may
-        // overshoot compact by only a hair.
-        let max_width = samples[min_w_i..]
-            .iter()
-            .map(|(w, _)| *w)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let max_height = samples[min_h_i..]
-            .iter()
-            .map(|(_, h)| *h)
-            .fold(f32::NEG_INFINITY, f32::max);
-        assert!(
-            max_width <= 0.01 && max_height <= 0.01,
-            "the recovery must overshoot compact only by a hair: {max_width} / {max_height}"
-        );
         let done = HoverExpand {
             start: Instant::now() - collapse,
             direction: MorphDirection::Collapse,
@@ -12175,9 +12643,10 @@ mod tests {
     #[test]
     fn expand_leg_is_more_expressive_than_collapse() {
         // The asymmetry that makes expansion feel like a reveal and collapse
-        // like a close: expand springs (overshoots its endpoint), collapse
-        // undershoots compact only in its tail (the settle-bounce); and the
-        // collapse leg itself is shorter.
+        // like a close: the expand springs past its endpoint (a visible
+        // overshoot), the collapse is critically damped and lands
+        // monotonically at compact with no bounce; and the collapse leg
+        // itself is shorter.
         let config = Config::default();
         assert!(morph_duration(&config, MorphDirection::Collapse) < morph_duration(&config, MorphDirection::Expand));
         // Mid-flight, the expand spring travels past its endpoint...
@@ -12204,9 +12673,9 @@ mod tests {
             expand_progress.height < expand_progress.width,
             "the height axis must trail the width axis, got {expand_progress:?}"
         );
-        // ...while the collapse at its own midpoint has only closed toward
-        // compact, dipping into the undershoot band (the settle-bounce) but
-        // never past the pinned trough.
+        // ...while the collapse at its own midpoint has all but reached
+        // compact: the critically damped return is monotonic, with no
+        // undershoot band to dip into.
         let collapse_mid = HoverExpand {
             start: Instant::now()
                 - Duration::from_millis(morph_duration(&config, MorphDirection::Collapse).as_millis() as u64 / 2),
@@ -12217,8 +12686,8 @@ mod tests {
         };
         let collapse_progress = hover_progress(&collapse_mid, &config);
         assert!(
-            collapse_progress.width >= COLLAPSE_TROUGH * 0.75 - 1e-3 && collapse_progress.width < 0.75,
-            "collapse must be inside its return path, got {}",
+            (0.0..0.1).contains(&collapse_progress.width),
+            "collapse must be nearly compact at its midpoint, got {}",
             collapse_progress.width
         );
     }
