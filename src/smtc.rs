@@ -425,6 +425,18 @@ struct ListenerState {
     /// once-per-appearance gate applies to the "ignored" detail line the same
     /// way it does to rejected sessions. Bounded like `rejected_seen`.
     ignored_seen: HashSet<usize>,
+    /// Keys of admitted (allowed and current) sessions already reported, so
+    /// the per-session "accepted" detail line prints once per appearance
+    /// instead of on every 2-second re-sync. Bounded like `rejected_seen`.
+    accepted_seen: HashSet<usize>,
+    /// The current-session identity last written to the log. An unchanged
+    /// identity skips the line; a sync with no current session clears it so a
+    /// returning session is reported again.
+    last_current_logged: Option<(usize, SourceIdentity)>,
+    /// The admission tallies last written to the log. Identical counts mean
+    /// the aggregate line would repeat the previous sync verbatim. Cleared
+    /// when a sync has nothing rejected, ignored, or cap-rejected.
+    last_admission: Option<(usize, usize, usize, usize, usize)>,
     /// Source apps whose last session reported Closed (or vanished from the
     /// session snapshot between syncs) and still owe the overlay a terminal
     /// `Stopped`, so a persistent pill does not linger at idle opacity
@@ -976,6 +988,9 @@ impl ListenerState {
             playback_executor: None,
             rejected_seen: HashSet::new(),
             ignored_seen: HashSet::new(),
+            accepted_seen: HashSet::new(),
+            last_current_logged: None,
+            last_admission: None,
             terminal_pending: HashMap::new(),
             last_track_per_source: HashMap::new(),
             budget_stripped_art: HashSet::new(),
@@ -1962,8 +1977,18 @@ impl ListenerState {
         let current = self.manager.GetCurrentSession().ok();
         let current_key = current.as_ref().map(session_key);
         let current_source = current.as_ref().map(read_source_app);
-        if let (Some(key), Some(source)) = (current_key, current_source.as_ref()) {
-            debug!("SMTC current session | key={key} | source={source}");
+        // Log the current session once per identity instead of on every
+        // 2-second poll. A poll with no current session clears the memory so
+        // a session that returns after a gap is reported again.
+        match (current_key, current_source.as_ref()) {
+            (Some(key), Some(source)) => {
+                let identity = (key, source.clone());
+                if self.last_current_logged.as_ref() != Some(&identity) {
+                    debug!("SMTC current session | key={key} | source={source}");
+                    self.last_current_logged = Some(identity);
+                }
+            }
+            _ => self.last_current_logged = None,
         }
         // Under browser session churn, GetCurrentSession can briefly return a
         // session that is missing from the GetSessions snapshot. It is still
@@ -2143,9 +2168,12 @@ impl ListenerState {
             // allow-list dump): at normal volumes this is the "which session
             // is this event for" trail. Placed after the caps so a saturated
             // sync never relabels rejected storm candidates as accepted; the
-            // aggregate below bounds the rejected-side volume.
+            // line is once-per-appearance and the aggregate below bounds the
+            // rejected-side volume.
             accepted += 1;
-            debug!("SMTC session accepted | key={key} | source={source}");
+            if note_appearance(&mut self.accepted_seen, *key) {
+                debug!("SMTC session accepted | key={key} | source={source}");
+            }
             let subscribed = match self.ensure_subscribed(session) {
                 Ok(subscribed) => subscribed,
                 Err(error) => {
@@ -2173,9 +2201,17 @@ impl ListenerState {
         // throttled WARN below remains the operator-facing overflow signal.
         if rejected_allow + ignored + rejected_overflow > 0 {
             let allow_list_len = self.cached_allowed.as_ref().map_or(0, |(raw, _)| raw.len());
-            debug!(
-                "SMTC admission: {accepted} accepted, {rejected_allow} rejected (allow-list/cooldown), {ignored} ignored (not current), {rejected_overflow} cap-rejected | allow_list_len={allow_list_len}"
-            );
+            let admission = (accepted, rejected_allow, ignored, rejected_overflow, allow_list_len);
+            if self.last_admission != Some(admission) {
+                debug!(
+                    "SMTC admission: {accepted} accepted, {rejected_allow} rejected (allow-list/cooldown), {ignored} ignored (not current), {rejected_overflow} cap-rejected | allow_list_len={allow_list_len}"
+                );
+                self.last_admission = Some(admission);
+            }
+        } else {
+            // Nothing rejected or ignored: remember no aggregate, so the next
+            // non-zero state logs even if its counts match an earlier one.
+            self.last_admission = None;
         }
         if rejected_overflow > 0 && self.may_warn_overflow() {
             warn!(
@@ -2264,10 +2300,11 @@ impl ListenerState {
             // notifications re-enable.
             self.emit(MediaEvent::SourceGone { source_app: source });
         }
-        // Forget rejected/ignored sessions that vanished so a later
+        // Forget rejected/ignored/accepted sessions that vanished so a later
         // reappearance is reported again.
         self.rejected_seen.retain(|key| alive.contains(key));
         self.ignored_seen.retain(|key| alive.contains(key));
+        self.accepted_seen.retain(|key| alive.contains(key));
         {
             let now = Instant::now();
             let mut maps = self
@@ -7010,6 +7047,39 @@ mod tests {
         // of the enumeration cap.
         assert_eq!(rejected, 1);
         assert!(ordered.iter().all(|(k, _)| *k <= 2 + MAX_TRACKED_SESSIONS));
+    }
+
+    #[test]
+    fn note_appearance_reports_a_key_once_until_it_is_forgotten() {
+        // The gate shared by the rejected, ignored, and accepted detail
+        // lines: one line per session appearance, not one per 2-second poll.
+        let mut seen = HashSet::new();
+        assert!(note_appearance(&mut seen, 7), "first appearance is reported");
+        assert!(!note_appearance(&mut seen, 7), "a re-sync must not repeat the line");
+        assert!(note_appearance(&mut seen, 8));
+        // Retention drops vanished sessions; a later reappearance logs again.
+        seen.retain(|key| *key != 7);
+        assert!(note_appearance(&mut seen, 7));
+    }
+
+    #[test]
+    fn note_appearance_stays_bounded_under_a_storm_of_new_keys() {
+        let mut seen = HashSet::new();
+        for key in 0..MAX_REPORTED_SESSIONS {
+            assert!(note_appearance(&mut seen, key));
+        }
+        assert_eq!(seen.len(), MAX_REPORTED_SESSIONS);
+        assert!(note_appearance(&mut seen, MAX_REPORTED_SESSIONS));
+        assert_eq!(
+            seen.len(),
+            MAX_REPORTED_SESSIONS,
+            "one old key is evicted instead of growing past the cap"
+        );
+        // The evicted key counts as a new appearance again.
+        let evicted = (0..MAX_REPORTED_SESSIONS)
+            .find(|key| !seen.contains(key))
+            .expect("one key must have been evicted");
+        assert!(note_appearance(&mut seen, evicted));
     }
 
     #[test]
