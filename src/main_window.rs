@@ -101,6 +101,12 @@ pub(crate) const WM_SETTINGS_FOCUS_MSG: u32 = WM_APP + 8;
 /// first, then forces one coherent repaint with a fresh dismiss deadline.
 pub(crate) const WM_SETTINGS_PREVIEW_MSG: u32 = WM_APP + 16;
 const TRAY_ID: u32 = 1;
+/// Tray tooltip before the first track arrives (and for a track with no title).
+const TRAY_TIP_FALLBACK: &str = "WinGlance media overlay";
+/// `NOTIFYICONDATAW.szTip` holds 128 UTF-16 units, including the terminator.
+const TRAY_TIP_MAX_CHARS: usize = 127;
+/// The disabled tray-menu header is a glance, not a detail view.
+const TRAY_MENU_HEADER_MAX_CHARS: usize = 100;
 const MENU_OPEN_ID: usize = 1001;
 const MENU_PREVIEW_NOTIFY_ID: usize = 1029;
 const MENU_NOTIFY_ID: usize = 1002;
@@ -1379,6 +1385,9 @@ struct MainWindowState {
     /// `TRAY_RETRY_TIMER_ID`). Zero while the icon is up or the budget is
     /// spent.
     tray_add_attempts: u32,
+    /// The tip text currently set on the tray icon, so an event batch that
+    /// leaves the track unchanged skips the `NIM_MODIFY` round trip.
+    last_tray_tip: String,
 }
 
 /// Set when this window's WM_NCCREATE claims the state box handed over in
@@ -1655,6 +1664,7 @@ impl MainWindowState {
             control_mailbox,
             position_hover: false,
             tray_add_attempts: 0,
+            last_tray_tip: TRAY_TIP_FALLBACK.to_string(),
         }
     }
 
@@ -2382,6 +2392,7 @@ impl MainWindowState {
         }
         if dirty {
             self.invalidate();
+            self.update_tray_tip();
         }
         // The accent follows the playing song's artwork; this runs even when
         // the batch only refreshed metadata (late cover arrival changes the
@@ -2398,6 +2409,29 @@ impl MainWindowState {
         // post drops the pending batch (and accounts for it) instead of
         // stranding events without a wake.
         crate::repost_if_pending(&self.queue, &self.wake, self.hwnd, "main window");
+    }
+
+    /// Pushes the current track into the tray tooltip. Called once per event
+    /// batch after `current` has been updated; an unchanged tip (a metadata
+    /// refresh that left title/artist/state alone) skips the shell call.
+    fn update_tray_tip(&mut self) {
+        let tip = tray_tip_for(self.current.as_ref());
+        if tip == self.last_tray_tip {
+            return;
+        }
+        let Ok(mut data) = tray_data(self.hwnd, &tip) else {
+            return;
+        };
+        // NIM_MODIFY applies only the fields named by `uFlags`; the icon,
+        // callback message, and id stay as registered.
+        data.uFlags = NIF_TIP;
+        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+            self.last_tray_tip = tip;
+        } else {
+            // The icon can be temporarily gone (Explorer restarting). Keep
+            // the old text so a later event retries the update.
+            debug!("tray tip update failed (NIM_MODIFY)");
+        }
     }
 
     /// Authoritative playback state for a new activity: the snapshot's own
@@ -5410,8 +5444,21 @@ fn install_tray_icon(hwnd: HWND) -> Result<()> {
     crate::winutil::set_panic_cleanup(Box::new(move || {
         remove_tray_icon(HWND(hwnd_raw as *mut core::ffi::c_void));
     }));
-    if !unsafe { Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)?) }.as_bool() {
+    // Re-adds after an Explorer restart and retries after a failed startup
+    // add must restore the live track, not the startup fallback.
+    let state_ptr = window_state::<MainWindowState>(hwnd);
+    let tip = if state_ptr.is_null() {
+        TRAY_TIP_FALLBACK.to_string()
+    } else {
+        tray_tip_for(unsafe { &*state_ptr }.current.as_ref())
+    };
+    if !unsafe { Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd, &tip)?) }.as_bool() {
         anyhow::bail!("Shell_NotifyIconW(NIM_ADD) failed");
+    }
+    if !state_ptr.is_null() {
+        unsafe {
+            (*state_ptr).last_tray_tip = tip;
+        }
     }
     Ok(())
 }
@@ -5429,7 +5476,7 @@ static TASKBAR_CREATED_MSG: OnceLock<u32> = OnceLock::new();
 pub(crate) const MAIN_WINDOW_CLASS: &str = "WinGlanceMainWindow";
 
 fn remove_tray_icon(hwnd: HWND) {
-    let Ok(data) = tray_data(hwnd) else {
+    let Ok(data) = tray_data(hwnd, TRAY_TIP_FALLBACK) else {
         return;
     };
     unsafe {
@@ -5437,7 +5484,7 @@ fn remove_tray_icon(hwnd: HWND) {
     }
 }
 
-fn tray_data(hwnd: HWND) -> Result<NOTIFYICONDATAW> {
+fn tray_data(hwnd: HWND, tip: &str) -> Result<NOTIFYICONDATAW> {
     let mut data = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -5447,8 +5494,83 @@ fn tray_data(hwnd: HWND) -> Result<NOTIFYICONDATAW> {
         hIcon: tray_icon()?,
         ..Default::default()
     };
-    crate::winutil::copy_wide_terminated(&mut data.szTip, "WinGlance media overlay");
+    crate::winutil::copy_wide_terminated(&mut data.szTip, tip);
     Ok(data)
+}
+
+/// Tray tooltip text for the current activity, capped to what
+/// `NOTIFYICONDATAW.szTip` holds.
+fn tray_tip_for(current: Option<&CurrentActivity>) -> String {
+    match tray_now_playing_line(current) {
+        Some(line) => truncate_utf16(&line, TRAY_TIP_MAX_CHARS),
+        None => TRAY_TIP_FALLBACK.to_string(),
+    }
+}
+
+/// The disabled header at the top of the tray menu. `None` when no track is
+/// known, so the menu keeps its usual shape until media appears.
+fn tray_menu_header(current: Option<&CurrentActivity>) -> Option<String> {
+    let line = tray_now_playing_line(current)?;
+    // A menu treats `&` as the accelerator marker; doubling it shows the
+    // literal character instead of underlining the next one.
+    Some(truncate_utf16(&line, TRAY_MENU_HEADER_MAX_CHARS).replace('&', "&&"))
+}
+
+/// Shared "state: title — artist" line for the tooltip and menu header.
+/// State comes first because truncation drops the tail.
+fn tray_now_playing_line(current: Option<&CurrentActivity>) -> Option<String> {
+    let current = current?;
+    let title = single_line(&current.track.title);
+    if title.is_empty() {
+        return None;
+    }
+    let state = match current.state {
+        PlaybackState::Playing | PlaybackState::NowPlaying => "Playing",
+        PlaybackState::Paused => "Paused",
+        PlaybackState::Stopped => "Stopped",
+    };
+    let artist = single_line(&current.track.artist);
+    Some(if artist.is_empty() {
+        format!("{state}: {title}")
+    } else {
+        format!("{state}: {title} — {artist}")
+    })
+}
+
+/// Collapses a multi-line value into one line and trims the ends. A title
+/// can carry control characters from its source; a tooltip or menu entry
+/// must stay single-line.
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Caps `text` at `max_units` UTF-16 units (the unit `szTip` is measured in)
+/// and appends an ellipsis when something was dropped. Counting UTF-16 units
+/// avoids splitting a surrogate pair, which a later fixed-width copy would
+/// otherwise cut in half.
+fn truncate_utf16(text: &str, max_units: usize) -> String {
+    if text.encode_utf16().count() <= max_units {
+        return text.to_string();
+    }
+    if max_units == 0 {
+        return String::new();
+    }
+    let mut truncated = String::new();
+    let mut units = 0;
+    for c in text.chars() {
+        let len = c.len_utf16();
+        if units + len > max_units - 1 {
+            break;
+        }
+        truncated.push(c);
+        units += len;
+    }
+    truncated.push('…');
+    truncated
 }
 
 /// Shows a one-shot balloon note on the tray icon (NIF_INFO), with the given
@@ -5457,10 +5579,12 @@ fn tray_data(hwnd: HWND) -> Result<NOTIFYICONDATAW> {
 /// the tracking window is hidden (start in tray).
 fn show_tray_note(hwnd: HWND, title: &str, text: &str, flags: NOTIFY_ICON_INFOTIP_FLAGS) {
     // Best-effort by design (see below): a missing icon skips the balloon.
-    let Ok(mut data) = tray_data(hwnd) else {
+    let Ok(mut data) = tray_data(hwnd, TRAY_TIP_FALLBACK) else {
         return;
     };
-    data.uFlags |= NIF_INFO;
+    // Only the balloon fields change: keeping NIF_TIP in `uFlags` would also
+    // rewrite the tooltip back to the fallback whenever a note is shown.
+    data.uFlags = NIF_INFO;
     data.dwInfoFlags = flags;
     // NUL-terminate explicitly via the shared helper (`copy_wide_terminated`
     // caps at len-1 and writes the terminator), so a truncated title/text
@@ -5509,6 +5633,17 @@ fn show_tray_menu(hwnd: HWND) {
         close_tray_flags |= MF_CHECKED;
     }
     unsafe {
+        if let Some(header) = tray_menu_header(state.current.as_ref()) {
+            // A disabled, greyed entry: it reports the current track but is
+            // not a command, so it carries no menu id.
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING | MF_DISABLED | MF_GRAYED,
+                0,
+                PCWSTR(wide(&header).as_ptr()),
+            );
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        }
         let _ = AppendMenuW(menu, open_flags, MENU_OPEN_ID, PCWSTR(wide("Open WinGlance").as_ptr()));
         let _ = AppendMenuW(
             menu,
@@ -9056,6 +9191,91 @@ mod tests {
             genre: None,
             ..TrackInfo::default()
         }
+    }
+
+    fn activity(title: &str, artist: &str, state: PlaybackState) -> CurrentActivity {
+        let mut track = track(title);
+        track.artist = artist.into();
+        CurrentActivity {
+            track,
+            state,
+            meta_line: String::new(),
+            art_blit: None,
+            art_fingerprint: None,
+            art_decode_failed: false,
+            icon_blit: None,
+        }
+    }
+
+    #[test]
+    fn tray_tip_names_the_current_track_and_playback_state() {
+        for (state, prefix) in [
+            (PlaybackState::Playing, "Playing"),
+            (PlaybackState::NowPlaying, "Playing"),
+            (PlaybackState::Paused, "Paused"),
+            (PlaybackState::Stopped, "Stopped"),
+        ] {
+            let current = activity("Song", "Artist", state);
+            assert_eq!(tray_tip_for(Some(&current)), format!("{prefix}: Song — Artist"));
+        }
+        assert_eq!(tray_tip_for(None), TRAY_TIP_FALLBACK);
+    }
+
+    #[test]
+    fn tray_tip_without_a_title_keeps_the_fallback() {
+        let blank = activity("   ", "Artist", PlaybackState::Playing);
+        assert_eq!(tray_tip_for(Some(&blank)), TRAY_TIP_FALLBACK);
+    }
+
+    #[test]
+    fn tray_tip_without_an_artist_shows_state_and_title() {
+        let no_artist = activity("Song", "  ", PlaybackState::Playing);
+        assert_eq!(tray_tip_for(Some(&no_artist)), "Playing: Song");
+    }
+
+    #[test]
+    fn tray_tip_collapses_control_characters_to_one_line() {
+        let multi = activity("Line one\nLine two", "Artist", PlaybackState::Playing);
+        assert_eq!(tray_tip_for(Some(&multi)), "Playing: Line one Line two — Artist");
+    }
+
+    #[test]
+    fn tray_tip_stays_within_the_sz_tip_limit_without_splitting_surrogates() {
+        // Each emoji is two UTF-16 units; a byte- or char-based cap that
+        // landed mid-pair would leave a lone surrogate for the shell to read.
+        let long = activity(&"😀".repeat(200), "", PlaybackState::Playing);
+        let tip = tray_tip_for(Some(&long));
+        assert!(tip.ends_with('…'));
+        assert_eq!(tip.encode_utf16().count(), TRAY_TIP_MAX_CHARS - 1);
+    }
+
+    #[test]
+    fn truncate_utf16_keeps_whole_code_points_and_the_ellipsis() {
+        assert_eq!(truncate_utf16("abcdef", 4), "abc…");
+        assert_eq!(truncate_utf16("abc", 4), "abc");
+        assert_eq!(truncate_utf16("abc", 0), "");
+        assert_eq!(truncate_utf16("😀😀", 3), "😀…");
+        assert_eq!(truncate_utf16("😀😀", 2), "…");
+    }
+
+    #[test]
+    fn tray_menu_header_escapes_ampersands_and_skips_an_empty_track() {
+        let rock = activity("Rock & Roll", "AC/DC", PlaybackState::Playing);
+        assert_eq!(
+            tray_menu_header(Some(&rock)).as_deref(),
+            Some("Playing: Rock && Roll — AC/DC")
+        );
+        assert_eq!(tray_menu_header(None), None);
+        let blank = activity("", "Artist", PlaybackState::Playing);
+        assert_eq!(tray_menu_header(Some(&blank)), None);
+    }
+
+    #[test]
+    fn tray_menu_header_is_capped() {
+        let long = activity(&"x".repeat(300), "", PlaybackState::Paused);
+        let header = tray_menu_header(Some(&long)).expect("header");
+        assert!(header.ends_with('…'));
+        assert_eq!(header.encode_utf16().count(), TRAY_MENU_HEADER_MAX_CHARS);
     }
 
     #[test]
