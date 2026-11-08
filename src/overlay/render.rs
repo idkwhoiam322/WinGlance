@@ -751,15 +751,22 @@ pub(super) fn dib_for(state: &mut OverlayState, width: i32, height: i32) -> Resu
     Ok((hdc, bitmap, bits))
 }
 
-/// Integer width of the progress-bar fill in buffer pixels for a pill body
-/// `pill_w` px wide, or `None` when no bar draws (missing position or
+/// Horizontal span of the progress bar's fill track: the pill body minus the
+/// two bottom corner arcs. The bar is painted on the bottom edge, where the
+/// rounded silhouette is only fully opaque between the corner radii; keeping
+/// the fill inside that span stops its ends from being visibly clipped. The
+/// radius is rounded up and clamped to half the body width, so a degenerate
+/// pill still yields a valid (possibly empty) span.
+fn bar_track_span(pill_w: usize, radius: f32) -> (usize, usize) {
+    let inset = (radius.ceil() as usize).min(pill_w / 2);
+    (inset, pill_w - inset * 2)
+}
+
+/// Integer width of the progress-bar fill in buffer pixels for a fill track
+/// `track_w` px wide, or `None` when no bar draws (missing position or
 /// duration, or a zero duration). The bar quantizes to whole pixels, so the
-/// drawn step is exactly `pill_w * fraction` rounded. `chrome_cache_key`
-/// shares this one formula: the cached background must change exactly when
-/// the painted bar moves, and a drift between the two sites would silently
-/// either rebuild the cache every frame or freeze the cached bar at an old
-/// width — both invisible in the logs.
-pub(super) fn bar_pixel_w(position: Option<f64>, duration: Option<u64>, pill_w: usize) -> Option<usize> {
+/// drawn step is exactly `track_w * fraction` rounded.
+pub(super) fn bar_pixel_w(position: Option<f64>, duration: Option<u64>, track_w: usize) -> Option<usize> {
     let (Some(position), Some(duration)) = (position, duration) else {
         return None;
     };
@@ -768,7 +775,7 @@ pub(super) fn bar_pixel_w(position: Option<f64>, duration: Option<u64>, pill_w: 
     }
     let clamped = position.clamp(0.0, duration as f64);
     let fraction = (clamped / duration as f64).clamp(0.0, 1.0) as f32;
-    Some((pill_w as f32 * fraction).round() as usize)
+    Some((track_w as f32 * fraction).round() as usize)
 }
 
 /// The frame's effective corner radius in pixels. A morph lerps the radius
@@ -1354,7 +1361,9 @@ pub(super) fn draw_edge_stroke(
 }
 
 /// Draws the progress bar: a thin accent fill at the pill's bottom edge,
-/// masked to the rounded body. Present only when the source reports both a
+/// masked to the rounded body. The fill is confined to the bottom edge's
+/// straight span, between the two corner arcs, so its ends are never clipped
+/// by the rounded silhouette. Present only when the source reports both a
 /// position and a non-zero duration. Called from the full rebuild AND after
 /// every chrome-cache reuse — the bar's width is deliberately not part of
 /// `ChromeKey`, so a playing pill's bar advances by repainting only this
@@ -1373,14 +1382,16 @@ pub(super) fn draw_progress_bar(
     position_secs: Option<f64>,
     duration_secs: Option<u64>,
 ) {
-    let Some(bar_w) = bar_pixel_w(position_secs, duration_secs, pill_w) else {
+    let (bar_inset, track_w) = bar_track_span(pill_w, radius);
+    let Some(bar_w) = bar_pixel_w(position_secs, duration_secs, track_w) else {
         return;
     };
     let bar_h = (2.0 * scale).round().max(1.0) as usize;
     let bar_y = inset + pill_h.saturating_sub(bar_h);
+    let bar_x = inset + bar_inset;
     let bar_alpha = (bar_color[3] as f32 * 0.8) as u32;
     for y in bar_y..(bar_y + bar_h).min(pill_h + inset * 2) {
-        for x in inset..(inset + bar_w) {
+        for x in bar_x..(bar_x + bar_w) {
             let cov = round_rect_coverage_supersampled(
                 (x as i32 - inset as i32) as f32,
                 (y as i32 - inset as i32) as f32,
@@ -4891,6 +4902,64 @@ mod tests {
                 PCWSTR(name.as_ptr()),
             )
         }
+    }
+
+    #[test]
+    fn bar_track_span_keeps_the_fill_between_the_corner_arcs() {
+        // The bottom edge is fully opaque only between the two corner radii.
+        // Insetting by the radius (rounded up) keeps the fill's ends out of
+        // the arcs; a fractional radius rounds up so no partially clipped
+        // pixel is painted.
+        assert_eq!(bar_track_span(200, 12.0), (12, 176));
+        assert_eq!(bar_track_span(200, 12.2), (13, 174));
+        assert_eq!(bar_track_span(200, 0.0), (0, 200));
+        // A radius larger than the body clamps to the middle instead of
+        // underflowing, yielding an empty track.
+        assert_eq!(bar_track_span(10, 12.0), (5, 0));
+    }
+
+    #[test]
+    fn bar_pixel_w_maps_the_fraction_onto_the_inset_track() {
+        // The fill quantizes over the visible track, not the whole body: the
+        // corner insets must not reappear as extra bar length.
+        assert_eq!(bar_pixel_w(Some(0.0), Some(100), 176), Some(0));
+        assert_eq!(bar_pixel_w(Some(25.0), Some(100), 176), Some(44));
+        assert_eq!(bar_pixel_w(Some(50.0), Some(100), 176), Some(88));
+        assert_eq!(bar_pixel_w(Some(100.0), Some(100), 176), Some(176));
+        // Out-of-range positions clamp to the track ends.
+        assert_eq!(bar_pixel_w(Some(-5.0), Some(100), 176), Some(0));
+        assert_eq!(bar_pixel_w(Some(150.0), Some(100), 176), Some(176));
+        // No bar without a position or with a zero duration.
+        assert_eq!(bar_pixel_w(None, Some(100), 176), None);
+        assert_eq!(bar_pixel_w(Some(50.0), Some(0), 176), None);
+    }
+
+    #[test]
+    fn draw_progress_bar_starts_and_ends_inside_the_corner_insets() {
+        // Paint a half-filled bar on a 200 px body with a 12 px radius. The
+        // visible track is 176 px wide and starts 12 px in, so the 88 px fill
+        // must span [22, 110) in buffer coordinates (body inset 10). This
+        // pins the draw offset that the geometry helpers alone cannot catch.
+        let width = 220;
+        let height = 50;
+        let mut pixels = vec![0u8; width * height * 4];
+        draw_progress_bar(
+            &mut pixels,
+            width,
+            10,
+            200,
+            30,
+            12.0,
+            1.0,
+            [255, 0, 0, 255],
+            Some(50.0),
+            Some(100),
+        );
+        let alpha = |x: usize, y: usize| pixels[(y * width + x) * 4 + 3];
+        assert_eq!(alpha(21, 38), 0, "the fill must not start inside the corner");
+        assert!(alpha(22, 38) > 0, "the fill starts at the left inset");
+        assert!(alpha(109, 38) > 0, "the fill covers its full quantized width");
+        assert_eq!(alpha(110, 38), 0, "the fill stops before the right inset");
     }
 
     #[test]
