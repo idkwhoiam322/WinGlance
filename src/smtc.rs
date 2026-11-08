@@ -437,6 +437,10 @@ struct ListenerState {
     /// the aggregate line would repeat the previous sync verbatim. Cleared
     /// when a sync has nothing rejected, ignored, or cap-rejected.
     last_admission: Option<(usize, usize, usize, usize, usize)>,
+    /// The latest admission tallies from `sync_subscriptions`, retained even
+    /// when nothing was rejected so a pill-emit context line can report the
+    /// current counts without re-enumerating sessions. Updated every sync.
+    admission_snapshot: (usize, usize, usize, usize, usize),
     /// Source apps whose last session reported Closed (or vanished from the
     /// session snapshot between syncs) and still owe the overlay a terminal
     /// `Stopped`, so a persistent pill does not linger at idle opacity
@@ -991,6 +995,7 @@ impl ListenerState {
             accepted_seen: HashSet::new(),
             last_current_logged: None,
             last_admission: None,
+            admission_snapshot: (0, 0, 0, 0, 0),
             terminal_pending: HashMap::new(),
             last_track_per_source: HashMap::new(),
             budget_stripped_art: HashSet::new(),
@@ -2199,9 +2204,10 @@ impl ListenerState {
         // accepted, so the storm cost in the log is O(1) lines per sync (the
         // per-session detail lines are gated once-per-appearance above). The
         // throttled WARN below remains the operator-facing overflow signal.
+        let allow_list_len = self.cached_allowed.as_ref().map_or(0, |(raw, _)| raw.len());
+        self.admission_snapshot = (accepted, rejected_allow, ignored, rejected_overflow, allow_list_len);
         if rejected_allow + ignored + rejected_overflow > 0 {
-            let allow_list_len = self.cached_allowed.as_ref().map_or(0, |(raw, _)| raw.len());
-            let admission = (accepted, rejected_allow, ignored, rejected_overflow, allow_list_len);
+            let admission = self.admission_snapshot;
             if self.last_admission != Some(admission) {
                 debug!(
                     "SMTC admission: {accepted} accepted, {rejected_allow} rejected (allow-list/cooldown), {ignored} ignored (not current), {rejected_overflow} cap-rejected | allow_list_len={allow_list_len}"
@@ -3071,6 +3077,52 @@ impl ListenerState {
         self.pending_deadline = Some(self.pending_deadline.map_or(deadline, |d| d.min(deadline)));
     }
 
+    /// Logs the current-session and admission snapshot when a pill-worthy
+    /// event is emitted. The change-gated sync lines cover state transitions;
+    /// this covers the other half of the rule — a pill can be shown for a
+    /// playback-state change or a re-show while the session/admission state is
+    /// unchanged, and the log would otherwise carry no context for it. The
+    /// admission tally is the latest `sync_subscriptions` snapshot (at most
+    /// one poll interval old); the session identity is queried fresh.
+    fn log_pill_session_context(&mut self, source: &SourceIdentity) {
+        let current = self.manager.GetCurrentSession().ok();
+        let current_key = current.as_ref().map(session_key);
+        let current_source = current.as_ref().map(read_source_app);
+        if let (Some(key), Some(current_source)) = (current_key, current_source.as_ref()) {
+            // Always re-log at the pill boundary, even when the sync already
+            // wrote the same identity: the line pairs the state with the pill,
+            // so deduplicating it against the sync path would defeat the point.
+            debug!("SMTC current session | key={key} | source={current_source}");
+            self.last_current_logged = Some((key, current_source.clone()));
+            if current_source == source {
+                debug!("SMTC session accepted | key={key} | source={current_source}");
+                // Keep the sync's once-per-appearance gate in step so the next
+                // 2-second poll does not repeat this line for the same session.
+                note_appearance(&mut self.accepted_seen, key);
+            }
+        }
+        let snapshot = self.admission_snapshot;
+        // An all-zero snapshot cannot describe a session that just emitted a
+        // pill: the session was discovered after the last sync (or the pill
+        // came from cached content). Logging it would claim "0 accepted"
+        // right before the sync writes the real tally. The next sync reports
+        // the fresh counts instead.
+        if snapshot != (0, 0, 0, 0, 0) {
+            let (accepted, rejected_allow, ignored, rejected_overflow, allow_list_len) = snapshot;
+            debug!(
+                "SMTC admission (last sync): {accepted} accepted, {rejected_allow} rejected (allow-list/cooldown), {ignored} ignored (not current), {rejected_overflow} cap-rejected | allow_list_len={allow_list_len}"
+            );
+            // The next sync must not repeat this exact tally; a genuinely new
+            // tally (or any rejection appearing) still logs. Zero-rejection
+            // tallies stay unremembered, matching the sync path.
+            self.last_admission = if rejected_allow + ignored + rejected_overflow > 0 {
+                Some(snapshot)
+            } else {
+                None
+            };
+        }
+    }
+
     /// Emits an event only while this worker generation is still current. A
     /// worker that stalled and was replaced must not keep producing events
     /// after its successor took over. The event travels as one shared `Arc`
@@ -3090,6 +3142,9 @@ impl ListenerState {
     fn emit(&mut self, event: MediaEvent) {
         if !self.is_current_generation() {
             return;
+        }
+        if let Some(source) = pill_source(&event) {
+            self.log_pill_session_context(source);
         }
         let mut event = event;
         let had_art = artwork_bytes(&event) != 0;
@@ -3221,6 +3276,16 @@ fn event_coalesce_key(event: &MediaEvent) -> (&'static str, Option<&SourceIdenti
         MediaEvent::ProgressChanged { source_app, .. } => ("progress", Some(source_app)),
         MediaEvent::WorkerFailed { .. } => ("worker-failed", None),
         MediaEvent::ArtworkBudgetExceeded => ("art-budget", None),
+    }
+}
+
+/// The source of an event that can surface a pill. Only these two variants
+/// reach the overlay as content; the rest are history/status/tray signals.
+fn pill_source(event: &MediaEvent) -> Option<&SourceIdentity> {
+    match event {
+        MediaEvent::TrackChanged(track) => Some(&track.source_app),
+        MediaEvent::PlaybackStateChanged(_, source) => Some(source),
+        _ => None,
     }
 }
 
@@ -7519,6 +7584,28 @@ mod tests {
             }),
             0
         );
+    }
+
+    #[test]
+    fn pill_source_selects_only_content_events() {
+        // The pill-context log fires for exactly the events the overlay turns
+        // into content; status/history events must not add a session snapshot.
+        let track = TrackInfo {
+            source_app: "A".into(),
+            ..track("Song", "Artist")
+        };
+        assert_eq!(
+            pill_source(&MediaEvent::TrackChanged(track)).map(SourceIdentity::as_str),
+            Some("A")
+        );
+        assert_eq!(
+            pill_source(&MediaEvent::PlaybackStateChanged(PlaybackState::Paused, "B".into()))
+                .map(SourceIdentity::as_str),
+            Some("B")
+        );
+        assert!(pill_source(&MediaEvent::SourceGone { source_app: "A".into() }).is_none());
+        assert!(pill_source(&MediaEvent::ArtworkBudgetExceeded).is_none());
+        assert!(pill_source(&MediaEvent::WorkerFailed { reason: "x".into() }).is_none());
     }
 
     #[test]
