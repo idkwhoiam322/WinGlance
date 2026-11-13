@@ -1013,29 +1013,26 @@ mod tests {
     }
 
     #[test]
-    fn parses_valid_durations_into_milliseconds() {
+    fn parse_duration_seconds_accepts_the_band_and_rejects_everything_else() {
+        // Valid decimal seconds convert to milliseconds, with surrounding
+        // whitespace trimmed.
         assert_eq!(parse_duration_seconds("3.5"), Some(3500));
         assert_eq!(parse_duration_seconds("7"), Some(7000));
         assert_eq!(parse_duration_seconds("0.5"), Some(500));
         assert_eq!(parse_duration_seconds("60"), Some(60_000));
         assert_eq!(parse_duration_seconds("1.234"), Some(1234));
         assert_eq!(parse_duration_seconds(" 4 "), Some(4000));
-    }
 
-    #[test]
-    fn rejects_out_of_range_input() {
+        // Out-of-range values are rejected; the inclusive bounds still commit.
         assert_eq!(parse_duration_seconds("0.25"), None);
         assert_eq!(parse_duration_seconds("0.1"), None);
         assert_eq!(parse_duration_seconds("-2"), None);
         assert_eq!(parse_duration_seconds("70"), None);
         assert_eq!(parse_duration_seconds("120"), None);
-        // Inclusive bounds still commit.
         assert_eq!(parse_duration_seconds("0.5"), Some(500));
         assert_eq!(parse_duration_seconds("60"), Some(60_000));
-    }
 
-    #[test]
-    fn rejects_unparseable_input() {
+        // Unparseable input, including non-finite float spellings, is rejected.
         assert_eq!(parse_duration_seconds("abc"), None);
         assert_eq!(parse_duration_seconds(""), None);
         assert_eq!(parse_duration_seconds("  "), None);

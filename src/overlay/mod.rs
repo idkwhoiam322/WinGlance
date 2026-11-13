@@ -5307,13 +5307,12 @@ mod tests {
         assert_eq!(mild.capacity(), 512 * 1024);
     }
 
-    /// This is the test that would have caught the original stride bug: it
-    /// constructs a destination buffer *larger* than the packed source (an
-    /// oversized DIB, standing in for the reused animation-frame backing
-    /// buffer) and asserts every row lands at its real stride, not the
-    /// source's packed width.
     #[test]
-    fn blit_packed_rows_respects_the_larger_destination_stride() {
+    fn blit_packed_rows_respects_the_destination_stride_and_no_op_inputs() {
+        // This is the case that would have caught the original stride bug: a
+        // destination buffer larger than the packed source (an oversized DIB
+        // standing in for the reused animation-frame backing buffer) must
+        // land every row at its real stride, not the source's packed width.
         let row_bytes = 3 * 4; // 3 pixels wide, BGRA
         let rows = 4;
         let dst_stride_bytes = 10 * 4; // destination is much wider (10px) per row
@@ -5347,20 +5346,15 @@ mod tests {
                 "row {row} overwrote destination padding past its packed width"
             );
         }
-    }
 
-    #[test]
-    fn blit_packed_rows_is_a_no_op_for_zero_rows_or_width() {
-        let mut dst = vec![0xAAu8; 40];
-        blit_packed_rows(&mut dst, 10, &[], 4, 0);
-        assert!(dst.iter().all(|&b| b == 0xAA));
-        let mut dst2 = vec![0xAAu8; 40];
-        blit_packed_rows(&mut dst2, 10, &[1, 2, 3], 0, 3);
-        assert!(dst2.iter().all(|&b| b == 0xAA));
-    }
+        // Zero rows or zero width is a no-op.
+        let mut untouched = vec![0xAAu8; 40];
+        blit_packed_rows(&mut untouched, 10, &[], 4, 0);
+        assert!(untouched.iter().all(|&b| b == 0xAA));
+        let mut untouched = vec![0xAAu8; 40];
+        blit_packed_rows(&mut untouched, 10, &[1, 2, 3], 0, 3);
+        assert!(untouched.iter().all(|&b| b == 0xAA));
 
-    #[test]
-    fn blit_packed_rows_is_identity_when_strides_match() {
         // When dst_stride_bytes == row_bytes (the pre-oversized-DIB case,
         // i.e. the pill at its fully expanded size), the blit degenerates to
         // a straight contiguous copy.
@@ -13080,69 +13074,53 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_picks_the_foreground_monitor_for_active_window() {
-        let displays = vec![fake_display(1, true), fake_display(2, false)];
-        // The foreground window sits on the second display.
-        assert_eq!(
-            resolve_target(MonitorMode::ActiveWindow, &displays, Some(1)),
-            Some(1),
-            "ActiveWindow must target the foreground window's monitor"
-        );
-    }
-
-    #[test]
-    fn resolve_target_falls_back_to_primary_without_a_foreground_monitor() {
-        let displays = vec![fake_display(1, true), fake_display(2, false)];
-        // No foreground window (or its monitor is not in the snapshot).
-        assert_eq!(
-            resolve_target(MonitorMode::ActiveWindow, &displays, None),
-            Some(0),
-            "ActiveWindow without a foreground monitor must fall back to primary"
-        );
-        // A stale foreground index (defensive: the lookup never yields one)
-        // must not produce an out-of-bounds pick.
-        assert_eq!(
-            resolve_target(MonitorMode::ActiveWindow, &displays, Some(9)),
-            Some(0),
-            "an out-of-range foreground index must fall back to primary"
-        );
-    }
-
-    #[test]
-    fn resolve_target_uses_the_primary_flag_for_primary() {
-        // The primary display is not necessarily the first enumerated.
-        let displays = vec![fake_display(1, false), fake_display(2, true)];
-        assert_eq!(resolve_target(MonitorMode::Primary, &displays, Some(0)), Some(1));
-        // No display flagged primary (should not happen): first enumerated wins.
-        let unmarked = vec![fake_display(1, false), fake_display(2, false)];
-        assert_eq!(resolve_target(MonitorMode::Primary, &unmarked, None), Some(0));
-    }
-
-    #[test]
-    fn resolve_target_maps_an_index_onto_the_enumeration_order() {
-        let displays = vec![fake_display(1, true), fake_display(2, false), fake_display(3, false)];
-        assert_eq!(resolve_target(MonitorMode::Index(0), &displays, None), Some(0));
-        assert_eq!(resolve_target(MonitorMode::Index(2), &displays, None), Some(2));
-        // The foreground monitor is irrelevant to an explicit index.
-        assert_eq!(resolve_target(MonitorMode::Index(1), &displays, Some(2)), Some(1));
-    }
-
-    #[test]
-    fn resolve_target_falls_back_to_primary_for_an_out_of_range_index() {
-        let displays = vec![fake_display(1, true), fake_display(2, false)];
-        assert_eq!(
-            resolve_target(MonitorMode::Index(2), &displays, None),
-            Some(0),
-            "an unattached index must resolve to primary, never to a missing display"
-        );
-        assert_eq!(resolve_target(MonitorMode::Index(7), &displays, None), Some(0));
-    }
-
-    #[test]
-    fn resolve_target_returns_none_without_any_display() {
-        assert_eq!(resolve_target(MonitorMode::ActiveWindow, &[], None), None);
-        assert_eq!(resolve_target(MonitorMode::Primary, &[], None), None);
-        assert_eq!(resolve_target(MonitorMode::Index(0), &[], None), None);
+    fn resolve_target_picks_the_monitor_for_each_mode_and_falls_back_safely() {
+        // One table for the whole selection contract: each mode picks its
+        // display, and every invalid or missing input falls back to the
+        // primary (or to no target at all) instead of an out-of-bounds pick.
+        let two = || vec![fake_display(1, true), fake_display(2, false)];
+        let three = || vec![fake_display(1, true), fake_display(2, false), fake_display(3, false)];
+        let cases = [
+            // ActiveWindow targets the foreground window's monitor.
+            (MonitorMode::ActiveWindow, two(), Some(1), Some(1)),
+            // No foreground monitor, or a stale index: fall back to primary.
+            (MonitorMode::ActiveWindow, two(), None, Some(0)),
+            (MonitorMode::ActiveWindow, two(), Some(9), Some(0)),
+            // Primary reads the primary flag, not the enumeration order.
+            (
+                MonitorMode::Primary,
+                vec![fake_display(1, false), fake_display(2, true)],
+                Some(0),
+                Some(1),
+            ),
+            // No display flagged primary (should not happen): first wins.
+            (
+                MonitorMode::Primary,
+                vec![fake_display(1, false), fake_display(2, false)],
+                None,
+                Some(0),
+            ),
+            // An explicit index maps onto the enumeration order and ignores
+            // the foreground monitor.
+            (MonitorMode::Index(0), three(), None, Some(0)),
+            (MonitorMode::Index(2), three(), None, Some(2)),
+            (MonitorMode::Index(1), three(), Some(2), Some(1)),
+            // An unattached index falls back to primary, never a missing display.
+            (MonitorMode::Index(2), two(), None, Some(0)),
+            (MonitorMode::Index(7), two(), None, Some(0)),
+            // No displays at all: there is no target to return.
+            (MonitorMode::ActiveWindow, Vec::new(), None, None),
+            (MonitorMode::Primary, Vec::new(), None, None),
+            (MonitorMode::Index(0), Vec::new(), None, None),
+        ];
+        for (mode, displays, foreground, expected) in cases {
+            assert_eq!(
+                resolve_target(mode, &displays, foreground),
+                expected,
+                "{mode:?} with {} display(s), foreground {foreground:?}",
+                displays.len()
+            );
+        }
     }
 
     #[test]
@@ -13249,381 +13227,355 @@ mod tests {
 
     #[test]
     fn placement_anchors_against_the_target_work_area() {
-        let work = RECT {
+        // Every anchor arm against the work area: the bottom/top taskbar
+        // cases, a full-monitor work rect, all four edges inset at once, and
+        // the aura inset / DPI scaling applied to the window origin.
+        let no_taskbar = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let bottom_taskbar = RECT {
             left: 0,
             top: 0,
             right: 1920,
             bottom: 1040, // 1080 minus a 40px taskbar
         };
-        let pos = anchor_pos(None, None);
-        // Center anchor with the DIB inset subtracted; margin scaled by DPI.
-        let point = placement(work, 400, 100, &pos, 0, 1.0);
-        assert_eq!(point, POINT { x: 760, y: 932 }, "centered, 8px from the bottom edge");
-        let point = placement(work, 400, 100, &pos, 10, 1.0);
-        assert_eq!(
-            point,
-            POINT { x: 750, y: 922 },
-            "the inset shifts the window, not the pill"
-        );
-        // 150 % DPI scales the margin.
-        let point = placement(work, 600, 150, &pos, 10, 1.5);
-        assert_eq!(point, POINT { x: 650, y: 868 }, "margin scales with DPI");
-        // Left/top anchors.
-        let left_top = OverlayPos {
-            vertical: VerticalPosition::Top,
-            horizontal: HorizontalPosition::Left,
-            ..anchor_pos(None, None)
+        let top_taskbar = RECT {
+            left: 0,
+            top: 40,
+            right: 1920,
+            bottom: 1080,
         };
-        let point = placement(work, 400, 100, &left_top, 0, 1.0);
-        assert_eq!(point, POINT { x: 8, y: 8 });
-        // Right anchor.
-        let right = OverlayPos {
-            vertical: VerticalPosition::Bottom,
-            horizontal: HorizontalPosition::Right,
-            ..anchor_pos(None, None)
+        let left_taskbar = RECT {
+            left: 80,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
         };
-        let point = placement(work, 400, 100, &right, 0, 1.0);
-        assert_eq!(point, POINT { x: 1512, y: 932 });
+        let right_taskbar = RECT {
+            left: 0,
+            top: 0,
+            right: 1840,
+            bottom: 1080,
+        };
+        let all_insets = RECT {
+            left: 80,
+            top: 40,
+            right: 1840,
+            bottom: 1040,
+        };
+        let pos = |vertical: VerticalPosition, horizontal: HorizontalPosition| OverlayPos {
+            vertical,
+            horizontal,
+            margin: 8,
+            x: None,
+            y: None,
+            monitor: MonitorMode::ActiveWindow,
+        };
+        let cases = [
+            // Bottom-center anchors to the work-area bottom, margin 8.
+            (
+                "bottom center",
+                bottom_taskbar,
+                400,
+                100,
+                pos(VerticalPosition::Bottom, HorizontalPosition::Center),
+                0,
+                1.0,
+                POINT { x: 760, y: 932 },
+            ),
+            // The aura inset shifts the window, not the pill body.
+            (
+                "bottom center, inset 10",
+                bottom_taskbar,
+                400,
+                100,
+                pos(VerticalPosition::Bottom, HorizontalPosition::Center),
+                10,
+                1.0,
+                POINT { x: 750, y: 922 },
+            ),
+            // 150 % DPI scales the margin.
+            (
+                "bottom center, 150% DPI",
+                bottom_taskbar,
+                600,
+                150,
+                pos(VerticalPosition::Bottom, HorizontalPosition::Center),
+                10,
+                1.5,
+                POINT { x: 650, y: 868 },
+            ),
+            // Left/top and right anchors read their own work edges.
+            (
+                "top left",
+                bottom_taskbar,
+                400,
+                100,
+                pos(VerticalPosition::Top, HorizontalPosition::Left),
+                0,
+                1.0,
+                POINT { x: 8, y: 8 },
+            ),
+            (
+                "bottom right",
+                bottom_taskbar,
+                400,
+                100,
+                pos(VerticalPosition::Bottom, HorizontalPosition::Right),
+                0,
+                1.0,
+                POINT { x: 1512, y: 932 },
+            ),
+            // Fullscreen or no taskbar: rcWork == rcMonitor, so the pill sits
+            // at the configured margin from the physical monitor edges.
+            (
+                "bottom center, full monitor",
+                no_taskbar,
+                400,
+                100,
+                pos(VerticalPosition::Bottom, HorizontalPosition::Center),
+                0,
+                1.0,
+                POINT { x: 760, y: 972 },
+            ),
+            (
+                "top center, full monitor",
+                no_taskbar,
+                400,
+                100,
+                pos(VerticalPosition::Top, HorizontalPosition::Center),
+                0,
+                1.0,
+                POINT { x: 760, y: 8 },
+            ),
+            // Each work-area inset must win over the physical monitor edge.
+            (
+                "top left, top taskbar",
+                top_taskbar,
+                400,
+                100,
+                pos(VerticalPosition::Top, HorizontalPosition::Left),
+                0,
+                1.0,
+                POINT { x: 8, y: 48 },
+            ),
+            (
+                "left, left taskbar",
+                left_taskbar,
+                400,
+                100,
+                pos(VerticalPosition::Bottom, HorizontalPosition::Left),
+                0,
+                1.0,
+                POINT { x: 88, y: 972 },
+            ),
+            (
+                "right, right taskbar",
+                right_taskbar,
+                400,
+                100,
+                pos(VerticalPosition::Bottom, HorizontalPosition::Right),
+                0,
+                1.0,
+                POINT { x: 1432, y: 972 },
+            ),
+            // All four edges inset at once: every arm reads its own boundary.
+            (
+                "top left, all insets",
+                all_insets,
+                400,
+                100,
+                pos(VerticalPosition::Top, HorizontalPosition::Left),
+                0,
+                1.0,
+                POINT { x: 88, y: 48 },
+            ),
+            (
+                "bottom right, all insets",
+                all_insets,
+                400,
+                100,
+                pos(VerticalPosition::Bottom, HorizontalPosition::Right),
+                0,
+                1.0,
+                POINT { x: 1432, y: 932 },
+            ),
+            (
+                "top center, all insets",
+                all_insets,
+                400,
+                100,
+                pos(VerticalPosition::Top, HorizontalPosition::Center),
+                0,
+                1.0,
+                POINT { x: 760, y: 48 },
+            ),
+        ];
+        for (label, work, w, h, p, inset, scale, expected) in cases {
+            assert_eq!(placement(work, w, h, &p, inset, scale), expected, "{label}");
+        }
     }
 
     #[test]
-    fn placement_honors_absolute_overrides_and_clamps_them() {
+    fn placement_absolute_overrides_win_and_clamp_into_the_target_work_area() {
         let work = RECT {
             left: 0,
             top: 0,
             right: 1920,
             bottom: 1040,
         };
-        let custom = anchor_pos(Some(100), Some(200));
-        let point = placement(work, 400, 100, &custom, 0, 1.0);
-        assert_eq!(point, POINT { x: 100, y: 200 }, "absolute overrides win over anchors");
-        // A far-off override is clamped back into the work area.
-        let huge = anchor_pos(Some(10_000), Some(10_000));
-        let point = placement(work, 400, 100, &huge, 0, 1.0);
-        assert_eq!(
-            point,
-            POINT { x: 1520, y: 940 },
-            "clamped to the work-area bottom-right"
-        );
-        // Absolute overrides are virtual-screen coordinates: a value beyond
-        // the target's work area is clamped back into it (the pill on a
-        // monitor left of the origin still lands on that monitor).
         let left_monitor = RECT {
             left: -1920,
             top: 0,
             right: 0,
             bottom: 1040,
         };
-        let point = placement(left_monitor, 400, 100, &custom, 0, 1.0);
-        assert_eq!(point, POINT { x: -400, y: 200 }, "clamped to the target work area");
-    }
-
-    #[test]
-    fn placement_custom_overrides_land_the_pill_body_at_the_coordinate() {
+        let custom = anchor_pos(Some(100), Some(200));
+        let huge = anchor_pos(Some(10_000), Some(10_000));
         // Custom `position_x`/`position_y` are pill-body coordinates: the aura
-        // inset is subtracted so the body (not the window) top-left lands at the
-        // configured spot, exactly like the anchor arms.
-        let work = RECT {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1040,
-        };
-        let custom = OverlayPos {
+        // inset is subtracted so the body (not the window) lands on the spot.
+        let body = OverlayPos {
             x: Some(200),
             y: Some(300),
             ..anchor_pos(None, None)
         };
-        // inset 10 at 1.0 scale: the window sits `inset` above/left of the body.
-        let point = placement(work, 400, 100, &custom, 10, 1.0);
-        assert_eq!(
-            point,
-            POINT { x: 190, y: 290 },
-            "the window top-left is the body coordinate minus the aura inset"
-        );
-        // At a non-1.0 scale the override scales first, then the inset subtracts.
-        let point = placement(work, 400, 100, &custom, 15, 1.5);
-        assert_eq!(
-            point,
-            POINT {
-                x: (200f32 * 1.5).round() as i32 - 15,
-                y: (300f32 * 1.5).round() as i32 - 15
-            },
-            "scale applies to the override, then the inset is subtracted"
-        );
+        let cases = [
+            (
+                "absolute overrides win over anchors",
+                work,
+                &custom,
+                0,
+                1.0,
+                POINT { x: 100, y: 200 },
+            ),
+            (
+                "clamped to the work-area bottom-right",
+                work,
+                &huge,
+                0,
+                1.0,
+                POINT { x: 1520, y: 940 },
+            ),
+            // Overrides are virtual-screen coordinates: a value beyond the
+            // target's work area clamps back into it, so a pill on a monitor
+            // left of the origin still lands on that monitor.
+            (
+                "clamped to a negative-origin target",
+                left_monitor,
+                &custom,
+                0,
+                1.0,
+                POINT { x: -400, y: 200 },
+            ),
+            (
+                "body coordinate minus the aura inset",
+                work,
+                &body,
+                10,
+                1.0,
+                POINT { x: 190, y: 290 },
+            ),
+            // At a non-1.0 scale the override scales first, then the inset subtracts.
+            (
+                "body coordinate scales before the inset",
+                work,
+                &body,
+                15,
+                1.5,
+                POINT { x: 285, y: 435 },
+            ),
+        ];
+        for (label, work, p, inset, scale, expected) in cases {
+            assert_eq!(placement(work, 400, 100, p, inset, scale), expected, "{label}");
+        }
     }
 
     #[test]
-    fn placement_with_no_work_area_inset_uses_the_full_monitor() {
-        // Fullscreen or no taskbar: Windows reports rcWork == rcMonitor, so the
-        // pill sits at the configured margin from the physical monitor edges —
-        // never retaining a stale taskbar-sized gap.
+    fn placement_keeps_the_pill_body_exactly_one_margin_from_each_edge() {
+        // With a non-zero aura (`inset`) the window origin is offset by the
+        // inset, so every anchor arm must subtract it: the PILL BODY
+        // (window edge + inset) sits at exactly `margin` from the work-area
+        // edge, never margin + inset. The exact window points also pin the
+        // sign: the old `+ inset` bug shifted each arm by a double inset.
         let work = RECT {
             left: 0,
             top: 0,
             right: 1920,
             bottom: 1080,
-        };
-        let bottom = anchor_pos(None, None);
-        assert_eq!(
-            placement(work, 400, 100, &bottom, 0, 1.0),
-            POINT {
-                x: (1920 - 400) / 2,
-                y: 1080 - 100 - 8
-            },
-            "bottom anchor uses the full-monitor bottom when there is no inset"
-        );
-        let top = OverlayPos {
-            vertical: VerticalPosition::Top,
-            ..anchor_pos(None, None)
-        };
-        assert_eq!(
-            placement(work, 400, 100, &top, 0, 1.0),
-            POINT {
-                x: (1920 - 400) / 2,
-                y: 8
-            }
-        );
-    }
-
-    #[test]
-    fn placement_top_inset_anchors_against_the_work_area_top() {
-        // Taskbar along the top edge: rcWork.top > rcMonitor.top. The top anchor
-        // must read the work-area top, not the physical monitor top.
-        let work = RECT {
-            left: 0,
-            top: 40,
-            right: 1920,
-            bottom: 1080,
-        };
-        let top_left = OverlayPos {
-            vertical: VerticalPosition::Top,
-            horizontal: HorizontalPosition::Left,
-            ..anchor_pos(None, None)
-        };
-        let point = placement(work, 400, 100, &top_left, 0, 1.0);
-        assert_eq!(
-            point,
-            POINT { x: 8, y: 48 },
-            "top-left pill sits margin from the work-area top-left"
-        );
-        // Anchoring on the physical monitor top (0) would land the pill at y = 8.
-        assert_ne!(point.y, 8);
-    }
-
-    #[test]
-    fn placement_top_inset_sits_the_pill_body_margin_from_the_work_edge() {
-        // With a non-zero aura (`inset`), the top anchor must place the PILL
-        // BODY (window.y + inset) at exactly `margin` from the work-area top —
-        // not `margin + inset`. The old `+ inset` sign shifted the pill down by
-        // a double inset (pill body sat at margin + 2*inset). A full-monitor work
-        // rect (no taskbar) isolates the sign from the fullscreen/aura logic.
-        let work = RECT {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1080,
-        };
-        let top = OverlayPos {
-            vertical: VerticalPosition::Top,
-            ..anchor_pos(None, None)
         };
         let inset = 6;
+        let margin = 8;
+        let top = OverlayPos {
+            vertical: VerticalPosition::Top,
+            horizontal: HorizontalPosition::Center,
+            margin,
+            ..anchor_pos(None, None)
+        };
         let point = placement(work, 400, 100, &top, inset, 1.0);
-        // window.y = work.top + margin - inset = 0 + 8 - 6 = 2. The buggy `+ inset`
-        // sign would yield y = 14 here.
+        // window.y = work.top + margin - inset = 0 + 8 - 6 = 2.
         assert_eq!(
             point,
             POINT {
                 x: (1920 - 400) / 2 - inset,
-                y: 8 - inset
+                y: margin - inset
             },
             "top anchor window.y = work.top + margin - inset"
         );
-        // Pill body top = window.y + inset = margin below the work-area top,
-        // matching the Bottom arm (vertical symmetry at this inset).
-        let pill_top = point.y + inset;
         assert_eq!(
-            pill_top - work.top,
-            8,
-            "pill body sits exactly `margin` (8) from the work-area top edge"
+            point.y + inset - work.top,
+            margin,
+            "pill body sits exactly `margin` from the work-area top edge"
         );
-        let bottom = anchor_pos(None, None);
-        let bpoint = placement(work, 400, 100, &bottom, inset, 1.0);
-        let pill_bottom = bpoint.y + 100 + inset;
-        assert_eq!(
-            work.bottom - pill_bottom,
-            8,
-            "pill body sits exactly `margin` (8) from the work-area bottom edge"
-        );
-    }
 
-    #[test]
-    fn placement_left_inset_sits_the_pill_body_margin_from_the_work_edge() {
-        // Mirror of the Top-arm regression, for the left edge: with a non-zero
-        // aura (`inset`), the Left anchor must place the PILL BODY (window.x +
-        // inset) at exactly `margin` from the work-area left — not `margin + inset`.
-        // The old `+ inset` sign (identical to the former Top bug) shifted the pill
-        // right by a double inset. A full-monitor work rect (no taskbar) isolates
-        // the sign. (vertical defaults to Bottom via anchor_pos, the same
-        // convention `placement_left_inset_anchors_against_the_work_area_left`
-        // uses; only the horizontal Left arm is under test here.)
-        let work = RECT {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1080,
-        };
-        let left = OverlayPos {
-            horizontal: HorizontalPosition::Left,
+        let bottom = OverlayPos {
+            vertical: VerticalPosition::Bottom,
+            horizontal: HorizontalPosition::Center,
+            margin,
             ..anchor_pos(None, None)
         };
-        let inset = 6;
+        let point = placement(work, 400, 100, &bottom, inset, 1.0);
+        assert_eq!(
+            work.bottom - (point.y + 100 + inset),
+            margin,
+            "pill body sits exactly `margin` from the work-area bottom edge"
+        );
+
+        let left = OverlayPos {
+            vertical: VerticalPosition::Bottom,
+            horizontal: HorizontalPosition::Left,
+            margin,
+            ..anchor_pos(None, None)
+        };
         let point = placement(work, 400, 100, &left, inset, 1.0);
-        // window.x = work.left + margin - inset = 0 + 8 - 6 = 2. The buggy `+ inset`
-        // sign would yield x = 14 here.
+        // window.x = work.left + margin - inset = 0 + 8 - 6 = 2.
         assert_eq!(
             point,
             POINT {
-                x: 8 - inset,
-                y: 1080 - 100 - 8 - inset
+                x: margin - inset,
+                y: 1080 - 100 - margin - inset
             },
             "left anchor window.x = work.left + margin - inset"
         );
-        // Pill body left = window.x + inset = margin from the work-area left,
-        // matching the Right arm (horizontal symmetry at this inset).
-        let pill_left = point.x + inset;
         assert_eq!(
-            pill_left - work.left,
-            8,
-            "pill body sits exactly `margin` (8) from the work-area left edge"
+            point.x + inset - work.left,
+            margin,
+            "pill body sits exactly `margin` from the work-area left edge"
         );
+
         let right = OverlayPos {
-            horizontal: HorizontalPosition::Right,
-            ..anchor_pos(None, None)
-        };
-        let rpoint = placement(work, 400, 100, &right, inset, 1.0);
-        let pill_right = rpoint.x + 400 + inset;
-        assert_eq!(
-            work.right - pill_right,
-            8,
-            "pill body sits exactly `margin` (8) from the work-area right edge"
-        );
-    }
-
-    #[test]
-    fn placement_left_inset_anchors_against_the_work_area_left() {
-        // Taskbar along the left edge: rcWork.left > rcMonitor.left.
-        let work = RECT {
-            left: 80,
-            top: 0,
-            right: 1920,
-            bottom: 1080,
-        };
-        let left = OverlayPos {
-            horizontal: HorizontalPosition::Left,
-            ..anchor_pos(None, None)
-        };
-        let point = placement(work, 400, 100, &left, 0, 1.0);
-        assert_eq!(
-            point,
-            POINT {
-                x: 88,
-                y: 1080 - 100 - 8
-            },
-            "left pill sits margin from the work-area left"
-        );
-        // Anchoring on the physical monitor left (0) would land the pill at x = 8.
-        assert_ne!(point.x, 8);
-    }
-
-    #[test]
-    fn placement_right_inset_anchors_against_the_work_area_right() {
-        // Taskbar along the right edge: rcWork.right < rcMonitor.right.
-        let work = RECT {
-            left: 0,
-            top: 0,
-            right: 1840,
-            bottom: 1080,
-        };
-        let right = OverlayPos {
-            horizontal: HorizontalPosition::Right,
-            ..anchor_pos(None, None)
-        };
-        let point = placement(work, 400, 100, &right, 0, 1.0);
-        assert_eq!(
-            point,
-            POINT {
-                x: 1840 - 400 - 8,
-                y: 1080 - 100 - 8
-            }
-        );
-        // Anchoring on the physical monitor right (1920) would land the pill at x = 1512.
-        assert_ne!(point.x, 1920 - 400 - 8);
-    }
-
-    #[test]
-    fn placement_bottom_inset_anchors_against_the_work_area_bottom() {
-        // Taskbar along the bottom edge: rcWork.bottom < rcMonitor.bottom.
-        let work = RECT {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1040,
-        };
-        let bottom = anchor_pos(None, None);
-        let point = placement(work, 400, 100, &bottom, 0, 1.0);
-        assert_eq!(
-            point,
-            POINT {
-                x: 760,
-                y: 1040 - 100 - 8
-            }
-        );
-        // Anchoring on the physical monitor bottom (1080) would land the pill at y = 972.
-        assert_ne!(point.y, 1080 - 100 - 8);
-    }
-
-    #[test]
-    fn placement_respects_all_four_work_area_insets_at_once() {
-        // Synthetic geometry with an inset on every edge: each anchor reads its
-        // own work-area boundary, never a physical-monitor boundary.
-        let work = RECT {
-            left: 80,
-            top: 40,
-            right: 1840,
-            bottom: 1040,
-        };
-        let span_w = work.right - work.left;
-        let top_left = OverlayPos {
-            vertical: VerticalPosition::Top,
-            horizontal: HorizontalPosition::Left,
-            ..anchor_pos(None, None)
-        };
-        let bottom_right = OverlayPos {
             vertical: VerticalPosition::Bottom,
             horizontal: HorizontalPosition::Right,
+            margin,
             ..anchor_pos(None, None)
         };
-        let top_center = OverlayPos {
-            vertical: VerticalPosition::Top,
-            horizontal: HorizontalPosition::Center,
-            ..anchor_pos(None, None)
-        };
-        assert_eq!(placement(work, 400, 100, &top_left, 0, 1.0), POINT { x: 88, y: 48 });
+        let point = placement(work, 400, 100, &right, inset, 1.0);
         assert_eq!(
-            placement(work, 400, 100, &bottom_right, 0, 1.0),
-            POINT {
-                x: 1840 - 400 - 8,
-                y: 1040 - 100 - 8
-            },
-        );
-        assert_eq!(
-            placement(work, 400, 100, &top_center, 0, 1.0),
-            POINT {
-                x: 80 + (span_w - 400) / 2,
-                y: 48
-            },
+            work.right - (point.x + 400 + inset),
+            margin,
+            "pill body sits exactly `margin` from the work-area right edge"
         );
     }
 

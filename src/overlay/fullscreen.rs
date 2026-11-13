@@ -129,33 +129,28 @@ mod refresh_period_tests {
     use super::*;
 
     #[test]
-    fn a_reported_ratio_becomes_an_exact_period() {
+    fn refresh_helpers_convert_and_clamp_the_reported_rate() {
+        // A reported ratio becomes an exact nanosecond period; 59.94 Hz
+        // (60000/1001) must not collapse to 60 Hz.
         assert_eq!(refresh_ratio_period(60, 1), Some(Duration::from_nanos(16_666_666)));
         assert_eq!(refresh_ratio_period(300, 1), Some(Duration::from_nanos(3_333_333)));
         assert_eq!(refresh_ratio_period(144, 1), Some(Duration::from_nanos(6_944_444)));
-        // 59.94 Hz (60000/1001) must not collapse to 60 Hz.
         assert_eq!(
             refresh_ratio_period(60_000, 1_001),
             Some(Duration::from_nanos(16_683_333))
         );
-    }
 
-    #[test]
-    fn an_unreported_ratio_is_rejected() {
+        // An unreported ratio is rejected.
         assert_eq!(refresh_ratio_period(0, 0), None);
         assert_eq!(refresh_ratio_period(0, 1), None);
         assert_eq!(refresh_ratio_period(60, 0), None);
-    }
 
-    #[test]
-    fn a_frequency_becomes_a_period_and_zero_is_rejected() {
+        // A plain frequency converts the same way; zero is rejected.
         assert_eq!(frequency_period(60), Some(Duration::from_nanos(16_666_666)));
         assert_eq!(frequency_period(300), Some(Duration::from_nanos(3_333_333)));
         assert_eq!(frequency_period(0), None);
-    }
 
-    #[test]
-    fn pathological_periods_are_clamped() {
+        // Pathological periods clamp; the default stays put.
         assert_eq!(clamp_refresh_period(Duration::ZERO), MIN_REFRESH_PERIOD);
         assert_eq!(clamp_refresh_period(Duration::from_secs(5)), MAX_REFRESH_PERIOD);
         assert_eq!(clamp_refresh_period(DEFAULT_REFRESH_PERIOD), DEFAULT_REFRESH_PERIOD);

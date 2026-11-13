@@ -8359,56 +8359,37 @@ mod tests {
     }
 
     #[test]
-    fn wait_async_timeout_marker_flows_through_the_macro_unchanged() {
-        // Drives wait_outcome through the FULL wait_async_op macro expansion
-        // with a simulated never-signalling operation. The shared mock
-        // (fire_after = None) reports Started and retains the completion
+    fn wait_timeout_marker_flows_through_both_macro_shapes_unchanged() {
+        // Drives wait_outcome through the FULL macro expansion with a
+        // simulated never-signalling operation, once per shape. The shared
+        // mocks (fire_after = None) report Started and retain the completion
         // handler without ever invoking it — the retained handler keeps the
-        // signal channel open, so the wait must block for the whole bound,
+        // signal channel open, so each wait must block for the whole bound,
         // and the error that propagates out of the macro must be the
         // AsyncReadTimeout marker is_wait_timeout recognizes, unchanged
-        // through the `?`.
+        // through the `?`. The progress shape pins the same contract for
+        // IAsyncOperationWithProgress<TResult, u32>, which drives the
+        // per-source exclusion.
         let op = MockAsyncOp::new(None, 0);
         assert_wait_times_out(|bound| wait_async(&op, bound));
+        let progress = MockAsyncOpProgress::new(None, 0);
+        assert_wait_times_out(|bound| wait_async_progress(&progress, bound));
     }
 
     #[test]
-    fn wait_async_progress_timeout_marker_flows_through_the_macro_unchanged() {
-        // The same wedged-read contract for the progress shape: the shared
-        // progress mock (fire_after = None) retains the completed handler
-        // without ever invoking it, so the wait times out and the
-        // AsyncReadTimeout marker must propagate out of wait_async_progress
-        // — the IAsyncOperationWithProgress<TResult, u32> macro expansion —
-        // unchanged, recognized by is_wait_timeout to drive the per-source
-        // exclusion.
-        let op = MockAsyncOpProgress::new(None, 0);
-        assert_wait_times_out(|bound| wait_async_progress(&op, bound));
-    }
-
-    #[test]
-    fn wait_async_returns_the_result_when_the_handler_fires_before_the_timeout() {
-        // The completion race won: the shared mock's firing thread invokes
-        // the retained handler FIRE_AFTER into the wait bound, so
-        // recv_timeout returns the signal and wait_async proceeds to
-        // GetResults — the result comes back and the source is never
-        // excluded. If the signal were lost or the wait misread a completed
-        // operation, the bound would expire and the AsyncReadTimeout marker
-        // would surface instead.
+    fn wait_returns_the_result_for_both_macro_shapes_when_the_handler_fires() {
+        // The completion race won for both shapes: each shared mock's firing
+        // thread invokes the retained handler FIRE_AFTER into the wait bound,
+        // so recv_timeout returns the signal and the wait proceeds to
+        // GetResults. The value comes back and the source is never excluded;
+        // a lost signal or a misread completed operation would race the
+        // deadline and surface the AsyncReadTimeout marker instead. The
+        // progress shape answers its own value (7), pinning the generic
+        // result flow through the progress macro.
         let op = MockAsyncOp::new(Some(Duration::from_millis(300)), 0);
         assert_wait_completes_with(0, |bound| wait_async(&op, bound));
-    }
-
-    #[test]
-    fn wait_async_progress_returns_the_result_when_the_handler_fires_before_the_timeout() {
-        // The progress shape's completion race won: the shared mock's firing
-        // thread invokes the retained completed handler FIRE_AFTER into the
-        // wait bound, so recv_timeout returns the signal and
-        // wait_async_progress proceeds to GetResults — the value comes back
-        // and the source is never excluded. The opposite outcome (the wedged
-        // read) is pinned by the sibling progress timeout test; this one
-        // proves the result survives the macro expansion too.
-        let op = MockAsyncOpProgress::new(Some(Duration::from_millis(300)), 7);
-        assert_wait_completes_with(7, |bound| wait_async_progress(&op, bound));
+        let progress = MockAsyncOpProgress::new(Some(Duration::from_millis(300)), 7);
+        assert_wait_completes_with(7, |bound| wait_async_progress(&progress, bound));
     }
 
     #[test]

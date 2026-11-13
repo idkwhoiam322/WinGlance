@@ -1611,6 +1611,21 @@ unsafe fn picker_proc_body(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPA
 mod tests {
     use super::*;
 
+    /// One `build_picker_list` case: label, current patterns, live entries,
+    /// expected row patterns, and which rows carry the "(not running)" label.
+    type PickerCase<'a> = (&'a str, &'a [&'a str], &'a [&'a str], &'a [&'a str], &'a [bool]);
+
+    /// One `build_pinned_source_list` case: label, current pins, allow-list,
+    /// live entries, expected row patterns, and which rows are "(not allowed)".
+    type PinnedCase<'a> = (
+        &'a str,
+        &'a [&'a str],
+        &'a [&'a str],
+        &'a [&'a str],
+        &'a [&'a str],
+        &'a [bool],
+    );
+
     #[test]
     fn nccreate_with_null_create_params_leaves_the_box_unclaimed() {
         // A valid CREATESTRUCTW whose lpCreateParams is null (WM_NCCREATE
@@ -1677,30 +1692,52 @@ mod tests {
     }
 
     #[test]
-    fn running_app_is_not_duplicated_with_a_not_running_row() {
-        let list = build_picker_list(&["telegram".to_string()], vec![entry("telegram")]);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].pattern, "telegram");
-        assert!(!list[0].display_name.contains("not running"));
-    }
-
-    #[test]
-    fn not_running_configured_source_is_retained_and_pre_checkable() {
-        let current = vec!["discord".to_string()];
-        let list = build_picker_list(&current, vec![]);
-        assert_eq!(list.len(), 1);
-        assert!(list[0].display_name.ends_with("(not running)"));
-        // The row's pattern is the stored pattern verbatim, so the existing
-        // pre-check (which matches normalized current patterns) marks it checked
-        // and it survives the main window's full-replace-on-save.
-        assert_eq!(list[0].pattern, "discord");
-        let norm = normalize_pattern(&list[0].pattern);
-        assert!(current.iter().any(|p| normalize_pattern(p) == norm));
-    }
-
-    #[test]
-    fn empty_patterns_add_no_rows() {
-        assert!(build_picker_list(&[" ".to_string(), "".to_string()], vec![]).is_empty());
+    fn build_picker_list_keeps_live_and_configured_sources_without_duplicates() {
+        // One table for the row set and order: live entries are sorted, a
+        // configured-but-closed source is kept with a "(not running)" label
+        // and pinned above them, a live row is never duplicated, and blank
+        // patterns add nothing.
+        let cases: [PickerCase; 6] = [
+            (
+                "live row is not duplicated",
+                &["telegram"],
+                &["telegram"],
+                &["telegram"],
+                &[false],
+            ),
+            ("closed source is retained", &["discord"], &[], &["discord"], &[true]),
+            ("blank patterns add no rows", &[" ", ""], &[], &[], &[]),
+            (
+                "live and closed coexist",
+                &["spotify", "discord"],
+                &["spotify"],
+                &["discord", "spotify"],
+                &[true, false],
+            ),
+            (
+                "closed sources pin above live ones",
+                &["zebra", "alpha"],
+                &["mango", "banana"],
+                &["alpha", "zebra", "banana", "mango"],
+                &[true, true, false, false],
+            ),
+            (
+                "closed group stays alphabetical",
+                &["zeta", "alpha"],
+                &[],
+                &["alpha", "zeta"],
+                &[true, true],
+            ),
+        ];
+        for (label, current, entries, expected, not_running_flags) in cases {
+            let current: Vec<String> = current.iter().map(|s| s.to_string()).collect();
+            let entries: Vec<ProcessEntry> = entries.iter().map(|p| entry(p)).collect();
+            let list = build_picker_list(&current, entries);
+            let patterns: Vec<&str> = list.iter().map(|e| e.pattern.as_str()).collect();
+            assert_eq!(patterns, expected, "{label}: patterns");
+            let flags: Vec<bool> = list.iter().map(|e| e.display_name.contains("not running")).collect();
+            assert_eq!(flags, not_running_flags, "{label}: labels");
+        }
     }
 
     #[test]
@@ -1723,139 +1760,71 @@ mod tests {
     }
 
     #[test]
-    fn running_and_configured_sources_coexist() {
-        let list = build_picker_list(&["spotify".to_string(), "discord".to_string()], vec![entry("spotify")]);
-        assert_eq!(list.len(), 2);
-        let by_pattern: HashMap<&str, &ProcessEntry> = list.iter().map(|e| (e.pattern.as_str(), e)).collect();
-        assert!(!by_pattern["spotify"].display_name.contains("not running"));
-        assert!(by_pattern["discord"].display_name.contains("not running"));
-        assert_eq!(by_pattern["spotify"].pattern, "spotify");
-        assert_eq!(by_pattern["discord"].pattern, "discord");
-    }
-
-    #[test]
-    fn not_running_sources_pin_to_the_top_of_the_list() {
-        // The configured-but-closed app must appear above every running app,
-        // regardless of alphabetical order, so a stored source is never lost
-        // below the fold of a long list.
-        let list = build_picker_list(
-            &["zebra".to_string(), "alpha".to_string()],
-            vec![entry("mango"), entry("banana")],
-        );
-        assert_eq!(list.len(), 4);
-        assert_eq!(list[0].pattern, "alpha");
-        assert_eq!(list[1].pattern, "zebra");
-        assert_eq!(list[2].pattern, "banana");
-        assert_eq!(list[3].pattern, "mango");
-        assert!(list[0].display_name.contains("not running"));
-        assert!(list[1].display_name.contains("not running"));
-        assert!(!list[2].display_name.contains("not running"));
-        assert!(!list[3].display_name.contains("not running"));
-    }
-
-    #[test]
-    fn not_running_group_stays_alphabetically_sorted() {
-        let list = build_picker_list(&["zeta".to_string(), "alpha".to_string()], vec![]);
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].pattern, "alpha");
-        assert_eq!(list[1].pattern, "zeta");
-    }
-
-    #[test]
-    fn pinned_source_list_is_restricted_to_allowed_sources() {
-        // The pinned-source picker may only offer apps matching the user's
-        // Allowed Sources: the worker excludes anything outside `media_sources`
-        // (non-empty), so a pin outside it could never fire.
-        let entries = vec![entry("spotify"), entry("spotifyhelper"), entry("chrome")];
-        let allowed = vec!["Spotify".to_string()];
-        let list = build_pinned_source_list(&[], &allowed, entries);
-        let patterns: Vec<&str> = list.iter().map(|e| e.pattern.as_str()).collect();
-        assert_eq!(
-            patterns,
-            ["spotify", "spotifyhelper"],
-            "only sources matching the allow-list may be pinned"
-        );
-    }
-
-    #[test]
-    fn pinned_source_list_with_empty_allow_list_shows_everything() {
-        // Empty `media_sources` = all apps allowed (documented semantics), so
-        // the pinned picker is unfiltered in that case.
-        let entries = vec![entry("spotify"), entry("chrome")];
-        let list = build_pinned_source_list(&[], &[], entries);
-        assert_eq!(list.len(), 2);
-    }
-
-    #[test]
-    fn pinned_source_list_matches_allow_patterns_bidirectionally() {
-        // The same identity rule as the pin at runtime: an allow pattern
-        // stored as "youtube music" matches the session-derived
-        // "youtube-music" entry, so the row set agrees with the worker.
-        let entries = vec![entry("youtube-music"), entry("brave")];
-        let allowed = vec!["youtube music".to_string()];
-        let list = build_pinned_source_list(&[], &allowed, entries);
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].pattern, "youtube-music");
-    }
-
-    #[test]
-    fn disallowed_stored_pin_stays_visible_and_clearable() {
-        // A pin that no longer matches the allow-list (media_sources was
-        // narrowed after pinning) must not vanish: it stays as a
-        // "(not allowed)" row — an accurate label even when the app is
-        // running — with the pattern verbatim so the pre-check marks it and
-        // the user can clear it.
-        let entries = vec![entry("foobar"), entry("spotify")];
-        let allowed = vec!["spotify".to_string()];
-        let list = build_pinned_source_list(&["foobar".to_string()], &allowed, entries);
-        assert_eq!(list.len(), 2, "the disallowed pin row plus the allowed live app");
-        assert!(
-            list[0].display_name.contains("not allowed"),
-            "label must read '(not allowed)', got '{}'",
-            list[0].display_name
-        );
-        assert_eq!(list[0].pattern, "foobar");
-        assert_eq!(list[1].pattern, "spotify");
-        // The stored-pin row's pattern is verbatim, so the pre-check (which
-        // matches normalized current patterns) marks it checked and it
-        // survives the single-select replace-on-save.
-        assert_eq!(normalize_pattern(&list[0].pattern), normalize_pattern("foobar"));
-    }
-
-    #[test]
-    fn a_still_allowed_stored_pin_is_offered_as_a_normal_row() {
-        // The happy-path complement to the disallowed-pin test: a stored pin
-        // that still matches the allow-list is a normal pre-checked row — no
-        // "(not allowed)" label, no "(not running)" duplicate.
-        let entries = vec![entry("spotify"), entry("chrome")];
-        let allowed = vec!["spotify".to_string()];
-        let list = build_pinned_source_list(&["spotify".to_string()], &allowed, entries);
-        assert_eq!(list.len(), 1, "chrome is filtered, spotify is offered");
-        assert_eq!(list[0].pattern, "spotify");
-        assert!(
-            !list[0].display_name.contains("not allowed"),
-            "a still-allowed pin must not be labeled, got '{}'",
-            list[0].display_name
-        );
-    }
-
-    #[test]
-    fn disallowed_stored_pins_sort_above_the_live_rows() {
-        // Multiple disallowed pins are sorted by name and pinned above the
-        // live allowed rows, so the clearable group is always findable.
-        let entries = vec![entry("spotify")];
-        let allowed = vec!["spotify".to_string()];
-        let current = vec!["zebra".to_string(), "alpha".to_string()];
-        let list = build_pinned_source_list(&current, &allowed, entries);
-        let patterns: Vec<&str> = list.iter().map(|e| e.pattern.as_str()).collect();
-        assert_eq!(
-            patterns,
-            ["alpha", "zebra", "spotify"],
-            "sorted disallowed pins first, the live allowed row last"
-        );
-        assert!(list[0].display_name.contains("not allowed"));
-        assert!(list[1].display_name.contains("not allowed"));
-        assert!(!list[2].display_name.contains("not allowed"));
+    fn build_pinned_source_list_filters_labels_and_orders_the_rows() {
+        // One table for the pinned picker: only allow-listed live entries are
+        // offered (bidirectional match), an empty allow-list offers
+        // everything, and a stored pin that no longer matches stays visible
+        // with a "(not allowed)" label, sorted above the live rows.
+        let cases: [PinnedCase; 6] = [
+            (
+                "allow-list restricts live rows",
+                &[],
+                &["Spotify"],
+                &["spotify", "spotifyhelper", "chrome"],
+                &["spotify", "spotifyhelper"],
+                &[false, false],
+            ),
+            (
+                "empty allow-list shows everything",
+                &[],
+                &[],
+                &["spotify", "chrome"],
+                &["chrome", "spotify"],
+                &[false, false],
+            ),
+            (
+                "allow patterns match bidirectionally",
+                &[],
+                &["youtube music"],
+                &["youtube-music", "brave"],
+                &["youtube-music"],
+                &[false],
+            ),
+            (
+                "disallowed pin stays clearable",
+                &["foobar"],
+                &["spotify"],
+                &["foobar", "spotify"],
+                &["foobar", "spotify"],
+                &[true, false],
+            ),
+            (
+                "still-allowed pin is a normal row",
+                &["spotify"],
+                &["spotify"],
+                &["spotify", "chrome"],
+                &["spotify"],
+                &[false],
+            ),
+            (
+                "disallowed pins sort above live rows",
+                &["zebra", "alpha"],
+                &["spotify"],
+                &["spotify"],
+                &["alpha", "zebra", "spotify"],
+                &[true, true, false],
+            ),
+        ];
+        for (label, current, allowed, entries, expected, not_allowed_flags) in cases {
+            let current: Vec<String> = current.iter().map(|s| s.to_string()).collect();
+            let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+            let entries: Vec<ProcessEntry> = entries.iter().map(|p| entry(p)).collect();
+            let list = build_pinned_source_list(&current, &allowed, entries);
+            let patterns: Vec<&str> = list.iter().map(|e| e.pattern.as_str()).collect();
+            assert_eq!(patterns, expected, "{label}: patterns");
+            let flags: Vec<bool> = list.iter().map(|e| e.display_name.contains("not allowed")).collect();
+            assert_eq!(flags, not_allowed_flags, "{label}: labels");
+        }
     }
 
     #[test]

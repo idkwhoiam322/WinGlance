@@ -9208,7 +9208,9 @@ mod tests {
     }
 
     #[test]
-    fn tray_tip_names_the_current_track_and_playback_state() {
+    fn tray_tip_describes_the_current_track_and_playback_state() {
+        // State prefix, fallbacks for a missing track or artist,
+        // control-character collapsing, and the shell's UTF-16 tip cap.
         for (state, prefix) in [
             (PlaybackState::Playing, "Playing"),
             (PlaybackState::NowPlaying, "Playing"),
@@ -9219,28 +9221,17 @@ mod tests {
             assert_eq!(tray_tip_for(Some(&current)), format!("{prefix}: Song — Artist"));
         }
         assert_eq!(tray_tip_for(None), TRAY_TIP_FALLBACK);
-    }
 
-    #[test]
-    fn tray_tip_without_a_title_keeps_the_fallback() {
+        // A blank title keeps the fallback; a blank artist drops the em dash.
         let blank = activity("   ", "Artist", PlaybackState::Playing);
         assert_eq!(tray_tip_for(Some(&blank)), TRAY_TIP_FALLBACK);
-    }
-
-    #[test]
-    fn tray_tip_without_an_artist_shows_state_and_title() {
         let no_artist = activity("Song", "  ", PlaybackState::Playing);
         assert_eq!(tray_tip_for(Some(&no_artist)), "Playing: Song");
-    }
 
-    #[test]
-    fn tray_tip_collapses_control_characters_to_one_line() {
+        // Control characters collapse to one line.
         let multi = activity("Line one\nLine two", "Artist", PlaybackState::Playing);
         assert_eq!(tray_tip_for(Some(&multi)), "Playing: Line one Line two — Artist");
-    }
 
-    #[test]
-    fn tray_tip_stays_within_the_sz_tip_limit_without_splitting_surrogates() {
         // Each emoji is two UTF-16 units; a byte- or char-based cap that
         // landed mid-pair would leave a lone surrogate for the shell to read.
         let long = activity(&"😀".repeat(200), "", PlaybackState::Playing);
@@ -9259,7 +9250,9 @@ mod tests {
     }
 
     #[test]
-    fn tray_menu_header_escapes_ampersands_and_skips_an_empty_track() {
+    fn tray_menu_header_escapes_ampersands_and_caps_the_text() {
+        // Ampersands double for the menu parser, a missing or blank track
+        // yields no header, and an overlong one is ellipsized to the cap.
         let rock = activity("Rock & Roll", "AC/DC", PlaybackState::Playing);
         assert_eq!(
             tray_menu_header(Some(&rock)).as_deref(),
@@ -9268,10 +9261,7 @@ mod tests {
         assert_eq!(tray_menu_header(None), None);
         let blank = activity("", "Artist", PlaybackState::Playing);
         assert_eq!(tray_menu_header(Some(&blank)), None);
-    }
 
-    #[test]
-    fn tray_menu_header_is_capped() {
         let long = activity(&"x".repeat(300), "", PlaybackState::Paused);
         let header = tray_menu_header(Some(&long)).expect("header");
         assert!(header.ends_with('…'));

@@ -298,27 +298,54 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_returns_none() {
-        assert!(palette_from_rgba(&[]).is_none());
+    fn palette_acceptance_matches_the_guard_tiers() {
+        // One table for the accept/reject boundary: empty and fully
+        // transparent input, black, the monochrome tier, the relaxed tier's
+        // dark-but-saturated case, and the square downscale path.
+        let cases: [(&str, Vec<u8>, bool); 9] = [
+            ("empty input", Vec::new(), false),
+            ("pure black", solid([0, 0, 0, 255], 8, 4), false),
+            ("fully transparent", solid([0, 0, 0, 0], 8, 4), false),
+            ("high-key white", solid([255, 255, 255, 255], 8, 4), true),
+            ("mid gray", solid([128, 128, 128, 255], 8, 4), true),
+            // 64x64 takes the square downscale path, not the raw histogram.
+            ("white square", solid([255, 255, 255, 255], 64, 64), true),
+            // Dark but saturated (S≈1.0, Y≈0.10): the relaxed tier accepts it.
+            ("dark red", solid([120, 0, 0, 255], 8, 4), true),
+            // Dark low saturation (S≈0.12, Y≈0.29) and very low saturation
+            // (S≈0.06): each falls through the strict guard but still yields
+            // a palette via the relaxed and monochrome tiers.
+            ("dark low saturation", solid([90, 70, 80, 255], 8, 4), true),
+            ("very low saturation", solid([81, 72, 76, 255], 8, 4), true),
+        ];
+        for (label, buffer, expected) in cases {
+            assert_eq!(
+                palette_from_rgba(&buffer).is_some(),
+                expected,
+                "{label} must {} a palette",
+                if expected { "yield" } else { "not yield" }
+            );
+        }
     }
 
     #[test]
-    fn pure_black_fails_the_luminance_guard() {
-        assert!(palette_from_rgba(&solid([0, 0, 0, 255], 8, 4)).is_none());
-    }
-
-    #[test]
-    fn pure_white_yields_a_monochrome_palette() {
-        // High-key white: the strict and relaxed guards reject Y > 0.85 and
-        // S = 0, but the monochrome tier accepts any non-black pixel.
-        let palette = palette_from_rgba(&solid([255, 255, 255, 255], 8, 4));
-        assert!(palette.is_some(), "high-key white art must get a palette");
-    }
-
-    #[test]
-    fn gray_yields_a_monochrome_palette() {
-        let palette = palette_from_rgba(&solid([128, 128, 128, 255], 8, 4));
-        assert!(palette.is_some(), "gray art must get a palette");
+    fn guard_tiers_accept_the_documented_color_bands() {
+        // The three tiers are cumulative: the basic guard needs saturation
+        // and mid luminance, the relaxed guard accepts dark low-saturation
+        // art, and the monochrome tier accepts near-neutral colors that fail
+        // both (but not black).
+        let cases = [
+            ("vibrant red", [220, 40, 40, 255], true, true, true),
+            ("dark low saturation", [90, 70, 80, 255], false, true, true),
+            ("very low saturation", [81, 72, 76, 255], false, false, true),
+            ("high-key white", [255, 255, 255, 255], false, false, true),
+            ("pure black", [0, 0, 0, 255], false, false, false),
+        ];
+        for (label, color, passes, relaxed, monochrome) in cases {
+            assert_eq!(passes_guard(color), passes, "{label}: basic guard");
+            assert_eq!(relaxed_guard(color), relaxed, "{label}: relaxed guard");
+            assert_eq!(monochrome_guard(color), monochrome, "{label}: monochrome guard");
+        }
     }
 
     #[test]
@@ -334,42 +361,6 @@ mod tests {
             r > 200 && g > 200 && b > 200,
             "primary should reflect the bright background, got [{r}, {g}, {b}]"
         );
-    }
-
-    #[test]
-    fn pure_black_fails_all_guards() {
-        // The final (monochrome) tier excludes near-black and dark neutrals;
-        // a dark but saturated color (dark red, S≈1.0, Y=0.10) must still
-        // get a palette via the relaxed tier.
-        assert!(palette_from_rgba(&solid([0, 0, 0, 255], 8, 4)).is_none());
-        assert!(palette_from_rgba(&solid([120, 0, 0, 255], 8, 4)).is_some());
-    }
-
-    #[test]
-    fn dark_low_saturation_color_passes_the_relaxed_guard() {
-        // S ≈ 0.12 (fails the basic guard's 0.25), Y ≈ 0.29 (passes):
-        // a dark moody skin tone that must still yield a palette.
-        let palette = palette_from_rgba(&solid([90, 70, 80, 255], 8, 4));
-        assert!(palette.is_some(), "dark but non-uniform art must get a palette");
-        assert!(!passes_guard([90, 70, 80, 255]));
-        assert!(relaxed_guard([90, 70, 80, 255]));
-    }
-
-    #[test]
-    fn very_low_saturation_dark_color_passes_the_monochrome_tier() {
-        // S ≈ 0.06 (below the relaxed floor of 0.10), Y ≈ 0.29: the dark
-        // portrait case falls through the strict and relaxed guards, but
-        // the monochrome tier still yields a palette instead of the pink
-        // accent default.
-        let palette = palette_from_rgba(&solid([81, 72, 76, 255], 8, 4));
-        assert!(palette.is_some(), "very low saturation dark art must get a palette");
-        assert!(!relaxed_guard([81, 72, 76, 255]));
-        assert!(monochrome_guard([81, 72, 76, 255]));
-    }
-
-    #[test]
-    fn transparent_image_returns_none() {
-        assert!(palette_from_rgba(&solid([0, 0, 0, 0], 8, 4)).is_none());
     }
 
     #[test]
@@ -438,15 +429,6 @@ mod tests {
             !(30.0..=330.0).contains(&hue),
             "primary should be red-ish, got hue {hue}"
         );
-    }
-
-    #[test]
-    fn white_square_uses_the_downscale_path() {
-        // Square buffers (the real worker decodes) go through the fixed-grid
-        // box average; a 64×64 white cover must still yield a monochrome
-        // palette, matching the non-square high-key behavior.
-        let palette = palette_from_rgba(&solid([255, 255, 255, 255], 64, 64));
-        assert!(palette.is_some(), "white square art must get a palette");
     }
 
     #[test]

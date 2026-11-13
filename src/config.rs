@@ -1741,12 +1741,72 @@ start_in_tray = false
     }
 
     #[test]
-    fn config_without_a_monitor_field_deserializes_to_active_window() {
-        // A config.toml written by a build before the monitor setting existed
-        // has no `[overlay] monitor` key and must keep today's behavior.
+    fn monitor_mode_defaults_round_trips_and_rejects_unknown_forms() {
+        // A config.toml written before the monitor setting existed has no
+        // `[overlay] monitor` key and must keep today's behavior while the
+        // rest of the section still loads.
         let config: Config = toml::from_str("[overlay]\nduration_ms = 4000\n").unwrap();
         assert_eq!(config.overlay.monitor, MonitorMode::ActiveWindow);
         assert_eq!(config.overlay.duration_ms, 4000);
+
+        // The exact on-disk forms, as a user would hand-edit them.
+        for (form, expected) in [
+            ("active-window", MonitorMode::ActiveWindow),
+            ("primary", MonitorMode::Primary),
+            ("index-0", MonitorMode::Index(0)),
+            ("index-2", MonitorMode::Index(2)),
+        ] {
+            let config: Config = toml::from_str(&format!("[overlay]\nmonitor = \"{form}\"\n")).unwrap();
+            assert_eq!(
+                config.overlay.monitor, expected,
+                "monitor = \"{form}\" in [overlay] must map to {expected:?}"
+            );
+        }
+
+        // Within a table, a mode serializes to a plain string value and
+        // parses back to the same variant.
+        #[derive(Serialize, Deserialize)]
+        struct Wrapper {
+            m: MonitorMode,
+        }
+        for mode in [
+            MonitorMode::ActiveWindow,
+            MonitorMode::Primary,
+            MonitorMode::Index(0),
+            MonitorMode::Index(3),
+        ] {
+            let text = toml::to_string_pretty(&Wrapper { m: mode }).unwrap();
+            let back: Wrapper = toml::from_str(&text).unwrap();
+            assert_eq!(back.m, mode, "round trip of {text:?} must preserve the mode");
+        }
+
+        // A full config save keeps the hand-editable string form.
+        let mut config = Config::default();
+        config.overlay.monitor = MonitorMode::Index(2);
+        let saved = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            saved.contains("monitor = \"index-2\""),
+            "the mode must serialize in its hand-editable string form:\n{saved}"
+        );
+        let reloaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(reloaded.overlay.monitor, MonitorMode::Index(2));
+
+        // Unknown strings and malformed indices are hard deserialization
+        // errors (the load path then applies defaults in memory and leaves
+        // the user's file untouched), never a silent reinterpretation.
+        for bad in [
+            "\"bogus\"",
+            "\"Index(1)\"",
+            "\"index\"",
+            "\"index-\"",
+            "\"index--1\"",
+            "\"index-abc\"",
+        ] {
+            assert!(
+                toml::from_str::<MonitorMode>(bad).is_err(),
+                "{bad} must not parse as a monitor mode"
+            );
+        }
     }
 
     #[test]
@@ -1786,72 +1846,6 @@ start_in_tray = false
         blank.behavior.pinned_source = Some("   ".to_string());
         blank.normalize();
         assert_eq!(blank.behavior.pinned_source, None);
-    }
-
-    #[test]
-    fn monitor_mode_round_trips_through_toml() {
-        // Round-trip direction: within a table, a mode serializes to a plain
-        // string value and parses back to the same variant.
-        #[derive(Serialize, Deserialize)]
-        struct Wrapper {
-            m: MonitorMode,
-        }
-        for mode in [
-            MonitorMode::ActiveWindow,
-            MonitorMode::Primary,
-            MonitorMode::Index(0),
-            MonitorMode::Index(3),
-        ] {
-            let text = toml::to_string_pretty(&Wrapper { m: mode }).unwrap();
-            let back: Wrapper = toml::from_str(&text).unwrap();
-            assert_eq!(back.m, mode, "round trip of {text:?} must preserve the mode");
-        }
-        // The exact on-disk forms, as a user would hand-edit them.
-        for (form, expected) in [
-            ("active-window", MonitorMode::ActiveWindow),
-            ("primary", MonitorMode::Primary),
-            ("index-0", MonitorMode::Index(0)),
-            ("index-2", MonitorMode::Index(2)),
-        ] {
-            let config: Config = toml::from_str(&format!("[overlay]\nmonitor = \"{form}\"\n")).unwrap();
-            assert_eq!(
-                config.overlay.monitor, expected,
-                "monitor = \"{form}\" in [overlay] must map to {expected:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_monitor_mode_is_rejected_not_reinterpreted() {
-        // Unknown strings and malformed indices are hard deserialization
-        // errors (the load path then applies defaults in memory and leaves
-        // the user's file untouched), never a silent reinterpretation.
-        for bad in [
-            "\"bogus\"",
-            "\"Index(1)\"",
-            "\"index\"",
-            "\"index-\"",
-            "\"index--1\"",
-            "\"index-abc\"",
-        ] {
-            assert!(
-                toml::from_str::<MonitorMode>(bad).is_err(),
-                "{bad} must not parse as a monitor mode"
-            );
-        }
-    }
-
-    #[test]
-    fn monitor_setting_survives_a_config_save_round_trip() {
-        let mut config = Config::default();
-        config.overlay.monitor = MonitorMode::Index(2);
-        let saved = toml::to_string_pretty(&config).unwrap();
-        assert!(
-            saved.contains("monitor = \"index-2\""),
-            "the mode must serialize in its hand-editable string form:\n{saved}"
-        );
-        let reloaded: Config = toml::from_str(&saved).unwrap();
-        assert_eq!(reloaded.overlay.monitor, MonitorMode::Index(2));
     }
 
     #[test]
@@ -1924,7 +1918,10 @@ start_in_tray = false
     }
 
     #[test]
-    fn compact_effective_mirrors_expanded_while_separation_is_off() {
+    fn compact_effective_mirrors_expanded_unless_separation_is_on() {
+        // Separation off: the Compact position mirrors the Expanded one, and
+        // a stale/customized independent Compact position must not leak
+        // through.
         let mut config = Config::default();
         config.overlay.vertical = VerticalPosition::Bottom;
         config.overlay.horizontal = HorizontalPosition::Right;
@@ -1932,8 +1929,6 @@ start_in_tray = false
         config.overlay.position_x = Some(120);
         config.overlay.position_y = Some(40);
         config.overlay.monitor = MonitorMode::Index(1);
-        // A stale/customized independent Compact position must not leak
-        // through while separation is off.
         config.overlay.compact_vertical = VerticalPosition::Top;
         config.overlay.compact_horizontal = HorizontalPosition::Left;
         assert_eq!(
@@ -1947,10 +1942,9 @@ start_in_tray = false
                 monitor: MonitorMode::Index(1),
             }
         );
-    }
 
-    #[test]
-    fn compact_effective_uses_independent_fields_while_separation_is_on() {
+        // Separation on: the independent Compact fields win, and the Expanded
+        // position itself is untouched by the flag.
         let mut config = Config::default();
         config.overlay.vertical = VerticalPosition::Bottom;
         config.overlay.compact_vertical = VerticalPosition::Top;
@@ -1959,12 +1953,9 @@ start_in_tray = false
         config.overlay.compact_position_separate = true;
         assert_eq!(config.overlay.compact_effective().vertical, VerticalPosition::Top);
         assert_eq!(config.overlay.compact_effective().x, Some(80));
-        // The Expanded position itself is untouched by the separation flag.
         assert_eq!(config.overlay.vertical, VerticalPosition::Bottom);
-    }
 
-    #[test]
-    fn compact_is_default_tracks_customization() {
+        // `compact_is_default` tracks any Compact customization.
         let mut config = Config::default();
         assert!(config.overlay.compact_is_default());
         config.overlay.compact_horizontal = HorizontalPosition::Right;
@@ -2012,25 +2003,20 @@ start_in_tray = false
     }
 
     #[test]
-    fn compact_corner_radius_defaults_without_touching_the_expanded_radius() {
+    fn compact_corner_radius_defaults_round_trips_and_clamps() {
+        // Defaults: expanded and Compact radii are independent knobs.
         let config = Config::default();
         assert_eq!(config.appearance.corner_radius, 26.0);
         assert_eq!(config.appearance.compact_corner_radius, 12.0);
-    }
 
-    #[test]
-    fn missing_compact_corner_radius_loads_with_the_default() {
         // A config written before this key existed must load successfully and
         // use the new default, with the existing radius untouched.
         let config: Config = toml::from_str("[appearance]\ncorner_radius = 26.0\n").unwrap();
         assert_eq!(config.appearance.corner_radius, 26.0);
         assert_eq!(config.appearance.compact_corner_radius, 12.0);
-    }
 
-    #[test]
-    fn compact_corner_radius_round_trips_and_stays_independent() {
-        // Expanded and Compact radii are independent knobs: any combination is
-        // valid, including equal values for both layouts.
+        // Any combination is valid, including equal values for both layouts;
+        // each radius round-trips independently.
         for (corner, compact) in [(26.0, 12.0), (20.0, 8.0), (26.0, 26.0)] {
             let config: Config = toml::from_str(&format!(
                 "[appearance]\ncorner_radius = {corner}\ncompact_corner_radius = {compact}\n"
@@ -2044,29 +2030,23 @@ start_in_tray = false
             assert_eq!(reloaded.appearance.corner_radius, corner);
             assert_eq!(reloaded.appearance.compact_corner_radius, compact);
         }
-    }
 
-    #[test]
-    fn effective_corner_radius_follows_the_effective_layout() {
-        let mut config = Config::default();
-        config.appearance.corner_radius = 20.0;
-        config.appearance.compact_corner_radius = 8.0;
         // `compact` is the already-resolved effective layout, so Auto that
         // resolved to Expanded/Compact selects the matching radius without
         // any Auto-specific logic here.
+        let mut config = Config::default();
+        config.appearance.corner_radius = 20.0;
+        config.appearance.compact_corner_radius = 8.0;
         assert_eq!(config.appearance.effective_corner_radius(false), 20.0);
         assert_eq!(config.appearance.effective_corner_radius(true), 8.0);
-    }
 
-    #[test]
-    fn compact_corner_radius_is_bounded() {
-        let mut config = Config::default();
-        config.appearance.compact_corner_radius = 1000.0;
-        config.normalize();
-        assert_eq!(config.appearance.compact_corner_radius, 48.0);
-        config.appearance.compact_corner_radius = -5.0;
-        config.normalize();
-        assert_eq!(config.appearance.compact_corner_radius, 4.0);
+        // Normalize clamps both ends of the Compact radius.
+        for (input, expected) in [(1000.0, 48.0), (-5.0, 4.0)] {
+            let mut config = Config::default();
+            config.appearance.compact_corner_radius = input;
+            config.normalize();
+            assert_eq!(config.appearance.compact_corner_radius, expected);
+        }
     }
 
     #[test]

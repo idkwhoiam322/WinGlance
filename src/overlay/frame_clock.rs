@@ -197,52 +197,33 @@ mod tests {
     }
 
     #[test]
-    fn sixty_hertz_is_not_truncated_to_sixteen_milliseconds() {
+    fn frame_period_honors_the_display_and_the_cap_band() {
+        // The cap must be the exact period, not a truncated millisecond
+        // value: 16 ms would be 62.5 fps, and a 144 Hz truncation would beat
+        // against the display.
         let period = frame_period(period_at(60), None);
-        // 16 ms would be 62.5 fps; the cap must be the exact 60 Hz period.
         assert_eq!(period, Duration::from_nanos(16_666_666));
         assert!(
             (1.0 / period.as_secs_f64() - 60.0).abs() < 0.001,
             "the effective rate must be 60 Hz, got {}",
             1.0 / period.as_secs_f64()
         );
-    }
+        assert_eq!(frame_period(period_at(300), Some(144)), Duration::from_nanos(6_944_444));
 
-    #[test]
-    fn a_display_slower_than_the_cap_keeps_its_own_period() {
-        let period = frame_period(period_at(30), Some(60));
-        assert_eq!(period, period_at(30));
-    }
-
-    #[test]
-    fn a_display_faster_than_the_cap_is_capped() {
+        // A display slower than the cap keeps its own period; a faster one
+        // is capped; an absent cap means 60 Hz.
+        assert_eq!(frame_period(period_at(30), Some(60)), period_at(30));
         assert_eq!(frame_period(period_at(300), Some(60)), period_at(60));
         assert_eq!(frame_period(period_at(144), Some(120)), period_at(120));
-    }
+        assert_eq!(frame_period(period_at(300), None), period_at(60));
 
-    #[test]
-    fn a_higher_cap_uses_the_exact_high_refresh_period() {
-        // 144 Hz is 6.944… ms; truncating to 6 or 7 ms beats against the
-        // display, so the cap must stay in nanoseconds.
-        let period = frame_period(period_at(300), Some(144));
-        assert_eq!(period, Duration::from_nanos(6_944_444));
-    }
-
-    #[test]
-    fn periods_are_clamped_to_the_supported_range() {
+        // Degenerate periods clamp to the supported range.
         assert_eq!(frame_period(Duration::ZERO, Some(1000)), MIN_PERIOD);
         assert_eq!(frame_period(Duration::from_secs(5), Some(60)), MAX_PERIOD);
-    }
 
-    #[test]
-    fn an_absent_cap_defaults_to_sixty_hertz() {
-        assert_eq!(frame_period(period_at(300), None), period_at(60));
-    }
-
-    #[test]
-    fn the_supported_cap_range_is_clamped_before_dividing() {
-        // Below the 60 Hz floor a user value would slow the animation under
-        // the documented minimum; above 1000 the period would underflow.
+        // The cap is clamped to the supported band before dividing: below
+        // the 60 Hz floor a user value would slow the animation under the
+        // documented minimum; above 1000 the period would underflow.
         assert_eq!(frame_period(period_at(300), Some(1)), period_at(60));
         assert_eq!(frame_period(period_at(1000), Some(u32::MAX)), period_at(1000));
     }

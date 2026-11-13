@@ -815,16 +815,54 @@ mod tests {
     }
 
     #[test]
-    fn same_media_requires_source_title_and_artist() {
-        let a = track("Love Me Not", "Ravyn Lenae");
-        assert!(a.same_media(&track("Love Me Not", "Ravyn Lenae")));
-        assert!(!a.same_media(&track("Other", "Ravyn Lenae")));
-        assert!(!a.same_media(&track("Love Me Not", "Other")));
-        let other_source = TrackInfo {
-            source_app: "spotify".into(),
-            ..a.clone()
+    fn same_media_compares_identity_fields_and_artwork() {
+        // One table for the identity predicate: title/artist/source and the
+        // cover bytes must all agree, identical bytes in separate Arcs still
+        // compare equal, artwork absence is compatible either way, and
+        // duration only decides when both sides know it.
+        let base = track("Love Me Not", "Ravyn Lenae");
+        let with_art = TrackInfo {
+            artwork: art(b"cover-a"),
+            ..base.clone()
         };
-        assert!(!a.same_media(&other_source));
+        let with_art_copy = TrackInfo {
+            artwork: art(b"cover-a"),
+            ..base.clone()
+        };
+        let with_other_art = TrackInfo {
+            artwork: art(b"cover-b"),
+            ..base.clone()
+        };
+        let shorter = TrackInfo {
+            duration_secs: Some(115),
+            ..base.clone()
+        };
+        let longer = TrackInfo {
+            duration_secs: Some(218),
+            ..base.clone()
+        };
+        let cases = [
+            ("identical metadata", base.clone(), base.clone(), true),
+            ("different title", base.clone(), track("Other", "Ravyn Lenae"), false),
+            ("different artist", base.clone(), track("Love Me Not", "Other"), false),
+            (
+                "different source",
+                base.clone(),
+                TrackInfo {
+                    source_app: "spotify".into(),
+                    ..base.clone()
+                },
+                false,
+            ),
+            ("different cover", with_art.clone(), with_other_art, false),
+            ("identical bytes in separate Arcs", with_art, with_art_copy, true),
+            ("unknown duration vs known", base.clone(), shorter.clone(), true),
+            ("both durations known and different", shorter, longer, false),
+        ];
+        for (label, a, b, expected) in cases {
+            assert_eq!(a.same_media(&b), expected, "{label} (forward)");
+            assert_eq!(b.same_media(&a), expected, "{label} (reverse)");
+        }
     }
 
     #[test]
@@ -872,46 +910,6 @@ mod tests {
         };
         assert!(!old.same_media(&incoming));
         assert!(!incoming.same_media(&old));
-    }
-
-    #[test]
-    fn same_media_distinguishes_different_covers() {
-        let a = TrackInfo {
-            artwork: art(b"cover-a"),
-            ..track("Love Me Not", "Ravyn Lenae")
-        };
-        let b = TrackInfo {
-            artwork: art(b"cover-b"),
-            ..track("Love Me Not", "Ravyn Lenae")
-        };
-        assert!(!a.same_media(&b), "a different cover is different media");
-        // Identical bytes in separate Arcs still compare equal.
-        let a_copy = TrackInfo {
-            artwork: art(b"cover-a"),
-            ..track("Love Me Not", "Ravyn Lenae")
-        };
-        assert!(a.same_media(&a_copy));
-    }
-
-    #[test]
-    fn same_media_uses_duration_when_both_lack_artwork() {
-        let a = track("Love Me Not", "Ravyn Lenae");
-        let shorter = TrackInfo {
-            duration_secs: Some(115),
-            ..a.clone()
-        };
-        let longer = TrackInfo {
-            duration_secs: Some(218),
-            ..a.clone()
-        };
-        assert!(
-            a.same_media(&shorter),
-            "unknown duration remains compatible with a later known value"
-        );
-        assert!(
-            !shorter.same_media(&longer),
-            "both known and different -> different media"
-        );
     }
 
     #[test]
@@ -965,12 +963,16 @@ mod tests {
     }
 
     #[test]
-    fn same_media_checks_playback_type_compatibility_independently() {
+    fn same_media_treats_unknown_optional_discriminators_as_compatible() {
+        // Each optional discriminator is compared only when both sides know
+        // it: an Unknown playback type or art generation 0 must not force a
+        // new-media decision, while two known values that disagree must.
+        let base = track("Same Name", "Same Artist");
         let music = TrackInfo {
             playback_type: PlaybackType::Music,
-            ..track("Same Name", "Same Artist")
+            ..base.clone()
         };
-        let unknown = TrackInfo {
+        let unknown_type = TrackInfo {
             playback_type: PlaybackType::Unknown,
             ..music.clone()
         };
@@ -978,34 +980,40 @@ mod tests {
             playback_type: PlaybackType::Video,
             ..music.clone()
         };
-        let same_music = music.clone();
-
-        assert!(unknown.same_media(&music));
-        assert!(music.same_media(&unknown));
-        assert!(music.same_media(&same_music));
-        assert!(!music.same_media(&video));
-    }
-
-    #[test]
-    fn same_media_checks_art_generation_compatibility_independently() {
         let generation_four = TrackInfo {
             art_generation: 4,
-            ..track("Same Name", "Same Artist")
+            ..base
         };
         let unknown_generation = TrackInfo {
             art_generation: 0,
             ..generation_four.clone()
         };
-        let same_generation = generation_four.clone();
         let generation_five = TrackInfo {
             art_generation: 5,
             ..generation_four.clone()
         };
-
-        assert!(unknown_generation.same_media(&generation_four));
-        assert!(generation_four.same_media(&unknown_generation));
-        assert!(generation_four.same_media(&same_generation));
-        assert!(!generation_four.same_media(&generation_five));
+        let cases = [
+            ("unknown playback type", unknown_type, music.clone(), true),
+            ("same playback type", music.clone(), music.clone(), true),
+            ("different playback type", music, video, false),
+            (
+                "unknown art generation",
+                unknown_generation,
+                generation_four.clone(),
+                true,
+            ),
+            (
+                "same art generation",
+                generation_four.clone(),
+                generation_four.clone(),
+                true,
+            ),
+            ("different art generation", generation_four, generation_five, false),
+        ];
+        for (label, a, b, expected) in cases {
+            assert_eq!(a.same_media(&b), expected, "{label} (forward)");
+            assert_eq!(b.same_media(&a), expected, "{label} (reverse)");
+        }
     }
 
     #[test]
